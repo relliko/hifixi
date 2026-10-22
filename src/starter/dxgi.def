@@ -1,0 +1,22 @@
+LIBRARY "dxgi"
+EXPORTS
+	ApplyCompatResolutionQuirking = thunk_ApplyCompatResolutionQuirking @1
+	CompatString = thunk_CompatString @2
+	CompatValue = thunk_CompatValue @3
+	DXGIDumpJournal = thunk_DXGIDumpJournal @4
+	PIXBeginCapture = thunk_PIXBeginCapture @5
+	PIXEndCapture = thunk_PIXEndCapture @6
+	PIXGetCaptureState = thunk_PIXGetCaptureState @7
+	SetAppCompatStringPointer = thunk_SetAppCompatStringPointer @8
+	UpdateHMDEmulationStatus = thunk_UpdateHMDEmulationStatus @9
+	CreateDXGIFactory1 = thunk_CreateDXGIFactory1 @10
+	CreateDXGIFactory2 = thunk_CreateDXGIFactory2 @11
+	CreateDXGIFactory = thunk_CreateDXGIFactory @12
+	DXGID3D10CreateDevice = thunk_DXGID3D10CreateDevice @13
+	DXGID3D10CreateLayeredDevice = thunk_DXGID3D10CreateLayeredDevice @14
+	DXGID3D10GetLayeredDeviceSize = thunk_DXGID3D10GetLayeredDeviceSize @15
+	DXGID3D10RegisterLayers = thunk_DXGID3D10RegisterLayers @16
+	DXGIDeclareAdapterRemovalSupport = thunk_DXGIDeclareAdapterRemovalSupport @17
+	DXGIDisableVBlankVirtualization = thunk_DXGIDisableVBlankVirtualization @18
+	DXGIGetDebugInterface1 = thunk_DXGIGetDebugInterface1 @19
+	DXGIReportAdapterConfiguration = thunk_DXGIReportAdapterConfiguration @20

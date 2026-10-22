@@ -1,0 +1,653 @@
+/*
+ * Grass for FFXI's world on Direct3D 12 (prototype): the renderer, free of ReShade so a test can drive
+ * it on its own device (tests/grass_test.cpp).
+ *
+ * Blades come from a baked file (tools/bake_grass.py: points on the zone's grass, from its collision,
+ * grouped in square cells). Each point is a tuft of curved blades, drawn with the game's own camera into
+ * the world's render target and depth buffer. Their colour comes from the ground under them: the world
+ * as drawn is copied into a buffer first, so grass takes the zone's texture, lighting, fog and time of
+ * day, and each point remembers it across frames. Only cells near the camera are drawn.
+ *
+ * Drawing changes the command list's root signature, root arguments, pipeline, topology, render
+ * targets, viewport and scissor; list_state holds the game's and puts them back.
+ */
+
+#pragma once
+
+#include "vistest.hpp"
+#include <d3d12.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace grass
+{
+	struct blade_file
+	{
+		struct cell
+		{
+			int32_t cx, cz;
+			uint32_t first, count;
+		};
+		uint32_t zone = 0;
+		float cell_size = 16.0f;
+		std::vector<cell> cells;
+		std::vector<float> blades; // x, y, z, seed per blade (the game's world: y is height, down is positive)
+		uint32_t stride = 4;       // floats a record
+		uint32_t blade_count() const { return static_cast<uint32_t>(blades.size() / stride); }
+	};
+
+	// Also the water files (tools/bake_water.py, tag 'WTR2'): the same layout, a record (8 floats) a triangle
+	// corner, three a triangle: the collision's x, y, z, kind (8 shallow, 9 deep, +100 steep), then the water's
+	// surface y over it, how far the water's edge is (yalms), and its flow (x, z, yalms a second)
+	bool read_blade_file(const wchar_t *path, blade_file &out, std::string &error, const char *magic = "GRS2", uint32_t stride = 4);
+
+	// The zone's visual meshes as one triangle soup, for the sun's shadow map (tools/bake_shadow_geo.py, tag
+	// 'SHD1'): triangles grouped in square cells by their centre, 12 words each: three corners of x, y, z (floats)
+	// and w (0 on a solid triangle; on a cut-out one, u | v << 12 | mask << 24: 12-bit texture coordinates and
+	// the cut-out texture's index + 1). The cut-out textures' alpha as bits: 4 words each (width, height, first
+	// word, words a row), then the words. A compact file ('SHD2': each model once and the zone's placements, packed)
+	// is expanded into the same when read.
+	struct shadow_file
+	{
+		uint32_t zone = 0;
+		float cell_size = 32.0f;
+		std::vector<blade_file::cell> cells;
+		std::vector<uint32_t> triangles;
+		std::vector<uint32_t> masks;
+		std::vector<uint32_t> words;
+		uint32_t triangle_count() const { return static_cast<uint32_t>(triangles.size() / 12); }
+	};
+	bool read_shadow_file(const wchar_t *path, shadow_file &out, std::string &error);
+
+	// Where a zone's ground is path or stone (tools/bake_wet.py, tag 'WET1'), for the wet look in rain: a mask seen
+	// from above, a bit a square (square yalms across), set where the topmost surface facing up there is path or
+	// stone; rows along x from the corner (x0, z0), words_a_row words each (bit i of word k: the square 32 k + i)
+	struct wet_file
+	{
+		uint32_t zone = 0;
+		float square = 0.5f;
+		float x0 = 0.0f, z0 = 0.0f;
+		uint32_t width = 0, height = 0, words_a_row = 0, set = 0;
+		std::vector<uint32_t> words;
+	};
+	bool read_wet_file(const wchar_t *path, wet_file &out, std::string &error);
+
+	// Where rain stops in a zone (tools/bake_rain.py, tag 'RHM1'): seen from above, the first surface a drop falling
+	// straight down meets over each square (square yalms across), from the corner (x0, z0): its height y0 + q * step
+	// (the game's y, down positive) and what it is (kRain*: nothing under it at all, something that stops rain without
+	// a splash (steep, leaves), ground facing up, the add-on's water). Rows along x, z first.
+	enum : uint8_t { kRainNothing = 0, kRainStops = 1, kRainGround = 2, kRainWater = 3 };
+	struct rain_file
+	{
+		uint32_t zone = 0;
+		float square = 0.5f;
+		float x0 = 0.0f, z0 = 0.0f;
+		float y0 = 0.0f, step = 1.0f / 16.0f;
+		uint32_t width = 0, height = 0, covered = 0;
+		std::vector<uint16_t> q;
+		std::vector<uint8_t> kinds;
+	};
+	// (unpacked with Windows' own XPRESS: ntdll's RtlDecompressBufferEx)
+	bool read_rain_file(const wchar_t *path, rain_file &out, std::string &error);
+
+
+	// The game's camera: D3D row-vector matrices, as the game keeps them (gGame +0x94 and +0x154)
+	struct camera
+	{
+		float view[16];
+		float proj[16];
+	};
+
+	// The game's weather (client-notes "Weather and sky"), as the worldfx Ashita addon reads it and sends it
+	// (worldfx_weather): kWeatherWords words, as the game keeps them (floats as their bits):
+	//   [0] the weather's id (the server's: 0 fine .. 19 dark; 0xFFFFFFFF not read)
+	//   [1] the weather shown (its 4-character name: the zone's weather folder in use; 0 none)
+	//   [2] while it changes, the one before (its name; 0 none), [3] how far the change is (f32 0..1: the new one's share)
+	//   [4] the fog the game draws the world with this frame (D3DCOLOR 0x00RRGGBB), [5] where it starts, [6] where it
+	//       ends (f32, yalms of view depth: the record's, times the game's draw distance setting)
+	//   [7] what was read: 1 the record, 2 the fog, 4 the weather object, 8 the id
+	//   [8..51] the record the game lights the zone by now (0xB0 bytes: its weather's keyframes blended by the hour),
+	//       its sky part (record +0x4C, words [27..50]) with it: the clear colour, the dome's segments, its 8 gradient
+	//       colours and their 8 heights (client-notes "Sky")
+	constexpr uint32_t kWeatherWords = 52;
+
+	struct weather
+	{
+		bool known = false;            // anything read at all
+		uint32_t id = 0xFFFFFFFF;      // (the server's weather)
+		uint32_t name = 0, before = 0; // the weather shown, and the one it's changing from (4 characters each; 0 none)
+		float change = 1.0f;           // the new one's share while it changes (1: done)
+		// The fog the world is drawn with: linear by view depth from start to end (yalms), toward colour (0..1); only from
+		// the renderer (the record's own is before the draw distance setting)
+		bool fog = false;
+		float fog_color[3] = {};
+		float fog_start = 0.0f, fog_end = 0.0f;
+		// From the record: the zone's light (the sun's or moon's colour and intensity, the ambient), the sky's colour,
+		// how far the zone is drawn (yalms) and the record's own fog (before the draw distance setting)
+		bool record = false;
+		float sun_color[3] = {}, ambient[3] = {}, sky[3] = {};
+		float intensity = 0.0f, draw_distance = 0.0f;
+		float record_fog_color[3] = {};
+		float record_fog_start = 0.0f, record_fog_end = 0.0f;
+		// The record's sky (its sky part, record +0x4C; client-notes "Sky"): the game draws a dome around the camera from
+		// it when segments > 2, the 8 gradient colours (bytes, 0..255) at their 8 heights (0 the horizon .. 1 overhead:
+		// the elevation over 90 degrees), and clears the world to the clear colour (bytes) behind it. sky_known when the
+		// heights make sense (0 to 1, rising).
+		bool sky_known = false;
+		uint32_t sky_segments = 0;
+		float sky_clear[3] = {};
+		float sky_colors[8][3] = {};
+		float sky_heights[8] = {};
+	};
+	// The weather from the addon's words (false when they hold nothing usable: then out is "not known")
+	bool decode_weather(const uint32_t *words, uint32_t count, weather &out);
+	// A weather's 4-character name as the word the game keeps it in ('fine' -> 0x656E6966)
+	constexpr uint32_t weather_name(const char (&s)[5])
+	{
+		return uint32_t(uint8_t(s[0])) | uint32_t(uint8_t(s[1])) << 8 | uint32_t(uint8_t(s[2])) << 16 | uint32_t(uint8_t(s[3])) << 24;
+	}
+	// A zone's clear sky through the day (tools/bake_clear_sky.py, worldfx-clearsky.txt next to the add-on): the light of
+	// its sun (or moon) in its clear weather (fine or sunshine, the brighter; a zone with neither, its brightest weather),
+	// the record's sun colour's luminance times its light intensity, at each Vana'diel hour
+	struct clear_sky
+	{
+		bool known = false;
+		float light[24] = {};
+	};
+	// The file's zones, indexed by zone id (false and why when it can't be read)
+	bool read_clear_sky_file(const wchar_t *path, std::vector<clear_sky> &out, std::string &error);
+	// Its light at a Vana'diel hour (0..24): linear between the hours, round midnight, as the game blends its keyframes
+	float clear_sky_light(const clear_sky &sky, double hour);
+	// The game's own sun (or moon) light in the weather's record: its colour's luminance times the zone's intensity (0
+	// when the record isn't known)
+	float weather_light(const weather &w);
+	// How much of the sun's (and the moon's) shadows the weather leaves: the game's own light in the record now as a share
+	// of the zone's clear sky's at the same hour, 1 at most. The game dims its sun that much (over all zones, at the
+	// median: cloud 0.89, mist 0.84, rain and squalls 0.59, thunder 0.65; a change between two is blended in its record
+	// already). 1 when the record isn't known or the clear sky's light is too faint to compare with (the darkest hours).
+	float weather_sunlight(const weather &w, float clear_light);
+	// How much it rains in a weather (1: rain, squalls, thunder, thunderstorms; else 0), blended the same way
+	float weather_rain(uint32_t name);
+	float weather_rain(const weather &w);
+	// How hard it rains (rain 0.55, squalls 0.8, thunder and thunderstorms 1; else 0) and how much the wind slants the
+	// drops and flakes (yalms across for each yalm fallen: blizzards the most, then squalls), blended the same way
+	float weather_downpour(uint32_t name);
+	float weather_downpour(const weather &w);
+	float weather_slant(uint32_t name);
+	float weather_slant(const weather &w);
+	// How hard it snows (snow 0.6, blizzards 1; else 0) and how far its flakes sway (yalms: snow 0.35, blizzards
+	// 0.15, the wind carrying them), blended the same way
+	float weather_snowfall(uint32_t name);
+	float weather_snowfall(const weather &w);
+	float weather_sway(uint32_t name);
+	float weather_sway(const weather &w);
+
+	// Characters and monsters that push grass aside, at most
+	constexpr uint32_t kMaxActors = 32;
+	// Weapon-skill cuts drawn into the grass at once (look::cuts), and how long each is kept for the frames to find
+	// (the points it covers are cut on the first frame they're drawn in that time; again changes nothing)
+	constexpr uint32_t kMaxCuts = 8;
+	constexpr double kCutKeep = 3.0;
+	// Rings spreading on the water from them as they move through it, at most at once
+	constexpr uint32_t kMaxRipples = 40;
+	// Lamps whose glow the shading pass adds, at most (the nearest lit ones in view: the add-on picks them)
+	constexpr uint32_t kMaxLamps = 16;
+
+	struct look
+	{
+		float distance = 40.0f; // yalms from the camera
+		float height = 0.5f;    // yalms, before the per-blade variation
+		float width = 0.03f;    // half the base, yalms
+		float color[3] = { 0.33f, 0.52f, 0.16f }; // the hue; brightness comes from the ground
+		int tuft = 5;           // blades per baked point
+		float time = 0.0f;      // seconds, for the wind
+		const float *actors = nullptr; // characters and monsters near: x, y, z (their feet), radius each
+		uint32_t actor_count = 0;      // (at most kMaxActors are used)
+		// Wear: the grass trodden down where they stand, more where they fight, and cut by weapon skills, growing back
+		// over minutes. clock: seconds on a steady clock (0: no wear at all); wear: how much it shows (0 none, up to 2);
+		// fighting: which of the actors are fighting (bit i: actor i); cuts: kMaxCuts at most, 8 floats each: a swath from
+		// x, y, z (the game's world) with its half-width (yalms), to x, y, z, and how long ago it was cut (seconds; those
+		// over kCutKeep ago are left out)
+		double clock = 0.0;
+		float wear = 0.0f;
+		uint32_t fighting = 0;
+		const float *cuts = nullptr;
+		uint32_t cut_count = 0;
+		// Colour rules: a root's colour samples leave out what isn't at the ground's height (characters, trees,
+		// names, the background) and samples far brighter or darker than the rest
+		bool rule_in_front = true, rule_outliers = true;
+		bool grass = true;              // the blades (off: only the shading below)
+		// The shading pass, before the grass and the interface: ambient occlusion (0 off) within a radius,
+		// and surface relief from the textures' own detail (0 off)
+		float ao_strength = 0.8f, ao_radius = 1.0f, relief = 0.6f;
+		// Sun shadows: toward the sun (the game's world: x east, y height with down positive, z north, a unit
+		// vector) and how dark its shadows are (0: none, the sun down or no sky)
+		float sun[3] = { 0.0f, -1.0f, 0.0f };
+		float sun_shadow = 0.0f;
+		// Whether characters and monsters (actors) cast sun shadows too: the game draws theirs itself
+		bool sun_characters = false;
+		// The sun's shadow map from the zone's own meshes (upload_shadow), when loaded: what's off screen casts
+		// too, and the march across the screen only reaches a couple of yalms there (contact shadows)
+		bool sun_map = true;
+		// Water, on the surface rebuilt over the zone's water collision: reflections (0 none, 1 as real water,
+		// up to 2), ripples (0 a still mirror) and darker where deep (0 none), within this many yalms. The sky
+		// when nothing on screen shows it (rgb), and the sun's glints (0 none: down or no sky) in its colour.
+		bool water = true;
+		float water_reflect = 1.0f, water_ripples = 1.0f, water_tint = 1.0f;
+		float water_distance = 300.0f;
+		float sky[3] = { 0.4f, 0.52f, 0.66f };
+		float glint = 0.0f;
+		float sun_color[3] = { 1.0f, 0.95f, 0.85f };
+		// The zone's fog colour (what the game clears the world to), for the sky along the horizon; not yet
+		// seen, the sky above is used there too
+		float fog[3] = { 0.0f, 0.0f, 0.0f };
+		bool fog_known = false;
+		// Rings on the water from characters and monsters moving through it, 8 floats each: where they started
+		// (x, the water's surface y, z), how strong (0..1), how old (seconds) and the ring's first radius (yalms)
+		const float *ripples = nullptr;
+		uint32_t ripple_count = 0; // (at most kMaxRipples are used)
+		float water_rings = 1.0f;  // how strong (0 none, up to 2)
+		// The zone's water collision drawn over the world (a debug view)
+		bool water_debug = false;
+		// Fireflies over the grass points at night: how many (0 none, 1 the usual, up to 2), how deep into the
+		// night it is (0 day .. 1 full night: they fade in at dusk), the glow's radius and how far they're drawn
+		float fireflies = 1.0f, night = 0.0f;
+		float firefly_size = 0.15f, firefly_distance = 40.0f;
+		// Lamps lit now (the zone's, from its bake, on or off as the game's light table says), their glow added
+		// by the shading pass on the ground and walls around them, 8 floats each: where the light is (x, y, z,
+		// the game's world), how far its glow reaches (yalms), its colour times how strong its glow is (rgb, the
+		// amount setting in it already), 1 when it casts lamp shadows (the zone's lights; a glow 0). And how much of a lamp's glow a surface it can't see loses (0 none:
+		// no lamp shadows). (At most kMaxLamps are used.)
+		const float *lamps = nullptr;
+		uint32_t lamp_count = 0;
+		float lamp_shadows = 0.0f;
+		// The game's own fog, as its weather and the hour have it now: linear by view depth, none at haze_start
+		// yalms, all haze_color at haze_end (the game's fog render states). The grass, the fireflies and the water
+		// fade into it as the scenery does, and what the shading pass darkens (ambient occlusion, relief, shadows)
+		// only the scene under it, not the fog over it. Off: drawn clear, as before.
+		bool haze = false;
+		float haze_color[3] = {};
+		float haze_start = 0.0f, haze_end = 0.0f;
+		// How much of the sun's (or moon's) shadows and glints the weather leaves (weather_sunlight: the game's light now
+		// against the zone's clear sky's, 1 at most), times sun_shadow and glint
+		float weather_sun = 1.0f;
+		// Wet ground in rain (0 dry .. 1 soaked), where the zone's wet mask (upload_wet) has path or stone, in the
+		// shading pass: darker, the sky mirrored at grazing angles (wet_sheen: its colour) and a little highlight
+		// toward the game's light (wet_light: its colour)
+		float wet = 0.0f;
+		float wet_sheen[3] = { 0.4f, 0.45f, 0.5f };
+		float wet_light[3] = { 0.6f, 0.6f, 0.6f };
+		// Rain (with the zone's rain map loaded: upload_rain): how hard (0 none .. 1 a thunderstorm's, times the
+		// amount setting), the drops' slant (yalms across for each yalm fallen, x and z: the snow's too), the light
+		// they catch (rgb: the overcast sky's), how many splashes (0 none, up to 2) and how strong the rings on the
+		// water (0 none, up to 2). Drops fall in a volume around the camera and end at the first surface under them
+		// (the map, and the tops of the characters and monsters near); splashes where they end near the camera.
+		float rain = 0.0f;
+		float rain_slant[2] = { 0.0f, 0.0f };
+		float rain_light[3] = { 0.55f, 0.58f, 0.62f };
+		float rain_splashes = 1.0f, rain_rings = 1.0f;
+		// Snow (with the zone's rain map loaded too: flakes end where drops do): how hard (0 none .. 1 a blizzard's,
+		// times the amount setting), how far a flake sways (yalms), the light the flakes catch (rgb). Slanted by
+		// rain_slant; no splashes.
+		float snow = 0.0f;
+		float snow_sway = 0.35f;
+		float snow_light[3] = { 0.85f, 0.87f, 0.9f };
+		// A sky of its own, in the shading pass, on the pixels where the zone drew nothing (the game's sky dome doesn't
+		// write depth: what's left there is the cleared depth): the weather record's gradient again, evaluated for each
+		// pixel's view ray (smooth: no strips, dithered), with a sun or moon toward the game's light and stars at night.
+		// Only where a pixel is still the colour the game's dome gives there (dome_colour): what the game drew over its
+		// dome later in the frame (clouds, its own sun and moon, effects) stays as drawn.
+		struct sky_dome
+		{
+			bool on = false;       // (the record's sky known, with a dome: segments > 2)
+			uint32_t segments = 0; // the game's dome's segments around
+			float stops[8][4] = {}; // its gradient: colour (bytes, 0..255) and height (0..1), the horizon first
+			float clear[3] = {};    // the clear colour (bytes): what's behind the dome, below the horizon
+			float sun = 0.0f;       // how strong the sun's (or the moon's) disc and glow (0 none: down, or no clear sky)
+			float moon = 0.0f;      // 0 the sun, 1 the moon (the game's light by night), between through twilight
+			float disc[3] = { 1.0f, 0.95f, 0.85f }; // their colour
+			float stars = 0.0f;     // how bright the stars (0 none: by day, or no clear sky)
+			float star_turn = 0.0f; // how far the stars have turned about the pole (radians: the Vana'diel hour's)
+			bool debug = false;     // what's repainted tinted magenta, sky left as the game drew it (clouds...) red
+		} dome;
+	};
+
+	// The game's sky dome as it draws it (client-notes "Sky": 03D640): each band between two stops cut into this many
+	// strips (one per 0.083 of height, at least one), each strip's edges coloured by the stops' bytes scaled and cut to
+	// whole bytes. The colour it gives along a direction (the game's world: x east, y down, z north; bytes): Gouraud
+	// across the facet of the ring of segments that direction meets, the clear colour below the horizon.
+	uint32_t dome_strips(float h0, float h1);
+	void dome_colour(const look::sky_dome &d, const float dir[3], float out[3]);
+	// The add-on's own gradient for a height (0 the horizon .. 1 overhead; bytes): through every stop's colour at its
+	// height, smooth between them (monotone cubic: no overshoot), as the shading pass draws it
+	void sky_slopes(const look::sky_dome &d, float out[8][3]);
+	void sky_gradient(const look::sky_dome &d, float height, float out[3]);
+
+	// What a root parameter was last set to by the game
+	struct root_arg
+	{
+		enum kind_t : uint8_t { unset, table, root_constants, cbv, srv, uav };
+		kind_t kind = unset;
+		uint64_t value = 0;               // table: GPU descriptor handle; cbv, srv, uav: GPU address
+		std::vector<uint32_t> constants;  // constants: values by offset
+		std::vector<uint8_t> constant_set; // which of them were set
+	};
+
+	// The game's graphics state on one command list, as far as drawing grass changes it
+	struct list_state
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+		UINT rtv_count = 0;
+		D3D12_CPU_DESCRIPTOR_HANDLE dsv = {};
+		ID3D12PipelineState *pipeline = nullptr;
+		D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+		D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+		UINT viewport_count = 0;
+		D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+		UINT scissor_count = 0;
+		ID3D12RootSignature *root = nullptr;
+		std::vector<root_arg> args;
+
+		void clear();
+		void set_root(ID3D12RootSignature *signature);
+		root_arg &arg(uint32_t param);
+		void set_constants(uint32_t param, uint32_t first, uint32_t count, const uint32_t *values);
+		// Binds all of it again on the list
+		void restore(ID3D12GraphicsCommandList *list) const;
+	};
+
+	struct draw_stats
+	{
+		uint32_t blades = 0;
+		uint32_t draws = 0;
+		bool shaded = false; // the shading pass ran
+		bool sun = false;    // with the sun's shadows (their half-size pass ran before it)
+		bool sun_map = false;           // ... and the shadow map read in it
+		uint32_t sun_map_cascades = 0;  // cascades of the shadow map drawn again this frame (bits: 1 near, 2 far)
+		float sun_map_fade[2] = { 1.0f, 1.0f }; // how far each cascade's last drawing has faded in over the one before
+		uint32_t sun_map_triangles = 0; // triangles drawn into them
+		uint32_t water_corners = 0; // of the water drawn (the water, or the debug view)
+		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
+		uint32_t lamps = 0;         // lamps whose glow the shading pass added
+		bool wet = false;           // the wet look on path and stone in the shading pass
+		uint32_t rain_drops = 0;    // raindrops drawn (instances: most of them dead or out of view at any moment)
+		uint32_t splashes = 0;      // splash places drawn (instances: a splash shows at each for a moment)
+		bool rain_map_moved = false; // the rain map's window around the camera was written again this frame
+		uint32_t snow_flakes = 0;   // snowflake places drawn (instances, as the drops)
+		bool sky = false;           // the sky of its own in the shading pass
+		bool wear = false;          // the grass's wear (trodden down, cut, growing back) in the blades
+		uint32_t cuts = 0;          // weapon-skill cuts sent to the blades this frame
+		uint32_t vis_boxes = 0;     // the game's visibility tests answered from the depth copy this frame (vistest)
+		bool bound = false;  // the renderer bound its own pipeline, root signature, targets and viewport in the list:
+		                     // the caller puts the game's back (D3D12 doesn't by itself)
+	};
+
+	// The world's target and depth buffer at the moment grass is drawn into the target. The depth buffer is
+	// only copied, its depth plane alone (the game may keep its stencil plane in another state, and ReShade
+	// doesn't say which plane a barrier was for): the blades test against that copy, and have a depth buffer
+	// of their own for each other.
+	struct target
+	{
+		ID3D12Resource *rt = nullptr;
+		ID3D12Resource *ds = nullptr;
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+		DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
+		DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN; // (the game's, for the log)
+		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		D3D12_RESOURCE_STATES ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE; // (of its depth plane)
+	};
+
+	// The shaders compiled from a source: a blob for each of the renderer's entry points (vs_main, ps_main, shade_vs ...
+	// snow_ps: grass_render.cpp's kShaderEntries, in its order), and the source's key (shader_key)
+	struct shader_code
+	{
+		std::vector<std::vector<uint8_t>> blobs;
+		uint64_t key = 0;
+	};
+	// A shader source's key: a hash of it, of the compiler (d3dcompiler_47.dll's build) and of how it's compiled.
+	// 0 when there's no compiler.
+	uint64_t shader_key(const std::string &source);
+	// Compiles a source's shaders, on any thread (it uses nothing of a renderer's). With a cache folder, they're first
+	// looked for there (a file named for the key, its contents checked), and written there once compiled; the
+	// kShaderCacheKeep files used last are kept, older ones deleted. from_cache says where they came from. False, with
+	// the compiler's messages in error, when the source doesn't compile (nothing is written then).
+	constexpr size_t kShaderCacheKeep = 4;
+	bool compile_shaders(const std::string &source, const std::wstring &cache_folder, shader_code &out, bool &from_cache, std::string &error);
+	// The built-in shaders' source (src/render/grass.hlsl, as the engine was built with it)
+	const std::string &built_in_shader_source();
+
+	class renderer
+	{
+	public:
+		~renderer();
+
+		// Compiles the built-in shaders and makes the root signature (once per device). With a cache folder the
+		// shaders come from there when it has them (compile_shaders); shaders_from_cache and shader_seconds then say
+		// how they came and how long it took.
+		bool init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache = std::wstring());
+		bool shaders_from_cache() const { return _shaders_from_cache; }
+		double shader_seconds() const { return _shader_seconds; }
+		uint64_t shader_key() const { return _shader_key; } // (the source of the shaders in use)
+		bool ready() const { return _root != nullptr; }
+		// GPU time (ms, smoothed) of the copies and the shading pass, and of the grass; 0 until known
+		void set_timestamp_frequency(uint64_t ticks_per_second) { _frequency = ticks_per_second; }
+		float shading_ms() const { return _shading_ms; }
+		float last_shading_ms() const { return _last_shading_ms; } // (the newest frame's alone, unsmoothed: for the bench)
+		float grass_ms() const { return _grass_ms; }
+		void reset_timing() { _shading_ms = _grass_ms = 0.0f; }
+		// Replaces the shaders with ones compiled from this source (the built-in ones: src/render/grass.hlsl); false
+		// and the compiler's messages in error, keeping the ones in use, when it doesn't compile
+		bool set_shader_source(const std::string &source, std::string &error);
+		// The same with shaders compiled already (compile_shaders, on another thread: compiling all of them takes
+		// seconds)
+		void set_shader_code(shader_code &&code);
+		// Puts the blades in a GPU buffer; the previous one is kept until release_old says it's unused
+		bool upload(const blade_file &file, std::string &error);
+		void unload();
+		bool loaded() const { return _buffer != nullptr; }
+		// The zone's water (tools/bake_water.py), for the water view; the previous one goes like the blades'
+		bool upload_water(const blade_file &file, std::string &error);
+		void unload_water();
+		bool water_loaded() const { return _water != nullptr; }
+		uint32_t water_zone() const { return _water_zone; }
+		uint32_t water_corners() const { return _water_corners; }
+		// The zone's wet mask (tools/bake_wet.py), for the wet look in rain; the previous one goes like the blades'
+		bool upload_wet(const wet_file &file, std::string &error);
+		void unload_wet();
+		bool wet_loaded() const { return _wet != nullptr; }
+		// The zone's rain map (tools/bake_rain.py), kept here whole; the part around the camera (kRainWindow squares a
+		// side) goes to the GPU, written again into a new buffer when the camera nears its edge (the previous one goes
+		// like the blades')
+		bool upload_rain(rain_file &&file, std::string &error);
+		void unload_rain();
+		bool rain_loaded() const { return !_rain.q.empty(); }
+		uint32_t rain_zone() const { return _rain.zone; }
+		// (for tests: the first surface's height and what it is at a world x, z, from the map; false off it)
+		bool rain_surface(float x, float z, float &y, uint8_t &kind) const;
+		// The zone's meshes for the sun's shadow map; the previous ones go like the blades'. A cascade of the map is
+		// drawn from them again as soon as the sun's turn would move a long shadow by a quarter of its texel, or the
+		// camera leaves its middle half: the shadows glide rather than skip.
+		bool upload_shadow(const shadow_file &file, std::string &error);
+		void unload_shadow();
+		bool shadow_loaded() const { return _shadow_geo != nullptr; }
+		uint32_t shadow_zone() const { return _shadow_zone; }
+		uint32_t shadow_triangles() const { return _shadow_triangles; }
+		// (for tests: the map's copy, two cascades of kSunMapSize rows of this many floats, the near one first)
+		ID3D12Resource *sun_map_copy() const { return _sun_map_copy; }
+		uint32_t sun_map_pitch() const { return _sun_map_pitch; }
+		// Forgets the ground colours seen so far (each blade point remembers its own, see the shader)
+		bool forget_colours(std::string &error);
+		uint32_t zone() const { return _zone; }
+		uint32_t blade_count() const { return _blade_count; }
+		// Called once a frame: buffers replaced this many frames ago are released
+		void release_old(uint32_t frames_to_keep = 30);
+
+		// The game's visibility tests (vistest.hpp): the boxes taken this frame, tested against the depth copy in the
+		// next draw. stamp: a count that grows by one a frame (the presents so far), for read_vis. False when every
+		// slot is still the GPU's (the boxes are dropped: the game asks again next frame).
+		bool set_vis_boxes(const uint32_t *objects, const vistest::box *boxes, uint32_t n, uint64_t stamp, std::string &error);
+		// The points passed in the oldest slot the GPU is done with (its stamp + 2 <= done, done being the stamps the
+		// GPU has finished), each slot read once: the test objects and their counts (0..vistest::kPoints). Returns how
+		// many; 0 when no slot is ready.
+		uint32_t read_vis(uint64_t done, uint32_t objects[vistest::kMaxBoxes], uint32_t points[vistest::kMaxBoxes]);
+
+		// Draws the blades near the camera into the target, leaving the target in its given states.
+		// The list's root signature, arguments, pipeline, topology, targets, viewport and scissor are
+		// left set to grass's: restore the game's afterwards (list_state::restore).
+		draw_stats draw(ID3D12GraphicsCommandList *list, const target &t, const camera &cam, const look &l, std::string &error);
+
+	private:
+		ID3D12PipelineState *pipeline_for(const target &t, std::string &error);
+		struct copy;
+		bool copy_buffer(copy &c, UINT64 size, std::string &error);
+		void finish_timing(ID3D12GraphicsCommandList *list, bool shaded);
+		ID3D12PipelineState *shade_pipeline_for(const target &t, std::string &error);
+		ID3D12PipelineState *sun_pipeline(std::string &error);
+		bool sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
+		ID3D12PipelineState *water_pipeline_for(const target &t, bool debug, std::string &error);
+		ID3D12PipelineState *firefly_pipeline_for(const target &t, std::string &error);
+		enum class fall { rain, splash, snow };
+		ID3D12PipelineState *rain_pipeline_for(const target &t, fall kind, std::string &error);
+		bool rain_window_for(const float eye[3], bool &moved, std::string &error);
+		uint32_t copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state);
+		bool blade_depth_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
+		bool world_rtv_for(const target &t, D3D12_CPU_DESCRIPTOR_HANDLE &rtv, std::string &error);
+		bool sun_map_for(std::string &error);
+		ID3D12PipelineState *shadow_pipeline(std::string &error);
+		uint32_t draw_sun_map(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3], double clock, uint32_t &triangles, std::string &error);
+		void sun_map_params(const camera &cam, double clock, float out[32], float prev[32]) const;
+		ID3D12PipelineState *vis_pipeline(std::string &error);
+		bool vis_buffers(std::string &error);
+		uint32_t draw_vis(ID3D12GraphicsCommandList *list, const float *constants, std::string &error);
+
+		ID3D12Device *_device = nullptr;
+		ID3D12RootSignature *_root = nullptr;
+		std::vector<uint8_t> _vs, _ps;
+		struct pso_entry
+		{
+			DXGI_FORMAT rtv, dsv;
+			DXGI_SAMPLE_DESC samples;
+			ID3D12PipelineState *pso;
+		};
+		std::vector<pso_entry> _psos, _shade_psos, _water_psos, _water_debug_psos, _firefly_psos, _rain_psos, _splash_psos, _snow_psos;
+		std::vector<uint8_t> _shade_vs, _shade_ps, _water_vs, _water_ps, _water_debug_vs, _water_debug_ps, _sun_ps, _shadow_vs, _shadow_ps, _firefly_vs, _firefly_ps;
+		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps;
+		uint64_t _shader_key = 0;
+		bool _shaders_from_cache = false;
+		double _shader_seconds = 0.0;
+		// The rain map (whole, on the CPU) and its window around the camera (an upload buffer, a uint a square: the
+		// surface's y as float bits with what it is in the low 2 bits), where that window's corner square is
+		rain_file _rain;
+		ID3D12Resource *_rain_window = nullptr;
+		int32_t _rain_window_i = 0, _rain_window_j = 0;
+		ID3D12PipelineState *_sun_pso = nullptr; // the sun's shadows at half size (no render target: it writes _sun_mask)
+		ID3D12Resource *_sun_mask = nullptr;     // what it works out, a uint for each of the world's pixels in four (UAV)
+		UINT64 _sun_mask_size = 0;
+
+		// The sun's shadow map: two cascades side by side in one D32 texture (each kSunMapSize square, around the
+		// camera, the near one kSunMapReach[0] yalms each way, the far one kSunMapReach[1]), drawn from the zone's
+		// meshes looking down the sun's rays, and copied into a buffer the sun pass reads (t0: root SRVs only take
+		// buffers, and the add-on binds no descriptor heap of its own over the game's)
+		ID3D12Resource *_shadow_geo = nullptr;     // the triangles, 48 bytes each (default heap)
+		ID3D12Resource *_shadow_staging = nullptr; // ... on their way there (upload heap; copied at the next draw)
+		ID3D12Resource *_shadow_masks = nullptr;   // the cut-out textures' alpha (upload heap): 4 words a mask, then the bits
+		uint32_t _shadow_zone = 0, _shadow_triangles = 0;
+		float _shadow_cell_size = 32.0f;
+		std::vector<blade_file::cell> _shadow_cells;
+		std::vector<float> _shadow_bounds; // each cell's triangles: the least x, y, z, then the most
+		float _shadow_lo[3] = {}, _shadow_hi[3] = {}; // all of them
+		ID3D12Resource *_sun_map = nullptr;           // the map (D32, DEPTH_WRITE between draws)
+		ID3D12DescriptorHeap *_sun_map_heap = nullptr; // its view
+		ID3D12Resource *_sun_map_copy = nullptr;      // its copy, a float a texel, rows of _sun_map_pitch uints
+		D3D12_RESOURCE_STATES _sun_map_copy_state = D3D12_RESOURCE_STATE_COMMON;
+		UINT _sun_map_pitch = 0;
+		UINT64 _sun_map_half = 0;        // (bytes from the copy's first half to its second: each a drawing of both cascades)
+		UINT64 _sun_map_offset[2] = {};  // (where each cascade starts within a half)
+		ID3D12PipelineState *_shadow_pso = nullptr;
+		struct cascade
+		{
+			bool valid = false;
+			float sun[3] = {};    // toward the sun when drawn
+			float centre[2] = {}; // where it's centred across the sun's rays (yalms, on its texel grid)
+			float world_to_clip[16] = {};
+			// The drawing before the last, which the last fades in over (with the look's clock), kept in the copy's other
+			// half: whether there is one, its matrix, when the last was drawn (the look's clock), and which half the last is in
+			bool prev_valid = false;
+			float prev_world_to_clip[16] = {};
+			double drawn_at = 0.0;
+			uint32_t slot = 0;
+			void forget() { valid = prev_valid = false; }
+		};
+		cascade _cascades[2];
+		uint32_t _sun_map_turn = 0; // (counts the map's frames: the far cascade's turn on every other one)
+
+		ID3D12Resource *_buffer = nullptr;
+		ID3D12Resource *_memory = nullptr; // the ground colour each blade point remembers (12 bytes a point)
+		bool _memory_fresh = false;         // zeroed at the next draw
+		// (the look's clock when the memory was zeroed, the wear's times count from it; and at the last draw)
+		double _memory_epoch = 0.0, _last_clock = 0.0;
+		ID3D12Resource *_zeros = nullptr;  // 1 MB of zeros (upload heap), for that
+		ID3D12Resource *_blade_depth = nullptr;     // the blades' own depth (D32, the world target's size, in DEPTH_WRITE)
+		ID3D12DescriptorHeap *_dsv_heap = nullptr;  // its view
+		ID3D12DescriptorHeap *_rtv_heap = nullptr;  // the add-on's own view of the world's target (made each draw)
+		static constexpr UINT kTimingSlots = 4;
+		ID3D12QueryHeap *_queries = nullptr; // timestamps: start, after the shading, end; a frame's in each slot in turn
+		ID3D12Resource *_times = nullptr;    // where they're resolved (readback heap)
+		UINT _time_slot = 0, _timed = 0;
+		uint64_t _frequency = 0;
+		float _shading_ms = 0.0f, _grass_ms = 0.0f, _last_shading_ms = 0.0f;
+		ID3D12Resource *_actors[4] = {};   // the actors near, a frame's in each in turn (upload heaps, mapped)
+		float *_actor_data[4] = {};
+		uint32_t _actor_slot = 0;
+		ID3D12Resource *_water_params = nullptr; // the water pass's parameters, a frame's in each 256 bytes in turn (upload heap, mapped)
+		uint8_t *_water_param_data = nullptr;
+		uint32_t _water_param_slot = 0;
+		uint32_t _zone = 0;
+		uint32_t _blade_count = 0;
+		float _cell_size = 16.0f;
+		std::vector<blade_file::cell> _cells;
+		ID3D12Resource *_wet = nullptr;    // the zone's wet mask's words (upload heap), and where it lies
+		float _wet_x0 = 0.0f, _wet_z0 = 0.0f, _wet_square = 0.5f;
+		uint32_t _wet_width = 0, _wet_height = 0, _wet_words_a_row = 0;
+		ID3D12Resource *_water = nullptr;  // the zone's water corners, 32 bytes each (upload heap)
+		uint32_t _water_zone = 0, _water_corners = 0;
+		float _water_cell_size = 32.0f;
+		std::vector<blade_file::cell> _water_cells;
+		struct copy
+		{
+			ID3D12Resource *buffer = nullptr;
+			UINT64 size = 0;
+			D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+		};
+		copy _ground, _depth; // the world as drawn, and its depth
+		// The game's visibility tests: each frame's boxes in a slot of _vis_boxes (upload heap, mapped: kVisSlots x
+		// kMaxBoxes x 32 bytes), tested by the vis pass into _vis_points (a uint a point, 0 or 1: UAV), which is
+		// copied to the slot's part of _vis_read (readback heap) and read once the GPU is done with it.
+		static constexpr UINT kVisSlots = 4;
+		struct vis_slot
+		{
+			enum class state_t { empty, set, recorded } state = state_t::empty;
+			uint32_t n = 0;
+			uint64_t stamp = 0;
+			uint32_t objects[vistest::kMaxBoxes] = {};
+		};
+		vis_slot _vis_slots[kVisSlots];
+		ID3D12Resource *_vis_boxes = nullptr;
+		uint8_t *_vis_box_data = nullptr;
+		ID3D12Resource *_vis_points = nullptr;
+		ID3D12Resource *_vis_read = nullptr;
+		ID3D12PipelineState *_vis_pso = nullptr;
+		std::vector<uint8_t> _vis_ps;
+		struct old_buffer
+		{
+			ID3D12DeviceChild *buffer; // (a buffer, or a pipeline)
+			uint32_t frames;
+		};
+		std::vector<old_buffer> _old;
+	};
+
+	// Matrix helpers (row vectors, D3D layout), shared with the test
+	void multiply(const float a[16], const float b[16], float out[16]);
+	void eye_from_view(const float view[16], float eye[3]);
+}

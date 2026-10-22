@@ -1,0 +1,5 @@
+LIBRARY "hifixi"
+EXPORTS
+    expGetInterfaceVersion
+    expCreatePlugin
+    expDestroyPlugin
