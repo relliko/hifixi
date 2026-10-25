@@ -15,6 +15,8 @@
  *   /hifi status   what each part is doing (the hooks' counts per frame since they went in, or /hifi reset)
  *   /hifi glows    the glows lighting the scene now
  *   /hifi gpu      World FX's GPU time by section, the costliest first
+ *   /hifi gamedraw [zone|chars] [on|off]   the game's own zone or character drawing switched off (a debug toggle for
+ *                  the native renderer to come: off at every start), or what's off
  *   /hifi reset    starts the counts again
  *   /hifi off|on   takes the hooks out, or puts them back
  */
@@ -24,6 +26,7 @@
 #include "../bake/runner.hpp"
 #include "../game/drawcull.hpp"
 #include "../game/feed.hpp"
+#include "../game/gamedraw.hpp"
 #include "../game/glows.hpp"
 #include "../game/hifps/exp.hpp"
 #include "../game/hifps/step.hpp"
@@ -36,7 +39,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.19;
+	constexpr double kVersion = 0.20;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -225,6 +228,7 @@ class hifixi final : public IPlugin
 				 hifi::game::drawcull::status(), hifi::bake::runner::status().lines })
 			for (const std::string &line : lines)
 				say(line);
+		say(hifi::game::gamedraw::status());
 		if (!hifi::host::installed())
 		{
 			say("The hooks aren't in (/hifi on).", true);
@@ -260,6 +264,34 @@ class hifixi final : public IPlugin
 			say(calls);
 	}
 
+	// /hifi gamedraw [zone|chars] [on|off]: one part of the game's own drawing switched (toggled without on|off), or
+	// what's off now
+	void gamedraw(std::string rest)
+	{
+		while (!rest.empty() && rest.front() == ' ')
+			rest.erase(rest.begin());
+		const size_t space = rest.find(' ');
+		const std::string which = rest.substr(0, space), how = space == std::string::npos ? std::string() : rest.substr(space + 1);
+		using hifi::game::gamedraw::part;
+		if (which.empty())
+		{
+			say(hifi::game::gamedraw::status());
+			return;
+		}
+		if ((which != "zone" && which != "chars") || (!how.empty() && how != "on" && how != "off"))
+		{
+			say("/hifi gamedraw zone|chars [on|off]: the game's own zone or character drawing on or off (toggled without on|off)");
+			return;
+		}
+		const part p = which == "zone" ? part::zone : part::chars;
+		const bool off = how.empty() ? !hifi::game::gamedraw::is_off(p) : how == "off";
+		std::string why;
+		if (!hifi::game::gamedraw::set(p, off, why))
+			say("The game's " + std::string(p == part::zone ? "zone" : "character") + " drawing not switched: " + why, true);
+		else
+			say(hifi::game::gamedraw::status());
+	}
+
 public:
 	const char *GetName() const override { return "hifixi"; }
 	const char *GetAuthor() const override { return "Relli"; }
@@ -293,6 +325,10 @@ public:
 
 	void Release() override
 	{
+		// (the game's own drawing back first, while the log still takes the reason it can't be)
+		std::string why;
+		if (!hifi::game::gamedraw::stop(why))
+			ashita_log(1, ("the game's own drawing not put back: " + why).c_str());
 		hifi::backend::set_log_sink(nullptr);
 		g_ashita_log = nullptr;
 		m_menu = false;
@@ -337,6 +373,8 @@ public:
 			for (const std::string &line : hifi::game::glows::list(g_entities))
 				say("  " + line);
 		}
+		else if (arg == "gamedraw" || arg.rfind("gamedraw ", 0) == 0)
+			gamedraw(arg.substr(8));
 		else if (arg.empty() || arg == "menu")
 			m_menu = !m_menu;
 		else if (arg == "off")
@@ -355,7 +393,7 @@ public:
 				say("Direct3D 12 hooks not in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
 		return true;
 	}
 

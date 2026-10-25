@@ -40,7 +40,7 @@ call "%~dp0build_engine.cmd" build\engine || exit /b 1
 rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hifps and drawcull did
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
 set "FEED=src\game\game.cpp src\game\feed.cpp src\game\glows.cpp src\game\gamewater.cpp src\game\gamerain.cpp"
-set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp"
+set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp"
 set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\sea.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 
@@ -83,8 +83,8 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
 echo Built build\feed_test.exe
 
 rem The game side's pieces on both dumps, each against the addon it took over (its routines and patches byte for byte):
-rem build\glows_test.exe, gamewater_test, gamerain_test, drawcull_test
-for %%t in (glows gamewater gamerain drawcull) do (
+rem build\glows_test.exe, gamewater_test, gamerain_test, drawcull_test; gamedraw_test (the off switches)
+for %%t in (glows gamewater gamerain drawcull gamedraw) do (
   cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
     tests\%%t_test.cpp src\game\%%t.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\%%t_test.exe" /link /NOLOGO user32.lib || exit /b 1
   echo Built build\%%t_test.exe
