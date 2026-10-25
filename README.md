@@ -18,8 +18,8 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone, with characters casting long shadows;
   - **Water** with reflections and ripples, carried on over the game's own sea past the zone's edge, out to the horizon;
   - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
-  - **Sky:** a smooth sky with a sun, a moon and stars;
-  - **Lamps and glows:** night lamps and glowing things lighting what's around them.
+  - **Sky:** a smooth sky with a sun, stars and a moon in the game's own phase;
+  - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn.
 
 Everything is in one menu (`/hifi`), with presets (Off, Balanced, High, Ultra) and a tooltip on every setting.
 
@@ -53,7 +53,8 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
 - `/hifi`: the menu.
 - `/hifi status`: what HiFi XI is doing, part by part.
-- `/hifi glows`: the glows lighting the scene now.
+- `/hifi glows`: the glows lighting the scene now, and the glowing effects met lately.
+- `/hifi gpu`: the GPU time each part of the richer world takes, the costliest first (also in the menu's **Performance** tab).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
 - `/hifi reset`: its counts started again.
 
