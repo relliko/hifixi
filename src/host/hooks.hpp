@@ -55,6 +55,13 @@ namespace hifi::host
 	};
 	bool is_quiet();
 
+	// A tracer (the stream log, /hifi streamlog: src/backend/streamlog): while one is set, every hooked call is handed to
+	// it before it's made, on the thread making it, with its object and its arguments in order (pointers and handles as
+	// their values, floats as their bits, signed numbers sign-extended); quiet: made by HiFi XI itself (World FX drawing
+	// into the frame). Not while the hooks are out.
+	using tracer = void (*)(uint32_t s, const void *self, const uint64_t *args, uint32_t count, bool quiet);
+	void set_tracer(tracer t);
+
 	struct target_seen
 	{
 		const void *resource = nullptr; // (an ID3D12Resource, not referenced: a pointer to compare)

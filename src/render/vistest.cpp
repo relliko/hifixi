@@ -17,9 +17,9 @@ namespace vistest
 		struct known
 		{
 			int32_t value = -1;
-			uint64_t asked_ms = 0; // last asked for (answers not asked for a while are forgotten)
+			uint64_t asked_ms = 0;  // last asked for (answers not asked for kRememberMs are forgotten)
 		};
-		constexpr uint64_t kForgetMs = 2000;
+		constexpr uint64_t kForgetMs = 2000; // (unasked longer: its answer is stale, kept for when it comes back)
 
 		std::mutex mutex;
 		std::unordered_map<uint32_t, pending> asked;
@@ -44,9 +44,14 @@ namespace vistest
 			asked_order.push_back(object);
 		}
 		known &k = answers[object];
+		if (k.value >= 0 && now_ms - k.asked_ms > kForgetMs)
+			counts.stale++;
 		k.asked_ms = now_ms;
 		if (k.value < 0)
+		{
 			counts.unknown++;
+			return kUnknown;
+		}
 		return k.value;
 	}
 
@@ -93,8 +98,13 @@ namespace vistest
 		if (now_ms - last_forget_ms > 1000)
 		{
 			last_forget_ms = now_ms;
+			// (kept kRememberMs since last asked; past kMaxRemembered, those not asked for kForgetMs go too)
+			const bool full = answers.size() > kMaxRemembered;
 			for (auto a = answers.begin(); a != answers.end();)
-				a = now_ms - a->second.asked_ms > kForgetMs ? answers.erase(a) : std::next(a);
+			{
+				const uint64_t idle = now_ms - a->second.asked_ms;
+				a = idle > kRememberMs || (full && idle > kForgetMs) ? answers.erase(a) : std::next(a);
+			}
 		}
 	}
 

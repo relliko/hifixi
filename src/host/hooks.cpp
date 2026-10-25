@@ -4,8 +4,10 @@
 #include "slots.hpp"
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <mutex>
+#include <type_traits>
 #include <unordered_set>
 
 // How the runtime dispatches (probed 2026-10-21, tests/hook_test.cpp keeps it honest): queues and devices share one
@@ -126,6 +128,34 @@ namespace hifi::host
 		inline void count(slot s) { counts[s].fetch_add(1, std::memory_order_relaxed); }
 		inline const events *ev() { return sink.load(std::memory_order_acquire); }
 
+		// The tracer (set_tracer): each call's arguments as numbers, handed over before the call
+		std::atomic<tracer> g_tracer { nullptr };
+		template <typename T>
+		uint64_t as_number(T v)
+		{
+			if constexpr (std::is_pointer_v<T>)
+				return uint64_t(reinterpret_cast<uintptr_t>(v));
+			else if constexpr (std::is_same_v<T, float>)
+			{
+				uint32_t bits;
+				std::memcpy(&bits, &v, sizeof(bits));
+				return bits;
+			}
+			else if constexpr (std::is_same_v<T, D3D12_CPU_DESCRIPTOR_HANDLE> || std::is_same_v<T, D3D12_GPU_DESCRIPTOR_HANDLE>)
+				return uint64_t(v.ptr);
+			else
+				return uint64_t(int64_t(v));
+		}
+		template <typename... A>
+		inline void trace(slot s, const void *self, A... a)
+		{
+			const tracer t = g_tracer.load(std::memory_order_acquire);
+			if (t == nullptr || passthrough.load(std::memory_order_relaxed))
+				return;
+			const uint64_t args[sizeof...(A) + 1] = { as_number(a)..., 0 };
+			t(uint32_t(s), self, args, uint32_t(sizeof...(A)), tl_quiet != 0);
+		}
+
 		bool is_depth_format(DXGI_FORMAT f)
 		{
 			switch (f)
@@ -185,6 +215,7 @@ namespace hifi::host
 		// The hooks: each calls on through the slot it came through, counts and hands the call to the backend
 		HRESULT STDMETHODCALLTYPE hk_reset(ID3D12GraphicsCommandList *self, ID3D12CommandAllocator *a, ID3D12PipelineState *p)
 		{
+			trace(list_reset, self, a, p);
 			const HRESULT hr = call<HRESULT(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12CommandAllocator *, ID3D12PipelineState *)>(self, list_reset, self, a, p);
 			if (!live())
 				return hr;
@@ -200,6 +231,7 @@ namespace hifi::host
 		}
 		HRESULT STDMETHODCALLTYPE hk_close(ID3D12GraphicsCommandList *self)
 		{
+			trace(list_close, self);
 			if (live())
 			{
 				count(list_close);
@@ -211,6 +243,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_barrier(ID3D12GraphicsCommandList *self, UINT n, const D3D12_RESOURCE_BARRIER *b)
 		{
+			trace(list_barrier, self, n, b);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *)>(self, list_barrier, self, n, b);
 			if (!live())
 				return;
@@ -225,6 +258,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_om_targets(ID3D12GraphicsCommandList *self, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL range, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv)
 		{
+			trace(list_om_targets, self, n, rtvs, range, dsv);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE *)>(self, list_om_targets, self, n, rtvs, range, dsv);
 			if (!live())
 				return;
@@ -235,6 +269,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_pipeline(ID3D12GraphicsCommandList *self, ID3D12PipelineState *p)
 		{
+			trace(list_pipeline, self, p);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12PipelineState *)>(self, list_pipeline, self, p);
 			if (!live())
 				return;
@@ -245,6 +280,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_topology(ID3D12GraphicsCommandList *self, D3D12_PRIMITIVE_TOPOLOGY t)
 		{
+			trace(list_topology, self, t);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, D3D12_PRIMITIVE_TOPOLOGY)>(self, list_topology, self, t);
 			if (!live())
 				return;
@@ -255,6 +291,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_viewports(ID3D12GraphicsCommandList *self, UINT n, const D3D12_VIEWPORT *v)
 		{
+			trace(list_viewports, self, n, v);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, const D3D12_VIEWPORT *)>(self, list_viewports, self, n, v);
 			if (!live())
 				return;
@@ -265,6 +302,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_scissors(ID3D12GraphicsCommandList *self, UINT n, const D3D12_RECT *r)
 		{
+			trace(list_scissors, self, n, r);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, const D3D12_RECT *)>(self, list_scissors, self, n, r);
 			if (!live())
 				return;
@@ -275,6 +313,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_signature(ID3D12GraphicsCommandList *self, ID3D12RootSignature *rs)
 		{
+			trace(list_root_signature, self, rs);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12RootSignature *)>(self, list_root_signature, self, rs);
 			if (!live())
 				return;
@@ -285,6 +324,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_table(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
 		{
+			trace(list_root_table, self, param, h);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_DESCRIPTOR_HANDLE)>(self, list_root_table, self, param, h);
 			if (!live())
 				return;
@@ -295,6 +335,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_constant(ID3D12GraphicsCommandList *self, UINT param, UINT value, UINT offset)
 		{
+			trace(list_root_constant, self, param, value, offset);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, UINT, UINT)>(self, list_root_constant, self, param, value, offset);
 			if (!live())
 				return;
@@ -305,6 +346,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_constants(ID3D12GraphicsCommandList *self, UINT param, UINT n, const void *values, UINT offset)
 		{
+			trace(list_root_constants, self, param, n, values, offset);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, UINT, const void *, UINT)>(self, list_root_constants, self, param, n, values, offset);
 			if (!live())
 				return;
@@ -315,6 +357,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_cbv(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS a)
 		{
+			trace(list_root_cbv, self, param, a);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_VIRTUAL_ADDRESS)>(self, list_root_cbv, self, param, a);
 			if (!live())
 				return;
@@ -325,6 +368,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_srv(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS a)
 		{
+			trace(list_root_srv, self, param, a);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_VIRTUAL_ADDRESS)>(self, list_root_srv, self, param, a);
 			if (!live())
 				return;
@@ -335,6 +379,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_root_uav(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS a)
 		{
+			trace(list_root_uav, self, param, a);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_VIRTUAL_ADDRESS)>(self, list_root_uav, self, param, a);
 			if (!live())
 				return;
@@ -345,6 +390,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_clear_depth(ID3D12GraphicsCommandList *self, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT n, const D3D12_RECT *r)
 		{
+			trace(list_clear_depth, self, dsv, f, d, s, n, r);
 			if (live())
 			{
 				count(list_clear_depth); // (before the call: where grass goes in before a mid-frame clear)
@@ -356,6 +402,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_clear_target(ID3D12GraphicsCommandList *self, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT c[4], UINT n, const D3D12_RECT *r)
 		{
+			trace(list_clear_target, self, rtv, c, n, r);
 			if (live())
 			{
 				count(list_clear_target);
@@ -367,6 +414,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_draw(ID3D12GraphicsCommandList *self, UINT v, UINT i, UINT sv, UINT si)
 		{
+			trace(list_draw, self, v, i, sv, si);
 			if (live())
 			{
 				count(list_draw);
@@ -378,6 +426,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_draw_indexed(ID3D12GraphicsCommandList *self, UINT n, UINT i, UINT si, INT bv, UINT sinst)
 		{
+			trace(list_draw_indexed, self, n, i, si, bv, sinst);
 			if (live())
 			{
 				count(list_draw_indexed);
@@ -390,30 +439,35 @@ namespace hifi::host
 		// (only to see whether dgVoodoo uses these: the backend doesn't follow them)
 		void STDMETHODCALLTYPE hk_execute_indirect(ID3D12GraphicsCommandList *self, ID3D12CommandSignature *sig, UINT max, ID3D12Resource *args, UINT64 args_at, ID3D12Resource *n, UINT64 n_at)
 		{
+			trace(list_execute_indirect, self, sig, max, args, args_at, n, n_at);
 			if (live())
 				count(list_execute_indirect);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12CommandSignature *, UINT, ID3D12Resource *, UINT64, ID3D12Resource *, UINT64)>(self, list_execute_indirect, self, sig, max, args, args_at, n, n_at);
 		}
 		void STDMETHODCALLTYPE hk_execute_bundle(ID3D12GraphicsCommandList *self, ID3D12GraphicsCommandList *bundle)
 		{
+			trace(list_execute_bundle, self, bundle);
 			if (live())
 				count(list_execute_bundle);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12GraphicsCommandList *)>(self, list_execute_bundle, self, bundle);
 		}
 		void STDMETHODCALLTYPE hk_clear_state(ID3D12GraphicsCommandList *self, ID3D12PipelineState *p)
 		{
+			trace(list_clear_state, self, p);
 			if (live())
 				count(list_clear_state);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12PipelineState *)>(self, list_clear_state, self, p);
 		}
 		void STDMETHODCALLTYPE hk_barrier7(ID3D12GraphicsCommandList7 *self, UINT32 n, const D3D12_BARRIER_GROUP *g)
 		{
+			trace(list_barrier7, self, n, g);
 			if (live())
 				count(list_barrier7);
 			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList7 *, UINT32, const D3D12_BARRIER_GROUP *)>(self, list_barrier7, self, n, g);
 		}
 		void STDMETHODCALLTYPE hk_queue_execute(ID3D12CommandQueue *self, UINT n, ID3D12CommandList *const *lists)
 		{
+			trace(queue_execute, self, n, lists);
 			const bool counting = live();
 			if (counting)
 			{
@@ -441,6 +495,7 @@ namespace hifi::host
 		}
 		HRESULT STDMETHODCALLTYPE hk_create_list(ID3D12Device *self, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *a, ID3D12PipelineState *p, REFIID riid, void **out)
 		{
+			trace(device_create_list, self, mask, type, a, p);
 			const HRESULT hr = call<HRESULT(STDMETHODCALLTYPE *)(ID3D12Device *, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *, REFIID, void **)>(self, device_create_list, self, mask, type, a, p, riid, out);
 			if (!live() || FAILED(hr) || out == nullptr || *out == nullptr || type != D3D12_COMMAND_LIST_TYPE_DIRECT)
 				return hr;
@@ -454,6 +509,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_create_rtv(ID3D12Device *self, ID3D12Resource *res, const D3D12_RENDER_TARGET_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE at)
 		{
+			trace(device_create_rtv, self, res, desc, at);
 			call<void(STDMETHODCALLTYPE *)(ID3D12Device *, ID3D12Resource *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE)>(self, device_create_rtv, self, res, desc, at);
 			if (!live())
 				return;
@@ -463,6 +519,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_create_dsv(ID3D12Device *self, ID3D12Resource *res, const D3D12_DEPTH_STENCIL_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE at)
 		{
+			trace(device_create_dsv, self, res, desc, at);
 			call<void(STDMETHODCALLTYPE *)(ID3D12Device *, ID3D12Resource *, const D3D12_DEPTH_STENCIL_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE)>(self, device_create_dsv, self, res, desc, at);
 			if (!live())
 				return;
@@ -473,6 +530,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_copy(ID3D12Device *self, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE *ds, const UINT *dn, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE *ss, const UINT *sn, D3D12_DESCRIPTOR_HEAP_TYPE type)
 		{
+			trace(device_copy, self, nd, ds, dn, ns, ss, sn, type);
 			call<void(STDMETHODCALLTYPE *)(ID3D12Device *, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, const UINT *, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, const UINT *, D3D12_DESCRIPTOR_HEAP_TYPE)>(self, device_copy, self, nd, ds, dn, ns, ss, sn, type);
 			if (!live() || (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
 				return;
@@ -482,6 +540,7 @@ namespace hifi::host
 		}
 		void STDMETHODCALLTYPE hk_copy_simple(ID3D12Device *self, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type)
 		{
+			trace(device_copy_simple, self, n, dst, src, type);
 			call<void(STDMETHODCALLTYPE *)(ID3D12Device *, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE)>(self, device_copy_simple, self, n, dst, src, type);
 			if (!live() || (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
 				return;
@@ -597,6 +656,11 @@ namespace hifi::host
 	void set_events(const events *e)
 	{
 		sink.store(e, std::memory_order_release);
+	}
+
+	void set_tracer(tracer t)
+	{
+		g_tracer.store(t, std::memory_order_release);
 	}
 
 	const char *slot_name(uint32_t s)

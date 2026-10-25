@@ -45,6 +45,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -149,6 +150,19 @@ namespace hifi::game::hifps::exp
 			uint32_t prev[3] = {}, rate[3] = {}; // skipped, merged, batches (a second)
 		};
 
+		// The draw tap (draw_tap): the client device's four draw slots pointed at the stream log's for a few frames
+		struct tap_state
+		{
+			bool on = false;
+			bool in_proxy = false;      // in the proxy's own vtable (it's on); else our copy of the device's in front
+			uintptr_t dev = 0;          // (our copy: the device whose vtable it is, and the one it had)
+			uint32_t vt = 0;
+			uint32_t taps[4] = {};      // what the slots hold while on
+			uint32_t saved[4] = {};     // (in the proxy: what they held)
+			uint32_t *copy = nullptr;   // (our copy: vtable[-1] then 128 slots; never freed while the device may use it)
+			bool held = false;          // something else replaced our copy on the device since: it stays
+		};
+
 		struct state
 		{
 			bool on[kCount] = {};
@@ -161,7 +175,8 @@ namespace hifi::game::hifps::exp
 			bool sse = false;                 // the flag byte we set (0: it was on already)
 			uintptr_t sse_addr = 0;
 			proxy_state proxy;
-			bool force = false;               // 'ashita' turned on although something uses the draw events
+			tap_state tap;
+			bool force = false;             // 'ashita' turned on although something uses the draw events
 			uintptr_t dp = 0;                 // the device wrapper's DrawPrimitive (for the plugin check)
 			std::map<std::string, std::vector<std::string>> scan; // addon name -> its uses of the draw events (cache)
 			std::vector<std::string> users;   // what would lose the draw events: 'addon x (...)', 'plugin y (...)'
@@ -970,6 +985,8 @@ namespace hifi::game::hifps::exp
 			return base;
 		}
 
+		void tap_off();
+
 		std::string proxy_on()
 		{
 			if (g.proxy.dev != 0)
@@ -977,6 +994,7 @@ namespace hifi::game::hifps::exp
 				proxy_flags();
 				return std::string();
 			}
+			tap_off(); // (the proxy copies the device's vtable as it is now: not with the tap in it)
 			const uintptr_t dev = client_device();
 			if (dev == 0)
 				return "the client device was not found";
@@ -1013,8 +1031,107 @@ namespace hifi::game::hifps::exp
 			return std::string();
 		}
 
+		// ---------------------------------------------------------------- the draw tap (draw_tap)
+
+		constexpr uint32_t kTapFirst = 70; // DrawPrimitive, DrawIndexedPrimitive, DrawPrimitiveUP, DrawIndexedPrimitiveUP
+
+		void tap_off()
+		{
+			if (!g.tap.on)
+				return;
+			if (g.tap.in_proxy)
+			{
+				// (the proxy's vtable is ours: its slots back, unless something else wrote them since)
+				for (uint32_t i = 0; i < 4; ++i)
+				{
+					const uintptr_t slot = psym(px::VTABLE) + 4 * (kTapFirst + i);
+					if (g.proxy.base != 0 && get32(slot) == g.tap.taps[i])
+						set32(slot, g.tap.saved[i]);
+				}
+			}
+			else if (g.tap.copy != nullptr)
+			{
+				// (the device's own vtable back, unless something else has replaced ours since: then our copy stays)
+				if (word(g.tap.dev) == uint32_t(reinterpret_cast<uintptr_t>(g.tap.copy + 1)))
+					write32(g.tap.dev, g.tap.vt);
+				else
+				{
+					g.tap.held = true;
+					say("draw tap: something else has replaced the client device's vtable since: left as it is");
+				}
+			}
+			g.tap.on = false;
+			g.tap.dev = 0;
+			g.tap.vt = 0;
+		}
+
+		bool tap_on(const void *const taps[4], void *originals[4], std::string &why)
+		{
+			tap_off();
+			for (uint32_t i = 0; i < 4; ++i)
+				g.tap.taps[i] = uint32_t(reinterpret_cast<uintptr_t>(taps[i]));
+			if (g.proxy.dev != 0 && word(g.proxy.dev) == uint32_t(psym(px::VTABLE)))
+			{
+				// The proxy is the device's vtable: its own slots swapped (our memory, the game's thread: no write to the game)
+				for (uint32_t i = 0; i < 4; ++i)
+				{
+					const uintptr_t slot = psym(px::VTABLE) + 4 * (kTapFirst + i);
+					g.tap.saved[i] = get32(slot);
+					originals[i] = reinterpret_cast<void *>(uintptr_t(g.tap.saved[i]));
+					set32(slot, g.tap.taps[i]);
+				}
+				g.tap.in_proxy = true;
+				g.tap.on = true;
+				return true;
+			}
+			const uintptr_t dev = client_device();
+			if (dev == 0)
+			{
+				why = "the client device was not found";
+				return false;
+			}
+			const uint32_t vt = word(dev);
+			if (vt == 0)
+			{
+				why = "the client device has no vtable";
+				return false;
+			}
+			if (g.tap.held)
+			{
+				why = "an earlier copy of the device's vtable is still in use";
+				return false;
+			}
+			// Else a copy of the device's vtable (as the proxy makes its own), the four slots ours, put in front
+			if (g.tap.copy == nullptr)
+				g.tap.copy = static_cast<uint32_t *>(std::calloc(129, sizeof(uint32_t)));
+			if (g.tap.copy == nullptr)
+			{
+				why = "no memory";
+				return false;
+			}
+			g.tap.copy[0] = word(vt - 4);
+			for (uint32_t i = 0; i < 128; ++i)
+				g.tap.copy[1 + i] = word(vt + 4 * i);
+			for (uint32_t i = 0; i < 4; ++i)
+			{
+				originals[i] = reinterpret_cast<void *>(uintptr_t(g.tap.copy[1 + kTapFirst + i]));
+				g.tap.copy[1 + kTapFirst + i] = g.tap.taps[i];
+			}
+			if (!write32(dev, uint32_t(reinterpret_cast<uintptr_t>(g.tap.copy + 1))))
+			{
+				why = "could not write the client device";
+				return false;
+			}
+			g.tap.in_proxy = false;
+			g.tap.dev = dev;
+			g.tap.vt = vt;
+			g.tap.on = true;
+			return true;
+		}
+
 		std::string proxy_off()
 		{
+			tap_off(); // (the tap goes first: it may be in the vtable going)
 			if (g.proxy.base == 0)
 				return std::string();
 			proxy_flags();
@@ -1297,11 +1414,24 @@ namespace hifi::game::hifps::exp
 	void stop()
 	{
 		exp_all_off();
+		tap_off();
+		if (g.tap.copy != nullptr && !g.tap.held)
+			std::free(g.tap.copy);
 		if (g.walls.base != 0 && !g.walls.held)
 			free_code(g.walls.base);
 		if (g.proxy.base != 0 && !g.proxy.held)
 			free_code(g.proxy.base);
 		g = state();
+	}
+
+	bool draw_tap(const void *const taps[4], void *originals[4], std::string &why)
+	{
+		return tap_on(taps, originals, why);
+	}
+
+	void draw_untap()
+	{
+		tap_off();
 	}
 
 	std::vector<std::string> status()

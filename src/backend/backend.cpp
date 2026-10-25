@@ -1,6 +1,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include "backend.hpp"
+#include "streamlog.hpp"
 #include "../host/events.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
@@ -188,6 +189,13 @@ namespace hifi::backend
 			std::lock_guard<std::mutex> lock(views_mutex);
 			const auto it = views.find(view);
 			return it != views.end() ? it->second.format : DXGI_FORMAT_UNKNOWN;
+		}
+		// (the stream log's: not counted as looked up)
+		void *streamlog_view(uint64_t view)
+		{
+			std::lock_guard<std::mutex> lock(views_mutex);
+			const auto it = views.find(view);
+			return it != views.end() ? it->second.resource : nullptr;
 		}
 
 		// HiFi XI's settings file: HIFIXI_SETTINGS when set (the tests), else config\hifixi\settings.ini beside the
@@ -408,6 +416,8 @@ namespace hifi::backend
 			p.folder = g_folder;
 			worldfx::set_port(p);
 			worldfx::load_settings();
+			streamlog::set_views(streamlog_view);
+			streamlog::set_folder(g_folder);
 		}
 
 		// The hooks' events

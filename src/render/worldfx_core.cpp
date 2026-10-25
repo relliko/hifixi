@@ -2953,9 +2953,10 @@ extern "C" __declspec(dllexport) void __cdecl worldfx_sun_map(uint32_t out[2])
 // The game's visibility tests (vistest.hpp). The worldfx Ashita addon points the game's calls of its test (FFXiMain
 // 06C280: thiscall on a test object, 9 arguments, ret 24h, 0..256 back) at these entries, one for each call site's
 // kind. Each runs on the game's thread: it asks for the test (its box goes to the GPU at the world's end) and answers
-// with that test object's newest answer, a few frames old. The game's own test runs instead while no answers are
-// coming in (the feature just turned on, zoning, the device gone) and for a test object with none yet, so nothing
-// shows or hides on a guess; that waits on the GPU as before, for those few frames and objects only. A box with none
+// with that test object's newest answer, a few frames old. The game's own test runs instead only while no answers
+// are coming in (the feature just turned on, zoning, the device gone); that waits on the GPU as before, for those
+// frames only. A test object with no answer yet (new in view, or gone a minute) is answered vistest::kUnknown
+// (hidden) until its first is in, a few frames on, instead of waiting for the game's test. A box with none
 // of it on the screen is answered 0 here at once, as the game's test does without drawing. (The game's test leaves
 // its own render states set when it draws, which an answer from here doesn't: the draws after it then see the states
 // before it, as they do on every frame where nothing on the screen is tested.)

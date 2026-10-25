@@ -976,6 +976,49 @@ namespace
 		put_bytes(kCpu + 9, std::string(1, '\0'));
 		put32(kDevice, uint32_t(kVtable));
 
+		// The stream log's draw tap: with the proxy off, a copy of the device's vtable in front of it; with it on, the
+		// proxy's own slots; the proxy going off takes the tap out first
+		hifi::game::set_alloc_at(dump::kAllocAt + 0x180000);
+		options.clear();
+		step_on = true;
+		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" })
+			set_option(n, "0");
+		exp::update();
+		{
+			const void *taps[4] = { reinterpret_cast<const void *>(uintptr_t(0x11110000)), reinterpret_cast<const void *>(uintptr_t(0x11110010)),
+				reinterpret_cast<const void *>(uintptr_t(0x11110020)), reinterpret_cast<const void *>(uintptr_t(0x11110030)) };
+			void *orig[4] = {};
+			std::string why;
+			const bool on = exp::draw_tap(taps, orig, why);
+			const uint32_t copy = word_at(kDevice);
+			bool slots = copy != uint32_t(kVtable) && word_at(copy - 4) == word_at(kRtti);
+			for (uint32_t i = 0; i < 128; ++i)
+				slots = slots && (i >= 70 && i < 74 ? word_at(copy + 4 * i) == uint32_t(0x11110000 + 0x10 * (i - 70)) : word_at(copy + 4 * i) == word_at(kVtable + 4 * i));
+			for (uint32_t i = 0; i < 4; ++i)
+				slots = slots && uint32_t(reinterpret_cast<uintptr_t>(orig[i])) == word_at(kVtable + 4 * (70 + i));
+			check(on && slots, "draw tap, proxy off: a copy of the device's vtable in front, its four draw slots the taps, the rest as they were");
+			exp::draw_untap();
+			check(word_at(kDevice) == uint32_t(kVtable), "  untapped: the device's own vtable back");
+
+			set_option("exp_batch", "1");
+			exp::update();
+			const uint32_t pvt = word_at(kDevice);
+			const uint32_t proxy_dip = word_at(pvt + 4 * 71);
+			const bool on2 = exp::draw_tap(taps, orig, why);
+			check(exp::toggle("batch").on && pvt != uint32_t(kVtable) && on2 && word_at(kDevice) == pvt && word_at(pvt + 4 * 71) == 0x11110010 &&
+					uint32_t(reinterpret_cast<uintptr_t>(orig[1])) == proxy_dip,
+				"draw tap, batch on: in the proxy's own vtable (the device's pointer unchanged), calling on to the proxy's own");
+			exp::draw_untap();
+			check(word_at(pvt + 4 * 71) == proxy_dip, "  untapped: the proxy's slots back");
+			exp::draw_tap(taps, orig, why);
+			set_option("exp_batch", "0");
+			exp::update();
+			check(word_at(kDevice) == uint32_t(kVtable) && word_at(pvt + 4 * 71) == proxy_dip, "  batch off while tapped: the tap out first, the device's own vtable back");
+			exp::draw_tap(taps, orig, why);
+			exp::stop();
+			check(word_at(kDevice) == uint32_t(kVtable), "  stop() while tapped: the device's own vtable back");
+		}
+
 		// stop() with everything on: the image the dump again, our memory freed
 		hifi::game::set_alloc_at(dump::kAllocAt + 0x200000);
 		options.clear();

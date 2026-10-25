@@ -46,7 +46,7 @@ set "GAME=%FEED% %MODULES% %BAKE%"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
   %GAME% build\engine\worldfx_engine.lib ^
   /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
@@ -65,6 +65,12 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEA
   /link /NOLOGO || exit /b 1
 echo Built build\hook_test.exe
 
+rem The stream log (/hifi streamlog) on the hooks, on WARP: build\streamlog_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\streamlog_test.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\test\\" ^
+  /Fe"build\streamlog_test.exe" /link /NOLOGO || exit /b 1
+echo Built build\streamlog_test.exe
+
 rem The render engine with the plugin's flags (C++20, /EHa): build\engine_check.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\engine_check.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\engine_check.exe" ^
@@ -73,7 +79,7 @@ echo Built build\engine_check.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
   %GAME% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\menu_test.exe
 
@@ -89,6 +95,10 @@ for %%t in (glows gamewater gamerain drawcull gamedraw) do (
     tests\%%t_test.cpp src\game\%%t.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\%%t_test.exe" /link /NOLOGO user32.lib || exit /b 1
   echo Built build\%%t_test.exe
 )
+rem The visibility tests' answers (src\render\vistest.cpp): build\vistest_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\vistest_test.cpp src\render\vistest.cpp /Fo"build\test\\" /Fe"build\vistest_test.exe" /link /NOLOGO || exit /b 1
+echo Built build\vistest_test.exe
 rem hifps's frame step against hifps.lua run under lupa (tests\hifps_golden.py): build\hifps_step_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\hifps_step_test.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\game.cpp /Fo"build\test\\" ^

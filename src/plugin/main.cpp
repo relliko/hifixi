@@ -17,12 +17,16 @@
  *   /hifi gpu      World FX's GPU time by section, the costliest first
  *   /hifi gamedraw [zone|chars] [on|off]   the game's own zone or character drawing switched off (a debug toggle for
  *                  the native renderer to come: off at every start), or what's off
+ *   /hifi streamlog [frames] [label]   the next world frame (up to 8) as dgVoodoo records it in Direct3D 12, call by
+ *                  call, and the game's own Direct3D 8 draws of it, into bootloader\hifixi-stream-<time>-<label>.txt
+ *                  (src/backend/streamlog; the label is what /hifi gamedraw has off when none is given)
  *   /hifi reset    starts the counts again
  *   /hifi off|on   takes the hooks out, or puts them back
  */
 
 #include "../../deps/ashita/plugins/sdk/Ashita.h"
 #include "../backend/backend.hpp"
+#include "../backend/streamlog.hpp"
 #include "../bake/runner.hpp"
 #include "../game/drawcull.hpp"
 #include "../game/feed.hpp"
@@ -39,7 +43,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.20;
+	constexpr double kVersion = 0.23;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -292,6 +296,52 @@ class hifixi final : public IPlugin
 			say(hifi::game::gamedraw::status());
 	}
 
+	// /hifi streamlog [frames] [label]: the next world frame(s) as dgVoodoo records them, and the game's draws of them,
+	// into a file beside hifixi.log (written a frame or two later, when it says so)
+	void streamlog(std::string rest)
+	{
+		using hifi::game::gamedraw::is_off;
+		using hifi::game::gamedraw::part;
+		if (!hifi::backend::started() || !hifi::host::installed())
+		{
+			say("The Direct3D 12 hooks aren't in: there's nothing to log.", true);
+			return;
+		}
+		uint32_t frames = 1;
+		std::string label;
+		while (!rest.empty())
+		{
+			while (!rest.empty() && rest.front() == ' ')
+				rest.erase(rest.begin());
+			const size_t space = rest.find(' ');
+			const std::string word = rest.substr(0, space);
+			rest = space == std::string::npos ? std::string() : rest.substr(space + 1);
+			if (word.empty())
+				continue;
+			if (word.find_first_not_of("0123456789") == std::string::npos && word.size() <= 2)
+				frames = uint32_t(std::stoul(word));
+			else
+				label += (label.empty() ? "" : "-") + word;
+		}
+		if (frames < 1 || frames > 8)
+		{
+			say("/hifi streamlog [frames 1-8] [label]: the next world frame(s) as dgVoodoo records them, into bootloader\\hifixi-stream-<time>-<label>.txt");
+			return;
+		}
+		if (label.empty())
+			label = std::string("zone-") + (is_off(part::zone) ? "off" : "on") + "-chars-" + (is_off(part::chars) ? "off" : "on");
+		char version[32];
+		std::snprintf(version, sizeof(version), "HiFi XI %.2f", kVersion);
+		const std::string context = std::string(version) + "; " + hifi::game::gamedraw::status() + "; World FX " +
+			(worldfx_drawing() != 0 ? "draws into the game's world" : "doesn't draw (no world found yet)") + "\n";
+		if (!hifi::backend::streamlog::request(frames, label, context))
+		{
+			say("A stream log is being made already.", true);
+			return;
+		}
+		say("Stream log: the next " + std::to_string(frames) + " world frame(s) go into bootloader\\hifixi-stream-<time>-" + label + ".txt");
+	}
+
 public:
 	const char *GetName() const override { return "hifixi"; }
 	const char *GetAuthor() const override { return "Relli"; }
@@ -318,6 +368,8 @@ public:
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&now_seconds), &self);
 		hifi::backend::set_log_sink(ashita_log);
 		hifi::game::hifps::exp::set_ashita(core);
+		// (the stream log's view of the game's draws: a tap on the client device, the hifps proxy's slots when it's in)
+		hifi::backend::streamlog::set_d3d8_tap(hifi::game::hifps::exp::draw_tap, hifi::game::hifps::exp::draw_untap);
 		start();
 		hifi::bake::runner::start(hifi::backend::folder());
 		return true;
@@ -326,6 +378,7 @@ public:
 	void Release() override
 	{
 		// (the game's own drawing back first, while the log still takes the reason it can't be)
+		hifi::backend::streamlog::set_d3d8_tap(nullptr, nullptr);
 		std::string why;
 		if (!hifi::game::gamedraw::stop(why))
 			ashita_log(1, ("the game's own drawing not put back: " + why).c_str());
@@ -375,6 +428,8 @@ public:
 		}
 		else if (arg == "gamedraw" || arg.rfind("gamedraw ", 0) == 0)
 			gamedraw(arg.substr(8));
+		else if (arg == "streamlog" || arg.rfind("streamlog ", 0) == 0)
+			streamlog(arg.substr(9));
 		else if (arg.empty() || arg == "menu")
 			m_menu = !m_menu;
 		else if (arg == "off")
@@ -393,7 +448,7 @@ public:
 				say("Direct3D 12 hooks not in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
 		return true;
 	}
 
@@ -444,6 +499,8 @@ public:
 			}
 		}
 		hifi::backend::present();
+		if (const std::string line = hifi::backend::streamlog::present(); !line.empty())
+			say(line);
 		if (g_gui != nullptr && hifi::game::option_on("hifps", "counter", true) && hifi::game::hifps::fps() > 0.0)
 		{
 			// (the frame rate, top left)

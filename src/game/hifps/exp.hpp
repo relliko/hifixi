@@ -32,6 +32,13 @@ namespace hifi::game::hifps::exp
 	void present(double now);
 	// Everything put back (only over our own bytes), the memory freed when nothing points into it, all forgotten
 	void stop();
+	// The stream log's tap on the game's draws (src/backend/streamlog): the client device's DrawPrimitive,
+	// DrawIndexedPrimitive, DrawPrimitiveUP and DrawIndexedPrimitiveUP (slots 70-73) pointed at taps[0..3], each
+	// calling on to originals[i] (filled here): in the proxy's own vtable while batch or dedupe has it in, else in a
+	// copy of the device's vtable put in front of it. On the game's thread only (a present); false and why when it
+	// can't. draw_untap puts the slots (or the device's own vtable) back; turning the proxy on or off does too.
+	bool draw_tap(const void *const taps[4], void *originals[4], std::string &why);
+	void draw_untap();
 	// For /hifi status and the menu: a line a toggle (as /hifps exp lists them), then why not and notes
 	std::vector<std::string> status();
 

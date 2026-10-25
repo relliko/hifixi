@@ -37,7 +37,13 @@ namespace vistest
 	};
 
 	// The game's thread: a test asked for. Returns the newest answer for this test object (0..256, as the game's test
-	// returns), or -1 when there's none yet. now_ms: GetTickCount64.
+	// returns): one read back lately, else the last one it had (kept kRememberMs since last asked: an object back in
+	// view after a while gets its old answer until the new one is in, a few frames on), else kUnknown, which every
+	// call site takes as hidden for those few frames (a glow, a lamp's light or the flare shows a few frames late, a
+	// door can't be targeted for them) instead of waiting on the GPU for the game's own test. now_ms: GetTickCount64.
+	constexpr int32_t kUnknown = 0;
+	constexpr uint64_t kRememberMs = 60000;
+	constexpr uint32_t kMaxRemembered = 8192; // (over it, answers not asked for 2 s go first)
 	int32_t ask(uint32_t object, const box &b, uint64_t now_ms);
 	// Whether answers have come in lately (within kLiveMs): the game's own test runs when they haven't
 	constexpr uint64_t kLiveMs = 250;
@@ -61,7 +67,8 @@ namespace vistest
 	struct stats
 	{
 		uint64_t asked = 0;    // tests asked for
-		uint64_t unknown = 0;  // ... with no answer yet
+		uint64_t unknown = 0;  // ... with no answer yet (answered kUnknown)
+		uint64_t stale = 0;    // ... answered from one kept while the object went unasked over 2 s
 		uint64_t taken = 0;    // boxes sent to the GPU
 		uint64_t dropped = 0;  // asked for over kMaxBoxes in a take
 		uint64_t answered = 0; // answers read back
