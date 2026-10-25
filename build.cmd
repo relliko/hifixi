@@ -40,8 +40,8 @@ call "%~dp0build_engine.cmd" build\engine || exit /b 1
 rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hifps and drawcull did
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
 set "FEED=src\game\game.cpp src\game\feed.cpp src\game\glows.cpp src\game\gamewater.cpp src\game\gamerain.cpp"
-set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\hifps\gfx.cpp"
-set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp"
+set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp"
+set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\sea.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
@@ -94,20 +94,18 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   tests\hifps_step_test.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\hifps_step_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\hifps_step_test.exe
-rem hifps's speed-ups and night lighting against hifps.lua under lupa (tests\hifps_exp_lua.py), with the addon's own
-rem stub harnesses (read from its folder, 32-bit, no CRT): build\hifps_exp_test.exe, build\test_hifps_exp\*_harness.exe
+rem hifps's speed-ups against hifps.lua under lupa (tests\hifps_exp_lua.py), with the addon's own walls stub harness
+rem (read from its folder, 32-bit, no CRT): build\hifps_exp_test.exe, build\test_hifps_exp\walls_harness.exe
 if not exist build\test_hifps_exp mkdir build\test_hifps_exp
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\hifps_exp_test.cpp src\game\hifps\exp.cpp src\game\hifps\gfx.cpp src\game\game.cpp /Fo"build\test_hifps_exp\\" ^
+  tests\hifps_exp_test.cpp src\game\hifps\exp.cpp src\game\game.cpp /Fo"build\test_hifps_exp\\" ^
   /Fe"build\hifps_exp_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\hifps_exp_test.exe
 set "HIFPS=C:\Games\PhoenixXI\addons\hifps\proxy"
-for %%t in (walls gfx) do (
-  cl /nologo /O1 /GS- /W3 /wd4164 /c "%HIFPS%\%%t_harness.c" /Fo"build\test_hifps_exp\%%t_harness.obj" || exit /b 1
-  link /nologo /subsystem:console /entry:main /nodefaultlib build\test_hifps_exp\%%t_harness.obj kernel32.lib user32.lib ^
-    /out:build\test_hifps_exp\%%t_harness.exe || exit /b 1
-  echo Built build\test_hifps_exp\%%t_harness.exe
-)
+cl /nologo /O1 /GS- /W3 /wd4164 /c "%HIFPS%\walls_harness.c" /Fo"build\test_hifps_exp\walls_harness.obj" || exit /b 1
+link /nologo /subsystem:console /entry:main /nodefaultlib build\test_hifps_exp\walls_harness.obj kernel32.lib user32.lib ^
+  /out:build\test_hifps_exp\walls_harness.exe || exit /b 1
+echo Built build\test_hifps_exp\walls_harness.exe
 rem The zone files made on their thread as zones are entered, into a folder of the test's own: build\runner_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\runner_test.cpp %BAKE% src\game\game.cpp /Fo"build\test\\" /Fe"build\runner_test.exe" /link /NOLOGO user32.lib || exit /b 1
@@ -116,18 +114,24 @@ rem The zone bakers against the Python bakers (tests\bake1_oracle.py, bake2_orac
 rem water, wet ground, rain), build\bake2_test.exe (shadow maps, lamps)
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\bake1_test.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp ^
-  src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\bake1_test.exe" /link /NOLOGO user32.lib || exit /b 1
+  src\bake\sea.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\bake1_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\bake1_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\bake2_test.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\bake2_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\bake2_test.exe
+rem The sea sheets against tools\bake_sea.py (tests\sea_oracle.py): build\sea_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\sea_test.cpp src\bake\sea.cpp src\bake\collision.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
+  /Fe"build\sea_test.exe" ^
+  /link /NOLOGO user32.lib || exit /b 1
+echo Built build\sea_test.exe
 rem The routines run as the game would, as reshade-worldfx's tests build them (their sprintf, and gamerain's ebp set in
 rem inline assembly on purpose, not warned about): build\test\gamewater_cave.exe, build\test\gamerain_cave.exe
-for %%t in (gamewater gamerain) do (
-  cl /nologo /Od /W3 /D_CRT_SECURE_NO_WARNINGS /wd4731 "..\reshade-worldfx\tests\%%t_cave.c" /Fe"build\test\%%t_cave.exe" ^
-    /Fo"build\test\%%t_cave.obj" || exit /b 1
-  echo Built build\test\%%t_cave.exe
+for %%t in ("..\reshade-worldfx\tests\gamewater_cave.c" "tests\gamerain_cave.c") do (
+  cl /nologo /Od /W3 /D_CRT_SECURE_NO_WARNINGS /wd4731 "%%~t" /Fe"build\test\%%~nt.exe" ^
+    /Fo"build\test\%%~nt.obj" || exit /b 1
+  echo Built build\test\%%~nt.exe
 )
 
 rem "build.cmd e2e": World FX's end-to-end test (..\reshade-worldfx\tests\e2e.cpp, built with /DWORLDFX_NATIVE) on

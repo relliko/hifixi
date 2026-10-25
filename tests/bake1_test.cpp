@@ -12,8 +12,11 @@
  *   - then a few bakes again on threads of their own, all at once: the same bytes again.
  * Zones: West Ronfaure 100 (grass, water; no rain), La Theine 102, Jugner 104 (its lake, rain), the Sanctuary of Zi'Tah
  * 121 and Yuhtunga 123 (Zilart: ROM2; Zi'Tah's cut-out canopy), Southern San d'Oria 230 (a town: canals) and Norg 252
- * (a town with rain, its MMBs using the second key table's swaps, no grass), Phanauet Channel 1 (no collision: none of
- * anything).
+ * (a town with rain, its MMBs using the second key table's swaps, no grass), Port San d'Oria 232 and Kazham 250 (their
+ * collision's water a floor under the game's sea: the water at the sea sheet's height), Phanauet Channel 1 (no
+ * collision: none of anything).
+ * And the water of Port San d'Oria and Kazham at their sea: every flat corner at the game's sea sheet's height
+ * (research/ffxi-re/notes-sea-height.md), with no flow.
  *
  *   build\bake1_test.exe              (from this folder)
  *   build\bake1_test.exe 104 121      (those zones only)
@@ -27,7 +30,9 @@
 #include "../src/bake/dat.hpp"
 #include "game_dump.hpp"
 #include <psapi.h>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +62,7 @@ extern "C"
 	void __cdecl worldfx_lamps(const uint32_t *, uint32_t) {}
 	void __cdecl worldfx_glows(const uint32_t *, uint32_t) {}
 	void __cdecl worldfx_weather(const uint32_t *, uint32_t) {}
+	void __cdecl worldfx_moon(uint32_t) {}
 	uintptr_t __cdecl worldfx_vis_entry(uint32_t) { return 0; }
 	void __cdecl worldfx_vis_setup(uintptr_t, uint32_t) {}
 	void __cdecl worldfx_vis_stats(uint32_t out[12]) { std::memset(out, 0, 12 * 4); }
@@ -223,7 +229,7 @@ int main(int argc, char **argv)
 	if (kinds.empty())
 		kinds.assign(std::begin(kKinds), std::end(kKinds));
 	if (zones.empty())
-		zones = { 100, 102, 104, 121, 123, 230, 252, 1 };
+		zones = { 100, 102, 104, 121, 123, 230, 252, 232, 250, 1 };
 
 	// This folder (the exe's, build\, one up), and ours under %TEMP%
 	char exe[MAX_PATH] = "";
@@ -267,6 +273,48 @@ int main(int argc, char **argv)
 			compare(kind, zone, py, cpp, oracles, total_cpp, total_py);
 	for (const std::string &kind : kinds)
 		std::printf("      %-5s: C++ %.2f s, Python %.2f s in all\n", kind.c_str(), total_cpp[kind], total_py[kind]);
+
+	// The water at the game's sea where the collision lies under it: every flat corner (kind under 100) at the sea sheet's
+	// placed height, no flow (before: Port San d'Oria's 4.5 yalms under it, Kazham's 0.05-4.05)
+	struct sea_check
+	{
+		uint32_t zone;
+		const char *what;
+		double y; // (the sheet's corners' y, float32 to float64)
+		uint32_t corners;
+	};
+	const sea_check kSea[] = {
+		{ 232, "Port San d'Oria, t_sa/effe/sea /sea1", 1.499999761581421, 1575 },
+		{ 250, "Kazham, t_ka/effe/sea /sea2 (model 'sea1')", -0.05000017210841179, 2922 },
+	};
+	for (const sea_check &c : kSea)
+	{
+		if (std::find(zones.begin(), zones.end(), c.zone) == zones.end() || std::find(kinds.begin(), kinds.end(), "water") == kinds.end())
+			continue;
+		std::vector<uint8_t> b;
+		uint32_t flat = 0, at_sea = 0, flowing = 0;
+		double worst = 0.0;
+		if (read_bytes(cpp + "water\\" + std::to_string(c.zone) + ".bin", b) && b.size() >= 20 && std::memcmp(b.data(), "WTR2", 4) == 0)
+		{
+			const size_t start = 20 + size_t(le32(b, 12)) * 16, corners = le32(b, 16);
+			for (size_t i = 0; i < corners && start + (i + 1) * 32 <= b.size(); ++i)
+			{
+				float v[8];
+				std::memcpy(v, b.data() + start + i * 32, 32);
+				if (v[3] >= 100.0f)
+					continue;
+				flat++;
+				const double d = std::fabs(double(v[4]) - c.y);
+				worst = std::max(worst, d);
+				at_sea += d < 1e-6;
+				flowing += v[6] != 0.0f || v[7] != 0.0f;
+			}
+		}
+		char text[256];
+		std::snprintf(text, sizeof(text), "water %u at the game's sea (%s, y %.3f): %u of %u flat corners on it (%u wanted), furthest %.6f, %u flowing",
+			c.zone, c.what, c.y, at_sea, flat, c.corners, worst, flowing);
+		check(flat == c.corners && at_sea == flat && flowing == 0, text);
+	}
 
 	// Some again, on threads of their own all at once (as several bakes may run): the same bytes
 	if (kinds.size() == std::size(kKinds))

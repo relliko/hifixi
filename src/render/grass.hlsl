@@ -41,6 +41,36 @@ float clear_at(float depth)
 
 float hash(float x) { return frac(sin(x * 91.3458) * 47453.5453); }
 
+// A hash of a whole-number point (0..1), steady at any distance from the zone's middle (sin-based ones
+// aren't, far out)
+float hash2(int2 p)
+{
+	uint n = uint(p.x) * 1597334677u ^ uint(p.y) * 3812015801u;
+	n = (n ^ (n >> 16)) * 2246822519u;
+	n ^= n >> 13;
+	return float(n & 0xFFFFFFu) / 16777215.0;
+}
+
+// Smooth noise (0..1) at p
+float noise2(float2 p)
+{
+	int2 i = int2(floor(p));
+	float2 f = p - floor(p);
+	float2 u = f * f * (3.0 - 2.0 * f);
+	return lerp(lerp(hash2(i), hash2(i + int2(1, 0)), u.x), lerp(hash2(i + int2(0, 1)), hash2(i + int2(1, 1)), u.x), u.y);
+}
+
+// The same repeating every `period` (a whole number) across both axes: what drifts on it (the clouds, the fog banks)
+// drifts without end, its offset wrapped by the period on the CPU
+float noise_wrap(float2 p, float period)
+{
+	float2 i = floor(p), f = p - i;
+	float2 u = f * f * (3.0 - 2.0 * f);
+	float2 a = i - period * floor(i / period), b = a + 1.0;
+	b -= period * floor(b / period);
+	return lerp(lerp(hash2(int2(a)), hash2(int2(b.x, a.y)), u.x), lerp(hash2(int2(a.x, b.y)), hash2(int2(b)), u.x), u.y);
+}
+
 float3 texel(int2 p)
 {
 	p = clamp(p, int2(0, 0), int2(ground.yz) - 1);
@@ -216,6 +246,22 @@ static const uint kWear = kHaze + 2 + 6 + 24; // (after the wet look's and the s
 static const uint kMaxCuts = 8;
 bool wearing() { return ((crowd.x >> 16) & 256) != 0; }
 
+// The weather of its own (crowd.x rule bit 512; t2 after the shadow map's drawings before the last, kSunMapPrev below:
+// grass_render.cpp kWxParams, look::weather_fx): [kWx] x, y: toward where the wind blows (the world's x, z) times how
+// hard, z: how hard (0 calm .. 1 wind .. 2 gales); [kWx + 1] the view's first row (a view-space point's world x is eye.x
+// + dot(it, the point)) and w: the ground's height under the camera (the game's y, down positive); [kWx + 2] its third
+// row (world z) and w: the time (seconds, as color.w); [kWx + 3] the clouds: how much of the sky they cover, how opaque at
+// most, the veil over all of it (mist), w: the stars' boost (1 none); [kWx + 4] how far the clouds have drifted (the
+// noise's units: the broad shapes' x, z, the detail's x, z); [kWx + 5] their colour where lit, w: how much darker the sky;
+// [kWx + 6] underneath, w: the aurora; [kWx + 7] the veil's colour; [kWx + 8] the lightning: x the flash now, y the
+// bolt's brightness, z its bearing (radians from north toward east), w how high it starts (radians); [kWx + 9] x its
+// shape (a number); [kWx + 10] the dust's colour, w how thick; [kWx + 11] x its streaks, y how fast they blow (yalms a
+// second); [kWx + 12] gloom's colour, w how thick; [kWx + 13] heat shimmer: x how strong, y, z from and whole by (yalms);
+// [kWx + 14] xy: how far the fog banks have drifted (the noise's units, 48 yalms each).
+// Read only behind a [branch] on weather_fx(), as the fog.
+static const uint kWx = kWear + 2 + 2 * kMaxCuts + 8;
+bool weather_fx() { return ((crowd.x >> 16) & 512) != 0; }
+
 // Each point's wear, after its colour in the memory (+12, +16: when its trampling will have worn off, and when it'll
 // have grown back from a cut; seconds on the memory's clock, 0 never). Whoever stands within their radius of it (its
 // own height within 3 yalms) pushes the first on by the frame's length, more the nearer: full (kWearHold ahead, the
@@ -355,12 +401,27 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 	float bend = 0.2 + 0.45 * hash(seed * 7.31);
 	float2 wind = float2(0.8, 0.6) * (0.5 + 0.5 * sin(color.w * 1.6 + dot(root.xz, float2(0.23, 0.17))))
 		+ 0.25 * sin(color.w * 3.7 + seed * 6.28);
+	// The weather's wind (weather_fx: [kWx] toward where it blows times how hard): the blades lean the way it blows, in
+	// gusts that roll across the grass along it, a tip bent over coming down as much as it goes across (about half a
+	// radian in a wind, a radian in gales); they flutter the more the harder it blows
+	float2 blown = 0.0;
+	float bowed = 0.0;
+	[branch] if (weather_fx())
+	{
+		float4 wv = actors[kWx];
+		float2 way = wv.z > 0.0 ? wv.xy / wv.z : float2(1.0, 0.0);
+		float gust = 0.65 + 0.35 * sin(color.w * 1.9 - dot(root.xz, way) * 0.3) + 0.12 * sin(color.w * 5.3 + seed * 6.28);
+		float tilt = min(0.55 * wv.z * gust, 1.15);
+		blown = way * sin(tilt);
+		bowed = 1.0 - cos(tilt);
+		wind *= 1.0 + 0.8 * wv.z;
+	}
 
 	float w = blade.y * (row == kSegments ? 0.0 : pow(1.0 - t, 0.8)) * (side ? 1.0 : -1.0);
 	float3 p = root;
 	float down = max(pushed, flat);
-	p.xz += across * w + (lean * (bend + 1.2 * flat) + wind * 0.15 * (1.0 - down)) * h * t * t + push * h * (0.5 * t + 0.6 * t * t);
-	p.y -= h * t * (1.0 - 0.25 * bend * t) * (1.0 - 0.6 * down);
+	p.xz += across * w + (lean * (bend + 1.2 * flat) + (wind * 0.15 + blown) * (1.0 - down)) * h * t * t + push * h * (0.5 * t + 0.6 * t * t);
+	p.y -= h * t * (1.0 - 0.25 * bend * t) * (1.0 - 0.6 * down) * (1.0 - bowed * t);
 	o.pos = mul(float4(p, 1.0), view_proj);
 
 	// Colour: the ground's, turned towards the grass's hue at the ground's brightness; dark at the root
@@ -638,7 +699,8 @@ float wet_here(float3 P)
 // disc and glow; [kSky + 13] toward the game's light (view space) and how much it's the moon; [kSky + 14] their colour
 // and the stars' turn about the pole (radians); [kSky + 15] x the time (seconds), y 1 for the debug view (what's repainted
 // tinted magenta, sky kept as the game drew it red), z and w how near a pixel must be to the game's dome to be repainted
-// (bytes: whole within z, none past w); [kSky + 16 + i] stop i's slope (bytes per height).
+// (bytes: whole within z, none past w); [kSky + 16 + i] stop i's slope (bytes per height), the first three's .w the
+// moon's lit side (view space), [kSky + 19].w how much of it is lit (the game's phase: 0 new .. 1 full).
 // Read only behind a [branch] on own_sky(), as the fog.
 static const uint kSky = kWet + 6;
 static const float kSkyDepth = 30000.0; // (yalms: the game's far plane is 65,535, its dome 52,400 out and depthless)
@@ -706,8 +768,8 @@ float3 sky_gradient(float height)
 }
 
 // Stars on a turning sphere (d: a direction fixed to the stars): a cube's faces cut into cells, a star in about one cell
-// in four, somewhere in its middle, most of them faint; each a soft dot about a pixel wide (px: radians a pixel) that
-// twinkles a little. Light added (0..1 each).
+// in four (times many: more of them in stellar glare), somewhere in its middle, most of them faint; each a soft dot about
+// a pixel wide (px: radians a pixel) that twinkles a little. Light added (0..1 each).
 static const float kStarCells = 90.0;
 uint star_hash(uint x) // (rain_hash's, defined further down)
 {
@@ -718,7 +780,7 @@ uint star_hash(uint x) // (rain_hash's, defined further down)
 	x ^= x >> 16;
 	return x;
 }
-float3 star_field(float3 d, float px, float time)
+float3 star_field(float3 d, float px, float time, float many)
 {
 	float3 a = abs(d);
 	float face;
@@ -757,7 +819,7 @@ float3 star_field(float3 d, float px, float time)
 	float2 star_uv = ((cell + 0.2 + 0.6 * float2(r1, r2)) / kStarCells) * 2.0 - 1.0;
 	float3 star = normalize(axis_n + axis_u * star_uv.x + axis_v * star_uv.y);
 	float apart = length(cross(d, star)); // (radians, for so small an angle)
-	float bright = r0 < 0.27 ? 0.05 + 0.95 * pow(r3, 7.0) : 0.0;
+	float bright = r0 < 0.27 * many ? 0.05 + 0.95 * pow(r3, 7.0) : 0.0;
 	float size = px * (0.6 + 0.7 * bright);
 	float twinkle = 0.75 + 0.25 * sin(time * (1.7 + 3.1 * r1) + 6.2831853 * r2);
 	float r4 = frac(r0 * 37.17 + r3 * 11.31);
@@ -765,10 +827,148 @@ float3 star_field(float3 d, float px, float time)
 	return tint * bright * twinkle * exp(-0.5 * apart * apart / (size * size));
 }
 
+// Clouds (weather_sky): a layer seen along the view ray, its point there (w.xz / up: wider apart toward the horizon) in
+// the noise's units (kCloudScale of them for a ray 45 degrees up; kCloudPeriod a repeat of the broadest octave)
+static const float kCloudScale = 0.9, kCloudPeriod = 64.0;
+
+// The clouds' noise at q (fbm: the broad shapes drifting by drift.xy, the detail by drift.zw, faster, so they change as
+// they go), each octave left out (as its mean) where its cells are under a couple of pixels (fine: the noise's units a
+// pixel), so they don't sparkle toward the horizon
+float cloud_noise(float2 q, float4 drift, float fine, int octaves)
+{
+	float sum = 0.0, total = 0.0, amp = 0.5, scale = 1.0, period = kCloudPeriod;
+	[unroll] for (int k = 0; k < 5; ++k)
+	{
+		if (k < octaves)
+		{
+			float keep = saturate(1.5 - fine * scale * 3.0);
+			float2 at = (q + (k < 2 ? drift.xy : drift.zw) + float2(k * 13.7, k * 7.3)) * scale;
+			sum += amp * lerp(0.5, noise_wrap(at, period), keep);
+			total += amp;
+		}
+		amp *= 0.5;
+		scale *= 2.0;
+		period *= 2.0;
+	}
+	return sum / total;
+}
+
+// An aurora's light along w (the world, y down; up: how high it is): curtains hanging in the sky, sheets that wave slowly
+// across it, seen through at eight heights from their foot up (green low down, violet higher, fainter as they rise); their
+// light in rays that hang straight down the sky (by the ray's bearing alone: the same up a column of the screen), slowly
+// shifting. Light added (before the night and the setting's strength).
+float3 aurora_light(float3 w, float up, float t)
+{
+	float3 sum = 0.0;
+	float2 dir = w.xz / max(up, 0.03);
+	float2 around = normalize(w.xz + 1e-5) * 60.0; // (the bearing on a circle: no seam)
+	float rays = 0.25 + 0.75 * saturate(noise2(around + float2(t * 0.05, 0.0)) * 0.6 + noise2(around * 2.7 - float2(0.0, t * 0.08)) * 0.6 - 0.1);
+	[unroll] for (int k = 0; k < 8; ++k)
+	{
+		float2 q = dir * (1.0 + 0.16 * k) * 0.35; // (where the ray is at that height, in the curtains' units)
+		float wave = q.y + 0.8 * sin(q.x * 0.45 + t * 0.021) + 0.3 * sin(q.x * 1.3 - t * 0.037 + 1.7);
+		float across = abs(frac(wave * 0.22) - 0.5) * 2.0; // (0 on a sheet .. 1 halfway to the next)
+		float sheet = exp(-across * across * 30.0);
+		float3 c = lerp(float3(0.1, 0.95, 0.4), float3(0.6, 0.15, 0.85), smoothstep(1.0, 6.0, float(k)));
+		sum += c * sheet * (1.0 - k / 9.0);
+	}
+	return sum * rays * 0.35 * smoothstep(0.04, 0.25, up);
+}
+
+// A lightning bolt's sideways offset (radians) at an elevation: kinks of three sizes, its own (seed)
+float bolt_jag(float e, float seed)
+{
+	return 0.12 * (noise2(float2(e * 18.0, seed)) - 0.5) + 0.05 * (noise2(float2(e * 60.0, seed + 17.0)) - 0.5) +
+		0.018 * (noise2(float2(e * 200.0, seed + 41.0)) - 0.5);
+}
+
+float bolt_line(float d, float px, float thin)
+{
+	float wd = 1.1 * px * thin;
+	return exp(-d * d / (wd * wd)) + 0.3 * exp(-d / (8.0 * px)) + 0.08 * exp(-d / 0.03);
+}
+
+// Its light along a ray at bearing az and elevation el (radians; px radians a pixel): a jagged line from where it starts
+// (top, coming out of the cloud) down to the horizon at its bearing, three branches forking off it downward and dying
+// out; a white core a pixel or two wide and a glow round it
+float bolt_light(float az, float el, float bearing, float top, float seed, float px)
+{
+	float light = 0.0;
+	[branch] if (el < top && el > -0.01)
+	{
+		float a = az - bearing - bolt_jag(el, seed);
+		a -= 6.2831853 * round(a / 6.2831853);
+		light = bolt_line(abs(a) * cos(el), px, 1.0);
+		[unroll] for (int b = 0; b < 3; ++b)
+		{
+			float h = frac(sin(seed * 12.9898 + b * 78.233) * 43758.5453);
+			float fork = top * (0.35 + 0.5 * h);                   // (where it forks off)
+			float len = fork * (0.3 + 0.4 * frac(h * 7.13));       // (how far down it reaches)
+			float slope = (frac(h * 3.71) < 0.5 ? -1.0 : 1.0) * (0.5 + 0.9 * frac(h * 5.17)); // (radians across for each radian down)
+			float rest = (el - (fork - len)) / len;                // (1 at the fork .. 0 where it dies out)
+			float ab = az - bearing - bolt_jag(fork, seed) - slope * (fork - el) - 0.6 * bolt_jag(el, seed + 5.3 * (b + 1));
+			ab -= 6.2831853 * round(ab / 6.2831853);
+			light += el < fork && rest > 0.0 ? 0.8 * sqrt(rest) * bolt_line(abs(ab) * cos(el), px, 0.75) : 0.0;
+		}
+		light *= smoothstep(top, top - 0.03, el);
+	}
+	return light;
+}
+
+// The sky's weather (weather_fx) over the gradient at this pixel (sky; w its view ray in the world, y down, up its
+// height's sine, v in view space; behind: the sun or moon and the stars, which the clouds hide): an aurora's curtains, a
+// veil over all of it (mist), the clouds lit by the sun or moon (light: toward it in view space, sun its strength, disc
+// its colour; at night the moon's), dust and gloom over them low down, the lightning's flash lighting the clouds most and
+// its bolt in front of them
+float3 weather_sky(float3 w, float3 v, float up, float3 sky, float3 behind, float px, float4 light, float sun, float3 disc)
+{
+	float4 clouds = actors[kWx + 3], drift = actors[kWx + 4], lit = actors[kWx + 5], shade_c = actors[kWx + 6], veil_c = actors[kWx + 7];
+	float4 flash = actors[kWx + 8], bolt = actors[kWx + 9], dust = actors[kWx + 10], gloom = actors[kWx + 12];
+	float t = actors[kWx + 2].w;
+	float3 colour = sky + behind;
+	[branch] if (shade_c.w > 0.0)
+		colour += aurora_light(w, up, t) * shade_c.w * saturate(1.2 - 4.0 * luma(sky));
+	float veil = clouds.z * (0.55 + 0.45 * (1.0 - up));
+	colour = lerp(colour, veil_c.rgb, veil);
+	float cover = 0.0;
+	[branch] if (clouds.x > 0.0 && clouds.y > 0.0)
+	{
+		float2 q = w.xz / (up + 0.06) * kCloudScale;
+		float fine = kCloudScale * px / ((up + 0.06) * (up + 0.06)); // (the layer's units a pixel there)
+		float n = cloud_noise(q, drift, fine, 5);
+		float from = lerp(0.74, -0.08, clouds.x); // (where the noise is cloud: more of it, the more they cover)
+		float d = smoothstep(from, from + 0.2, n);
+		// Lit where it thins toward the light (the noise a little way toward it lower), in shade where it thickens
+		float3 toward = float3(dot(actors[kWx + 1].xyz, light.xyz), dot(up_row.xyz, light.xyz), dot(actors[kWx + 2].xyz, light.xyz));
+		float2 lean = toward.xz / max(length(toward.xz), 1e-3) * 0.35;
+		float n2 = cloud_noise(q + lean, drift, fine, 3);
+		float litness = saturate(0.55 + (n - n2) * 4.0) * saturate(0.35 - toward.y * 2.0);
+		float3 cc = lerp(shade_c.rgb, lit.rgb, litness);
+		// (a bright rim on thin cloud near the sun; toward the horizon they fade into the sky's own colour)
+		float apart = acos(clamp(dot(v, light.xyz), -1.0, 1.0));
+		cc += disc * sun * exp(-apart / 0.12) * 4.0 * d * (1.0 - d) * 0.8;
+		cc = lerp(cc, sky, 0.5 * (1.0 - smoothstep(0.0, 0.3, up)));
+		cover = d * clouds.y * smoothstep(0.0, 0.08, up);
+		colour = lerp(colour, cc, cover);
+	}
+	[branch] if (dust.w > 0.0)
+		colour = lerp(colour, dust.rgb, saturate(dust.w * (0.2 + 0.5 * (1.0 - up) * (1.0 - up))));
+	[branch] if (gloom.w > 0.0)
+		colour = lerp(colour, gloom.rgb, saturate(gloom.w * 0.6 * (1.0 - smoothstep(0.0, 0.3, up))));
+	// (the flash lights the clouds from within, the clear sky a little)
+	[branch] if (flash.x > 0.0)
+		colour = colour * (1.0 + flash.x * (0.15 + 0.6 * cover + 0.2 * veil)) + flash.x * (0.03 + 0.06 * cover) * float3(0.78, 0.85, 1.0);
+	[branch] if (flash.y > 0.0)
+		colour += flash.y * bolt_light(atan2(w.x, w.z), asin(saturate(up)), flash.z, flash.w, bolt.x, px) * float3(0.85, 0.9, 1.0);
+	return colour;
+}
+
 // The sky at a pixel the zone left, as the add-on draws it (col: what the game drew there): its own gradient by the view
 // ray's elevation with the sun or moon and the stars over it, where the pixel is still the game's dome (within
 // [kSky + 15].z bytes of dome_colour, fading out by .w); what the game drew over its dome later in the frame (clouds, its
-// sun and moon, effects) stays. Dithered by under half a byte, so the gradient doesn't come out in steps of one.
+// sun and moon, effects) stays. Dithered by under half a byte, so the gradient doesn't come out in steps of one. With the
+// weather of its own (weather_fx): the sky darker as the weather has it, the stars brighter and more of them in stellar
+// glare, and the weather's clouds and the rest over it (weather_sky).
 float3 sky_paint(float2 xy, float3 col)
 {
 	float2 ndc = float2(xy.x / ground.y * 2.0 - 1.0, 1.0 - xy.y / ground.z * 2.0);
@@ -786,16 +986,44 @@ float3 sky_paint(float2 xy, float3 col)
 	float height = asin(saturate(up)) / 1.5707963;
 	float3 sky = sky_gradient(height) / 255.0;
 	float px = 2.0 / (lin.w * ground.z); // (radians a pixel, near the middle of the screen)
+	bool weather = weather_fx();
+	float boost = 1.0;
+	[branch] if (weather)
+	{
+		sky *= 1.0 - actors[kWx + 5].w;
+		boost = actors[kWx + 3].w;
+	}
 	// The sun (or the moon): a disc about one and a half times the real one's, and a glow around it; the moon's smaller and
-	// fainter. Cut by the horizon (soft by a pixel).
+	// fainter. Cut by the horizon (soft by a pixel). The moon in its phase (the game's: [kSky + 16..18].w its lit side in
+	// view space, [kSky + 19].w how much of it is lit, 0 new .. 1 full): a sphere lit from the side by as much, the
+	// terminator soft by about a pixel, the dark part just a faint earthshine; its glow as bright as its lit share.
 	float3 add = 0.0;
+	float shine = row2.w; // (the sun's or moon's strength as the clouds are lit by it)
 	[branch] if (row2.w > 0.0)
 	{
 		float apart = acos(clamp(dot(v, light.xyz), -1.0, 1.0));
 		float radius = lerp(0.008, 0.007, light.w);
 		float body = 1.0 - smoothstep(radius - px, radius + px, apart);
+		float lit = actors[kSky + 19].w;
+		float phase = 1.0;
+		[branch] if (light.w > 0.0 && body > 0.0)
+		{
+			float3 side = float3(actors[kSky + 16].w, actors[kSky + 17].w, actors[kSky + 18].w);
+			side -= light.xyz * dot(side, light.xyz);
+			float len = length(side);
+			side = len > 1e-4 ? side / len : float3(1.0, 0.0, 0.0); // (straight at the moon: any side)
+			float3 q = v - light.xyz * dot(v, light.xyz); // (on the disc, out from its middle)
+			float x = dot(q, side) / radius, y = dot(q, cross(light.xyz, side)) / radius;
+			float z = sqrt(saturate(1.0 - x * x - y * y)); // (toward the eye)
+			// (the sun from the side by the phase angle: a share lit of (1 + cos a) / 2 = lit)
+			float c = 2.0 * saturate(lit) - 1.0, s = sqrt(saturate(1.0 - c * c));
+			float edge = max(1.5 * px / radius, 0.04);
+			phase = lerp(0.04, 1.0, smoothstep(-edge, edge, x * s + z * c));
+		}
+		float glow_share = lerp(1.0, 0.08 + 0.92 * saturate(lit), light.w);
 		float glow = lerp(0.45 * exp(-apart / 0.035) + 0.16 * exp(-apart / 0.25), 0.22 * exp(-apart / 0.03) + 0.05 * exp(-apart / 0.15), light.w);
-		add += disc.rgb * (body * lerp(1.0, 0.85, light.w) + glow) * row2.w * smoothstep(-px, px, up);
+		add += disc.rgb * (body * lerp(1.0, 0.85 * phase, light.w) + glow * glow_share) * row2.w * smoothstep(-px, px, up);
+		shine *= glow_share;
 	}
 	// The stars, turned about the pole (35 degrees up in the north) by the hour; fewer near the horizon and none on a sky
 	// still bright (twilight)
@@ -804,12 +1032,50 @@ float3 sky_paint(float2 xy, float3 col)
 		const float3 pole = float3(0.0, -0.5735764, 0.8191520);
 		float c = cos(disc.w), s = sin(disc.w);
 		float3 turned = w * c + cross(pole, w) * s + pole * dot(pole, w) * (1.0 - c);
-		float dark = saturate(1.3 - 4.0 * luma(sky));
-		add += star_field(turned, px, misc.x) * row0.w * dark * smoothstep(0.0, 0.25, up);
+		float dark = saturate(1.3 + 0.25 * (boost - 1.0) - 4.0 * luma(sky));
+		add += star_field(turned, px, misc.x, min(boost, 2.0)) * row0.w * boost * dark * smoothstep(0.0, 0.25, up);
 	}
+	float3 seen = sky + add;
+	[branch] if (weather)
+		seen = weather_sky(w, v, up, sky, add, px, light, shine, disc.rgb);
 	float noise = frac(52.9829189 * frac(dot(xy, float2(0.06711056, 0.00583715)))) - 0.5;
-	float3 painted = lerp(col, sky + add + noise / 255.0, bare);
+	float3 painted = lerp(col, seen + noise / 255.0, bare);
 	return misc.y > 0.5 ? lerp(painted, lerp(float3(1.0, 0.0, 0.0), float3(1.0, 0.0, 1.0), bare), 0.3) : painted;
+}
+
+// The world's colour at a point between pixels (from the copy: the four around, blended)
+float3 texel_at(float2 s)
+{
+	float2 f = s - 0.5;
+	int2 a = int2(floor(f));
+	float2 k = f - floor(f);
+	return lerp(lerp(texel(a), texel(a + int2(1, 0)), k.x), lerp(texel(a + int2(0, 1)), texel(a + int2(1, 1)), k.x), k.y);
+}
+
+// Heat shimmer (weather_fx: [kWx + 13] x how strong, y, z the distance it starts at and is whole by, yalms): what's drawn
+// far off over the ground taken from a little way off on the screen (between pixels: no stepping), the offset wavering
+// as hot rising air bends the light, mostly up and down; more with distance, none near the camera, the more the nearer
+// the ground under the camera (none 14 yalms over it: far hills, treetops). The wavering is fixed to the view's
+// direction in the world, so it stays put as the camera turns. Never from the sky, a name, or what stands much nearer
+// (the edge of a tree in front stays clean).
+float3 shimmered(int2 p, float3 P, float z, float3 col)
+{
+	float4 h = actors[kWx + 13], r0 = actors[kWx + 1], r2 = actors[kWx + 2];
+	float over = r0.w - (eye.y + dot(P, up_row.xyz)); // (y is down)
+	float k = h.x * smoothstep(h.y, h.z, z) * (1.0 - smoothstep(3.0, 14.0, over));
+	[branch] if (k > 0.0)
+	{
+		float3 d = normalize(float3(dot(r0.xyz, P), dot(up_row.xyz, P), dot(r2.xyz, P)));
+		float t = r2.w;
+		float2 at = d.xz * 140.0 + float2(-d.y * 140.0 - t * 1.7, -d.y * 90.0 + t * 1.1);
+		float2 wob = float2(noise2(at) - 0.5, noise2(at * 1.6 + 23.0) - 0.5) * float2(0.5, 1.0);
+		float2 s = float2(p) + 0.5 + wob * k * 0.0016 * ground.y;
+		int2 q = clamp(int2(s), int2(0, 0), int2(ground.yz) - 1);
+		float zq = drawn_depth(q);
+		if (zq < 1e8 && zq > 0.7 * z && !name_at(q))
+			col = texel_at(s);
+	}
+	return col;
 }
 
 float4 shade_ps(float4 pos : SV_Position) : SV_Target
@@ -825,6 +1091,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 
 	// The surface's point and facing, from the depth around it (for the ambient occlusion, the sun and the lamps)
 	float3 P = view_at(p);
+	[branch] if (weather_fx())
+		col = shimmered(p, P, z, col);
 	float3 n = float3(0.0, 0.0, 1.0);
 	float steep = 1.0;
 	bool lamps = ((crowd.x >> 16) & 16) != 0;
@@ -1423,7 +1691,8 @@ void sun_ps(float4 pos : SV_Position)
 // depth: what's drawn under the surface is the bed, seen through it. Each pixel is worked out whole from the
 // copies: the game's colour there (bent a little by the ripples, darker the deeper the water), the world
 // reflected in it (marched along the depth copy; the sky where nothing on screen is hit) by how much water
-// reflects at that angle, and the sun's glints.
+// reflects at that angle, and the sun's glints. The game's own sea sheets past the zone's water (the sea: SEA1, the same
+// corners, kind 200, its edge 8 yalms off: open water, no flow, its bed 30 under it) are drawn with the same shaders.
 // The pass's parameters, in t2 (where the grass has its actors): [0] toward the sun (world), glint strength;
 // [1] the sky's colour when none is on screen, reflection strength; [2] ripples, depth tint, seconds, the
 // water's draw distance; [3] the sun's colour, w flags: 1 when [4] holds the zone's fog colour (the world's
@@ -1449,16 +1718,6 @@ water_v2p water_vs(uint vid : SV_VertexID)
 	o.edge = s.y;
 	o.flow = s.zw;
 	return o;
-}
-
-// A hash of a whole-number point (0..1), steady at any distance from the zone's middle (sin-based ones
-// aren't, far out)
-float hash2(int2 p)
-{
-	uint n = uint(p.x) * 1597334677u ^ uint(p.y) * 3812015801u;
-	n = (n ^ (n >> 16)) * 2246822519u;
-	n ^= n >> 13;
-	return float(n & 0xFFFFFFu) / 16777215.0;
 }
 
 // A well-mixed hash of a whole number (the rain's: every bit of it random)
@@ -1648,7 +1907,9 @@ float4 water_ps(water_v2p i) : SV_Target
 	float range = length(to_eye);
 	float3 v = to_eye / range; // toward the camera
 	float under_depth = clamp(drawn - w, 0.0, 20.0) * range / max(w, 0.01);
-	float deep = under_depth * abs(v.y);
+	// (straight down from the whole of it, not those 20 yalms: far out, looked at along the surface, 20 yalms through is only
+	// a few hundredths of a yalm deep, and the open sea faded out into the game's own toward the horizon)
+	float deep = clamp(drawn - w, 0.0, 10000.0) * range / max(w, 0.01) * abs(v.y);
 
 	// Fades: in from the water's edge over a yalm; in over the last few hundredths of a yalm of water around
 	// what stands in it (a rock, a log, someone's legs: no hard edge, and nothing flickers there between
@@ -1657,6 +1918,16 @@ float4 water_ps(water_v2p i) : SV_Target
 	float fade = saturate(i.edge / 1.0) * smoothstep(0.0, 0.08, deep) * saturate((knobs.w - along) / (0.15 * knobs.w));
 	if (fade <= 0.0)
 		discard;
+	// In a zone with a sea (grass_render.cpp water_pipeline_for) the baked water is drawn in two parts, blade.z saying
+	// which: 1 its pixels at their whole (the rest left: the sea is drawn where these aren't), 2 those it fades in at,
+	// blended over what's there by then (the sea, or the game's own). 0 (no sea, and the sea itself): all of it.
+	uint part = uint(blade.z + 0.5);
+	if ((part == 1 && fade < 0.999) || (part == 2 && fade >= 0.999))
+		discard;
+	// (far out, past kNearWater yalms, no march toward the sun's glints or along the reflection: what's on screen that far
+	// off is too thin to be found by either; their results faded out over the last fifth before it, so there's no line)
+	static const float kNearWater = 250.0;
+	float near_water = 1.0 - smoothstep(0.8 * kNearWater, kNearWater, w);
 
 	// The surface's facing: up, tipped by the ripples (the world's y is down: up is -y)
 	float yalms_per_px = w / (lin.z * 0.5 * ground.y);
@@ -1700,22 +1971,25 @@ float4 water_ps(water_v2p i) : SV_Target
 	r = normalize(r);
 	float t = 0.4, last = 0.0, lo = 0.0, hi = 0.0;
 	bool going = true, found = false;
-	[unroll] for (int k = 0; k < 16; ++k)
+	[branch] if (near_water > 0.0)
 	{
-		int2 q;
-		float d;
-		float2 ndc;
-		going = going && on_screen(i.world + r * t, q, d, ndc);
-		float behind = d - drawn_depth(clamp(q, int2(0, 0), int2(ground.yz) - 1));
-		bool now = going && !found && behind > 0.0 && behind < max(0.5 + 0.02 * d, t * 0.5);
-		lo = now ? last : lo;
-		hi = now ? t : hi;
-		found = found || now;
-		last = t;
-		t *= 1.42;
+		[unroll] for (int k = 0; k < 16; ++k)
+		{
+			int2 q;
+			float d;
+			float2 ndc;
+			going = going && on_screen(i.world + r * t, q, d, ndc);
+			float behind = d - drawn_depth(clamp(q, int2(0, 0), int2(ground.yz) - 1));
+			bool now = going && !found && behind > 0.0 && behind < max(0.5 + 0.02 * d, t * 0.5);
+			lo = now ? last : lo;
+			hi = now ? t : hi;
+			found = found || now;
+			last = t;
+			t *= 1.42;
+		}
 	}
 	float3 mirrored = sky_toward(r);
-	if (found)
+	[branch] if (found)
 	{
 		[unroll] for (int b = 0; b < 5; ++b)
 		{
@@ -1734,7 +2008,7 @@ float4 water_ps(water_v2p i) : SV_Target
 		q = clamp(q, int2(0, 0), int2(ground.yz) - 1);
 		float thick = 0.5 + 0.02 * d;
 		float trust = (1.0 - smoothstep(0.5 * thick, thick, d - drawn_depth(q))) *
-			saturate((1.0 - max(abs(ndc.x), abs(ndc.y))) / 0.1) * (1.0 - smoothstep(40.0, 80.0, hi));
+			saturate((1.0 - max(abs(ndc.x), abs(ndc.y))) / 0.1) * (1.0 - smoothstep(40.0, 80.0, hi)) * near_water;
 		mirrored = lerp(mirrored, texel(q), trust);
 	}
 	// (how much water reflects at this angle: 2% looking straight down, all of it along the surface)
@@ -1745,7 +2019,7 @@ float4 water_ps(water_v2p i) : SV_Target
 	// so a glint near a shadow's edge doesn't blink)
 	float3 h = normalize(v + sun.xyz);
 	float glint = sun.w > 0.0 ? pow(saturate(dot(n, h)), 500.0) * 25.0 * sun.w : 0.0;
-	if (glint > 0.002)
+	[branch] if (glint > 0.002 && near_water > 0.0)
 	{
 		float s = 0.15, shade = 0.0;
 		[unroll] for (int j = 0; j < 12; ++j)
@@ -1759,7 +2033,7 @@ float4 water_ps(water_v2p i) : SV_Target
 			shade = max(shade, in_view ? smoothstep(bias, 2.0 * bias, behind) * (1.0 - smoothstep(0.7 * thick, thick, behind)) : 0.0);
 			s *= 1.45;
 		}
-		glint *= 1.0 - shade;
+		glint *= 1.0 - shade * near_water;
 	}
 
 	// (the rings' tops catch a little more light, so they show where little is reflected: near, from above)
@@ -1773,7 +2047,7 @@ float4 water_ps(water_v2p i) : SV_Target
 		float clear = saturate((h.y - w) * h.z);
 		water = lerp(fog, water, clear) + (1.0 - clear) * (1.0 - fresnel) * kept * (game_under - fog);
 	}
-	return float4(lerp(seen, water, fade), 1.0);
+	return part == 2 ? float4(water, fade) : float4(lerp(seen, water, fade), 1.0);
 }
 
 // The water view (a debug overlay): the zone's water collision itself (not the surface), each spot tinted
@@ -1912,15 +2186,6 @@ struct firefly_v2p
 	float2 uv : TEXCOORD0;               // across the sprite, -1..1
 	nointerpolation float glow : GLOW;   // its brightness this frame
 };
-
-// Smooth noise (0..1) at p
-float noise2(float2 p)
-{
-	int2 i = int2(floor(p));
-	float2 f = p - floor(p);
-	float2 u = f * f * (3.0 - 2.0 * f);
-	return lerp(lerp(hash2(i), hash2(i + int2(1, 0)), u.x), lerp(hash2(i + int2(0, 1)), hash2(i + int2(1, 1)), u.x), u.y);
-}
 
 firefly_v2p firefly_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 {
@@ -2090,15 +2355,17 @@ struct rain_drop
 	float4 r;     // random numbers of its own
 };
 
-// The column an instance draws: the columns a side (blade.w) around the camera's own, a layer after another
-rain_drop rain_column(uint iid)
+// The column an instance draws: the columns a side (blade.w) around the one through the camera at the height `level` (y,
+// down positive: the camera's own for the rain and snow, the ground's under it for the leaves, blown far across), a
+// layer after another
+rain_drop rain_column_at(uint iid, float level)
 {
 	uint n = asuint(blade.w);
 	uint per = n * n;
 	uint layer = iid / per;
 	uint k = iid - layer * per;
 	float spacing = shade.z;
-	float2 at_eye = eye.xz - blade.yz * eye.y; // (the camera's point in the slanted columns)
+	float2 at_eye = eye.xz - blade.yz * level; // (the camera's point in the slanted columns)
 	int2 cell = int2(floor(at_eye / spacing)) - int(n / 2) + int2(k % n, k / n);
 	float4 r = rain_random(cell, layer, 0u);
 	rain_drop d;
@@ -2108,6 +2375,11 @@ rain_drop rain_column(uint iid)
 	d.r = rain_random(cell, layer, 1013904223u);
 	d.phase = d.r.x * kRainPeriod;
 	return d;
+}
+
+rain_drop rain_column(uint iid)
+{
+	return rain_column_at(iid, eye.y);
 }
 
 // Behind what the game drew there (the depth copy)
@@ -2392,6 +2664,198 @@ float4 snow_ps(snow_v2p i) : SV_Target
 		discard;
 	float edge = 1.0 - r2;
 	return float4(color.rgb, i.alpha * edge * sqrt(edge));
+}
+
+// Leaves in wind and gales (leaf_vs, leaf_ps): in the rain's columns (its constants as the snow's), falling slowly
+// (blade.x yalms a second, each 0.7 to 1.3 times that) and blown far across as they go (blade.yz yalms across for each
+// yalm fallen: the wind's way), tumbling about their path (shade.y yalms) and turning over. Their columns are taken round
+// the ground under the camera (the weather's [kWx + 1].w), not the camera: blown this far across, they'd otherwise all be
+// downwind of it by the time they come down. Seen only within kLeafHigh yalms of what's under them, in a volume from
+// kLeafAbove yalms over the camera to kLeafPeriod below that: a gust carrying them along the ground. A small leaf facing
+// the camera, its own colour (dry brown, yellow, dull green) in the light color.rgb, turning about its middle, its face
+// catching the light as it turns over. It ends at what's under it; fogged and hidden as the snow.
+static const float kLeafPeriod = 14.0, kLeafAbove = 5.0, kLeafHigh = 5.0;
+
+struct leaf_v2p
+{
+	float4 pos : SV_Position;
+	float2 uv : TEXCOORD0;               // across the sprite, -1..1
+	nointerpolation float4 tint : TINT;  // its colour, and how opaque
+	nointerpolation float2 turn : TURN;  // how far it has turned (its cosine and sine)
+};
+
+leaf_v2p leaf_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+{
+	leaf_v2p o;
+	o.pos = float4(0.0, 0.0, -1.0, 1.0); // (in front of the near plane: clipped)
+	o.uv = 0.0;
+	o.tint = 0.0;
+	o.turn = float2(1.0, 0.0);
+	float level = weather_fx() ? actors[kWx + 1].w : eye.y + 2.0;
+	rain_drop d = rain_column_at(iid, level);
+	if (!d.falls)
+		return o;
+	float speed = d.speed * (0.7 + 0.6 * d.r.w);
+	float top = eye.y - kLeafAbove;
+	float fallen = color.w * speed + d.phase;
+	float y = fallen - kLeafPeriod * floor(fallen / kLeafPeriod);
+	y += kLeafPeriod * ceil((top - y) / kLeafPeriod);
+	// (tumbling: across x and z, each its own number of turns an hour as the clock wraps hourly)
+	float2 turns = floor(float2(700.0, 760.0) + float2(800.0, 700.0) * d.r.yz);
+	float2 tumble = shade.y * (0.5 + 0.5 * d.r.w) * sin(6.2831853 * (frac(color.w * turns / 3600.0) + d.r.zy));
+	float3 at = float3(d.u.x + blade.y * y + tumble.x, y, d.u.y + blade.z * y + tumble.y);
+	float under = min(rain_top(rain_cell(at.xz)), person_top(at.xz));
+	if (y >= under)
+		return o;
+	float high = under - y; // (over what's under it: y is down)
+	float fade = saturate(high / 0.1) * (1.0 - smoothstep(0.6 * kLeafHigh, kLeafHigh, high));
+	fade *= saturate((y - top) / 2.0) * saturate((top + kLeafPeriod - y) / 2.0);
+	fade *= saturate((eye.w - distance(at.xz, eye.xz)) / (0.35 * eye.w));
+	float4 c = mul(float4(at, 1.0), view_proj);
+	if (c.w < 0.4 || fade <= 0.0)
+		return o;
+	fade *= saturate((c.w - 0.4) / 1.5); // (one right by the lens would be a blot across the screen)
+	[branch] if (hazy())
+		fade *= clear_at(c.w);
+	// On screen: its half-length (0.04 to 0.08 yalms) at least a pixel (fainter by the area it's drawn bigger than it is)
+	float2 half_px = float2(ground.yz) * 0.5;
+	float radius = (0.04 + 0.04 * d.r.y) * lin.z * half_px.x / c.w;
+	float shown = max(radius, 1.0);
+	float alpha = shade.w * fade * 0.95 * (radius / shown) * (radius / shown);
+	if (alpha <= 0.002)
+		return o;
+	float3 hue = lerp(lerp(float3(0.42, 0.26, 0.1), float3(0.62, 0.5, 0.16), saturate(d.r.z * 2.0)), float3(0.3, 0.42, 0.14), saturate(d.r.z * 2.0 - 1.0));
+	float spin = 6.2831853 * frac(color.w * floor(1800.0 + 5400.0 * d.r.x) / 3600.0 + d.r.y);
+	o.turn = float2(cos(spin), sin(spin));
+	o.tint = float4(hue * color.rgb * (0.7 + 0.3 * abs(cos(spin * 1.7))), alpha);
+	static const float2 corner[6] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(-1, 1), float2(1, -1), float2(1, 1) };
+	float2 cn = corner[vid % 6];
+	c.xy += cn * (shown + 0.5) / half_px * c.w;
+	o.pos = c;
+	o.uv = cn * (shown + 0.5) / shown;
+	return o;
+}
+
+float4 leaf_ps(leaf_v2p i) : SV_Target
+{
+	if (behind_drawn(i.pos))
+		discard;
+	// A narrow oval turned about its middle, a little pointed toward its tip
+	float2 uv = float2(i.uv.x * i.turn.x - i.uv.y * i.turn.y, i.uv.x * i.turn.y + i.uv.y * i.turn.x);
+	float wide = 0.42 * (1.0 - 0.35 * saturate(uv.x));
+	float e = uv.x * uv.x + uv.y * uv.y / (wide * wide);
+	if (e >= 1.0)
+		discard;
+	return float4(i.tint.rgb, i.tint.a * saturate((1.0 - e) * 3.0));
+}
+
+// The air pass (weather_fx; grass_render.cpp air_pipeline_for): over the world as everything has been drawn into it (the
+// game's, the grass, the water, the rain), the world times keep plus add (dual-source blending). In it:
+// - dust (or sand, [kWx + 10]) and gloom's fog banks ([kWx + 12]): thick near the ground and thinning above it (an
+//   exponential profile over the ground under the camera, all of it below that: valleys fill), along the view to what's
+//   drawn (the depth copy: the grass and the water a yalm or two in front of what's behind them, near enough); the
+//   banks' thickness wanders across the ground with slow noise drifting with the wind ([kWx + 14].xy);
+// - streaks of blown dust near the camera ([kWx + 11]): on upright sheets along the wind fixed in the world, 2 to 26 yalms out, where that's
+//   in front of what's drawn and low over the ground, noise stretched along the wind and blowing along it.
+// (The lightning's flash is a pass of its own after it: flash_ps.) Names facelift drew into the world are left clear, as
+// the shading pass leaves them; the sky gets only the streaks (its own dust and gloom are weather_sky's).
+struct air_out
+{
+	float4 add : SV_Target0;
+	float4 keep : SV_Target1;
+};
+
+// How much of a fog thinning upward is along a stretch, a unit of it at the ground (optical depth for a density of 1
+// there): from height a to b over the ground (below it, the ground's density) over len yalms; scale: yalms it takes to
+// thin to 1/e
+float fog_along(float a, float b, float len, float scale)
+{
+	// (the profile exp(-max(h, 0) / scale) integrated over the height: h - scale below the ground, -scale e^(-h / scale) above)
+	float fa = a <= 0.0 ? a - scale : -scale * exp(-a / scale);
+	float fb = b <= 0.0 ? b - scale : -scale * exp(-b / scale);
+	return abs(b - a) > 1e-3 ? len * (fb - fa) / (b - a) : len * exp(-max(a, 0.0) / scale);
+}
+
+air_out air_ps(float4 pos : SV_Position)
+{
+	air_out o;
+	o.add = 0.0;
+	o.keep = 1.0;
+	int2 p = int2(pos.xy);
+	if (ground.w != 0 && name_at(p))
+		return o;
+	float z = drawn_depth(p);
+	bool sky = z > kSkyDepth;
+	float4 wind = actors[kWx], r0 = actors[kWx + 1], r2 = actors[kWx + 2];
+	float4 dust = actors[kWx + 10], streak = actors[kWx + 11], gloom = actors[kWx + 12], banks = actors[kWx + 14];
+	float t = r2.w;
+	// The view ray in the world (y down), and how far to what's drawn
+	float2 ndc = float2((p.x + 0.5) / ground.y * 2.0 - 1.0, 1.0 - (p.y + 0.5) / ground.z * 2.0);
+	float3 v = sky ? float3(ndc.x / lin.z, ndc.y / lin.w, up_row.w) : view_at(p);
+	float len = sky ? 1e9 : length(v);
+	float3 wd = normalize(float3(dot(r0.xyz, v), dot(up_row.xyz, v), dot(r2.xyz, v)));
+	float3 add = 0.0, keep = 1.0;
+	[branch] if (!sky && (dust.w > 0.0 || gloom.w > 0.0))
+	{
+		float he = r0.w - eye.y, hp = he - wd.y * len; // (over the ground under the camera, at the camera and at what's drawn)
+		float2 far_xz = (eye.xz + wd.xz * min(len, 160.0)) / 48.0, near_xz = (eye.xz + wd.xz * min(len, 25.0)) / 48.0;
+		float bank = 0.35 + 1.3 * smoothstep(0.25, 0.75, 0.5 * (noise_wrap(far_xz + banks.xy, 256.0) + noise_wrap(near_xz + banks.xy, 256.0)));
+		float tau_g = gloom.w * 0.05 * bank * fog_along(he, hp, len, 2.2);
+		float tau_d = dust.w * 0.016 * (0.75 + 0.25 * bank) * fog_along(he, hp, len, 9.0);
+		float clear = exp(-(tau_g + tau_d));
+		add = (gloom.rgb * tau_g + dust.rgb * tau_d) / max(tau_g + tau_d, 1e-6) * (1.0 - clear);
+		keep = clear;
+	}
+	[branch] if (streak.x > 0.0)
+	{
+		// On sheets fixed in the world: upright, along the wind, kStreakGap yalms apart, read where the view ray crosses
+		// them between 2 and 26 yalms out (faded in and out at the ends). They were read on spheres round the camera
+		// (3.5 to 24 yalms), which slid through the noise as the camera moved: running forward, it streamed out from
+		// the middle of the screen like rings (in game, 2026-10-23). A sheet's streaks blow along it; looking along
+		// the wind, the ray crosses few of them.
+		const float kStreakGap = 2.5, kStreakNear = 2.0, kStreakFar = 26.0;
+		float2 way = wind.z > 0.0 ? wind.xy / wind.z : float2(1.0, 0.0);
+		float2 side = float2(-way.y, way.x);
+		float c = dot(wd.xz, side), e0 = dot(eye.xz, side);
+		float clear = 1.0;
+		[branch] if (abs(c) > 1e-3)
+		{
+			float dir = c > 0.0 ? 1.0 : -1.0;
+			float u = (e0 + c * kStreakNear) / kStreakGap;
+			float m = dir > 0.0 ? ceil(u) : floor(u); // (the first sheet past kStreakNear)
+			float step_d = kStreakGap / abs(c);
+			float dist = (m * kStreakGap - e0) / c;
+			[loop] for (int k = 0; k < 10 && dist < min(kStreakFar, len); ++k) // (at most (26 - 2) / 2.5 + 1 crossings)
+			{
+				float3 s = eye.xyz + wd * dist;
+				float over = r0.w - s.y;
+				float low = 1.0 - smoothstep(0.3, 3.5, over);
+				float along = dot(s.xz, way);
+				float n = noise2(float2(along * 0.12 - t * streak.y * 0.12, over * 1.1 + frac(m * 0.6180339) * 97.0));
+				float ends = smoothstep(kStreakNear, kStreakNear + 2.0, dist) * (1.0 - smoothstep(kStreakFar - 8.0, kStreakFar, dist));
+				clear *= 1.0 - streak.x * 0.2 * smoothstep(0.5, 0.85, n) * low * ends * saturate((len - dist) / 1.5);
+				m += dir;
+				dist += step_d;
+			}
+		}
+		add = add * clear + dust.rgb * (1.0 - clear);
+		keep *= clear;
+	}
+	o.add = float4(add, 0.0);
+	o.keep = float4(keep, 1.0);
+	return o;
+}
+
+// The lightning's flash (weather_fx: [kWx + 8].x; grass_render.cpp air_pipeline_for, after the air pass): what's drawn lit
+// cool white for a moment, the world plus the world times this, up to twice as bright (light on it, in proportion to its
+// own colour). The sky is lit with its clouds (weather_sky); names facelift drew are left as they are.
+float4 flash_ps(float4 pos : SV_Position) : SV_Target
+{
+	int2 p = int2(pos.xy);
+	float f = actors[kWx + 8].x;
+	if ((ground.w != 0 && name_at(p)) || drawn_depth(p) > kSkyDepth)
+		f = 0.0;
+	return float4(saturate(f * 0.9 * float3(0.78, 0.86, 1.0)), 0.0);
 }
 
 // The game's visibility tests (vistest.hpp; client-notes "The visibility test, and a replacement that doesn't

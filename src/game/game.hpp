@@ -91,13 +91,36 @@ extern "C"
 	void __cdecl worldfx_lamps(const uint32_t *words, uint32_t count);
 	void __cdecl worldfx_glows(const uint32_t *words, uint32_t count);
 	void __cdecl worldfx_weather(const uint32_t *words, uint32_t count);
+	// The game's Vana'diel clock (Earth seconds since 2002-01-01 JST, as FFXiMain 1039E0 has it): the moon's phase
+	void __cdecl worldfx_moon(uint32_t clock);
 	uintptr_t __cdecl worldfx_vis_entry(uint32_t kind);
 	void __cdecl worldfx_vis_setup(uintptr_t original, uint32_t on);
 	void __cdecl worldfx_vis_stats(uint32_t out[12]);
 	int __cdecl worldfx_setting(const char *key, char *out, uint32_t size);
 	uint32_t __cdecl worldfx_casts_characters();
+	uint32_t __cdecl worldfx_drawing();
+	// What of the weather World FX draws of its own now (World FX drawing, its settings on): bits, kWeatherFx* below.
+	// With kWeatherFxAll set, World FX draws all of the zone's weather (its sky, sun, moon, stars, clouds and whatever
+	// the weather brings): the game's own weather elements are all left out, sky layers too.
+	uint32_t __cdecl worldfx_weather_drawn();
 	const char *__cdecl worldfx_folder();
 	// HiFi XI's own options (the backend; the tests stub them)
 	int __cdecl hifixi_option(const char *section, const char *key, char *out, uint32_t size);
 	void __cdecl hifixi_set_option(const char *section, const char *key, const char *value);
+}
+
+namespace hifi::game
+{
+	// worldfx_weather_drawn's bits: each of World FX's own weather parts drawn now (in this zone and weather)
+	constexpr uint32_t kWeatherFxAll = 1u << 0;       // all of the weather World FX's own: the game's weather left out whole
+	constexpr uint32_t kWeatherFxSky = 1u << 1;       // its sky: the dome, sun, moon, stars
+	constexpr uint32_t kWeatherFxClouds = 1u << 2;    // its clouds, as the weather has them
+	constexpr uint32_t kWeatherFxRain = 1u << 3;      // rain, squalls (and thunderstorms' rain)
+	constexpr uint32_t kWeatherFxSnow = 1u << 4;      // snow, blizzards
+	constexpr uint32_t kWeatherFxLightning = 1u << 5; // thunder, thunderstorms: flashes lighting the scene, bolts in the sky
+	constexpr uint32_t kWeatherFxDust = 1u << 6;      // dust storms, sand storms: blown dust and sand along the ground
+	constexpr uint32_t kWeatherFxWind = 1u << 7;      // wind, gales: grass bent hard, streaks of dust and leaves
+	constexpr uint32_t kWeatherFxHeat = 1u << 8;      // hot spells, heat waves: heat shimmer over distant ground
+	constexpr uint32_t kWeatherFxAurora = 1u << 9;    // auroras: curtains in the sky
+	constexpr uint32_t kWeatherFxGloom = 1u << 10;    // gloom, darkness: fog banks along the ground
 }

@@ -9,24 +9,29 @@
  * position at +0x14), then a command whose byte 1 is 0x47 (the light element), 16 (colour, bytes R G B A, 0x80 = 1.0),
  * 58 (four words: f1, f2, w3, w4 -> range f1*(1+w3), brightness f2*(1+w4)); 2E in the next list is a distance window.
  * Ids with no generator of that name in the zone DAT (West Ronfaure's pgh1/pgh2, ...) can't be baked: they're left out
- * (the add-on can still see them live). Whether a lamp is lit isn't in the DAT: the add-on reads that from the game's
- * global light table, by id.
+ * (the add-on can still see them live). How bright a lamp is now isn't in the DAT: the add-on reads that from the
+ * game's global light table, by id. What the DAT has is its brightness fully lit: 58's, or for a lamp whose brightness
+ * follows the hour (research/ffxi-re/notes-lamp-hours.md: its 6C names a curve over the day, chunk 0x19 in the
+ * generator's own folder, which its 49 sets the brightness to each frame) max(0, the curve's peak) x (1 + w4)
+ * (zone_lamps.py's zone_hours).
  *
- * The file ('LMP1'), little-endian, the grass file's layout with its own tag and three float4s a lamp:
- *     char  magic[4] 'LMP1'
+ * The file ('LMP2'), little-endian, the grass file's layout with its own tag and three float4s a lamp:
+ *     char  magic[4] 'LMP2'
  *     u32   zone
  *     f32   cell size (yalms)
  *     u32   cell count
  *     u32   lamp count
  *     cells: i32 cx, i32 cz, u32 first lamp, u32 lamp count   (sorted by cz, then cx)
  *     lamps: f32 x, y, z, range           (the game's world: y is height, down positive; range in yalms)
- *            f32 r, g, b, brightness      (colour 1.0 = 0x80; the game's light is colour x brightness)
+ *            f32 r, g, b, brightness      (colour 1.0 = 0x80; the game's light is colour x brightness; fully lit)
  *            u32 id                       (the 4 characters, as the game keeps them: first character lowest)
  *            u32 slot                     (its 1-based slot in the zone's light table)
  *            u32 flags                    (1 the id starts with 'c': lights the game uses on characters only;
- *                                          2 no colour in the DAT (white); 4 no range or brightness in it (5, 4))
+ *                                          2 no colour in the DAT (white); 4 no range or brightness in it (5, 4);
+ *                                          8 its brightness follows the hour: the one here is its curve's peak)
  *            f32 the far end of its distance window (yalms; 0 when it has none)
  *     (grouped by cell, in the light table's order within one)
+ * LMP1 (before 2026-10-23) was the same but for the hour: brightness always 58's, no flag 8.
  *
  * The Python's arithmetic is in doubles (range and brightness, colour / 128), rounded to float32 when written; a read
  * past a chunk's end fails the zone, as the Python's struct.error does.
@@ -49,7 +54,7 @@ namespace hifi::bake
 	namespace
 	{
 		constexpr double kCell = 64.0;
-		constexpr uint32_t kCharacters = 1, kNoColour = 2, kNoRange = 4;
+		constexpr uint32_t kCharacters = 1, kNoColour = 2, kNoRange = 4, kFollowsHour = 8;
 		constexpr double kDefaultRange = 5.0, kDefaultBrightness = 4.0;
 
 		using mmb::f32;
@@ -139,6 +144,75 @@ namespace hifi::bake
 			return true;
 		}
 
+		// hour_of: how a light generator's brightness follows the hour (the curve's name and its 58's w4); false when
+		// it doesn't (no 58, or no 6C naming a curve in a register its per-frame list's 49 reads)
+		bool hour_of(const uint8_t *ch, size_t size, std::string &curve, double &w4)
+		{
+			uint32_t o = 0, e = 0;
+			if (size < 0x8C || !u32(ch, size, 0x84, o) || !u32(ch, size, 0x88, e))
+				return false;
+			if (uint64_t(o) + 0x30 > size || ch[o] != 1 || ch[o + 0x21] != 0x47)
+				return false;
+			std::map<uint32_t, std::string> named;
+			bool has_w4 = false;
+			const uint64_t end = std::min<uint64_t>(e, size);
+			for (uint64_t p = uint64_t(o) + 0x20; p + 4 <= end;)
+			{
+				const uint32_t op = ch[p], b1 = ch[p + 1];
+				const uint32_t step = cmd_size(op, b1);
+				if (step == 0)
+					break;
+				uint32_t word = 0;
+				float w = 0.0f;
+				if (op == 0x6C && p + 12 <= size && u32(ch, size, p, word))
+					named.emplace((word >> 13) & 0x3F, std::string(reinterpret_cast<const char *>(ch + p + 8), 4));
+				else if (op == 0x58 && p + 20 <= size && f32(ch, size, p + 16, w))
+				{
+					has_w4 = true;
+					w4 = double(w);
+				}
+				p += step;
+			}
+			for (uint64_t p = e; p + 4 <= size && has_w4;)
+			{
+				const uint32_t op = ch[p], b1 = ch[p + 1];
+				const uint32_t step = cmd_size(op, b1);
+				if (step == 0)
+					break;
+				uint32_t word = 0;
+				if (op == 0x49 && u32(ch, size, p, word))
+				{
+					const auto n = named.find((word >> 13) & 0x3F);
+					if (n != named.end())
+					{
+						curve = n->second;
+						return true;
+					}
+				}
+				p += step;
+			}
+			return false;
+		}
+
+		// curve_peak: a curve's (chunk 0x19, its body) highest value, its keyframes (t, value) up to the first with t >= 1
+		// (where the game's evaluators stop); false when it has none
+		bool curve_peak(const uint8_t *body, size_t size, double &peak)
+		{
+			bool any = false;
+			for (size_t p = 0; p + 8 <= size; p += 8)
+			{
+				float t = 0.0f, v = 0.0f;
+				std::memcpy(&t, body + p, 4);
+				std::memcpy(&v, body + p + 4, 4);
+				if (!any || double(v) > peak)
+					peak = double(v);
+				any = true;
+				if (t >= 1.0f)
+					break;
+			}
+			return any;
+		}
+
 		// A lamp as written: x, y, z, range, r, g, b, brightness, id, slot, flags, far
 		struct lamp
 		{
@@ -212,18 +286,41 @@ namespace hifi::bake
 		std::set<std::string> want;
 		for (const auto &[slot, id] : ids)
 			want.insert(id);
+		// (and the curves over the day, the first of a name in each folder (its path, as the Python's chunks gives it);
+		// with each generator's, the folder it's in and the curve it follows the hour by, when it does)
 		std::map<std::string, light> gens;
+		std::map<std::pair<std::string, std::string>, std::pair<bool, double>> curves;
+		std::map<std::string, std::pair<std::string, std::pair<std::string, double>>> hours;
+		std::vector<std::string> folders;
 		for (const chunk &c : chunks(dat))
 		{
-			if (c.type != 0x05)
+			if (c.type == 0x01)
+				folders.emplace_back(c.name, 4);
+			else if (c.type == 0x00 && !folders.empty())
+				folders.pop_back();
+			if (c.type == 0x00 || c.type == 0x01)
 				continue;
+			std::string folder;
+			for (size_t i = 0; i < folders.size(); ++i)
+				folder += (i != 0 ? "/" : "") + folders[i];
 			const std::string name(c.name, 4);
-			if (want.count(name) == 0 || gens.count(name) != 0)
+			if (c.type == 0x19)
+			{
+				double peak = 0.0;
+				const bool any = curve_peak(c.body, c.size, peak);
+				curves.emplace(std::make_pair(folder, name), std::make_pair(any, peak));
+				continue;
+			}
+			if (c.type != 0x05 || want.count(name) == 0 || gens.count(name) != 0)
 				continue;
 			light l;
 			if (!light_of(c.body - 16, c.size + 16, l))
 				return fail(r, "a light generator is cut short");
 			gens.emplace(name, l);
+			std::string curve;
+			double w4 = 0.0;
+			if (hour_of(c.body - 16, c.size + 16, curve, w4))
+				hours.emplace(name, std::make_pair(folder, std::make_pair(curve, w4)));
 		}
 
 		// The object list's light slots (zone_lamps reads them all: a list cut short by the MZB's end fails the zone)
@@ -271,6 +368,21 @@ namespace hifi::bake
 				brightness = kDefaultBrightness;
 				it.flags |= kNoRange;
 			}
+			else if (const auto h = hours.find(id); h != hours.end())
+			{
+				// (fully lit by its curve: max(0, the peak) x (1 + w4), NaN kept as the Python's max keeps it)
+				const auto c = curves.find(std::make_pair(h->second.first, h->second.second.first));
+				if (c != curves.end() && c->second.first)
+				{
+					const double peak = c->second.second;
+					const double lit = (0.0 > peak ? 0.0 : peak) * (1.0 + h->second.second.second);
+					if (std::isfinite(lit))
+					{
+						brightness = lit;
+						it.flags |= kFollowsHour;
+					}
+				}
+			}
 			const double f[8] = { l.pos[0], l.pos[1], l.pos[2], range, colour[0], colour[1], colour[2], brightness };
 			std::copy(f, f + 8, it.f);
 			std::memcpy(&it.id, id.data(), 4);
@@ -293,7 +405,7 @@ namespace hifi::bake
 			cells[{ cz, cx }].push_back(&it);
 		}
 		std::vector<uint8_t> file;
-		put(file, "LMP1", 4);
+		put(file, "LMP2", 4);
 		const float cell = float(kCell);
 		const uint32_t head[2] = { uint32_t(cells.size()), uint32_t(items.size()) };
 		put(file, &zone, 4);

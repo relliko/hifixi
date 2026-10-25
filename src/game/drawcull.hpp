@@ -8,10 +8,10 @@
 //   - the object culling scale's call through a stub that multiplies it by the world multiplier once more, and the
 //     four mesh detail compares through stubs that scale the distance by 1 / lod^2 (in at the first update, out at
 //     stop);
-//   - the zone visibility list's read made 0 (vis), the projection's aspect constant 0.75 (square), the culling
-//     frustum's height 384 (frustum), as the options say.
+//   - the zone visibility list's read made 0 (vis), the projection's aspect constant 0.75 (square), the zone's copy of
+//     the culling frustum narrowed to the camera's height, 384 (frustum: effects keep the game's), as the options say.
 // Each patch goes in only over the game's own bytes and comes out only over ours; the stubs are the addon's, byte for
-// byte.
+// byte (the frustum's routine is HiFi XI's own: the addon narrowed the effects' frustum too).
 
 #include "game.hpp"
 #include <string>

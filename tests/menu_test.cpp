@@ -218,8 +218,8 @@ int main()
 			return hifi::backend::option(section, key, v) ? v : std::string("(none)");
 		};
 		check(option("hifps", "enabled") == "1" && option("hifps", "limit") == "0" && option("hifps", "counter") == "0" && option("hifps", "exp_walls") == "1" &&
-			option("hifps", "exp_sse") == "0" && option("hifps", "gfx_lamps") == "1.25" && option("hifps", "exp_glows") == "(none)",
-			"hifps's settings taken ([hifps]: its exp and gfx tables as exp_ and gfx_, its glows toggle left out)");
+			option("hifps", "exp_sse") == "0" && option("hifps", "gfx_lamps") == "(none)" && option("hifps", "exp_glows") == "(none)",
+			"hifps's settings taken ([hifps]: its exp table as exp_; its gfx table, the game's own lights, and glows toggle left out)");
 		check(option("drawcull", "world") == "5" && option("drawcull", "entity") == "10" && option("drawcull", "square") == "1",
 			"drawcull's taken from the character whose settings were saved last");
 		check(option("display", "aspect") == "(none)" && option("display", "mipmap") == "(none)", "nothing of aspect's or mipmap's (not HiFi XI's)");

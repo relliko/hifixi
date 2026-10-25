@@ -7,8 +7,8 @@
 
 // The hifps Ashita addon's hifps.lua (0.9.9), its frame step ported (its comments carried over where they still hold):
 // the site tables, the smoothing loops, the name pulse, the divisor, enable() and disable(), the limiter and the frame
-// rate's measurement. Its experimental toggles and graphics settings are exp.cpp and gfx.cpp; its config window is
-// HiFi XI's menu; bisect, the leak hunt and /hifps mem (debugging) are left out.
+// rate's measurement. Its experimental toggles are exp.cpp; its graphics settings (the game's own lights) aren't HiFi
+// XI's; its config window is HiFi XI's menu; bisect, the leak hunt and /hifps mem (debugging) are left out.
 //
 // The addon's history, as far as it explains the tables:
 //   v0.4: the music-start and push-through-entity sites moved to whole ticks (found by bisecting).

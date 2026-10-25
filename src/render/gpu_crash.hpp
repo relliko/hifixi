@@ -23,8 +23,15 @@ namespace gpu_crash
 	// Before the device is released
 	void unwatch();
 
-	// The report for a removed device (the reason, the page fault, the command lists the GPU hadn't finished)
+	// The report for a removed device (the reason, the GPU and its video memory then, the page fault, the command
+	// lists the GPU hadn't finished)
 	std::string report(ID3D12Device *device);
+
+	// The GPU a device runs on, for the log and the report: its name, PCI ids and driver version ("NVIDIA GeForce RTX
+	// 4080 (vendor 10DE, device 2704), driver 32.0.15.6094 (NVIDIA 560.94)"); and its video memory now: what this
+	// process uses of the budget Windows gives it, on the card and shared. Each says so when DXGI can't tell.
+	std::string gpu_name(ID3D12Device *device);
+	std::string gpu_memory(ID3D12Device *device);
 
 	// Direct3D 12's debug layer (a diagnostic: it checks every call, the game's and the add-on's, and costs
 	// CPU time), before D3D12CreateDevice like enable(). False when it isn't installed (Windows' optional

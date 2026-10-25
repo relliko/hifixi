@@ -30,6 +30,9 @@ namespace hifi::bake
 	bool rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r);
 	// tools/bake_shadow_geo.py: the zone's meshes for the sun's shadow map (compact SHD2)
 	bool shadow(uint32_t zone, const std::wstring &out, result &r);
-	// tools/bake_lamps.py: the zone's lamps (LMP1)
+	// tools/bake_lamps.py: the zone's lamps (LMP2)
 	bool lamps(uint32_t zone, const std::wstring &out, result &r);
+	// tools/bake_sea.py: the game's own sea sheets that carry on past World FX's water, at its level (SEA1);
+	// water_file: the zone's worldfx-water file (none without one)
+	bool sea(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r);
 }

@@ -16,18 +16,18 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
 - **A richer world**, drawn into the game's own frame:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
   - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone, with characters casting long shadows;
-  - **Water** with reflections and ripples;
-  - **Weather:** rain and snow of its own, and wet ground in the rain;
+  - **Water** with reflections and ripples, carried on over the game's own sea past the zone's edge, out to the horizon;
+  - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
   - **Sky:** a smooth sky with a sun, a moon and stars;
   - **Lamps and glows:** night lamps and glowing things lighting what's around them.
-- **The game's own night lighting** made adjustable: lamp brightness and reach, moonlight and shadow fill.
 
 Everything is in one menu (`/hifi`), with presets (Off, Balanced, High, Ultra) and a tooltip on every setting.
 
 ## Requirements
 
 - Ashita v4.
-- dgVoodoo's output on Direct3D 12: in dgVoodoo's config, `OutputAPI = d3d12_fl11_0`. The game's own Windows default is Direct3D 11, and the menu tells you when it isn't 12.
+- For the richer world (grass, shadows, water, weather, sky, lamps and glows): dgVoodoo's output on Direct3D 12. In dgVoodoo's config set `OutputAPI = d3d12_fl11_0`; the game's own Windows default is Direct3D 11, and the menu tells you when it isn't 12.
+  - With any other output (dgVoodoo on Direct3D 11, DXVK...), the frame rate and the view distance still work, and the game keeps its own water, rain and shadows.
 - No ReShade: HiFi XI draws into Direct3D 12 itself. If ReShade's `dxgi.dll` is in your `bootloader` folder, move it out.
 
 Check your server's rules on client modifications before using it.
@@ -45,7 +45,7 @@ Your settings from hifps and drawcull are taken over the first time HiFi XI star
 
 ## Zone data
 
-Grass, water, rain, wet ground, the sun's shadow map and the lamps come from each zone's own files in your game. HiFi XI makes them on your PC, in the background, the first time you enter a zone; nothing from the game's data ships with HiFi XI. To make every zone's at once: **Grass, water, weather -> Make every zone's files now**.
+Grass, water, the sea past the zone's edge, rain, wet ground, the sun's shadow map and the lamps come from each zone's own files in your game. HiFi XI makes them on your PC, in the background, the first time you enter a zone; nothing from the game's data ships with HiFi XI. To make every zone's at once: **Grass, water, weather -> Make every zone's files now**.
 
 They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
@@ -61,4 +61,10 @@ Settings are saved as you change them, in `config\hifixi\settings.ini`.
 
 ## Diagnostics
 
-With **Advanced -> GPU crash reports** on (the default), a GPU hang or page fault writes what the GPU was doing to `bootloader\worldfx-gpu-crash.txt`. HiFi XI's log is `bootloader\hifixi.log`.
+With **Advanced -> GPU crash reports** on (the default), a GPU hang or page fault writes what the GPU was doing to `bootloader\worldfx-gpu-crash.txt`, with your GPU, its driver and the video memory in use at that moment. HiFi XI's log is `bootloader\hifixi.log`; it names your GPU, its driver and its video memory at start.
+
+If the GPU hangs (`DXGI_ERROR_DEVICE_HUNG`):
+
+- Set the game's profile in your graphics driver back to its defaults (NVIDIA Control Panel or AMD Software), with anisotropic filtering, antialiasing and texture filtering left to the application. For sharper textures at an angle, use dgVoodoo's own `Filtering` setting (an anisotropy level, 1 to 16) instead.
+- Run your GPU at its stock clocks and voltage.
+- Send the crash report and the log when you ask for help.

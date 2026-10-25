@@ -5,7 +5,6 @@
 #include "../game/drawcull.hpp"
 #include "../game/feed.hpp"
 #include "../game/hifps/exp.hpp"
-#include "../game/hifps/gfx.hpp"
 #include "../game/hifps/step.hpp"
 #include "../host/hooks.hpp"
 #include "../render/worldfx_core.hpp"
@@ -397,12 +396,6 @@ namespace hifi::ui
 			draw_lines(g, "What it's doing", game::drawcull::status());
 		}
 
-		void draw_lighting(const gui &g)
-		{
-			draw_tab_settings(g, settings::tab::lighting);
-			draw_lines(g, "The game's own lights", game::hifps::gfx::status());
-		}
-
 		// The world's settings, then the zone files HiFi XI makes from the game's own (once a zone, the first time you
 		// enter it; or all at once)
 		void draw_world(const gui &g)
@@ -577,7 +570,6 @@ namespace hifi::ui
 				case settings::tab::overview: draw_overview(g); break;
 				case settings::tab::frame_rate: draw_frame_rate(g); break;
 				case settings::tab::distance: draw_distance(g); break;
-				case settings::tab::lighting: draw_lighting(g); break;
 				case settings::tab::world: draw_world(g); break;
 				case settings::tab::performance: draw_performance(g); break;
 				case settings::tab::game: draw_game(g); break;

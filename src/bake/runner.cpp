@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <new>
@@ -22,9 +23,11 @@ namespace hifi::bake
 		// has no collision, meshes or lamps: none of each, quickly)
 		constexpr uint32_t kFirstZone = 0, kLastZone = 299;
 
-		// The kinds, in the order they're made (rain after water: it reads the zone's water)
-		enum class kind { grass, water, wet, rain, shadow, lamps };
-		const kind kKinds[] = { kind::grass, kind::water, kind::wet, kind::rain, kind::shadow, kind::lamps };
+		// The kinds, in the order they're made (rain and the sea after water: they read the zone's water). A kind added
+		// later (the sea, 2026-10-22) is simply missing for every zone of an install made before it: made as zones are
+		// entered, or by "every zone".
+		enum class kind { grass, water, wet, rain, sea, shadow, lamps };
+		const kind kKinds[] = { kind::grass, kind::water, kind::wet, kind::rain, kind::sea, kind::shadow, kind::lamps };
 		const wchar_t *folder_of(kind k)
 		{
 			switch (k)
@@ -33,6 +36,7 @@ namespace hifi::bake
 			case kind::water: return L"worldfx-water";
 			case kind::wet: return L"worldfx-wet";
 			case kind::rain: return L"worldfx-rain";
+			case kind::sea: return L"worldfx-sea";
 			case kind::shadow: return L"worldfx-shadow";
 			default: return L"worldfx-lamps";
 			}
@@ -45,6 +49,7 @@ namespace hifi::bake
 			case kind::water: return "water";
 			case kind::wet: return "wet ground";
 			case kind::rain: return "rain";
+			case kind::sea: return "sea";
 			case kind::shadow: return "shadow map";
 			default: return "lamps";
 			}
@@ -72,10 +77,31 @@ namespace hifi::bake
 			return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
 		}
 
+		// Whether a zone's lamps file is one from before the hour (LMP1, 2026-10-23: brightness without the lamp's
+		// curve over the day): made again, as if missing
+		bool older_lamps(kind k, const std::wstring &path)
+		{
+			if (k != kind::lamps)
+				return false;
+			char tag[4] = {};
+			FILE *f = nullptr;
+			if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || f == nullptr)
+				return false;
+			const bool read = fread(tag, 1, 4, f) == 4;
+			fclose(f);
+			return read && std::memcmp(tag, "LMP1", 4) == 0;
+		}
+
 		std::wstring file_of(const std::wstring &folder, kind k, uint32_t zone, const wchar_t *ext)
 		{
 			return folder + folder_of(k) + L"\\" + std::to_wstring(zone) + ext;
 		}
+
+		// Water made by the sea rule (2026-10-23: where the zone's collision water lies well under the game's sea sheets,
+		// the water takes the sheets' height; it was 2-4.5 yalms under the sea in Port San d'Oria, Port Windurst,
+		// Kazham, Lufaise, Misareaux, Qufim and 13 more) gets this mark beside it (an empty <zone>.r2). A water file
+		// without it is from before: it and what's made from it (rain, sea; their none marks too) are made again.
+		constexpr const wchar_t *kWaterRule = L".r2";
 
 		// Whether the zone is one the sun lights (worldfx-sunlit.txt, shipped with HiFi XI: hand-made); every zone when
 		// the list isn't there
@@ -105,13 +131,34 @@ namespace hifi::bake
 		bool make_zone(const std::wstring &folder, uint32_t zone)
 		{
 			bool any = false;
+			const bool old_water = exists(file_of(folder, kind::water, zone, L".bin")) && !exists(file_of(folder, kind::water, zone, kWaterRule));
 			for (const kind k : kKinds)
 			{
 				const std::wstring out = file_of(folder, k, zone, L".bin"), none = file_of(folder, k, zone, L".none");
-				if (exists(out) || exists(none))
+				const bool redo = older_lamps(k, out) || (old_water && (k == kind::water || k == kind::rain || k == kind::sea));
+				if (!redo && (exists(out) || exists(none)))
 					continue;
+				if (redo)
+				{
+					// (made again from nothing: a none mark or an old file left would stand for it if this one fails)
+					DeleteFileW(none.c_str());
+					if (k != kind::water && k != kind::lamps)
+						DeleteFileW(out.c_str());
+				}
 				if (k == kind::shadow && !sunlit(folder, zone))
 					continue;
+				// (the sea reads the zone's water: none when the zone has none; when its water wasn't made (it failed),
+				// not tried, so not marked none either: tried again with the water next time)
+				if (k == kind::sea && !exists(file_of(folder, kind::water, zone, L".bin")))
+				{
+					if (exists(file_of(folder, kind::water, zone, L".none")))
+					{
+						std::lock_guard<std::mutex> lock(g.mutex);
+						g.none++;
+						write_file(none, "", 0);
+					}
+					continue;
+				}
 				result r;
 				const auto t0 = std::chrono::steady_clock::now();
 				bool ok = false;
@@ -124,6 +171,7 @@ namespace hifi::bake
 					case kind::water: ok = water(zone, out, r); break;
 					case kind::wet: ok = wet(zone, out, r); break;
 					case kind::rain: ok = rain(zone, out, file_of(folder, kind::water, zone, L".bin"), r); break;
+					case kind::sea: ok = sea(zone, out, file_of(folder, kind::water, zone, L".bin"), r); break;
 					case kind::shadow: ok = shadow(zone, out, r); break;
 					case kind::lamps: ok = lamps(zone, out, r); break;
 					}
@@ -142,6 +190,8 @@ namespace hifi::bake
 				}
 				const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 				char line[256];
+				if (ok && k == kind::water)
+					write_file(file_of(folder, kind::water, zone, kWaterRule), "", 0);
 				std::lock_guard<std::mutex> lock(g.mutex);
 				if (ok)
 				{

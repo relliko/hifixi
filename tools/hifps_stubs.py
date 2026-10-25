@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ADDON = r'C:\Games\PhoenixXI\addons\hifps'
 OUT = os.path.join(ROOT, 'src', 'game', 'hifps', 'stubs.inc')
-STUBS = ('proxy', 'walls', 'gfx')
+STUBS = ('proxy', 'walls')  # (gfx.asm, the addon's lamps and night lighting, isn't HiFi XI's)
 
 
 def parse_lua(path):

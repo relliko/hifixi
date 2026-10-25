@@ -3,6 +3,7 @@
  */
 
 #include "gpu_crash.hpp"
+#include <dxgi1_4.h>
 #include <share.h>
 #include <cctype>
 #include <cstdarg>
@@ -92,6 +93,28 @@ namespace gpu_crash
 			add(out, "  %s:\n", heading);
 			for (int i = 0; node != nullptr && i < 32; node = node->pNext, ++i)
 				add(out, "    %s (allocation type %u)\n", name_of(node->ObjectNameA, node->ObjectNameW).c_str(), static_cast<unsigned>(node->AllocationType));
+		}
+
+		// The DXGI adapter a device runs on (found by its LUID), or nullptr. Through Windows' own dxgi.dll: in the game's
+		// folder that name is HiFi XI's starter.
+		IDXGIAdapter3 *adapter_of(ID3D12Device *device)
+		{
+			static const HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+			using create_fn = HRESULT(WINAPI *)(REFIID, void **);
+			const auto create = dxgi != nullptr ? reinterpret_cast<create_fn>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+			IDXGIFactory4 *factory = nullptr;
+			if (create == nullptr || FAILED(create(IID_PPV_ARGS(&factory))))
+				return nullptr;
+			IDXGIAdapter3 *adapter = nullptr;
+			if (FAILED(factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))))
+				adapter = nullptr;
+			factory->Release();
+			return adapter;
+		}
+
+		unsigned long long megabytes(UINT64 bytes)
+		{
+			return static_cast<unsigned long long>((bytes + 524288) / 1048576);
 		}
 
 		struct watch_state
@@ -295,6 +318,59 @@ namespace gpu_crash
 		delete w;
 	}
 
+	std::string gpu_name(ID3D12Device *device)
+	{
+		IDXGIAdapter3 *const adapter = adapter_of(device);
+		DXGI_ADAPTER_DESC1 desc = {};
+		if (adapter == nullptr || FAILED(adapter->GetDesc1(&desc)))
+		{
+			if (adapter != nullptr)
+				adapter->Release();
+			return "unknown (DXGI didn't say)";
+		}
+		char line[320];
+		std::snprintf(line, sizeof(line), "%s (vendor %04X, device %04X), driver ", narrow(desc.Description).c_str(), desc.VendorId, desc.DeviceId);
+		std::string out = line;
+		// (the user-mode driver's version, as DXGI gives it for a Direct3D 10+ device; NVIDIA's own number is its last
+		// five digits: 32.0.15.6094 is 560.94)
+		LARGE_INTEGER v = {};
+		if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &v)))
+		{
+			const unsigned a = HIWORD(v.HighPart), b = LOWORD(v.HighPart), c = HIWORD(v.LowPart), d = LOWORD(v.LowPart);
+			std::snprintf(line, sizeof(line), "%u.%u.%u.%u", a, b, c, d);
+			out += line;
+			if (desc.VendorId == 0x10DE)
+			{
+				const unsigned n = (c % 10) * 10000 + d % 10000;
+				std::snprintf(line, sizeof(line), " (NVIDIA %u.%02u)", n / 100, n % 100);
+				out += line;
+			}
+		}
+		else
+			out += "version unknown";
+		adapter->Release();
+		return out;
+	}
+
+	std::string gpu_memory(ID3D12Device *device)
+	{
+		IDXGIAdapter3 *const adapter = adapter_of(device);
+		DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, shared = {};
+		if (adapter == nullptr || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) ||
+			FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+		{
+			if (adapter != nullptr)
+				adapter->Release();
+			return "unknown (DXGI didn't say)";
+		}
+		adapter->Release();
+		char line[320];
+		std::snprintf(line, sizeof(line), "the game uses %llu MB of the %llu MB Windows lets it have on the card%s, and %llu MB of %llu MB shared",
+			megabytes(local.CurrentUsage), megabytes(local.Budget), local.CurrentUsage > local.Budget ? " (OVER: Windows swaps it out)" : "",
+			megabytes(shared.CurrentUsage), megabytes(shared.Budget));
+		return line;
+	}
+
 	std::string report(ID3D12Device *device)
 	{
 		std::string out;
@@ -305,6 +381,7 @@ namespace gpu_crash
 		if (localtime_s(&local, &now) == 0)
 			std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &local);
 		add(out, "FFXI World FX: the GPU stopped at %s: %s (0x%08lX).\n", when, reason_name(reason), static_cast<unsigned long>(reason));
+		out += "\nThe GPU: " + gpu_name(device) + "\nIts video memory at that moment: " + gpu_memory(device) + "\n";
 
 		ID3D12DeviceRemovedExtendedData1 *dred = nullptr;
 		if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))))

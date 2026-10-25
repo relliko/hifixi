@@ -397,6 +397,14 @@ namespace
 		resource(9, "fvib", chr);
 		resource(10, "fmrk", chr);
 		poke<uint32_t>(gens["hpgl"] + 0x28, uint32_t(magic));
+		// Melee's (in game: syst/effe/hit1/g012's clones, damv's dam1): left out; another of syst/effe's (sb05) isn't
+		const uintptr_t syst = resource(11, "syst", 0), effe = resource(12, "effe", syst);
+		const uintptr_t hit1 = resource(13, "hit1", effe), g012 = resource(14, "g012", hit1);
+		resource(15, "hclo", g012);
+		const uintptr_t damv = resource(16, "damv", 0);
+		resource(17, "dam1", damv);
+		const uintptr_t sb05 = resource(18, "sb05", effe);
+		resource(19, "sbg1", sb05);
 
 		// The task list
 		std::vector<uintptr_t> nodes;
@@ -435,6 +443,9 @@ namespace
 		for (const char *step : { "0200", "clon", "fvib", "fmrk" })                  // footsteps' (additive, white)
 			element(step, off, 0x80808080, {});
 		element("far1", { kEye[0] + 60, kEye[1], kEye[2] }, blue, {});               // 60 yalms off
+		for (const char *hit : { "hclo", "dam1" })                                   // melee hits' (additive)
+			element(hit, off, 0x80808080, {});
+		element("sbg1", { kEye[0] + 60, kEye[1], kEye[2] }, blue, {});               // syst/effe's, not a hit (60 yalms off)
 		element("fir1", fire, 0x40805010, { .letter = 'h', .fade = 0.5f });          // weight 1 x 0.5 x 0.5 = 0.25
 		const v3 fire2 = { fire[0] + 0.6, fire[1] - 0.3, fire[2] + 0.5 };
 		element("fir2", fire2, 0x80804008, { .letter = 'I', .more = 2.0f });         // weight 2: the two merged
@@ -552,15 +563,18 @@ namespace
 		}
 		{
 			std::string text = glows::status();
-			bool effect_line = false, home_line = false;
+			bool effect_line = false, home_line = false, lately = false, step_lately = false;
 			for (const std::string &line : glows::list(ent))
 			{
 				text += " | " + line;
 				effect_line = effect_line || has(line, "effect hpgl weight 3.00");
 				home_line = home_line || has(line, "Home Point #1 at 10.0 -4.6 20.0");
+				lately = lately || has(line, "lately: hpgl in magi, glowed in ");
+				step_lately = step_lately || has(line, "lately: fvib");
 			}
-			check(has(glows::status(), "2 glowing fixtures shown; effects: 2 lights from 5 glowing of 17 elements (21 tasks)") &&
-				has(glows::status(), "; 4 footsteps' elements left out") && effect_line && home_line, "status and list say so: %s", text.c_str());
+			check(has(glows::status(), "2 glowing fixtures shown; effects: 2 lights from 5 glowing of 20 elements (24 tasks)") &&
+				has(glows::status(), "; 4 footsteps' elements left out; 2 melee hits' and misses' elements left out") && effect_line && home_line, "status and list say so: %s", text.c_str());
+			check(lately && !step_lately, "the sources met lately listed with their folders (hpgl in magi), footsteps' not: %s", text.c_str());
 		}
 
 		// A list that loops: the walk stops at its cap
@@ -597,7 +611,7 @@ namespace
 			poke<uint32_t>(c.at, was);
 		}
 		game.present(ent, 2);
-		check(of_kind(last_sent(), 3).size() == 2 && has(glows::status(), "2 lights from 5 glowing of 17 elements (21 tasks)"), "  and the next walk whole again (%s)",
+		check(of_kind(last_sent(), 3).size() == 2 && has(glows::status(), "2 lights from 5 glowing of 20 elements (24 tasks)"), "  and the next walk whole again (%s)",
 			glows::status().c_str());
 
 		// No task manager or gfx yet (their globals 0), a view matrix that isn't numbers: only the fixtures
@@ -613,7 +627,7 @@ namespace
 			const uint32_t was = peek<uint32_t>(gfx + 0xB50 + 4 * 5);
 			poke<uint32_t>(gfx + 0xB50 + 4 * 5, 0x7FC00000);
 			game.present(ent, 2);
-			check(last_sent().size() == 2 && of_kind(last_sent(), 2).size() == 2 && has(glows::status(), "0 lights from 5 glowing of 17 elements (21 tasks)"),
+			check(last_sent().size() == 2 && of_kind(last_sent(), 2).size() == 2 && has(glows::status(), "0 lights from 5 glowing of 20 elements (24 tasks)"),
 				"a view matrix that isn't numbers (a NaN): the walk counted, no effects sent (%s)", glows::status().c_str());
 			poke<uint32_t>(gfx + 0xB50 + 4 * 5, was);
 		}

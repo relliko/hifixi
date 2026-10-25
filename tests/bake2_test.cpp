@@ -55,6 +55,7 @@ extern "C"
 	void __cdecl worldfx_lamps(const uint32_t *, uint32_t) {}
 	void __cdecl worldfx_glows(const uint32_t *, uint32_t) {}
 	void __cdecl worldfx_weather(const uint32_t *, uint32_t) {}
+	void __cdecl worldfx_moon(uint32_t) {}
 	uintptr_t __cdecl worldfx_vis_entry(uint32_t) { return 0; }
 	void __cdecl worldfx_vis_setup(uintptr_t, uint32_t) {}
 	void __cdecl worldfx_vis_stats(uint32_t out[12]) { std::memset(out, 0, 12 * 4); }

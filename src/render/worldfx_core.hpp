@@ -15,6 +15,7 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace worldfx
 {
@@ -67,6 +68,8 @@ namespace worldfx
 	void forget_colours();
 	// The zone's files read again (from the next frame: the zone's own were just made, HiFi XI's bakers)
 	void reload_zone();
+	// The GPU time of each of World FX's sections, the costliest first (lines for /hifi gpu and the status)
+	std::vector<std::string> gpu_times();
 
 	// What dgVoodoo has bound on one command list: the host keeps one for each list, reset with the list
 	struct list_data

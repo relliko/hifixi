@@ -6,14 +6,15 @@
  *   game's own frame on HiFi XI's Direct3D 12 hooks (src/host, src/backend). HiFi XI's starter (bootloader\dxgi.dll)
  *   starts it before dgVoodoo makes its device; without it, it starts here, late, and can't find the world.
  * - The game side (src/game): what World FX needs from the game each frame (feed: the zone, characters near, weapon
- *   skills, lamps, glows, the weather), and the game's own effects it replaces left out; hifps's frame step, limiter,
- *   speed-ups and night lighting (hifps/); drawcull's view distance (drawcull).
+ *   skills, lamps, glows, the weather), and the game's own effects it replaces left out while World FX draws;
+ *   hifps's frame step, limiter and speed-ups (hifps/); drawcull's view distance (drawcull).
  * - Each zone's files made on the player's PC from their own game files the first time it's entered (src/bake).
  * - Settings in config\hifixi\settings.ini, the menu (src/ui/menu) drawn through Ashita's ImGui.
  *
  *   /hifi          the menu (presets, settings by tab, status), or closes it
  *   /hifi status   what each part is doing (the hooks' counts per frame since they went in, or /hifi reset)
  *   /hifi glows    the glows lighting the scene now
+ *   /hifi gpu      World FX's GPU time by section, the costliest first
  *   /hifi reset    starts the counts again
  *   /hifi off|on   takes the hooks out, or puts them back
  */
@@ -25,9 +26,9 @@
 #include "../game/feed.hpp"
 #include "../game/glows.hpp"
 #include "../game/hifps/exp.hpp"
-#include "../game/hifps/gfx.hpp"
 #include "../game/hifps/step.hpp"
 #include "../host/hooks.hpp"
+#include "../render/worldfx_core.hpp"
 #include "../ui/menu.hpp"
 #include <cmath>
 #include <cstdio>
@@ -35,7 +36,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.11;
+	constexpr double kVersion = 0.19;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -220,7 +221,7 @@ class hifixi final : public IPlugin
 			say(line);
 		for (const std::string &line : hifi::game::feed::status())
 			say(line);
-		for (const auto &lines : { hifi::game::hifps::status(), hifi::game::hifps::exp::status(), hifi::game::hifps::gfx::status(),
+		for (const auto &lines : { hifi::game::hifps::status(), hifi::game::hifps::exp::status(),
 				 hifi::game::drawcull::status(), hifi::bake::runner::status().lines })
 			for (const std::string &line : lines)
 				say(line);
@@ -297,7 +298,6 @@ public:
 		m_menu = false;
 		hifi::bake::runner::stop();
 		hifi::game::feed::stop();
-		hifi::game::hifps::gfx::stop();
 		hifi::game::hifps::exp::stop();
 		hifi::game::hifps::stop();
 		hifi::game::drawcull::stop();
@@ -324,6 +324,12 @@ public:
 		}
 		else if (arg == "status")
 			report();
+		else if (arg == "gpu")
+		{
+			// (World FX's GPU time by section, the costliest first)
+			for (const std::string &line : worldfx::gpu_times())
+				say(line);
+		}
 		else if (arg == "glows")
 		{
 			// (what lights the scene now: the glowing fixtures, then the effects, nearest first)
@@ -349,7 +355,7 @@ public:
 				say("Direct3D 12 hooks not in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
 		return true;
 	}
 
@@ -379,14 +385,12 @@ public:
 		// and drawcull's work, each following its options every half second
 		hifi::game::hifps::present(now);
 		hifi::game::hifps::exp::present(now);
-		hifi::game::hifps::gfx::present(now);
 		hifi::game::drawcull::frame(now);
 		if (now >= m_next_update)
 		{
 			m_next_update = now + 0.5;
 			hifi::game::hifps::update();
 			hifi::game::hifps::exp::update();
-			hifi::game::hifps::gfx::update();
 			hifi::game::drawcull::update();
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first
@@ -394,7 +398,8 @@ public:
 		if (hifi::backend::started() && hifi::host::installed())
 		{
 			hifi::game::feed::frame(g_entities, party_now(), now);
-			if (const uint32_t zone = hifi::game::feed::zone(); zone != m_zone)
+			// (only while World FX draws into the game's world: on another output its files would go unused)
+			if (const uint32_t zone = hifi::game::feed::zone(); zone != m_zone && worldfx_drawing() != 0)
 			{
 				m_zone = zone;
 				hifi::bake::runner::zone_entered(zone);

@@ -1,7 +1,7 @@
 """
-The hifps addon's own experimental toggles and graphics settings (C:\\Games\\PhoenixXI\\addons\\hifps\\hifps.lua),
-run under lupa's LuaJIT on an FFXiMain dump, step by step, for tests/hifps_exp_test.cpp to hold HiFi XI's C++ port
-(src/game/hifps/exp.cpp, gfx.cpp) against, byte for byte.
+The hifps addon's own experimental toggles (C:\\Games\\PhoenixXI\\addons\\hifps\\hifps.lua), run under lupa's
+LuaJIT on an FFXiMain dump, step by step, for tests/hifps_exp_test.cpp to hold HiFi XI's C++ port
+(src/game/hifps/exp.cpp) against, byte for byte.
 
     python tests/hifps_exp_lua.py <in.txt> <out.bin>
 
@@ -9,14 +9,14 @@ run under lupa's LuaJIT on an FFXiMain dump, step by step, for tests/hifps_exp_t
 renderer and device, Ashita's draw methods and plugin list, the CPU feature object: regions mapped here at the same
 addresses, and the dump's bytes it changed), QueryPerformanceCounter's address and frequency in the test, Ashita's
 folder, and the steps: each an action (what the addon's config window or /hifps does: exp_toggle, a tick of
-exp_tick, gfx_apply, disable...), what the host says then (the frame rate, the plugins, the loaded addons, the
-player's and the target's actors, the Vana'diel clock) and the edits made before it (bytes, files). After each step
-out.bin gets the memory the test compares (the image's bytes that differ from the dump file, the fakes, the addon's
-allocations) and the addon's state as text (exp.on/err, exp_stat, exp.users/checked/notes/force, gfx.err/nerr,
-gfx_stat, night_stat).
+exp_tick, disable...), what the host says then (the frame rate, the plugins, the loaded addons, the player's and the
+target's actors) and the edits made before it (bytes, files). After each step out.bin gets the memory the test
+compares (the image's bytes that differ from the dump file, the fakes, the addon's allocations) and the addon's state
+as text (exp.on/err, exp_stat, exp.users/checked/notes/force).
 
-hifps.lua's top-level locals are reached by loading its source with a line appended that exports them. The addon's
-files are only read.
+hifps.lua's own graphics settings (lamps, night lighting) stay at their defaults (1.0: stock), so it lays nothing down
+for them: HiFi XI doesn't do them. hifps.lua's top-level locals are reached by loading its source with a line appended
+that exports them. The addon's files are only read.
 """
 
 import ctypes
@@ -154,7 +154,7 @@ def main():
     original = bytes(dump)
     fakes = [(a, len(h)) for a, h in cfg['regions']]
 
-    host = {'fps': 0.0, 'plugins': 0, 'addons': None, 'actors': None, 'clock': 0}
+    host = {'fps': 0.0, 'plugins': 0, 'addons': None, 'actors': None}
 
     lua = luajit21.LuaRuntime(unpack_returned_tuples=True)
     g = lua.globals()
@@ -235,12 +235,7 @@ def main():
             GetModuleHandleA = function (name) if (name == 'kernel32.dll') then return real.cast('void*', 0x1000); end return nil; end,
             GetProcAddress = function (m, name) if (name == 'QueryPerformanceCounter') then return qpc_fn; end return nil; end,
         }, { __index = real.C })
-        local cast = function (t, v)
-            -- The Vana'diel clock: its value from the test, not the dump's code run (32-bit, not here)
-            if (t == 'uint32_t (__cdecl *)(void)') then return function () return py_host('clock'); end end
-            return real.cast(t, v)
-        end
-        package.loaded['ffi'] = setmetatable({ C = C, cast = cast }, { __index = real })
+        package.loaded['ffi'] = setmetatable({ C = C }, { __index = real })
         package.loaded['imgui'] = {}
         printed = {}
         print = function (s) printed[#printed + 1] = tostring(s); end
@@ -299,9 +294,9 @@ def main():
     ''' % (LIBS, ADDON))
 
     src = open(os.path.join(ADDON, 'hifps.lua'), encoding='utf-8').read()
-    src += ('\nHIFPS = { exp = exp, gfx = gfx, prefs = prefs, state = state, exp_toggle = exp_toggle, exp_tick = exp_tick, '
+    src += ('\nHIFPS = { exp = exp, state = state,exp_toggle = exp_toggle, exp_tick = exp_tick, '
             'exp_stat = exp_stat, exp_all_off = exp_all_off, restore_exp = restore_exp, walls_keep = walls_keep, '
-            'gfx_apply = gfx_apply, gfx_off = gfx_off, gfx_stat = gfx_stat, night_stat = night_stat, disable = disable };\n')
+            'disable = disable };\n')
     fn = lua.eval('function (src) local f, e = loadstring(src, "@hifps.lua"); if (f == nil) then error(e); end f(); end')
     fn(src)
     H = g.HIFPS
@@ -320,12 +315,6 @@ def main():
         t[#t + 1] = 'ashita.checked=' .. s(H.exp.checked)
         t[#t + 1] = 'ashita.notes=' .. table.concat(H.exp.notes or {}, '; ')
         t[#t + 1] = 'ashita.force=' .. (H.exp.force and '1' or '0')
-        t[#t + 1] = 'gfx.lamps=' .. (H.gfx.calls ~= nil and '1' or '0')
-        t[#t + 1] = 'gfx.night=' .. (H.gfx.night ~= nil and '1' or '0')
-        t[#t + 1] = 'gfx.err=' .. s(H.gfx.err)
-        t[#t + 1] = 'gfx.nerr=' .. s(H.gfx.nerr)
-        t[#t + 1] = 'gfx.stat=' .. s(H.gfx_stat())
-        t[#t + 1] = 'night.stat=' .. s(H.night_stat())
         return t
     end''')
     names = lua.table_from(NAMES)
@@ -337,8 +326,6 @@ def main():
             return int(H.exp.walls.base)
         if name == 'proxy':
             return int(H.exp.proxy.base)
-        if name == 'gfx':
-            return int(H.gfx.base)
         sys.exit('FAIL  in.txt: unknown base %r' % name)
 
     out = open(out_path, 'wb')
@@ -353,8 +340,6 @@ def main():
             g.set_addons_known(host['addons'] is not None)
         if 'actors' in s:
             host['actors'] = None if s['actors'] == 'none' else lua.table_from([int(v, 16) for v in s['actors'].split(',')])
-        if 'clock' in s:
-            host['clock'] = int(s['clock'])
         for step, where, off, h in cfg['edits']:
             if step == i:
                 mem_write(where_base(where) + off, h)
@@ -376,14 +361,9 @@ def main():
                 H.walls_keep()
             H.state.fps = host['fps']
             H.exp_tick()
-        elif a[0] == 'gfx':
-            H.prefs.gfx.lamps, H.prefs.gfx.reach, H.prefs.gfx.moon, H.prefs.gfx.fill = (float(v) for v in a[1:5])
-            H.gfx_apply()
         elif a[0] == 'disable':
             H.exp_all_off()
-            H.gfx_off()
         elif a[0] == 'enable':
-            H.gfx_apply()
             H.restore_exp()
         elif a[0] == 'unload':
             H.disable()

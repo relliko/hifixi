@@ -272,7 +272,7 @@ namespace hifi::backend
 
 		// The addons HiFi XI took over, their settings taken once into their sections, when there are any and HiFi XI
 		// hasn't taken them before ([hifixi] addons=1): hifps's
-		// (config\addons\hifps\settings.lua: a returned table, exp = {...} and gfx = {...} inside: exp_<name>, gfx_<name>),
+		// (config\addons\hifps\settings.lua: a returned table, its exp = {...} inside as exp_<name>; its gfx = {...} left out),
 		// drawcull's (config\addons\drawcull\<character>\settings.lua: settings["key"] = value lines; the character's
 		// whose file was saved last). Literal tables only: no Lua is run.
 		void import_addon_options()
@@ -322,7 +322,8 @@ namespace hifi::backend
 						prefix = key;
 						continue;
 					}
-					if (key.empty() || value.empty() || key == "glows")
+					// (its graphics settings, gfx, the game's own lights, and its old glows toggle aren't HiFi XI's)
+					if (key.empty() || value.empty() || key == "glows" || prefix == "gfx")
 						continue;
 					put(L"hifps", prefix.empty() ? key : prefix + "_" + key, value_of(value));
 					taken++;

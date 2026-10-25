@@ -17,7 +17,8 @@
  *   occlusion-tested (+0x10C bits 2, 22, 18), not a weather's (its generator, [[+0xFC]], +0xDE bit 7: rain and snow
  *   are additive too), not a footstep's (footstep): each step on any ground starts the zone's footstep effect (its
  *   folder fses, fser in rain, the generators in its fefs / fefr) and the walker's own fvib, and they're additive:
- *   every step lit the ground white round your feet (in game, 2026-10-22). Their weight (brightest channel x alpha x fade x +0x134) is added up by the generator that
+ *   every step lit the ground white round your feet (in game, 2026-10-22); not a melee hit's or miss's (melee: the
+ *   hit sparks in syst/effe/hit.., the damage and miss flashes in damv / misv). Their weight (brightest channel x alpha x fade x +0x134) is added up by the generator that
  *   made them (one light per emitter: it stays put while its particles come and go); those within kGlowMerge yalms
  *   are merged, and the nearest kGlowEffectsMax within kGlowReach of the camera kept. Where: the game's own view-space
  *   position of this frame (+0x188), back into the world through the effects' view matrix (gfx +0xB50, gfx found by
@@ -55,6 +56,7 @@ namespace hifi::game::glows
 		constexpr double kGlowReach = 40.0, kGlowMerge = 2.0;
 		constexpr uint32_t kGlowFixtureScan = 64, kGlowFixtureLast = 1023; // (entities looked at a frame; the zone's NPCs are 0..1023)
 		constexpr double kPi = 3.141592653589793;
+		constexpr uint32_t kGlowFolders = 4, kGlowSeenMax = 24; // (folders kept per generator; sources /hifi glows recalls)
 
 		// The glowing fixtures, by the start of their name: colour, the glow's height over their feet, reach, brightness,
 		// how deep the pulse goes and its period (seconds)
@@ -93,6 +95,7 @@ namespace hifi::game::glows
 		{
 			double w, x, y, z, r, g, b;
 			uint32_t key, gen, name;
+			uint32_t folders[kGlowFolders]; // (the generator's folders' names, nearest first, 0 past the last)
 		};
 
 		// What a walk found, in plain memory only (walk_tasks' guard can't unwind objects): how many nodes, elements and
@@ -100,7 +103,7 @@ namespace hifi::game::glows
 		// order they were first met
 		struct walk
 		{
-			uint32_t nodes, elements, glowing, steps, next, groups;
+			uint32_t nodes, elements, glowing, steps, hits, next, groups;
 			uint32_t view[16];
 			group list[kGlowNodesMax];
 		};
@@ -116,6 +119,19 @@ namespace hifi::game::glows
 			double x, y, z, r, g, b, weight;
 			uint32_t key;
 			std::string name;
+		};
+
+		// A source of glowing effects met lately (for /hifi glows: effects that last a moment, a hit's spark, are gone
+		// before it can be typed): its generator's name and folders, how many walks it glowed in, its heaviest weight,
+		// the walk it last glowed in
+		struct seen
+		{
+			uint32_t name;
+			uint32_t folders[kGlowFolders];
+			uint32_t walks;
+			double weight;
+			uint32_t last;
+			double at; // (the frame's clock, seconds)
 		};
 
 		// The game's code found (find_code): the task manager's and gfx's globals (where they are), the task callback,
@@ -135,11 +151,13 @@ namespace hifi::game::glows
 			code fx = {};
 			std::string why = "not looked for yet";
 			std::vector<effect> effects;
-			uint32_t elements = 0, glowing = 0, steps = 0, nodes = 0, abandoned = 0;
+			uint32_t elements = 0, glowing = 0, steps = 0, hits = 0, nodes = 0, abandoned = 0;
 			bool capped = false;
 			double ms = 0.0, ms_most = 0.0;
 			uint32_t walks = 0;
 			std::vector<group *> order, kept; // (read_effects': kept between walks for their memory)
+			std::vector<seen> recent;
+			double now = 0.0;
 		};
 		state g;
 
@@ -235,6 +253,17 @@ namespace hifi::game::glows
 			grp.key = key;
 			grp.gen = gen;
 			grp.name = pointer(gen) ? at32(gen + 0x20) : 0;
+			// (its folders, as footstep() walks them: each [handle] up the +0x28 parents)
+			uint32_t at = gen;
+			for (uint32_t up = 0; up < kGlowFolders && pointer(at); ++up)
+			{
+				const uint32_t handle = at32(at + 0x28);
+				const uint32_t parent = pointer(handle) ? at32(handle) : 0;
+				if (!pointer(parent))
+					break;
+				grp.folders[up] = at32(parent + 0x20);
+				at = parent;
+			}
 			return grp;
 		}
 
@@ -269,6 +298,37 @@ namespace hifi::game::glows
 			return false;
 		}
 
+		// Whether a generator is a melee hit's or miss's (in game, 2026-10-23, /hifi glows' recent sources while
+		// fighting): the hit sparks are clones in ROM/0/0.DAT's syst/effe/hit1..hit9 and hi17, hi26..hi30 (a subfolder
+		// g0xx between), the damage and miss flashes in ROM/0/27.DAT's damv / misv (the schedulers 072ED0 looks up).
+		// syst/effe also holds other effects (sb.., ei.., geom...), so only those names under it. Only under walk_tasks'
+		// guard.
+		bool melee(uint32_t gen)
+		{
+			uint32_t chain[6] = {}, n = 0, at = gen;
+			while (n < 6)
+			{
+				const uint32_t handle = at32(at + 0x28);
+				const uint32_t parent = pointer(handle) ? at32(handle) : 0;
+				if (!pointer(parent))
+					break;
+				chain[n++] = at32(parent + 0x20);
+				at = parent;
+			}
+			for (uint32_t i = 0; i < n; ++i)
+			{
+				const uint32_t f = chain[i];
+				if (f == four("damv") || f == four("misv"))
+					return true;
+				const char c0 = char(f), c1 = char(f >> 8), c2 = char(f >> 16), c3 = char(f >> 24);
+				const bool digit2 = c2 >= '0' && c2 <= '9', digit3 = c3 >= '0' && c3 <= '9';
+				if (i + 2 < n && chain[i + 1] == four("effe") && chain[i + 2] == four("syst") && c0 == 'h' && c1 == 'i' &&
+					((c2 == 't' && digit3) || (digit2 && digit3)))
+					return true;
+			}
+			return false;
+		}
+
 		// The walk itself (see above): the game's memory read directly, each pointer tested before it's followed. 1:
 		// walked; 0: no task manager or gfx yet.
 		int walk_unguarded(const code &fx, walk &out)
@@ -280,7 +340,7 @@ namespace hifi::game::glows
 			std::memset(g_slots, 0, sizeof(g_slots));
 			out.groups = 0;
 			uint32_t node = at32(manager + 0xD50);
-			uint32_t nodes = 0, elements = 0, glowing = 0, steps = 0;
+			uint32_t nodes = 0, elements = 0, glowing = 0, steps = 0, hits = 0;
 			while (node != 0 && nodes < kGlowNodesMax && pointer(node))
 			{
 				nodes++;
@@ -303,8 +363,10 @@ namespace hifi::game::glows
 						const bool weather = pointer(gen) && (at8(gen + 0xDE) & 0x80) != 0;
 						const bool step = pointer(gen) && !weather && footstep(gen);
 						steps += step ? 1 : 0;
+						const bool hit = pointer(gen) && !weather && !step && melee(gen);
+						hits += hit ? 1 : 0;
 						float v[3];
-						if (top >= 0x10 && a > 0 && !weather && !step && float_of(p[0x188 / 4], v[0]) && float_of(p[0x18C / 4], v[1]) && float_of(p[0x190 / 4], v[2]))
+						if (top >= 0x10 && a > 0 && !weather && !step && !hit && float_of(p[0x188 / 4], v[0]) && float_of(p[0x18C / 4], v[1]) && float_of(p[0x190 / 4], v[2]))
 						{
 							const double vx = v[0], vy = v[1], vz = v[2];
 							if (vx * vx + vy * vy + vz * vz <= kGlowReach * kGlowReach)
@@ -335,6 +397,7 @@ namespace hifi::game::glows
 			out.elements = elements;
 			out.glowing = glowing;
 			out.steps = steps;
+			out.hits = hits;
 			out.next = node;
 			for (uint32_t i = 0; i < 16; ++i)
 				out.view[i] = at32(gfx + 0xB50 + i * 4);
@@ -355,6 +418,27 @@ namespace hifi::game::glows
 			}
 		}
 
+		// A group's source counted in g.recent (the one met longest ago makes room)
+		void remember(const group &grp)
+		{
+			for (seen &s : g.recent)
+				if (s.name == grp.name && std::memcmp(s.folders, grp.folders, sizeof(s.folders)) == 0)
+				{
+					if (s.last != g.walks)
+						s.walks++;
+					s.last = g.walks;
+					s.weight = std::max(s.weight, grp.w);
+					s.at = g.now;
+					return;
+				}
+			seen s = { grp.name, {}, 1, grp.w, g.walks, g.now };
+			std::memcpy(s.folders, grp.folders, sizeof(s.folders));
+			if (g.recent.size() < kGlowSeenMax)
+				g.recent.push_back(s);
+			else
+				*std::min_element(g.recent.begin(), g.recent.end(), [](const seen &a, const seen &b) { return a.last < b.last; }) = s;
+		}
+
 		// The effects that glow now (see above): the task list walked, its glowing elements grouped by generator, close
 		// groups merged, the nearest kGlowEffectsMax into g.effects (none when there's no task list yet, the walk was
 		// abandoned or the view matrix isn't numbers)
@@ -372,6 +456,7 @@ namespace hifi::game::glows
 			g.elements = g_walk.elements;
 			g.glowing = g_walk.glowing;
 			g.steps = g_walk.steps;
+			g.hits = g_walk.hits;
 			g.capped = g_walk.next != 0;
 			// (heaviest first, each taking in the lighter ones within kGlowMerge of it)
 			g.order.clear();
@@ -382,6 +467,7 @@ namespace hifi::game::glows
 				grp.y = grp.y / grp.w;
 				grp.z = grp.z / grp.w;
 				g.order.push_back(&grp);
+				remember(grp);
 			}
 			std::stable_sort(g.order.begin(), g.order.end(), [](const group *a, const group *b) { return a->w > b->w; });
 			g.kept.clear();
@@ -492,6 +578,7 @@ namespace hifi::game::glows
 	void frame(const entities &e, double now)
 	{
 		g.frames++;
+		g.now = now;
 		scan_fixtures(e);
 		if (g.frames % kGlowsEvery != 0)
 			return;
@@ -528,6 +615,11 @@ namespace hifi::game::glows
 			std::snprintf(line, sizeof(line), "; %u footsteps' elements left out", g.steps);
 			s += line;
 		}
+		if (g.hits != 0)
+		{
+			std::snprintf(line, sizeof(line), "; %u melee hits' and misses' elements left out", g.hits);
+			s += line;
+		}
 		if (g.abandoned != 0)
 		{
 			std::snprintf(line, sizeof(line), "; a walk abandoned %u times (memory gone under it)", g.abandoned);
@@ -553,6 +645,22 @@ namespace hifi::game::glows
 		{
 			const effect &ef = g.effects[k];
 			std::snprintf(line, sizeof(line), "effect %s weight %.2f, colour %.2f %.2f %.2f at %.1f %.1f %.1f", ef.name.c_str(), ef.weight, ef.r, ef.g, ef.b, ef.x, ef.y, ef.z);
+			out.push_back(line);
+		}
+		// (the sources met lately, the latest first: a hit's spark is gone before /hifi glows can be typed)
+		std::vector<const seen *> recent;
+		for (const seen &s : g.recent)
+			recent.push_back(&s);
+		std::sort(recent.begin(), recent.end(), [](const seen *a, const seen *b) { return a->last > b->last; });
+		for (const seen *s : recent)
+		{
+			std::string folders;
+			for (uint32_t f : s->folders)
+				if (f != 0)
+					folders += (folders.empty() ? "" : " < ") + name_text(f);
+			const double ago = g.now - s->at;
+			std::snprintf(line, sizeof(line), "lately: %s in %s, glowed in %u reads, weight %.2f at most, %.0f s ago", name_text(s->name).c_str(),
+				folders.empty() ? "-" : folders.c_str(), s->walks, s->weight, ago);
 			out.push_back(line);
 		}
 		return out;

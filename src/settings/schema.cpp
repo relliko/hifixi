@@ -115,6 +115,8 @@ namespace hifi::settings
 				"Water", false, { _, 0.5f, 0.5f, 0.5f } },
 			{ "WaterRings", tab::world, "Water", "Rings from moving", "Rings spread where people and monsters move through it (0: none).",
 				"%.2f", "Water", false, { _, 1.0f, 1.0f, 1.0f } },
+			{ "WaterSea", tab::world, "Water", "The sea to the horizon", "The game's own sea past the zone's edge drawn as World FX "
+				"water, out to the horizon.", nullptr, "Water", false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			// Weather
 			{ "WeatherFog", tab::world, "Weather", "Fog over the grass and water",
 				"The grass, fireflies and water fade into the game's fog as the world does.", nullptr, nullptr, false,
@@ -134,6 +136,24 @@ namespace hifi::settings
 				{ 0.0f, 1.0f, 1.0f, 1.0f } },
 			{ "SnowAmount", tab::world, "Weather", "How hard it snows", "Times the weather's own.", "%.2f", "Snow", false,
 				{ _, _, _, _ } },
+			{ "WeatherOwn", tab::world, "Weather", "All of the weather its own",
+				"HiFi XI draws all of the weather itself, with its sky: clouds, lightning, dust and sand, wind, heat shimmer, "
+				"auroras and gloom, as well as its rain and snow. The game's own weather effects are left out under open sky "
+				"(they disturbed the shadows); their sound, light and fog stay.", nullptr, "Sky", false, { 0.0f, 0.0f, 1.0f, 1.0f } },
+			{ "Clouds", tab::world, "Weather", "Clouds", "Clouds of its own, as thick and dark as the weather has them, drifting "
+				"with the wind.", nullptr, "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "Lightning", tab::world, "Weather", "Lightning", "In thunder and thunderstorms, flashes that light everything for a "
+				"moment, and bolts in the sky.", nullptr, "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "WeatherDust", tab::world, "Weather", "Dust and sand storms", "Dust and sand blown along the ground (0: none).",
+				"%.2f", "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "WeatherWind", tab::world, "Weather", "Wind and gales", "The grass bent hard with the wind, and streaks of dust and "
+				"leaves (0: none).", "%.2f", "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "HeatShimmer", tab::world, "Weather", "Heat shimmer", "In hot spells and heat waves, the air shimmering over distant "
+				"ground (0: none).", "%.2f", "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "Aurora", tab::world, "Weather", "Auroras", "Curtains of light across the sky in an aurora (0: none).", "%.2f",
+				"WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "GloomFog", tab::world, "Weather", "Gloom", "In gloom and darkness, fog banks lying along the ground (0: none).",
+				"%.2f", "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
 			// Sky
 			{ "Sky", tab::world, "Sky", "Sky", "The game's sky gradient drawn smooth, with a sun, a moon and stars of its own.",
 				nullptr, nullptr, false, { 0.0f, 0.0f, 1.0f, 1.0f } },
@@ -155,22 +175,11 @@ namespace hifi::settings
 				flag, 0.0f, 1.0f, 1.0f },
 			{ "drawcull.frustum", tab::distance, "View distance", "Cull at the camera's own height of view",
 				"The game culls the zone against a view far taller than the camera's, so what's above and below the screen is "
-				"drawn anyway. Nothing on screen is cut.", nullptr, nullptr, false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
+				"drawn anyway. Nothing on screen is cut, and effects (water sheets, smoke, sparks) keep the game's own view.", nullptr,
+				nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
 			{ "drawcull.square", tab::distance, "Display", "Square pixels",
 				"The game draws the world about 5.5% wider than the window: people look broad, round things oval. This draws it "
 				"at the window's own shape.", nullptr, nullptr, false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
-
-			// The game's own lights at night (hifps's graphics settings: [hifps])
-			{ "hifps.gfx_lamps", tab::lighting, "The game's own lights at night", "Lamp brightness",
-				"The game's own lamp light at night, times its own.", "%.2fx", "hifps.enabled", false, { _, _, _, _ }, number, 0.5f,
-				3.0f, 1.0f },
-			{ "hifps.gfx_reach", tab::lighting, "The game's own lights at night", "Lamp reach", "How far the game's lamps light.",
-				"%.2fx", "hifps.enabled", false, { _, _, _, _ }, number, 1.0f, 2.0f, 1.0f },
-			{ "hifps.gfx_moon", tab::lighting, "The game's own lights at night", "Moonlight", "The game's moonlight at night.", "%.2fx",
-				"hifps.enabled", false, { _, _, _, _ }, number, 0.5f, 2.5f, 1.0f },
-			{ "hifps.gfx_fill", tab::lighting, "The game's own lights at night", "Shadow fill",
-				"The game's ambient light at night: how dark the shade is.", "%.2fx", "hifps.enabled", false, { _, _, _, _ }, number,
-				0.5f, 2.5f, 1.0f },
 
 			// The game's own, left out where HiFi XI draws its own
 			{ "HideFlare", tab::game, "Left out", "The game's lens flare",
@@ -179,9 +188,11 @@ namespace hifi::settings
 			{ "HideGameWater", tab::game, "Left out", "The game's water, where HiFi XI draws its own",
 				"The game's scrolling water layers, and the ripples at a wading character's feet, aren't drawn where HiFi XI draws "
 				"its water (in a zone it has water for, with its Water setting on).", nullptr, nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
-			{ "HideGameRain", tab::game, "Left out", "The game's rain and snow, while HiFi XI draws its own",
-				"The game's raindrops and snowflakes aren't drawn while HiFi XI's rain or snow falls; their sound, clouds, light and "
-				"fog stay.", nullptr, nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
+			{ "HideGameRain", tab::game, "Left out", "The game's weather, while HiFi XI draws its own",
+				"With \"All of the weather its own\" on, none of the game's weather effects are drawn under open sky (its clouds, "
+				"sun, moon and stars, rain, snow, lightning, dust...): HiFi XI draws them. Otherwise only the game's raindrops and "
+				"snowflakes are left out while HiFi XI's rain or snow falls. The weather's sound, light and fog stay.", nullptr,
+				nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			{ "HideGameShadows", tab::game, "Left out", "The game's character shadows, while HiFi XI casts its own",
 				"The game's own shadow under each character (your silhouette, blobs under the rest) isn't drawn while HiFi XI's "
 				"characters cast sun or moon shadows here: two at different angles looked like copies of one. Where HiFi XI casts "

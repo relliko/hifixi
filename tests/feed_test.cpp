@@ -8,6 +8,8 @@
  *   - the zone told through the environment, a Mog House as 1000 + its room's model (from the zone-in packet);
  *   - lamps written into the game's light table: the lit point lights sent every 3rd frame, as they are;
  *   - the weather: an environment, its weather and record and the renderer's fog faked behind the game's globals;
+ *   - the moon: the game's Vana'diel clock (its clock object's seconds + the server's offset) read through the globals
+ *     its clock function uses, sent each frame once the clock object is set, nothing before;
  *   - the lens flare's je made a jmp and put back, the visibility tests' calls pointed at World FX's entries and back,
  *     each only over the game's own bytes;
  *   - the game's water and rain routed to their routines and back as their settings say;
@@ -49,6 +51,7 @@ namespace
 		uint32_t lamp_calls = 0;
 		std::vector<uint32_t> weather;
 		uint32_t weather_calls = 0;
+		uint32_t moon = 0, moon_calls = 0;
 		uint32_t glow_calls = 0;
 		uintptr_t vis_original = 0;
 		uint32_t vis_on = 0;
@@ -57,6 +60,7 @@ namespace
 	std::map<std::string, std::string> g_settings;
 	std::string g_folder;
 	uint32_t g_casting = 0; // (World FX casting characters' shadows, as worldfx_casts_characters says)
+	uint32_t g_drawing = 1; // (World FX drawing into the game's world, as worldfx_drawing says)
 }
 
 extern "C"
@@ -79,6 +83,11 @@ extern "C"
 		g_sent.weather.assign(words, words + count);
 		g_sent.weather_calls++;
 	}
+	void __cdecl worldfx_moon(uint32_t clock)
+	{
+		g_sent.moon = clock;
+		g_sent.moon_calls++;
+	}
 	// (each kind's entry: a stand-in address)
 	uintptr_t __cdecl worldfx_vis_entry(uint32_t kind) { return 0x31000000u + kind * 0x10; }
 	void __cdecl worldfx_vis_setup(uintptr_t original, uint32_t on)
@@ -98,6 +107,9 @@ extern "C"
 	}
 	const char *__cdecl worldfx_folder() { return g_folder.c_str(); }
 	uint32_t __cdecl worldfx_casts_characters() { return g_casting; }
+	uint32_t __cdecl worldfx_drawing() { return g_drawing; }
+	// (all of the weather World FX's own: the routing is what's checked here, gamerain_test checks what follows from it)
+	uint32_t __cdecl worldfx_weather_drawn() { return hifi::game::kWeatherFxAll; }
 	int __cdecl hifixi_option(const char *, const char *, char *, uint32_t) { return 0; }
 	void __cdecl hifixi_set_option(const char *, const char *, const char *) {}
 }
@@ -201,6 +213,7 @@ namespace
 			return;
 		g_sent = sent();
 		g_casting = 0;
+		g_drawing = 1;
 		g_settings = { { "HideFlare", "1" }, { "HideGameWater", "0" }, { "HideGameRain", "0" }, { "VisTest", "0" } };
 		char temp[MAX_PATH] = "";
 		GetTempPathA(MAX_PATH, temp);
@@ -451,6 +464,47 @@ namespace
 			}
 		}
 
+		// 5b. The moon: the game's Vana'diel clock, its clock object's seconds (+0xC) plus the server's offset, read
+		// through the globals the clock function's code names (FFXiMain 1039E0 -> 0DC130 -> 0DC080)
+		{
+			const uintptr_t clock_fn = hifi::game::find("E8????????0305????????C3");
+			const uintptr_t seconds_fn = clock_fn != 0 ? hifi::game::rel_target(clock_fn) : 0;
+			const uintptr_t reader = seconds_fn != 0 ? hifi::game::rel_target(seconds_fn + 5) : 0;
+			const uintptr_t object_at = reader != 0 ? *reinterpret_cast<const uint32_t *>(reader + 1) : 0;
+			const uintptr_t offset_at = clock_fn != 0 ? *reinterpret_cast<const uint32_t *>(clock_fn + 7) : 0;
+			check(inside(object_at, 4) && inside(offset_at, 4), "the Vana'diel clock's object and offset globals found (in the image)");
+			if (inside(object_at, 4) && inside(offset_at, 4))
+			{
+				static uint32_t object[8];
+				*reinterpret_cast<uint32_t *>(object_at) = 0; // (the title screen: not running yet)
+				*reinterpret_cast<uint32_t *>(offset_at) = 0x2A000000u;
+				g_sent.moon_calls = 0;
+				now += 0.02;
+				hifi::game::feed::frame(e, p, now);
+				check(g_sent.moon_calls == 0, "the clock not running yet: no moon sent");
+				object[3] = 1234567u; // (+0xC: whole seconds)
+				*reinterpret_cast<uint32_t *>(object_at) = uint32_t(uintptr_t(object));
+				for (int f = 0; f < 3; ++f)
+				{
+					now += 0.02;
+					hifi::game::feed::frame(e, p, now);
+				}
+				check(g_sent.moon_calls == 3 && g_sent.moon == 0x2A000000u + 1234567u, "the game's clock sent every frame: its seconds plus the offset");
+				// (day 46 of the 84: the full moon, the game's phase 6; 103BA0 says 100)
+				object[3] = 46u * 3456u + 1000u - 0x2A000000u % 290304u + 290304u;
+				now += 0.02;
+				hifi::game::feed::frame(e, p, now);
+				const std::vector<std::string> lines = hifi::game::feed::status();
+				const bool full = std::count_if(lines.begin(), lines.end(), [](const std::string &l) {
+					return l.find("moon: the game's clock") == 0 && l.find("day 46 of the 84, phase 6 of 12, 100% lit") != std::string::npos; }) == 1;
+				check(full, "the status: the game's day, phase and light from its clock (day 46: full)");
+				put_back(object_at, 4);
+				put_back(offset_at, 4);
+				now += 0.02;
+				hifi::game::feed::frame(e, p, now);
+			}
+		}
+
 		// 6. The lens flare: hidden (HideFlare on), shown again, never over something else's bytes
 		{
 			check(flare != 0, "the lens flare's code found");
@@ -586,7 +640,35 @@ namespace
 				"left out again (put back by stop, below), and the status says so");
 		}
 
-		// 10. Status, then everything put back
+		// 10. World FX not drawing into the game's world (another output: DXVK, dgVoodoo's Direct3D 11): the game keeps its
+		// own water, rain and snow, character shadows and visibility tests, whatever the settings say; back with it
+		{
+			const hifi::game::gamewater::sites w = hifi::game::gamewater::where();
+			const hifi::game::gamerain::sites r = hifi::game::gamerain::where();
+			g_settings["HideGameWater"] = "1";
+			g_settings["HideGameRain"] = "1";
+			g_settings["VisTest"] = "1";
+			g_casting = 1;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			const bool routed = w.call != 0 && hifi::game::rel_target(w.call) >= w.memory && r.site != 0 && *reinterpret_cast<const uint8_t *>(r.site) == 0xE8 &&
+				g_sent.vis_on == 1;
+			g_drawing = 0;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			const std::vector<std::string> lines = hifi::game::feed::status();
+			const bool own = w.call != 0 && hifi::game::rel_target(w.call) == w.draw && *reinterpret_cast<const uint8_t *>(r.site) == 0x8A && g_sent.vis_on == 0 &&
+				std::count_if(lines.begin(), lines.end(), [](const std::string &l) { return l.find("its own (World FX isn't drawing") != std::string::npos; }) == 1;
+			check(routed && own, "World FX not drawing: the game's water, rain and visibility tests its own again, the status says why");
+			g_drawing = 1;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			check(hifi::game::rel_target(w.call) >= w.memory && *reinterpret_cast<const uint8_t *>(r.site) == 0xE8 && g_sent.vis_on == 1,
+				"drawing again: left out again (put back by stop, below)");
+			g_settings["VisTest"] = "0";
+		}
+
+		// 11. Status, then everything put back
 		{
 			const std::vector<std::string> s = hifi::game::feed::status();
 			check(s.size() >= 8 && s[0].find("zone 101") != std::string::npos, "the status lines (the zone first)");

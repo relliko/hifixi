@@ -13,6 +13,16 @@
  * - The surface between them is the smoothest one through them (Laplace), and never under the bed.
  * - Where it slopes, the water flows downhill (for the ripples); the distance to the nearest edge fades the water in at
  *   the shore.
+ * - The game's own sea, where the collision is a floor under it: the game draws its sea as flat sheets placed by the
+ *   zone's effect generators (sheets.hpp), and in some zones the collision's water lies well under them, a flat floor or
+ *   a seabed sloping to the docks (Port San d'Oria's 4.5 yalms under its sea, Port Windurst's 4-10, Kazham's 0-4,
+ *   Lufaise and Misareaux 2.77, Qufim's north 2-9: research/ffxi-re/notes-sea-height.md). A sea sheet: flat (its
+ *   corners' heights spread less than kSeaFlat), at least kSeaSize across both ways, no corner further out than kSeaFar.
+ *   Of the corners of the water's flat triangles it lies over or under (inside one of its triangles, 1e-4 slack; of
+ *   several, the highest), those within kSeaLo..kSeaHi of it (surface y - its y, the game's y down) are its; when at
+ *   least kSeaMin are and their median is over kSeaLow (the water as a whole well under it), it's the sea there: each
+ *   corner it has, of each such sheet (the highest of several), takes its height (never under the bed), with no flow.
+ *   Everywhere else the water is as above, to the bit.
  *
  * The Python does this with numpy; the sums here are added as numpy adds them (its pairwise sum, its sums along an
  * axis in order), a column's heights averaged with CPython's sum(), and the conjugate gradients' dot products (BLAS's
@@ -36,6 +46,7 @@
 #include "bake.hpp"
 #include "collision.hpp"
 #include "dat.hpp"
+#include "sheets.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -60,6 +71,15 @@ namespace hifi::bake
 		constexpr double kEdgeCap = 8.0;   // edge distance kept up to this (yalms)
 		constexpr double kFlow = 15.0;     // flow speed (yalms a second) per unit of the surface's slope
 		constexpr double kFlowCap = 1.5;
+		constexpr double kSeaFlat = 0.5;   // a sea sheet's corners' heights spread less than this...
+		constexpr double kSeaSize = 150.0; // ...and it's at least this wide across x and z (yalms)...
+		constexpr double kSeaFar = 1e6;    // ...with no corner's x, y or z further out than this
+		constexpr double kSeaLo = -1.5;    // a water corner is a sea sheet's when its surface y - the sheet's is over this...
+		constexpr double kSeaHi = 12.0;    // ...and at most this
+		constexpr size_t kSeaMin = 200;    // a sea sheet with at least this many corners...
+		constexpr double kSeaLow = 1.5;    // ...whose median is over this (the sea bake's kMaxOffset) sets their height
+		constexpr double kSeaCell = 8.0;   // the sea sheets' triangles' lookup grid (yalms): each in the cells its x/z box +
+		constexpr double kSeaPad = 1.0;    // kSeaPad touches, in the sheet's order
 		constexpr double kInf = std::numeric_limits<double>::infinity();
 		constexpr double kSqrt2 = 1.4142135623730951; // (math.sqrt(2.0))
 
@@ -437,6 +457,84 @@ namespace hifi::bake
 			surf = std::move(surface);
 		}
 
+		// A sea sheet: its triangles (ax, az, ay, bx, bz, by, cx, cz, cy) by the kSeaCell-yalm cells their x/z box (+ kSeaPad)
+		// touches
+		struct sea_sheet
+		{
+			std::vector<double> tris;
+			std::map<std::pair<int64_t, int64_t>, std::vector<uint32_t>> cells;
+
+			explicit sea_sheet(const std::vector<double> &world)
+			{
+				const size_t n = world.size() / 9;
+				tris.resize(n * 9);
+				for (size_t i = 0; i < n; ++i)
+					for (int k = 0; k < 3; ++k)
+					{
+						const double *c = &world[i * 9 + k * 3];
+						tris[i * 9 + k * 3] = c[0];
+						tris[i * 9 + k * 3 + 1] = c[2];
+						tris[i * 9 + k * 3 + 2] = c[1];
+					}
+				for (uint32_t i = 0; i < n; ++i)
+				{
+					const double *t = &tris[size_t(i) * 9];
+					const double x0 = std::min({ t[0], t[3], t[6] }) - kSeaPad, x1 = std::max({ t[0], t[3], t[6] }) + kSeaPad;
+					const double z0 = std::min({ t[1], t[4], t[7] }) - kSeaPad, z1 = std::max({ t[1], t[4], t[7] }) + kSeaPad;
+					for (int64_t cx = int64_t(std::floor(x0 / kSeaCell)); cx <= int64_t(std::floor(x1 / kSeaCell)); ++cx)
+						for (int64_t cz = int64_t(std::floor(z0 / kSeaCell)); cz <= int64_t(std::floor(z1 / kSeaCell)); ++cz)
+							cells[{ cx, cz }].push_back(i);
+				}
+			}
+
+			// Its y over or under (x, z): of the triangles it lies in (1e-4 slack), the highest (least y); false if none
+			bool height(double x, double z, double &out) const
+			{
+				const auto it = cells.find({ int64_t(std::floor(x / kSeaCell)), int64_t(std::floor(z / kSeaCell)) });
+				if (it == cells.end())
+					return false;
+				bool any = false;
+				for (const uint32_t i : it->second)
+				{
+					const double *t = &tris[size_t(i) * 9];
+					const double ax = t[0], az = t[1], ay = t[2], bx = t[3], bz = t[4], by = t[5], cx = t[6], cz = t[7], cy = t[8];
+					const double d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+					if (std::fabs(d) < 1e-9)
+						continue;
+					const double u = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d;
+					const double v = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d;
+					if (u < -1e-4 || v < -1e-4 || u + v > 1 + 1e-4)
+						continue;
+					const double y = (u * ay + v * by) + ((1.0 - u) - v) * cy;
+					if (!any || y < out)
+						out = y;
+					any = true;
+				}
+				return any;
+			}
+		};
+
+		// The zone's sea sheets (sheets::placed: flat, at least kSeaSize across, none of it further out than kSeaFar), in
+		// DAT order
+		bool sea_sheets(const std::vector<uint8_t> &dat, std::vector<sea_sheet> &out, std::string &why)
+		{
+			return sheets::placed(dat, [&](const std::vector<double> &world) {
+				double lo[3], hi[3];
+				for (int e = 0; e < 3; ++e)
+					lo[e] = hi[e] = world[e];
+				for (size_t i = 0; i < world.size(); ++i)
+				{
+					const double v = world[i];
+					if (!(std::fabs(v) <= kSeaFar))
+						return;
+					lo[i % 3] = std::min(lo[i % 3], v);
+					hi[i % 3] = std::max(hi[i % 3], v);
+				}
+				if (hi[1] - lo[1] < kSeaFlat && hi[0] - lo[0] >= kSeaSize && hi[2] - lo[2] >= kSeaSize)
+					out.emplace_back(world);
+			}, why);
+		}
+
 		void put32(std::vector<uint8_t> &out, size_t at, uint32_t v)
 		{
 			std::memcpy(out.data() + at, &v, 4);
@@ -450,12 +548,12 @@ namespace hifi::bake
 		bool bake_water(uint32_t zone, const std::wstring &out, result &r)
 		{
 			std::vector<tri> tris;
+			std::vector<sea_sheet> seas;
 			{
 				std::vector<uint8_t> dat;
 				collision::reader rd;
 				if (!collision::read_zone(zone, dat, r) || !collision::open(dat, rd, r))
 					return false;
-				dat = std::vector<uint8_t>();
 				collision::each(rd, [&](const collision::triangle &t) {
 					if (t.terrain == collision::kShallow || t.terrain == collision::kDeep)
 					{
@@ -465,6 +563,13 @@ namespace hifi::bake
 						tris.push_back(w);
 					}
 				});
+				rd = collision::reader();
+				std::string why;
+				if (!tris.empty() && !sea_sheets(dat, seas, why))
+				{
+					r.why = why;
+					return false;
+				}
 			}
 			if (tris.empty())
 			{
@@ -551,6 +656,66 @@ namespace hifi::bake
 				cells[{ int64_t(std::floor(mz / kCell)), int64_t(std::floor(mx / kCell)) }].push_back(k);
 			}
 			const size_t corners = 3 * tris.size(), head = 20, table = head + 16 * cells.size();
+
+			// Every corner's record (in the file's order), then the sea's height over those in it
+			struct rec
+			{
+				const double *p;
+				uint32_t kind;
+				double o[4];
+			};
+			std::vector<rec> recs;
+			recs.reserve(corners);
+			for (const auto &[key, list] : cells)
+				for (const uint32_t k : list)
+				{
+					const tri &t = tris[k];
+					const uint32_t kind = t.kind + (steep(t.p[0], t.p[1], t.p[2]) ? 100 : 0);
+					for (const auto &p : t.p)
+					{
+						rec e{ p, kind, {} };
+						at(p, e.o);
+						recs.push_back(e);
+					}
+				}
+			if (!seas.empty())
+			{
+				// (per corner: the highest qualifying sheet's y; NaN where it's in none)
+				std::vector<double> sea(recs.size(), std::nan("")), hs(recs.size()), gaps;
+				std::vector<uint8_t> has(recs.size());
+				for (const sea_sheet &sh : seas)
+				{
+					gaps.clear();
+					for (size_t i = 0; i < recs.size(); ++i)
+					{
+						has[i] = recs[i].kind < 100 && sh.height(recs[i].p[0], recs[i].p[2], hs[i]);
+						const double g = recs[i].o[0] - hs[i];
+						if (has[i] && kSeaLo < g && g <= kSeaHi)
+							gaps.push_back(g);
+					}
+					if (gaps.size() < kSeaMin)
+						continue;
+					std::stable_sort(gaps.begin(), gaps.end());
+					const size_t mid = gaps.size() / 2;
+					const double median = (gaps.size() & 1) != 0 ? gaps[mid] : (gaps[mid - 1] + gaps[mid]) / 2.0;
+					if (!(median > kSeaLow))
+						continue;
+					for (size_t i = 0; i < recs.size(); ++i)
+					{
+						const double g = recs[i].o[0] - hs[i];
+						if (has[i] && kSeaLo < g && g <= kSeaHi && (std::isnan(sea[i]) || hs[i] < sea[i]))
+							sea[i] = hs[i];
+					}
+				}
+				for (size_t i = 0; i < recs.size(); ++i)
+					if (!std::isnan(sea[i]))
+					{
+						// (Python's min(h, bed y)), no flow
+						recs[i].o[0] = recs[i].p[1] < sea[i] ? recs[i].p[1] : sea[i];
+						recs[i].o[2] = recs[i].o[3] = 0.0;
+					}
+			}
+
 			std::vector<uint8_t> file(table + 32 * corners);
 			std::memcpy(file.data(), "WTR2", 4);
 			put32(file, 4, zone);
@@ -568,20 +733,13 @@ namespace hifi::bake
 				put32(file, at_cell + 12, count);
 				at_cell += 16;
 				first += count;
-				for (const uint32_t k : list)
-				{
-					const tri &t = tris[k];
-					const uint32_t kind = t.kind + (steep(t.p[0], t.p[1], t.p[2]) ? 100 : 0);
-					for (const auto &p : t.p)
-					{
-						double o[4];
-						at(p, o);
-						const double rec[8] = { p[0], p[1], p[2], double(kind), o[0], o[1], o[2], o[3] };
-						for (int e = 0; e < 8; ++e)
-							putf(file, at_corner + 4 * e, rec[e]);
-						at_corner += 32;
-					}
-				}
+			}
+			for (const rec &e : recs)
+			{
+				const double v[8] = { e.p[0], e.p[1], e.p[2], double(e.kind), e.o[0], e.o[1], e.o[2], e.o[3] };
+				for (int k = 0; k < 8; ++k)
+					putf(file, at_corner + 4 * k, v[k]);
+				at_corner += 32;
 			}
 			if (!write_file(out, file.data(), file.size()))
 			{

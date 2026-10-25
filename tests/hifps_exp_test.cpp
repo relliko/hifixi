@@ -1,33 +1,33 @@
 /*
- * Offline test of hifps's experimental toggles and graphics settings in C++ (src/game/hifps/exp.cpp, gfx.cpp), held
- * against the hifps addon itself (C:\Games\PhoenixXI\addons\hifps\hifps.lua) step by step, byte for byte.
+ * Offline test of hifps's experimental toggles in C++ (src/game/hifps/exp.cpp: ashita and its check and force,
+ * occlusion, walls, sse, batch, dedupe), held against the hifps addon itself (C:\Games\PhoenixXI\addons\hifps\
+ * hifps.lua) step by step, byte for byte. (The addon's graphics settings, lamps and night lighting, aren't HiFi XI's:
+ * the addon's stay stock here.)
  *   - stubs.inc is what tools/hifps_stubs.py makes of the addon's proxy/*.blob and *_code.lua now;
- *   - an image without the game's code: each says why, nothing taken;
+ *   - an image without the game's code: the toggles wait, nothing taken;
  *   - each FFXiMain dump mapped at its own base (game_dump.hpp), our memory from 0x30000000; its sites checked to
  *     be the game's own (both dumps are, at every site here); fakes of what the dump only points at, at 0x38000000:
  *     the client's renderer and device (its vtable), Ashita's four draw methods, the code its per-draw loop calls
  *     and its plugin list (8 plugins: named, unnamed, faulted, flags read and not...), the CPU feature object; the
  *     dump's renderer and CPU feature pointers pointed at them (in the mapped copy, put back at the end); addons'
  *     Lua files in a folder of the test's own;
- *   - a scenario of 40 steps (the 'ashita' check refusing, forced, a newcomer kept and one turning it off, on with
+ *   - a scenario of 34 steps (the 'ashita' check refusing, forced, a newcomer kept and one turning it off, on with
  *     the proxy's vtable in; occlusion at 256, 128, 1024 and 64fps; walls refused while its call goes elsewhere,
  *     on, its kept actors and stats, left alone when repointed; sse on AMD and Intel; batch and dedupe with their
- *     stats; lamps, night lighting refused while its entry is held then on, the hour's factors, the lamp stats;
- *     hifps off and on again, the saved toggles restored; unload), run by the addon under lupa
+ *     stats; hifps off and on again, the saved toggles restored; unload), run by the addon under lupa
  *     (tests/hifps_exp_lua.py) and by the port: after each step the image (where it isn't the dump file), the
  *     fakes and our memory (the stubs as laid down, their fields) the same byte for byte, and the addon's state
  *     (on, why not, what each is doing) the same text;
  *   - what only the port does: the toggles wait for the client's device; nothing put back over bytes that aren't
  *     ours (occlusion, sse, the device's vtable), the memory kept then; stop() frees our memory, and the image is
  *     the dump again, byte for byte;
- *   - the walls and gfx stubs as the port laid them down, run by the addon's own harnesses (proxy/walls_harness.c,
- *     gfx_harness.c, built 32-bit by build_hifps_exp_test.cmd into build\test_hifps_exp\).
+ *   - the walls stub as the port laid it down, run by the addon's own harness (proxy/walls_harness.c, built 32-bit
+ *     by build.cmd into build\test_hifps_exp\).
  *
- *   build\hifps_exp_test.exe     (built by tests\build_hifps_exp_test.cmd)
+ *   build\hifps_exp_test.exe     (built by build.cmd)
  */
 
 #include "../src/game/hifps/exp.hpp"
-#include "../src/game/hifps/gfx.hpp"
 #include "game_dump.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -42,7 +42,6 @@ namespace
 #include "../src/game/hifps/stubs.inc"
 
 	namespace exp = hifi::game::hifps::exp;
-	namespace gfx = hifi::game::hifps::gfx;
 
 	int failures = 0, passes = 0;
 	void check(bool ok, const std::string &what)
@@ -54,7 +53,7 @@ namespace
 			failures++;
 	}
 
-	// ---------------------------------------------------------------- HiFi XI's options, the host, the clock
+	// ---------------------------------------------------------------- HiFi XI's options, the host
 
 	std::map<std::string, std::string> options;
 	void set_option(const char *key, const std::string &value)
@@ -79,29 +78,9 @@ namespace
 		return actors_known;
 	}
 	exp::host host;
-	uint32_t clock_now = 0;
 	// hifps's frame step (step.hpp), stubbed: on, and its frames a second
 	bool step_on = false;
 	double step_fps = 0.0;
-	uint32_t __cdecl test_clock()
-	{
-		return clock_now;
-	}
-	// (the game clock's timer stood in for: the game's import isn't resolved here)
-	DWORD WINAPI stand_in_now()
-	{
-		return 123456;
-	}
-	// (a place nothing is at: reserved, then given back)
-	uintptr_t gone_place()
-	{
-		static const uintptr_t at = [] {
-			void *a = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
-			VirtualFree(a, 0, MEM_RELEASE);
-			return reinterpret_cast<uintptr_t>(a);
-		}();
-		return at;
-	}
 
 	// ---------------------------------------------------------------- bytes
 
@@ -148,10 +127,6 @@ namespace
 			out += char(std::strtoul(two, nullptr, 16));
 		}
 		return out;
-	}
-	std::string f32_bytes(float f)
-	{
-		return std::string(reinterpret_cast<const char *>(&f), 4);
 	}
 
 	bool memory_free(uintptr_t at)
@@ -395,12 +370,11 @@ namespace
 		std::string action;
 		int fps = 0, plugins = 8;
 		std::string addons = "alpha,zeta,hifps", actors = "0A001000,0A002000,0";
-		uint32_t clock = 0;
 	};
 	struct edit
 	{
 		int step;
-		std::string where; // abs, walls, gfx, proxy
+		std::string where; // abs, walls, proxy
 		uint32_t off;
 		std::string bytes;
 	};
@@ -416,7 +390,6 @@ namespace
 		std::vector<file_edit> files;
 	};
 
-	constexpr uint32_t kDay = 3456; // Earth seconds a Vana'diel day (144 an hour)
 	const char *const kAlpha = "-- alpha: uses 'd3d_dp' only in a comment\nlocal x = 1\nashita.events.register('d3d_dip', 'alpha_dip', function () end);\n";
 	const char *const kHelper = "  -- \"d3d_dpup\"\nashita.events.register(\"d3d_dipup\", 'h', function () end);\n";
 	const char *const kQuiet = "-- nothing here\nlocal y = 'd3d_dp_not'\n";
@@ -424,15 +397,14 @@ namespace
 	// The sites the scenario changes in the dump (as another addon would)
 	struct dump_sites
 	{
-		uintptr_t walls_call = 0, amb = 0, renderer_global = 0, cpu_global = 0;
-		std::string walls_rel, amb_byte;
+		uintptr_t walls_call = 0, renderer_global = 0, cpu_global = 0;
+		std::string walls_rel;
 	};
 
 	scenario make_scenario(const dump_sites &d, const std::string &install)
 	{
 		scenario s;
 		step cur;
-		cur.clock = kDay * 1000 + 22 * 144;
 		const auto next = [&]() { return int(s.steps.size()); };
 		const auto add = [&](const std::string &action) { cur.action = action; s.steps.push_back(cur); };
 		const auto edit_at = [&](const std::string &where, uintptr_t off, const std::string &b) { s.edits.push_back({ next(), where, uint32_t(off), b }); };
@@ -498,23 +470,8 @@ namespace
 		add("tick");
 		add("off batch");
 		add("off dedupe");
-		add("gfx 1.5 1.25 1 1");
-		edit_at("abs", d.amb, "\xE9");
-		add("gfx 1.3 1.7 1.8 1.4");                         // night lighting refused: its entry is held
-		edit_at("abs", d.amb, d.amb_byte);
-		add("gfx 1.3 1.7 1.75 1.4");
-		cur.fps = 128;
-		cur.clock = kDay * 1001 + 792;                      // 5:30
-		add("tick");
-		cur.clock = kDay * 1002 + 2628;                     // 18:15
-		edit_at("gfx", stubs::gfx::S_VSC, word_bytes(1280));
-		edit_at("gfx", stubs::gfx::S_LIGHT, word_bytes(5120));
-		edit_at("gfx", stubs::gfx::S_ACTOR, word_bytes(384));
-		add("tick");
-		cur.clock = kDay * 1003 + 12 * 144;                 // noon
-		add("tick");
 		add("disable");
-		add("enable");                                      // occlusion and walls back on, the lamps and night lighting
+		add("enable");                                      // occlusion and walls back on
 		cur.fps = 256;
 		cur.actors = "none";
 		add("tick");
@@ -588,8 +545,8 @@ namespace
 		std::string a = s.action;
 		std::replace(a.begin(), a.end(), ' ', '_');
 		char line[256];
-		std::snprintf(line, sizeof(line), "step %d %s fps=%d plugins=%d addons=%s actors=%s clock=%u\n", i, a.c_str(), s.fps, s.plugins, s.addons.c_str(),
-			s.actors.c_str(), s.clock);
+		std::snprintf(line, sizeof(line), "step %d %s fps=%d plugins=%d addons=%s actors=%s\n", i, a.c_str(), s.fps, s.plugins, s.addons.c_str(),
+			s.actors.c_str());
 		return line;
 	}
 
@@ -633,8 +590,6 @@ namespace
 				mem.push_back({ exp::where().walls, stubs::walls::size });
 			if (exp::where().proxy != 0)
 				mem.push_back({ exp::where().proxy, stubs::proxy::size + 16 + 0x20000 });
-			if (gfx::where().memory != 0)
-				mem.push_back({ gfx::where().memory, stubs::gfx::size });
 			std::sort(mem.begin(), mem.end());
 			for (const auto &m : mem)
 				s.chunks.push_back({ uint32_t(m.first), bytes_at(m.first, m.second) });
@@ -652,13 +607,6 @@ namespace
 		s.texts.push_back("ashita.checked=" + a.checked);
 		s.texts.push_back("ashita.notes=" + joined(a.notes, "; "));
 		s.texts.push_back(std::string("ashita.force=") + (a.force ? "1" : "0"));
-		const gfx::view v = gfx::state();
-		s.texts.push_back(std::string("gfx.lamps=") + (v.lamps ? "1" : "0"));
-		s.texts.push_back(std::string("gfx.night=") + (v.night ? "1" : "0"));
-		s.texts.push_back("gfx.err=" + v.lamps_err);
-		s.texts.push_back("gfx.nerr=" + v.night_err);
-		s.texts.push_back("gfx.stat=" + v.lamps_stat);
-		s.texts.push_back("night.stat=" + v.night_stat);
 		return s;
 	}
 
@@ -730,11 +678,10 @@ namespace
 			actor_target = std::strtoul(end + 1, &end, 16);
 			actor_status = std::strtoul(end + 1, &end, 16);
 		}
-		clock_now = st.clock;
 	}
 
 	double t_now = 1000.0;
-	bool timers = false; // (both modules' frame rate timers going)
+	bool timers = false; // (the toggles' frame rate timer going)
 
 	// A second of presents at fps (exactly: 1000 + whole seconds, steps of 1/fps)
 	void tick(int fps)
@@ -743,13 +690,10 @@ namespace
 		if (!timers)
 		{
 			exp::present(t_now);
-			gfx::present(t_now);
 			timers = true;
 		}
 		exp::present(t_now + 0.5);
-		gfx::present(t_now + 0.5);
 		exp::present(t_now + 1.0);
-		gfx::present(t_now + 1.0);
 		t_now += 1.0;
 	}
 
@@ -762,11 +706,8 @@ namespace
 			step_on = true;
 			for (const char *n : { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe", "ashita_force" })
 				set_option(n, "0");
-			for (const char *n : { "gfx_lamps", "gfx_reach", "gfx_moon", "gfx_fill" })
-				set_option(n, "1");
 			timers = false;
 			exp::update();
-			gfx::update();
 		}
 		else if (words[0] == "on")
 		{
@@ -787,26 +728,14 @@ namespace
 		}
 		else if (action == "tick")
 			tick(st.fps);
-		else if (words[0] == "gfx" && words.size() == 5)
-		{
-			set_option("gfx_lamps", words[1]);
-			set_option("gfx_reach", words[2]);
-			set_option("gfx_moon", words[3]);
-			set_option("gfx_fill", words[4]);
-			gfx::update();
-		}
 		else if (action == "disable" || action == "enable")
 		{
 			step_on = action == "enable";
 			timers = false;
 			exp::update();
-			gfx::update();
 		}
 		else if (action == "unload")
-		{
 			exp::stop();
-			gfx::stop();
-		}
 		else
 			check(false, "unknown action " + action);
 	}
@@ -817,12 +746,10 @@ namespace
 			return exp::where().walls;
 		if (where == "proxy")
 			return exp::where().proxy;
-		if (where == "gfx")
-			return gfx::where().memory;
 		return 0;
 	}
 
-	// ---------------------------------------------------------------- the addon's harnesses
+	// ---------------------------------------------------------------- the addon's harness
 
 	// A stub as the port laid it down, back to the blob its harness reads (the copy's base taken off each relocated
 	// word): its size, relocations, symbols, bytes
@@ -849,7 +776,7 @@ namespace
 		const std::string exe = folder + name + "_harness.exe";
 		if (GetFileAttributesA(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
 		{
-			check(false, exe + " built (tests\\build_hifps_exp_test.cmd)");
+			check(false, exe + " built (build.cmd)");
 			return;
 		}
 		if (!write_file(folder + name + ".blob", blob_bytes))
@@ -869,8 +796,8 @@ namespace
 
 	struct dump_run
 	{
-		std::string walls_laid, gfx_laid;
-		uintptr_t walls_base = 0, gfx_base = 0;
+		std::string walls_laid;
+		uintptr_t walls_base = 0;
 	};
 
 	void test_dump(const std::string &path, const std::string &root, dump_run &laid)
@@ -895,34 +822,23 @@ namespace
 		const uintptr_t walls = find("8D8EF0080000E8????????3BC58986F4");
 		const uintptr_t vis = find("A1????????53568BF18A9828080000");
 		d.walls_call = walls != 0 ? walls + 6 : 0;
-		d.amb = find("8B41E483EC2083F8015674");
 		const uintptr_t dev = find("8BC8E8????????85C0A3????????0F84????????8B5C241C");
 		const uintptr_t cpu = find("A1????????8A4009C3");
 		d.renderer_global = dev != 0 ? word(dev + 10) : 0;
 		d.cpu_global = cpu != 0 ? word(cpu + 1) : 0;
 		const bool stock_walls = d.walls_call != 0 && rel_target(d.walls_call) == vis;
 		const bool stock_occl = find("8BBEF0090000E8????????250300008079054883C8FC403BC7") != 0;
-		const uintptr_t setlight = find("83EC68538B5C2474");
-		const uintptr_t actor_lamp = find("8B441C4C83C6C45056E8");
-		const uintptr_t scale = actor_lamp != 0 ? rel_target(actor_lamp + 9) : 0;
-		bool stock_lamps = find("6A0468????????6A0F8B400C508B08FF913C010000") != 0;
-		for (const char *pat : { "8B95B09403008B0D????????5652E8", "8B95B49403008B0D????????5652E8", "8B95B89403008B0D????????5652E8",
-				 "8B85BC9403008B0D????????5650E8" })
-			stock_lamps = stock_lamps && find(pat) != 0 && rel_target(find(pat) + 14) == setlight;
-		stock_lamps = stock_lamps && scale != 0 && hifi::game::code_is(scale, from_hex("8B442404D9442408D808D918").data(), 12);
-		const bool stock_night = find("83EC3053568B74243C578BD933FF897E34") != 0 && d.amb != 0;
-		std::snprintf(line, sizeof(line), "the dump's sites are the game's own: walls %s, occlusion %s, lamps %s, night lighting %s",
-			stock_walls ? "yes" : "NO", stock_occl ? "yes" : "NO", stock_lamps ? "yes" : "NO", stock_night ? "yes" : "NO");
-		check(stock_walls && stock_occl && stock_lamps && stock_night, line);
+		std::snprintf(line, sizeof(line), "the dump's sites are the game's own: walls %s, occlusion %s", stock_walls ? "yes" : "NO",
+			stock_occl ? "yes" : "NO");
+		check(stock_walls && stock_occl, line);
 		check(d.renderer_global != 0 && d.cpu_global != 0, "the client's renderer and CPU feature pointers found");
-		if (!stock_walls || !stock_occl || !stock_lamps || !stock_night || d.renderer_global == 0 || d.cpu_global == 0)
+		if (!stock_walls || !stock_occl || d.renderer_global == 0 || d.cpu_global == 0)
 		{
 			check(false, "(the scenario needs the game's own bytes at every site: not run on this dump)");
 			dump::unmap(base);
 			return;
 		}
 		d.walls_rel = bytes_at(d.walls_call + 1, 4);
-		d.amb_byte = bytes_at(d.amb, 1);
 		const std::string renderer_was = bytes_at(d.renderer_global, 4), cpu_was = bytes_at(d.cpu_global, 4);
 		build_fakes();
 
@@ -980,7 +896,6 @@ namespace
 
 		// The port's run, step by step against the addon's
 		exp::set_host(&host);
-		gfx::set_clock(test_clock);
 		t_now = 1000.0;
 		options.clear();
 		for (size_t i = 0; i < sc.steps.size(); ++i)
@@ -1016,17 +931,12 @@ namespace
 				laid.walls_base = exp::where().walls;
 				laid.walls_laid = bytes_at(laid.walls_base, stubs::walls::size);
 			}
-			if (gfx::where().memory != 0 && laid.gfx_laid.empty())
-			{
-				laid.gfx_base = gfx::where().memory;
-				laid.gfx_laid = bytes_at(laid.gfx_base, stubs::gfx::size);
-			}
 		}
 		const exp::sites w = exp::where();
-		check(w.walls == 0 && w.proxy == 0 && gfx::where().memory == 0, "unload: everything forgotten");
+		check(w.walls == 0 && w.proxy == 0, "unload: everything forgotten");
 		check(laid.walls_base == dump::kAllocAt && !memory_free(laid.walls_base),
 			"  the walls stub's memory kept (its call was repointed by something else, and is still)");
-		check(memory_free(laid.gfx_base) && memory_free(dump::kAllocAt + 0x10000), "  the gfx and proxy stubs' memory freed");
+		check(memory_free(dump::kAllocAt + 0x10000), "  the proxy stub's memory freed");
 		check(bytes_at(d.walls_call + 1, 4) != d.walls_rel, "  the repointed call left as it is");
 		put_bytes(d.walls_call + 1, d.walls_rel);
 		VirtualFree(reinterpret_cast<void *>(laid.walls_base), 0, MEM_RELEASE);
@@ -1066,64 +976,19 @@ namespace
 		put_bytes(kCpu + 9, std::string(1, '\0'));
 		put32(kDevice, uint32_t(kVtable));
 
-		// hifps 0.9.10's launch crash: the game's clock reads through its object's pointer, 0 until the client starts
-		// its clock. Night lighting turns on then, but the clock isn't called: its first call is through the game's
-		// import table (not resolved here: called, the test would crash). Then a clock object that isn't there: the
-		// guard catches the fault, the clock is left alone after.
-		{
-			gfx::stop();
-			gfx::set_clock(nullptr);
-			const uintptr_t clock = hifi::game::find("E8????????0305????????C3");
-			const uintptr_t tick = clock != 0 ? hifi::game::rel_target(hifi::game::rel_target(clock)) : 0;
-			const uintptr_t object_at = tick != 0 ? hifi::game::word(tick + 9) : 0;
-			const uintptr_t now_import = tick != 0 ? hifi::game::word(hifi::game::rel_target(tick + 2) + 2) : 0; // (jmp [import])
-			check(object_at >= base && object_at < base + size && now_import >= base && now_import < base + size,
-				"the clock's object pointer and its timer's import found in the image");
-			if (object_at >= base && object_at < base + size && now_import >= base && now_import < base + size)
-			{
-				const uint32_t object_was = hifi::game::word(object_at), import_was = hifi::game::word(now_import);
-				put32(object_at, 0);
-				options.clear();
-				step_on = true;
-				set_option("gfx_moon", "1.5");
-				gfx::update();
-				for (int f = 0; f < 3; ++f)
-					gfx::present(10.0 + f * 1.1);
-				const std::string s = joined(gfx::status(), "|");
-				check(gfx::state().night && contains(s, "Night lighting starts once the game's clock runs (after logging in)"),
-					"its object not set yet: night lighting on, the clock not called, stock until it runs (" + s + ")");
-				// (the timer a stand-in; the object somewhere that isn't there)
-				put32(now_import, uint32_t(reinterpret_cast<uintptr_t>(&stand_in_now)));
-				put32(object_at, uint32_t(gone_place() + 0x80));
-				for (int f = 0; f < 3; ++f)
-					gfx::present(20.0 + f * 1.1);
-				const std::string t = joined(gfx::status(), "|");
-				check(contains(t, "The game's clock faulted when asked the hour: night lighting stays stock"),
-					"its object gone: the fault caught, the clock left alone (" + t + ")");
-				gfx::stop();
-				put32(object_at, object_was);
-				put32(now_import, import_was);
-			}
-			gfx::set_clock(test_clock);
-		}
-
 		// stop() with everything on: the image the dump again, our memory freed
 		hifi::game::set_alloc_at(dump::kAllocAt + 0x200000);
 		options.clear();
 		step_on = true;
 		for (const char *n : { "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" })
 			set_option(n, "1");
-		set_option("gfx_lamps", "2");
-		set_option("gfx_moon", "1.5");
 		host_addons_known = false;
 		exp::update();
-		gfx::update();
-		const uintptr_t mw = exp::where().walls, mp = exp::where().proxy, mg = gfx::where().memory;
-		check(exp::toggle("occlusion").on && exp::toggle("walls").on && exp::toggle("sse").on && exp::toggle("batch").on && exp::toggle("dedupe").on &&
-			gfx::state().lamps && gfx::state().night, "everything on");
+		const uintptr_t mw = exp::where().walls, mp = exp::where().proxy;
+		check(exp::toggle("occlusion").on && exp::toggle("walls").on && exp::toggle("sse").on && exp::toggle("batch").on && exp::toggle("dedupe").on,
+			"everything on");
 		exp::stop();
-		gfx::stop();
-		check(memory_free(mw) && memory_free(mp) && memory_free(mg), "stop(): our memory freed");
+		check(memory_free(mw) && memory_free(mp), "stop(): our memory freed");
 		put_bytes(d.renderer_global, renderer_was);
 		put_bytes(d.cpu_global, cpu_was);
 		check(dump::same_as_file(path, base, size), "  the image the dump again, byte for byte (the test's pointers to its fakes put back)");
@@ -1189,26 +1054,21 @@ int main()
 			"src\\game\\hifps\\stubs.inc is what tools\\hifps_stubs.py makes of the addon's proxy/*.blob and *_code.lua now");
 	}
 
-	// An image without the game's code: each says why, nothing taken
+	// An image without the game's code: the toggles wait, nothing taken
 	{
 		std::vector<uint8_t> empty(0x10000, 0);
 		hifi::game::set_image(reinterpret_cast<uintptr_t>(empty.data()), empty.size());
 		hifi::game::set_alloc_at(dump::kAllocAt);
 		exp::set_host(&host);
-		gfx::set_clock(test_clock);
 		step_on = true;
-		set_option("gfx_lamps", "1.5");
-		set_option("gfx_moon", "1.5");
+		options.clear();
+		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" })
+			set_option(n, "1");
 		exp::update();
-		gfx::update();
-		const gfx::view v = gfx::state();
-		check(!v.lamps && v.lamps_err == "the lamp constants call was not found (changed client, or another addon patched it)" && !v.night &&
-			v.night_err == "the light builder was not found (changed client, or another addon hooks it)",
-			"an image without the game's code: lamps: " + v.lamps_err + "; night: " + v.night_err);
-		check(contains(exp::status()[0], "once the client's device exists"), "  the toggles wait for the client's device: " + exp::status()[0]);
+		check(contains(exp::status()[0], "once the client's device exists"),
+			"an image without the game's code: the toggles wait for the client's device: " + exp::status()[0]);
 		check(memory_free(dump::kAllocAt), "  no memory taken");
 		exp::stop();
-		gfx::stop();
 		options.clear();
 	}
 
@@ -1227,21 +1087,17 @@ int main()
 		}
 		dump_run one;
 		test_dump(path, root, one);
-		if (laid.walls_laid.empty() && !one.walls_laid.empty() && !one.gfx_laid.empty())
+		if (laid.walls_laid.empty() && !one.walls_laid.empty())
 			laid = one;
 	}
 
-	// The stubs as the port laid them down, run by the addon's own harnesses
-	std::printf("\nthe addon's harnesses\n");
-	if (laid.walls_laid.empty() || laid.gfx_laid.empty())
-		check(false, "the stubs laid down by the port (no dump ran)");
+	// The walls stub as the port laid it down, run by the addon's own harness
+	std::printf("\nthe addon's harness\n");
+	if (laid.walls_laid.empty())
+		check(false, "the walls stub laid down by the port (no dump ran)");
 	else
-	{
 		run_harness(folder, "walls", blob(laid.walls_laid, laid.walls_base, stubs::walls::relocs, std::size(stubs::walls::relocs), stubs::walls::symbols,
 			std::size(stubs::walls::symbols)));
-		run_harness(folder, "gfx", blob(laid.gfx_laid, laid.gfx_base, stubs::gfx::relocs, std::size(stubs::gfx::relocs), stubs::gfx::symbols,
-			std::size(stubs::gfx::symbols)));
-	}
 
 	std::printf(failures == 0 ? "\nall passed (%d)\n" : "\n%d failed\n", failures == 0 ? passes : failures);
 	return failures;

@@ -10,7 +10,8 @@
 //   sse        the client's SSE skinning on non-Intel CPUs
 //   batch      consecutive text and UI quads merged into one draw (proxy.asm, the client device's vtable)
 //   dedupe     device calls that set a value already in effect dropped (the same proxy)
-// The options are [hifps] ashita_force and exp_<name> (all off by default, as hifps's).
+// The options are [hifps] ashita_force (off by default) and exp_<name> (all on by default: the frame rate's options
+// are on in every preset).
 
 #include "../game.hpp"
 #include <cstddef>

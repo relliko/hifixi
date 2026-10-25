@@ -42,6 +42,13 @@ namespace grass
 	// surface y over it, how far the water's edge is (yalms), and its flow (x, z, yalms a second)
 	bool read_blade_file(const wchar_t *path, blade_file &out, std::string &error, const char *magic = "GRS2", uint32_t stride = 4);
 
+	// The game's own sea sheets that carry on past the zone's water (tools/bake_sea.py, HiFi XI's src/bake/sea.cpp: 'SEA1':
+	// the zone, how many sheets, how many corners, then the corners in the water file's layout: x, bed y (the surface's +
+	// 30), z, kind 200; the surface's y (already at the baked water's level), edge 8 (open water), no flow). No cells: a few
+	// big sheets, drawn whole. Read into out as a water file with no cells (stride 8); sheets: how many. "no file for this
+	// zone" when there's none (a zone the bake keeps none for has a .none file instead: the same).
+	bool read_sea_file(const wchar_t *path, blade_file &out, uint32_t &sheets, std::string &error);
+
 	// The zone's visual meshes as one triangle soup, for the sun's shadow map (tools/bake_shadow_geo.py, tag
 	// 'SHD1'): triangles grouped in square cells by their centre, 12 words each: three corners of x, y, z (floats)
 	// and w (0 on a solid triangle; on a cut-out one, u | v << 12 | mask << 24: 12-bit texture coordinates and
@@ -183,6 +190,37 @@ namespace grass
 	float weather_sway(uint32_t name);
 	float weather_sway(const weather &w);
 
+	// What a weather brings of World FX's own beyond rain and snow (the game's weather folders drew these: its clouds,
+	// lightning, dust, wind, heat haze, aurora, gloom, a starry sky), by its name (either set), each 0 when it has none:
+	//   cover: how much of the sky its clouds cover (0 none .. 1 overcast), thick: how opaque they are at most, dark: how
+	//   dark their undersides (0 white .. 1 near black), veil: a low-contrast haze over the whole sky (mist), speed: how fast
+	//   they drift (1 a light breeze's);
+	//   wind: how hard the wind blows near the ground (0 calm .. 1 wind .. 2 gales: the grass bends with it), windy: 1 in
+	//   wind and gales (their streaks and leaves), streaks: dust blown along the ground in streaks, leaves: leaves blown
+	//   along it;
+	//   dust: dust or sand thick in the air (a storm's: 1), sand: 0 dust (brown-grey) .. 1 sand (tan);
+	//   flashes: lightning (thunder 0.7, thunderstorms 1), heat: heat shimmer (hot spells 0.5, heat waves 1), aurora: its
+	//   curtains, gloom: fog banks along the ground, sky_dark: how much darker the sky (0 as the record has it), stars: the
+	//   stars' brightness and number (1 as they are; stellar glare's more)
+	struct weather_kind_fx
+	{
+		float cover = 0.0f, thick = 0.0f, dark = 0.0f, veil = 0.0f, speed = 0.0f;
+		float wind = 0.0f, windy = 0.0f, streaks = 0.0f, leaves = 0.0f;
+		float dust = 0.0f, sand = 0.0f;
+		float flashes = 0.0f, heat = 0.0f, aurora = 0.0f, gloom = 0.0f, sky_dark = 0.0f, stars = 1.0f;
+	};
+	weather_kind_fx weather_fx_of(uint32_t name);
+	// The same blended through a change (the one before's by the share left), as the game blends its records; nothing (all
+	// 0, stars 1) when the weather isn't known
+	weather_kind_fx weather_fx_of(const weather &w);
+	// Which way the wind blows in a zone and weather (radians: the bearing it blows toward, from north toward east; x east,
+	// z north). The game has no wind of its own: this is the way its own clouds drifted there (research/ffxi-re/client-notes.md
+	// "Wind": each weather's sky layers scroll; 459 zone and weather pairs, either name of a weather); for a weather the
+	// zone's clouds don't say, the way its other weathers' go (their mean), for a zone with none, west (the way they go in
+	// most zones). The second blends through a change (the two ways by their shares).
+	float wind_bearing(uint32_t zone, uint32_t name);
+	float wind_bearing(uint32_t zone, const weather &w);
+
 	// Characters and monsters that push grass aside, at most
 	constexpr uint32_t kMaxActors = 32;
 	// Weapon-skill cuts drawn into the grass at once (look::cuts), and how long each is kept for the frames to find
@@ -236,6 +274,11 @@ namespace grass
 		bool water = true;
 		float water_reflect = 1.0f, water_ripples = 1.0f, water_tint = 1.0f;
 		float water_distance = 300.0f;
+		// The sea (with the zone's sea sheets uploaded: upload_sea): the game's own sea past the zone's water drawn as the
+		// water is, where the baked water isn't, out to sea_distance yalms (the game's fog's end); the baked water then
+		// reaches as far, so nothing changes where one would have faded out
+		bool sea = true;
+		float sea_distance = 1000.0f;
 		float sky[3] = { 0.4f, 0.52f, 0.66f };
 		float glint = 0.0f;
 		float sun_color[3] = { 1.0f, 0.95f, 0.85f };
@@ -309,9 +352,59 @@ namespace grass
 			float disc[3] = { 1.0f, 0.95f, 0.85f }; // their colour
 			float stars = 0.0f;     // how bright the stars (0 none: by day, or no clear sky)
 			float star_turn = 0.0f; // how far the stars have turned about the pole (radians: the Vana'diel hour's)
+			float moon_lit = 1.0f;  // how much of the moon is lit (the game's phase: 0 new .. 1 full)
+			float moon_side[3] = { -1.0f, 0.0f, 0.0f }; // which way its lit side faces (the world's: west waxing, east waning)
 			bool debug = false;     // what's repainted tinted magenta, sky left as the game drew it (clouds...) red
 		} dome;
+		// The weather of its own beyond rain and snow (weather_fx_of; the core fills it in while World FX draws all of the
+		// zone's weather, its settings in it): each part 0 when it isn't there. The sky's parts (clouds, aurora, the bolt, a
+		// darker or starrier sky) are drawn with the sky of its own (dome.on); heat shimmer in the shading pass; dust, sand
+		// and wind streaks, gloom's fog banks and the lightning's flash over everything drawn at the end (the air pass:
+		// over the grass, the water and the rain too); the grass bends with the wind; leaves fly on the rain map.
+		struct weather_fx
+		{
+			// Toward where the wind blows (x, z: the game's world, a unit vector) and how hard (0 calm .. 1 wind .. 2 gales)
+			float wind[2] = { 1.0f, 0.0f };
+			float wind_strength = 0.0f;
+			// The ground under the camera (the game's y, down positive): fog banks and dust lie on it, heat shimmers over it
+			float ground_y = 0.0f;
+			// Clouds (with dome.on): how much of the sky they cover (0 none .. 1 overcast) and how opaque at most; a veil over
+			// all of the sky (mist) in its colour; where they've drifted to (the noise's units, each pair wrapped to its
+			// period: the broad shapes', then the detail's, which drifts faster, so they change as they go); their colour
+			// where the sun or moon lights them and underneath
+			float cloud_cover = 0.0f, cloud_thick = 0.0f, cloud_veil = 0.0f;
+			float veil_colour[3] = { 0.6f, 0.62f, 0.66f };
+			float cloud_drift[4] = {};
+			float cloud_lit[3] = { 1.0f, 1.0f, 1.0f }, cloud_shade[3] = { 0.6f, 0.62f, 0.66f };
+			// Lightning: how bright its flash is now (0 none: the scene lit cool white for a moment, the sky and clouds with
+			// it), and its bolt's (0 none) with where it is: its bearing (radians from north toward east), how high it
+			// starts (radians over the horizon), its shape (a number of its own)
+			float flash = 0.0f, bolt = 0.0f, bolt_bearing = 0.0f, bolt_top = 0.3f, bolt_seed = 0.0f;
+			// Dust or sand in the air (0 none .. 1 a storm's, up to 2), its colour as lit now, and its streaks blown along
+			// the ground (0 none); the wind's own streaks (wind and gales) are these with no dust
+			float dust = 0.0f, streaks = 0.0f;
+			float dust_colour[3] = { 0.5f, 0.44f, 0.36f };
+			// Gloom's fog banks along the ground (0 none .. 1 darkness's, up to 2), their colour as lit now, and how far
+			// they've drifted with the wind (the noise's units, 48 yalms each, wrapped to its period of 256)
+			float gloom = 0.0f;
+			float gloom_colour[3] = { 0.3f, 0.31f, 0.33f };
+			float bank_drift[2] = {};
+			// Heat shimmer over distant ground (0 none .. 1 a heat wave's, up to 2)
+			float heat = 0.0f;
+			// An aurora's curtains in the sky (0 none .. 1, already as strong as the night makes them)
+			float aurora = 0.0f;
+			// The sky darker (0 as the record has it .. 1 black), the stars brighter and more of them (1 as they are)
+			float sky_dark = 0.0f, star_boost = 1.0f;
+			// Leaves blown along the ground (with the rain map: the share of the rain's columns with one) in this light
+			float leaves = 0.0f;
+			float leaf_light[3] = { 0.6f, 0.6f, 0.6f };
+		} wx;
 	};
+
+	// The weather of its own's colours and amounts from a weather and its record (weather_fx_of, then the clouds, dust and
+	// gloom lit as its record lights the zone, the veil in its fog's colour), into wx; what moves (the wind's direction,
+	// the clouds' drift, the lightning, the ground's height) and the settings are the caller's
+	void weather_look(const weather &w, const look::sky_dome &dome, look::weather_fx &wx);
 
 	// The game's sky dome as it draws it (client-notes "Sky": 03D640): each band between two stops cut into this many
 	// strips (one per 0.083 of height, at least one), each strip's edges coloured by the stops' bytes scaled and cut to
@@ -368,6 +461,7 @@ namespace grass
 		float sun_map_fade[2] = { 1.0f, 1.0f }; // how far each cascade's last drawing has faded in over the one before
 		uint32_t sun_map_triangles = 0; // triangles drawn into them
 		uint32_t water_corners = 0; // of the water drawn (the water, or the debug view)
+		uint32_t sea_corners = 0;   // of the sea's sheets drawn
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
 		uint32_t lamps = 0;         // lamps whose glow the shading pass added
 		bool wet = false;           // the wet look on path and stone in the shading pass
@@ -376,6 +470,10 @@ namespace grass
 		bool rain_map_moved = false; // the rain map's window around the camera was written again this frame
 		uint32_t snow_flakes = 0;   // snowflake places drawn (instances, as the drops)
 		bool sky = false;           // the sky of its own in the shading pass
+		bool weather = false;       // the weather of its own's parameters went to the passes (look::wx)
+		bool shimmer = false;       // heat shimmer in the shading pass
+		bool air = false;           // the air pass at the end (dust, streaks, fog banks) or the lightning's flash after it
+		uint32_t leaves = 0;        // leaf places drawn (instances, as the snow's)
 		bool wear = false;          // the grass's wear (trodden down, cut, growing back) in the blades
 		uint32_t cuts = 0;          // weapon-skill cuts sent to the blades this frame
 		uint32_t vis_boxes = 0;     // the game's visibility tests answered from the depth copy this frame (vistest)
@@ -435,7 +533,17 @@ namespace grass
 		float shading_ms() const { return _shading_ms; }
 		float last_shading_ms() const { return _last_shading_ms; } // (the newest frame's alone, unsmoothed: for the bench)
 		float grass_ms() const { return _grass_ms; }
-		void reset_timing() { _shading_ms = _grass_ms = 0.0f; }
+		// GPU time by section (each marker's name, from it to the next marker: "worldfx: water" ...), smoothed over the
+		// frames it ran in, and in how many of the frames timed since the last reset it ran
+		struct gpu_section
+		{
+			std::wstring name;
+			float ms = 0.0f;
+			uint32_t frames = 0;
+		};
+		const std::vector<gpu_section> &gpu_sections() const { return _sections; }
+		uint32_t frames_timed() const { return _frames_timed; }
+		void reset_timing() { _shading_ms = _grass_ms = 0.0f; _sections.clear(); _frames_timed = 0; }
 		// Replaces the shaders with ones compiled from this source (the built-in ones: src/render/grass.hlsl); false
 		// and the compiler's messages in error, keeping the ones in use, when it doesn't compile
 		bool set_shader_source(const std::string &source, std::string &error);
@@ -452,6 +560,11 @@ namespace grass
 		bool water_loaded() const { return _water != nullptr; }
 		uint32_t water_zone() const { return _water_zone; }
 		uint32_t water_corners() const { return _water_corners; }
+		// The zone's sea sheets (read_sea_file), for the sea; the previous ones go like the blades'
+		bool upload_sea(const blade_file &file, std::string &error);
+		void unload_sea();
+		bool sea_loaded() const { return _sea != nullptr; }
+		uint32_t sea_corners() const { return _sea_corners; }
 		// The zone's wet mask (tools/bake_wet.py), for the wet look in rain; the previous one goes like the blades'
 		bool upload_wet(const wet_file &file, std::string &error);
 		void unload_wet();
@@ -505,9 +618,13 @@ namespace grass
 		ID3D12PipelineState *shade_pipeline_for(const target &t, std::string &error);
 		ID3D12PipelineState *sun_pipeline(std::string &error);
 		bool sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
-		ID3D12PipelineState *water_pipeline_for(const target &t, bool debug, std::string &error);
+		// The water's pipelines: the water alone (a zone without a sea), the debug view, and with a sea the baked water's
+		// whole pixels (marking them in the stencil), the sea where they aren't, the baked water's fading pixels over that
+		enum class water_kind { plain, debug, whole, sea, fading };
+		ID3D12PipelineState *water_pipeline_for(const target &t, water_kind kind, std::string &error);
 		ID3D12PipelineState *firefly_pipeline_for(const target &t, std::string &error);
-		enum class fall { rain, splash, snow };
+		ID3D12PipelineState *air_pipeline_for(const target &t, bool flash, std::string &error);
+		enum class fall { rain, splash, snow, leaf };
 		ID3D12PipelineState *rain_pipeline_for(const target &t, fall kind, std::string &error);
 		bool rain_window_for(const float eye[3], bool &moved, std::string &error);
 		uint32_t copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state);
@@ -530,9 +647,10 @@ namespace grass
 			DXGI_SAMPLE_DESC samples;
 			ID3D12PipelineState *pso;
 		};
-		std::vector<pso_entry> _psos, _shade_psos, _water_psos, _water_debug_psos, _firefly_psos, _rain_psos, _splash_psos, _snow_psos;
+		std::vector<pso_entry> _psos, _shade_psos, _water_psos, _water_debug_psos, _firefly_psos, _rain_psos, _splash_psos, _snow_psos, _leaf_psos, _air_psos, _flash_psos;
+		std::vector<pso_entry> _water_whole_psos, _sea_psos, _water_fading_psos;
 		std::vector<uint8_t> _shade_vs, _shade_ps, _water_vs, _water_ps, _water_debug_vs, _water_debug_ps, _sun_ps, _shadow_vs, _shadow_ps, _firefly_vs, _firefly_ps;
-		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps;
+		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps, _leaf_vs, _leaf_ps, _air_ps, _flash_ps;
 		uint64_t _shader_key = 0;
 		bool _shaders_from_cache = false;
 		double _shader_seconds = 0.0;
@@ -588,15 +706,24 @@ namespace grass
 		// (the look's clock when the memory was zeroed, the wear's times count from it; and at the last draw)
 		double _memory_epoch = 0.0, _last_clock = 0.0;
 		ID3D12Resource *_zeros = nullptr;  // 1 MB of zeros (upload heap), for that
-		ID3D12Resource *_blade_depth = nullptr;     // the blades' own depth (D32, the world target's size, in DEPTH_WRITE)
+		ID3D12Resource *_blade_depth = nullptr;     // the blades' own depth (D24S8, the world target's size, in DEPTH_WRITE;
+		                                            // the water pass marks the baked water's pixels in its stencil)
 		ID3D12DescriptorHeap *_dsv_heap = nullptr;  // its view
 		ID3D12DescriptorHeap *_rtv_heap = nullptr;  // the add-on's own view of the world's target (made each draw)
-		static constexpr UINT kTimingSlots = 4;
-		ID3D12QueryHeap *_queries = nullptr; // timestamps: start, after the shading, end; a frame's in each slot in turn
+		static constexpr UINT kTimingSlots = 4, kTimingMarks = 32;
+		ID3D12QueryHeap *_queries = nullptr; // timestamps: one at each section's marker and one at the end; a frame's in each slot in turn
 		ID3D12Resource *_times = nullptr;    // where they're resolved (readback heap)
 		UINT _time_slot = 0, _timed = 0;
 		uint64_t _frequency = 0;
 		float _shading_ms = 0.0f, _grass_ms = 0.0f, _last_shading_ms = 0.0f;
+		// Each slot's markers: their names (nullptr: the end), how many, where the copies and shading part ended
+		// (kTimingMarks: it didn't: all of it was)
+		const wchar_t *_mark_names[kTimingSlots][kTimingMarks] = {};
+		UINT _mark_count[kTimingSlots] = {}, _shade_end[kTimingSlots] = {};
+		std::vector<gpu_section> _sections;
+		uint32_t _frames_timed = 0;
+		// A section starting: the GPU crash report's marker, and a timestamp
+		void section(ID3D12GraphicsCommandList *list, const wchar_t *name);
 		ID3D12Resource *_actors[4] = {};   // the actors near, a frame's in each in turn (upload heaps, mapped)
 		float *_actor_data[4] = {};
 		uint32_t _actor_slot = 0;
@@ -612,6 +739,9 @@ namespace grass
 		uint32_t _wet_width = 0, _wet_height = 0, _wet_words_a_row = 0;
 		ID3D12Resource *_water = nullptr;  // the zone's water corners, 32 bytes each (upload heap)
 		uint32_t _water_zone = 0, _water_corners = 0;
+		ID3D12Resource *_sea = nullptr;    // the zone's sea sheets' corners, the same (upload heap)
+		uint32_t _sea_corners = 0;
+		float _sea_box[4] = {};            // its corners' x and z, least and most: none drawn while it's all past the water's reach
 		float _water_cell_size = 32.0f;
 		std::vector<blade_file::cell> _water_cells;
 		struct copy

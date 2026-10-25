@@ -1,10 +1,11 @@
 /*
  * HiFi XI's zone files made on the player's PC (src/bake/runner: the bakers on a thread of their own), into a folder of
  * the test's own, the FFXiMain dump mapped (tests/game_dump.hpp) for the game's key tables:
- *   - a zone entered (West Ronfaure, 100): its grass, water, shadow map and lamps made; its wet ground and rain, which
- *     it has none of, marked .none (not tried again); the shadow map only because the zone is in worldfx-sunlit.txt;
+ *   - a zone entered (West Ronfaure, 100): its grass, water, shadow map and lamps made; its wet ground, rain and sea
+ *     (its pond lies inside the zone: no sheet goes on past it), which it has none of, marked .none (not tried again);
+ *     the shadow map only because the zone is in worldfx-sunlit.txt;
  *   - a zone with only meshes under open sky (1): its shadow map, every other kind .none;
- *   - entered again: nothing made twice;
+ *   - entered again: nothing made twice; but a lamps file from before the hour (LMP1) made again, as LMP2;
  *   - each file the same bytes as the baker's own, made straight (the bakers' tests check those against the Python);
  *   - status while it works and after, and stop() with the thread ending.
  *
@@ -61,7 +62,7 @@ namespace
 
 	void empty_folder(const std::wstring &folder)
 	{
-		for (const wchar_t *kind : { L"worldfx-grass", L"worldfx-water", L"worldfx-wet", L"worldfx-rain", L"worldfx-shadow", L"worldfx-lamps" })
+		for (const wchar_t *kind : { L"worldfx-grass", L"worldfx-water", L"worldfx-wet", L"worldfx-rain", L"worldfx-sea", L"worldfx-shadow", L"worldfx-lamps" })
 		{
 			WIN32_FIND_DATAW d;
 			const std::wstring sub = folder + kind + L"\\";
@@ -129,10 +130,11 @@ int main()
 	auto bin = [&](const wchar_t *kind, uint32_t zone) { return folder + kind + L"\\" + std::to_wstring(zone) + L".bin"; };
 	auto none = [&](const wchar_t *kind, uint32_t zone) { return folder + kind + L"\\" + std::to_wstring(zone) + L".none"; };
 	char line[200];
-	std::snprintf(line, sizeof(line), "zone 100: its grass, water, shadow map and lamps made (%.1f s); its wet ground and rain marked none",
+	std::snprintf(line, sizeof(line), "zone 100: its grass, water, shadow map and lamps made (%.1f s); its wet ground, rain and sea marked none",
 		seconds);
 	check(exists(bin(L"worldfx-grass", 100)) && exists(bin(L"worldfx-water", 100)) && exists(bin(L"worldfx-shadow", 100)) &&
-		exists(bin(L"worldfx-lamps", 100)) && exists(none(L"worldfx-wet", 100)) && exists(none(L"worldfx-rain", 100)), line);
+		exists(bin(L"worldfx-lamps", 100)) && exists(none(L"worldfx-wet", 100)) && exists(none(L"worldfx-rain", 100)) &&
+		exists(none(L"worldfx-sea", 100)) && !exists(bin(L"worldfx-sea", 100)), line);
 	check(g_reloads == 1, "World FX told to read zone 100's files again (it's the zone you're in)");
 
 	// The same bytes as each baker's own, made straight
@@ -149,14 +151,20 @@ int main()
 			std::vector<uint8_t> a, b;
 			same = same && o.bake(100, mine, r) && hifi::bake::read_file(mine, a) && hifi::bake::read_file(bin(o.kind, 100), b) && a == b;
 		}
-		check(same, "each the same bytes as its baker's own");
+		{
+			// (the sea from the water the runner made: none, as the runner found)
+			const std::wstring mine = straight + L"worldfx-sea.bin";
+			DeleteFileW(mine.c_str()); // (an earlier run's)
+			same = same && !hifi::bake::sea(100, mine, bin(L"worldfx-water", 100), r) && r.none && !exists(mine);
+		}
+		check(same, "each the same bytes as its baker's own (the sea: none from the baker too)");
 	}
 
 	// A zone with no collision and no lamps (Phanauet Channel, 1: the barge's), only meshes under open sky
 	hifi::bake::runner::zone_entered(1);
 	check(wait_idle(60.0), "zone 1 entered: done");
 	bool all_none = true;
-	for (const wchar_t *kind : { L"worldfx-grass", L"worldfx-water", L"worldfx-wet", L"worldfx-rain", L"worldfx-lamps" })
+	for (const wchar_t *kind : { L"worldfx-grass", L"worldfx-water", L"worldfx-wet", L"worldfx-rain", L"worldfx-sea", L"worldfx-lamps" })
 		all_none = all_none && exists(none(kind, 1)) && !exists(bin(kind, 1));
 	check(all_none && exists(bin(L"worldfx-shadow", 1)), "zone 1: its shadow map made, every other kind marked none, nothing written for them");
 
@@ -169,6 +177,47 @@ int main()
 	const hifi::bake::runner_status after = hifi::bake::runner::status();
 	check(CompareFileTime(&grass_at, &grass_again) == 0 && after.lines.front() == before.lines.front(), "nothing made twice");
 	std::printf("  status: %s\n", after.lines.front().c_str());
+
+	// A lamps file from before the hour (LMP1): made again as LMP2 when the zone is entered, nothing else
+	{
+		std::vector<uint8_t> lamps;
+		check(hifi::bake::read_file(bin(L"worldfx-lamps", 100), lamps) && lamps.size() > 4 && std::memcmp(lamps.data(), "LMP2", 4) == 0,
+			"zone 100's lamps made as LMP2 (their brightness fully lit, by their curves over the day)");
+		std::vector<uint8_t> older = lamps;
+		if (older.size() > 4)
+			std::memcpy(older.data(), "LMP1", 4);
+		hifi::bake::write_file(bin(L"worldfx-lamps", 100), older.data(), older.size());
+		hifi::bake::runner::zone_entered(100);
+		check(wait_idle(30.0), "zone 100 entered with an LMP1 lamps file: done");
+		std::vector<uint8_t> again;
+		const FILETIME grass_now = written(bin(L"worldfx-grass", 100));
+		check(hifi::bake::read_file(bin(L"worldfx-lamps", 100), again) && again == lamps && CompareFileTime(&grass_at, &grass_now) == 0,
+			"its lamps made again (the same LMP2 bytes), its grass left as it was");
+	}
+
+	// Water from before the sea rule (no <zone>.r2 beside it): it, the rain and the sea made again (their none marks
+	// too), nothing else
+	{
+		const std::wstring mark = folder + L"worldfx-water\\100.r2";
+		check(exists(mark), "zone 100's water made with the sea rule's mark (100.r2)");
+		std::vector<uint8_t> water;
+		hifi::bake::read_file(bin(L"worldfx-water", 100), water);
+		DeleteFileW(mark.c_str());
+		const FILETIME rain_none_at = written(none(L"worldfx-rain", 100)), grass_now = written(bin(L"worldfx-grass", 100));
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		hifi::bake::runner::zone_entered(100);
+		check(wait_idle(60.0), "zone 100 entered with water from before the sea rule: done");
+		std::vector<uint8_t> again;
+		const FILETIME rain_none_again = written(none(L"worldfx-rain", 100)), grass_again2 = written(bin(L"worldfx-grass", 100));
+		check(exists(mark) && hifi::bake::read_file(bin(L"worldfx-water", 100), again) && again == water && exists(none(L"worldfx-rain", 100)) &&
+				exists(none(L"worldfx-sea", 100)) && CompareFileTime(&rain_none_at, &rain_none_again) != 0 &&
+				CompareFileTime(&grass_now, &grass_again2) == 0,
+			"its water made again (the same bytes here, the mark back), its rain and sea looked at again (none), its grass left as it was");
+		hifi::bake::runner::zone_entered(100);
+		const bool idle = wait_idle(10.0);
+		const FILETIME rain_none_third = written(none(L"worldfx-rain", 100));
+		check(idle && CompareFileTime(&rain_none_again, &rain_none_third) == 0, "and entered once more: nothing made");
+	}
 
 	// A Mog House (1000 + its room): nothing to make
 	hifi::bake::runner::zone_entered(1261);

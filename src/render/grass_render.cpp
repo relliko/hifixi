@@ -48,6 +48,7 @@ namespace grass
 		// height), its clear colour and the dome's segments, each band's strips, the view's first and third rows with
 		// the stars' and the sun's strength, toward the light (view space) and whether it's the moon, the disc's colour
 		// and the stars' turn, the time and how near the game's dome a pixel must be to be repainted, the stops' slopes
+		// (with the moon's lit side and phase in the first four's spare places)
 		constexpr UINT kSkyParams = 96;
 		// ... and after the sky the grass's wear (grass.hlsl kWear): the memory's clock now, the frame's length, how much
 		// the wear shows and who's fighting (bits); how many cuts; then each cut's swath (8 floats: from, half-width, to,
@@ -55,8 +56,12 @@ namespace grass
 		constexpr UINT kWearParams = 8 + kMaxCuts * 8;
 		// ... and after the wear's the shadow map's drawings before the last (grass.hlsl kSunMapPrev; sun_map_params)
 		constexpr UINT kSunMapPrevParams = 32;
-		constexpr UINT kActorBytes = kMaxActors * 16 + kSunMapParams * 4 + kLampParams * 4 + kHazeParams * 4 + kWetParams * 4 + kSkyParams * 4 +
-			kWearParams * 4 + kSunMapPrevParams * 4;
+		// ... and after those the weather of its own's (grass.hlsl kWx, look::weather_fx; rule bit 512): the wind, the view's
+		// first and third rows with the ground's height and the time, the clouds and their colours, the lightning, the
+		// dust, the gloom and the heat
+		constexpr UINT kWxParams = 64;
+		constexpr UINT kWxOffset = kMaxActors * 4 + kSunMapParams + kLampParams + kHazeParams + kWetParams + kSkyParams + kWearParams + kSunMapPrevParams;
+		constexpr UINT kActorBytes = (kWxOffset + kWxParams) * 4;
 		// Each point's memory (grass.hlsl kMemoryStride): its ground colour (12 bytes), then when its trampling wears off
 		// and when it has grown back from a cut (f32 seconds on the memory's clock, 0 never)
 		constexpr UINT kMemoryStride = 20;
@@ -76,6 +81,15 @@ namespace grass
 		// kSnowSpeed yalms a second (each flake 0.7 to 1.4 times that)
 		constexpr float kSnowRadius = 20.0f, kSnowSpeed = 2.0f;
 		constexpr UINT kSnowLayers = 8;
+		// Leaves in wind and gales: in the same columns (two a column, kLeafLayers), drawn within kLeafRadius yalms, falling
+		// about kLeafSpeed yalms a second and blown far across as they go (grass.hlsl, "Leaves"); at most kLeafShare of the
+		// columns hold one
+		constexpr float kLeafRadius = 20.0f, kLeafSpeed = 1.4f, kLeafShare = 0.2f;
+		constexpr UINT kLeafLayers = 2;
+		// The blades' own depth buffer, also the water pass's (the nearest water kept): with a stencil, where the baked water
+		// marks the pixels it draws whole, so the sea isn't drawn there (D24: the blades are within 40 yalms, the depth only
+		// decides which of the water's own surfaces is in front; the world's own depth is a copy of the game's D24 anyway)
+		constexpr DXGI_FORMAT kBladeDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 
 		// The shaders: src/render/grass.hlsl, built in (tools/embed.py); worldfx.hlsl next to the add-on replaces them
 		// while the game runs (compiled on a thread of its own, then set_shader_code)
@@ -101,7 +115,8 @@ namespace grass
 			{ "shadow_vs", "vs_5_0" }, { "shadow_ps", "ps_5_0" }, { "water_vs", "vs_5_0" }, { "water_ps", "ps_5_0" },
 			{ "water_debug_vs", "vs_5_0" }, { "water_debug_ps", "ps_5_0" }, { "firefly_vs", "vs_5_0" }, { "firefly_ps", "ps_5_0" },
 			{ "rain_vs", "vs_5_0" }, { "rain_ps", "ps_5_0" }, { "splash_vs", "vs_5_0" }, { "splash_ps", "ps_5_0" },
-			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" } };
+			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" }, { "leaf_vs", "vs_5_0" }, { "leaf_ps", "ps_5_0" },
+			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" } };
 		constexpr size_t kShaderEntryCount = sizeof(kShaderEntries) / sizeof(kShaderEntries[0]);
 		constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
@@ -392,6 +407,166 @@ namespace grass
 					return &k;
 			return nullptr;
 		}
+
+		// What each weather brings of the add-on's own beyond rain and snow (weather_kind_fx, grass_render.hpp), by id as
+		// kWeathers: its clouds (cover, thick, dark, veil, speed), its wind (wind, windy, streaks, leaves), dust and sand,
+		// lightning, heat, aurora, gloom, a darker sky and the stars. Fine weather a few clouds, sunshine scattered ones,
+		// clouds overcast, mist a low-contrast haze; rain, squalls and thunder dark overcast, snow and blizzards grey; dust
+		// and sand storms a brown haze; wind and gales clouds racing; gloom and darkness heavy and dark.
+		const weather_kind_fx kWeatherFx[] = {
+			//  cover  thick  dark  veil  speed   wind windy streaks leaves  dust  sand  flash heat  aurora gloom  dark  stars
+			{ 0.22f, 0.85f, 0.05f, 0.0f, 0.7f, 0.15f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f },   // fine
+			{ 0.4f, 0.9f, 0.08f, 0.0f, 0.8f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f },     // sunshine
+			{ 0.8f, 0.95f, 0.3f, 0.08f, 0.9f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 1.0f },   // clouds
+			{ 0.55f, 0.55f, 0.15f, 0.7f, 0.4f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f },   // mist
+			{ 0.15f, 0.75f, 0.05f, 0.08f, 0.6f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f },  // hot spell
+			{ 0.08f, 0.6f, 0.05f, 0.12f, 0.5f, 0.15f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f },  // heat wave
+			{ 0.95f, 1.0f, 0.6f, 0.2f, 1.1f, 0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.15f, 1.0f },    // rain
+			{ 1.0f, 1.0f, 0.65f, 0.25f, 1.8f, 0.9f, 0.0f, 0.0f, 0.25f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f, 1.0f },   // squall
+			{ 0.55f, 0.8f, 0.25f, 0.3f, 1.6f, 1.0f, 0.0f, 1.0f, 0.0f, 0.75f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 1.0f },  // dust storm
+			{ 0.6f, 0.85f, 0.3f, 0.4f, 2.0f, 1.3f, 0.0f, 1.2f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 1.0f },    // sand storm
+			{ 0.5f, 0.9f, 0.15f, 0.05f, 2.4f, 1.0f, 1.0f, 0.35f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f },   // wind
+			{ 0.72f, 0.95f, 0.3f, 0.1f, 3.6f, 2.0f, 1.0f, 0.6f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 1.0f },   // gales
+			{ 0.92f, 1.0f, 0.35f, 0.25f, 0.6f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 1.0f },  // snow
+			{ 1.0f, 1.0f, 0.45f, 0.4f, 2.4f, 1.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 1.0f },     // blizzard
+			{ 1.0f, 1.0f, 0.72f, 0.15f, 1.3f, 0.6f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.7f, 0.0f, 0.0f, 0.0f, 0.2f, 1.0f },    // thunder
+			{ 1.0f, 1.0f, 0.8f, 0.2f, 1.6f, 0.9f, 0.0f, 0.0f, 0.15f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.25f, 1.0f },    // thunderstorm
+			{ 0.1f, 0.7f, 0.1f, 0.0f, 0.5f, 0.15f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.3f },     // aurora
+			{ 0.04f, 0.6f, 0.05f, 0.0f, 0.5f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2.2f },    // stellar glare
+			{ 0.9f, 1.0f, 0.75f, 0.35f, 0.5f, 0.15f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.75f, 0.35f, 1.0f }, // gloom
+			{ 1.0f, 1.0f, 0.9f, 0.45f, 0.6f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.55f, 1.0f },    // darkness
+		};
+		static_assert(sizeof(kWeatherFx) / sizeof(kWeatherFx[0]) == sizeof(kWeathers) / sizeof(kWeathers[0]), "a look for each weather");
+
+		float luma(const float c[3]) { return 0.3f * c[0] + 0.59f * c[1] + 0.11f * c[2]; }
+
+		// The way the game's own clouds drift in each zone and weather (research/ffxi-re/data/zone_wind.txt, from
+		// tools/zone_wind.py: the bearing they go toward, degrees from north toward east; client-notes "Wind"): the zone,
+		// the weather's folder, the bearing
+		struct zone_wind
+		{
+			uint16_t zone;
+			char name[5];
+			float bearing;
+		};
+		const zone_wind kZoneWinds[] = {
+			{ 1, "clod", 280.8f }, { 1, "mist", 290.0f }, { 1, "rain", 236.4f }, { 1, "suny", 192.8f }, { 1, "thdr", 290.0f },
+			{ 2, "clod", 281.1f }, { 2, "mist", 290.0f }, { 2, "rain", 236.4f }, { 2, "suny", 276.1f }, { 2, "thdr", 284.7f },
+			{ 3, "clod", 280.8f }, { 3, "mist", 290.0f }, { 3, "suny", 192.8f }, { 4, "clod", 270.0f }, { 4, "fine", 180.0f },
+			{ 4, "mist", 281.1f }, { 4, "suny", 237.4f }, { 5, "clod", 282.0f }, { 5, "mist", 280.8f }, { 5, "snow", 290.0f },
+			{ 5, "suny", 276.2f }, { 6, "fine", 218.6f }, { 6, "suny", 258.7f }, { 7, "clod", 280.8f }, { 7, "dust", 197.3f },
+			{ 7, "mist", 280.8f }, { 7, "suny", 276.1f }, { 7, "wind", 276.9f }, { 8, "clod", 280.8f }, { 8, "dust", 197.3f },
+			{ 8, "mist", 280.8f }, { 8, "suny", 276.1f }, { 8, "wind", 276.9f }, { 24, "clod", 282.6f },
+			{ 24, "fogd", 270.0f }, { 24, "mist", 281.1f }, { 24, "suny", 283.5f }, { 24, "thdr", 283.6f },
+			{ 24, "wind", 280.0f }, { 25, "clod", 291.4f }, { 25, "fogd", 270.0f }, { 25, "mist", 281.1f },
+			{ 25, "suny", 288.7f }, { 25, "thdr", 286.2f }, { 25, "wind", 281.2f }, { 26, "clod", 288.5f },
+			{ 26, "fogd", 287.4f }, { 26, "mist", 287.4f }, { 26, "suny", 279.0f }, { 26, "thdr", 283.8f },
+			{ 26, "wind", 279.0f }, { 29, "clod", 215.4f }, { 29, "stom", 88.1f }, { 29, "thdr", 215.4f },
+			{ 30, "clod", 215.4f }, { 30, "stom", 88.1f }, { 30, "thdr", 215.4f }, { 31, "clod", 215.4f },
+			{ 31, "stom", 88.1f }, { 31, "thdr", 215.4f }, { 33, "clod", 15.4f }, { 33, "fine", 15.4f },
+			{ 33, "mist", 15.4f }, { 33, "suny", 15.4f }, { 39, "dark", 281.4f }, { 40, "dark", 281.4f },
+			{ 41, "dark", 281.4f }, { 42, "dark", 281.4f }, { 43, "suny", 273.6f }, { 44, "suny", 273.6f },
+			{ 46, "clod", 270.0f }, { 46, "thdr", 191.6f }, { 47, "clod", 270.0f }, { 47, "thdr", 191.6f },
+			{ 49, "clod", 281.1f }, { 49, "mist", 281.1f }, { 49, "suny", 276.1f }, { 51, "clod", 270.0f },
+			{ 52, "clod", 270.0f }, { 58, "clod", 270.0f }, { 58, "mis1", 281.1f }, { 58, "suny", 310.0f },
+			{ 58, "thdr", 281.9f }, { 58, "wind", 270.0f }, { 59, "clod", 270.0f }, { 59, "mis1", 281.1f },
+			{ 59, "suny", 310.0f }, { 59, "thdr", 281.9f }, { 59, "wind", 270.0f }, { 61, "mist", 348.7f },
+			{ 65, "clod", 270.0f }, { 66, "clod", 270.0f }, { 67, "clod", 270.0f }, { 70, "clod", 281.4f },
+			{ 70, "mist", 281.1f }, { 70, "rain", 260.8f }, { 70, "squl", 236.4f }, { 70, "stom", 197.1f },
+			{ 70, "suny", 276.1f }, { 73, "clod", 270.0f }, { 73, "suny", 254.2f }, { 74, "clod", 268.9f },
+			{ 74, "suny", 254.2f }, { 74, "thdr", 281.0f }, { 75, "clod", 270.0f }, { 75, "suny", 94.8f },
+			{ 76, "clod", 270.0f }, { 76, "suny", 254.2f }, { 76, "thdr", 281.9f }, { 77, "aura", 203.8f },
+			{ 77, "suny", 203.8f }, { 81, "clod", 290.0f }, { 82, "rain", 262.4f }, { 83, "bolt", 283.8f },
+			{ 83, "clod", 282.3f }, { 83, "wind", 290.0f }, { 84, "clod", 278.8f }, { 84, "suny", 250.0f },
+			{ 85, "clod", 278.8f }, { 85, "rain", 276.3f }, { 85, "thdr", 285.3f }, { 87, "clod", 278.8f },
+			{ 89, "clod", 278.8f }, { 89, "thdr", 285.3f }, { 90, "clod", 278.8f }, { 90, "rain", 285.8f },
+			{ 90, "thdr", 285.3f }, { 91, "clod", 281.1f }, { 91, "mist", 281.1f }, { 91, "rain", 285.8f },
+			{ 92, "clod", 281.6f }, { 92, "rain", 262.4f }, { 92, "thdr", 282.7f }, { 94, "clod", 278.8f },
+			{ 95, "clod", 283.6f }, { 95, "mist", 280.0f }, { 97, "suny", 250.0f }, { 98, "clod", 278.8f },
+			{ 98, "suny", 250.0f }, { 98, "thdr", 284.3f }, { 99, "suny", 250.0f }, { 100, "clod", 281.1f },
+			{ 100, "mist", 281.1f }, { 100, "suny", 276.1f }, { 101, "clod", 281.1f }, { 101, "mist", 281.1f },
+			{ 101, "suny", 276.1f }, { 102, "clod", 281.4f }, { 102, "mist", 281.1f }, { 102, "rain", 260.8f },
+			{ 102, "suny", 276.1f }, { 102, "wind", 276.9f }, { 103, "clod", 281.1f }, { 103, "dust", 197.3f },
+			{ 103, "mist", 281.1f }, { 103, "suny", 276.1f }, { 104, "clod", 281.1f }, { 104, "mist", 280.0f },
+			{ 104, "rain", 262.4f }, { 104, "suny", 276.1f }, { 104, "thdr", 280.7f }, { 105, "clod", 281.1f },
+			{ 105, "dust", 197.3f }, { 105, "mist", 281.1f }, { 105, "snow", 281.1f }, { 105, "suny", 276.1f },
+			{ 106, "clod", 281.1f }, { 106, "mist", 281.1f }, { 106, "suny", 276.1f }, { 107, "clod", 281.1f },
+			{ 107, "mist", 281.1f }, { 107, "suny", 276.1f }, { 108, "clod", 281.3f }, { 108, "dust", 197.3f },
+			{ 108, "mist", 281.1f }, { 108, "suny", 276.1f }, { 108, "thdr", 284.0f }, { 109, "clod", 281.6f },
+			{ 109, "mist", 281.1f }, { 109, "rain", 261.0f }, { 109, "suny", 276.1f }, { 109, "thdr", 283.6f },
+			{ 110, "clod", 281.1f }, { 110, "mist", 281.1f }, { 110, "rain", 260.8f }, { 110, "suny", 276.1f },
+			{ 111, "clod", 281.4f }, { 111, "fogd", 270.0f }, { 111, "mist", 280.6f }, { 111, "snow", 280.0f },
+			{ 112, "clod", 281.4f }, { 112, "dark", 281.4f }, { 112, "fogd", 270.0f }, { 112, "mist", 280.8f },
+			{ 112, "snow", 290.0f }, { 113, "clod", 281.1f }, { 113, "mist", 281.1f }, { 113, "stom", 197.1f },
+			{ 113, "suny", 276.1f }, { 113, "wind", 197.3f }, { 114, "dust", 197.3f }, { 114, "sand", 196.4f },
+			{ 114, "suny", 276.1f }, { 115, "clod", 281.3f }, { 115, "mist", 280.0f }, { 115, "suny", 276.6f },
+			{ 116, "clod", 281.3f }, { 116, "mist", 280.0f }, { 116, "suny", 276.6f }, { 117, "clod", 280.8f },
+			{ 117, "dust", 197.3f }, { 117, "mist", 280.8f }, { 117, "suny", 276.1f }, { 117, "wind", 276.9f },
+			{ 118, "clod", 281.1f }, { 118, "mist", 281.1f }, { 118, "rain", 262.4f }, { 118, "squl", 262.4f },
+			{ 118, "suny", 276.1f }, { 118, "wind", 276.9f }, { 119, "clod", 280.8f }, { 119, "dust", 197.3f },
+			{ 119, "suny", 276.1f }, { 120, "clod", 281.1f }, { 120, "dust", 197.3f }, { 120, "suny", 276.1f },
+			{ 120, "thdr", 284.0f }, { 122, "clod", 281.6f }, { 122, "mist", 281.5f }, { 122, "suny", 276.2f },
+			{ 122, "thdr", 284.7f }, { 123, "clod", 281.1f }, { 123, "mist", 280.0f }, { 123, "rain", 236.4f },
+			{ 123, "squl", 236.4f }, { 123, "suny", 276.1f }, { 124, "clod", 281.1f }, { 124, "mist", 280.0f },
+			{ 124, "rain", 236.4f }, { 124, "squl", 236.4f }, { 124, "suny", 276.1f }, { 125, "dust", 197.3f },
+			{ 125, "sand", 196.4f }, { 125, "suny", 276.1f }, { 126, "clod", 281.5f }, { 126, "ligt", 277.5f },
+			{ 126, "mist", 281.5f }, { 126, "suny", 276.2f }, { 126, "thdr", 283.6f }, { 127, "clod", 281.5f },
+			{ 127, "ligt", 277.5f }, { 127, "mist", 281.5f }, { 127, "suny", 276.1f }, { 127, "thdr", 283.6f },
+			{ 128, "clod", 281.1f }, { 128, "mist", 281.1f }, { 128, "stom", 197.1f }, { 128, "suny", 276.1f },
+			{ 128, "wind", 197.3f }, { 130, "aura", 270.0f }, { 130, "fine", 270.0f }, { 130, "suny", 270.0f },
+			{ 130, "wind", 270.0f }, { 134, "dark", 281.4f }, { 135, "dark", 281.4f }, { 136, "clod", 282.8f },
+			{ 136, "mist", 280.8f }, { 136, "snow", 290.0f }, { 137, "clod", 282.8f }, { 137, "mist", 280.8f },
+			{ 137, "snow", 290.0f }, { 138, "clod", 277.4f }, { 138, "dark", 270.0f }, { 139, "clod", 279.2f },
+			{ 139, "mist", 281.3f }, { 139, "suny", 276.3f }, { 140, "clod", 281.1f }, { 140, "mist", 281.1f },
+			{ 140, "suny", 276.1f }, { 141, "clod", 281.1f }, { 141, "mist", 281.1f }, { 141, "suny", 276.1f },
+			{ 142, "clod", 279.2f }, { 142, "mist", 281.3f }, { 142, "suny", 276.3f }, { 145, "clod", 281.1f },
+			{ 145, "mist", 281.1f }, { 145, "suny", 275.2f }, { 146, "clod", 281.1f }, { 146, "mist", 281.1f },
+			{ 146, "suny", 275.2f }, { 147, "clod", 281.6f }, { 147, "mist", 281.1f }, { 147, "rain", 261.0f },
+			{ 147, "suny", 276.1f }, { 147, "thdr", 280.7f }, { 149, "clod", 279.8f }, { 149, "mist", 280.3f },
+			{ 149, "rain", 261.0f }, { 149, "suny", 276.4f }, { 149, "thdr", 280.7f }, { 151, "clod", 282.0f },
+			{ 151, "dust", 197.3f }, { 151, "suny", 276.1f }, { 156, "clod", 277.4f }, { 156, "dark", 270.0f },
+			{ 161, "clod", 283.4f }, { 161, "dark", 281.4f }, { 161, "fogd", 270.0f }, { 161, "mist", 280.0f },
+			{ 161, "snow", 270.0f }, { 165, "clod", 282.6f }, { 165, "dark", 282.4f }, { 165, "fogd", 270.0f },
+			{ 165, "mist", 283.2f }, { 165, "snow", 279.3f }, { 177, "aura", 270.0f }, { 177, "fine", 276.3f },
+			{ 177, "suny", 275.3f }, { 177, "wind", 280.7f }, { 178, "aura", 270.0f }, { 178, "fine", 276.3f },
+			{ 178, "suny", 275.3f }, { 178, "wind", 280.7f }, { 185, "dark", 281.4f }, { 186, "dark", 281.4f },
+			{ 187, "dark", 281.4f }, { 188, "dark", 281.4f }, { 190, "clod", 281.1f }, { 190, "mist", 279.9f },
+			{ 190, "suny", 276.1f }, { 191, "clod", 281.1f }, { 191, "mist", 278.9f }, { 191, "suny", 276.1f },
+			{ 198, "clod", 281.2f }, { 198, "dust", 190.4f }, { 198, "mist", 281.3f }, { 198, "suny", 274.9f },
+			{ 198, "wind", 270.0f }, { 205, "clod", 281.1f }, { 205, "mist", 280.0f }, { 205, "rain", 236.4f },
+			{ 205, "squl", 236.4f }, { 205, "suny", 276.1f }, { 206, "bliz", 280.0f }, { 206, "clod", 281.1f },
+			{ 206, "fogd", 270.0f }, { 206, "mist", 280.0f }, { 206, "snow", 280.0f }, { 210, "clod", 281.1f },
+			{ 210, "mist", 281.1f }, { 210, "suny", 276.1f }, { 220, "clod", 280.8f }, { 220, "mist", 281.7f },
+			{ 220, "rain", 261.0f }, { 220, "suny", 192.1f }, { 220, "thdr", 191.6f }, { 221, "clod", 280.8f },
+			{ 221, "mist", 281.7f }, { 221, "rain", 261.0f }, { 221, "suny", 192.1f }, { 221, "thdr", 191.6f },
+			{ 223, "suny", 191.5f }, { 224, "suny", 191.5f }, { 225, "suny", 191.5f }, { 226, "suny", 191.9f },
+			{ 227, "clod", 280.8f }, { 227, "mist", 281.7f }, { 227, "rain", 261.0f }, { 227, "suny", 192.1f },
+			{ 227, "thdr", 191.6f }, { 228, "clod", 280.8f }, { 228, "mist", 281.7f }, { 228, "rain", 261.0f },
+			{ 228, "suny", 192.1f }, { 228, "thdr", 191.6f }, { 229, "clod", 277.4f }, { 229, "dark", 270.0f },
+			{ 230, "clod", 281.3f }, { 230, "mist", 280.3f }, { 230, "suny", 276.4f }, { 231, "clod", 281.3f },
+			{ 231, "mist", 280.3f }, { 231, "suny", 276.4f }, { 232, "clod", 281.3f }, { 232, "mist", 280.3f },
+			{ 232, "suny", 276.4f }, { 233, "clod", 281.3f }, { 233, "mist", 280.3f }, { 233, "suny", 276.4f },
+			{ 234, "clod", 281.6f }, { 234, "mist", 281.1f }, { 234, "suny", 276.1f }, { 235, "clod", 281.3f },
+			{ 235, "mist", 280.6f }, { 235, "suny", 276.4f }, { 236, "clod", 281.3f }, { 236, "mist", 280.3f },
+			{ 236, "suny", 276.4f }, { 237, "clod", 281.3f }, { 237, "mist", 280.3f }, { 237, "suny", 276.4f },
+			{ 238, "clod", 281.4f }, { 238, "mist", 281.1f }, { 238, "suny", 276.1f }, { 239, "clod", 281.4f },
+			{ 239, "mist", 281.4f }, { 239, "suny", 276.2f }, { 240, "clod", 280.3f }, { 240, "mist", 281.1f },
+			{ 240, "suny", 276.1f }, { 241, "clod", 281.6f }, { 241, "mist", 281.1f }, { 241, "suny", 276.1f },
+			{ 243, "clod", 279.8f }, { 243, "mist", 280.3f }, { 243, "suny", 276.4f }, { 244, "clod", 280.0f },
+			{ 244, "mist", 280.8f }, { 244, "suny", 276.4f }, { 245, "clod", 279.9f }, { 245, "mist", 280.6f },
+			{ 245, "suny", 276.4f }, { 246, "clod", 279.9f }, { 246, "mist", 280.8f }, { 246, "suny", 276.4f },
+			{ 247, "dust", 197.3f }, { 247, "sand", 196.4f }, { 247, "suny", 276.1f }, { 248, "clod", 283.1f },
+			{ 248, "dust", 197.3f }, { 248, "mist", 281.1f }, { 248, "suny", 276.1f }, { 249, "clod", 281.6f },
+			{ 249, "mist", 281.1f }, { 249, "rain", 262.4f }, { 249, "squl", 262.4f }, { 249, "suny", 276.1f },
+			{ 249, "wind", 276.9f }, { 250, "clod", 281.4f }, { 250, "mist", 281.1f }, { 250, "suny", 276.1f },
+			{ 251, "bolt", 275.3f }, { 251, "clod", 275.3f }, { 251, "fine", 275.3f }, { 251, "mist", 275.3f },
+			{ 251, "rain", 275.3f }, { 251, "suny", 275.3f }, { 251, "thdr", 275.3f }, { 252, "clod", 281.4f },
+			{ 252, "mist", 281.1f }, { 252, "suny", 276.1f }, { 252, "thdr", 284.0f }, { 272, "clod", 281.1f },
+			{ 272, "mist", 281.1f }, { 272, "suny", 276.1f }, { 273, "clod", 281.1f }, { 273, "mist", 281.1f },
+			{ 273, "suny", 276.1f }
+		};
+		// (where the zone's clouds say nothing: west, the way they go in most zones)
+		constexpr float kWindDefault = 275.0f;
 
 		// For the weather now, blended with the one it's changing from
 		float blended(const weather &w, float (*of)(uint32_t), float unknown)
@@ -686,6 +861,151 @@ namespace grass
 		return blended(w, static_cast<float (*)(uint32_t)>(weather_sway), 0.0f);
 	}
 
+	weather_kind_fx weather_fx_of(uint32_t name)
+	{
+		const weather_kind *k = weather_by_name(name);
+		return k != nullptr ? kWeatherFx[k - kWeathers] : weather_kind_fx();
+	}
+
+	weather_kind_fx weather_fx_of(const weather &w)
+	{
+		if (!w.known || w.name == 0)
+			return weather_kind_fx();
+		const weather_kind_fx now = weather_fx_of(w.name);
+		if (w.before == 0 || w.change >= 1.0f)
+			return now;
+		const weather_kind_fx was = weather_fx_of(w.before);
+		const float f = std::clamp(w.change, 0.0f, 1.0f);
+		auto mix = [f](float a, float b) { return a + (b - a) * f; };
+		weather_kind_fx out;
+		out.cover = mix(was.cover, now.cover);
+		out.thick = mix(was.thick, now.thick);
+		out.dark = mix(was.dark, now.dark);
+		out.veil = mix(was.veil, now.veil);
+		out.speed = mix(was.speed, now.speed);
+		out.wind = mix(was.wind, now.wind);
+		out.windy = mix(was.windy, now.windy);
+		out.streaks = mix(was.streaks, now.streaks);
+		out.leaves = mix(was.leaves, now.leaves);
+		out.dust = mix(was.dust, now.dust);
+		// (sand's share of the dust in the air: each weather's by how much dust it has)
+		const float d0 = was.dust * (1.0f - f), d1 = now.dust * f;
+		out.sand = d0 + d1 > 0.0f ? (was.sand * d0 + now.sand * d1) / (d0 + d1) : 0.0f;
+		out.flashes = mix(was.flashes, now.flashes);
+		out.heat = mix(was.heat, now.heat);
+		out.aurora = mix(was.aurora, now.aurora);
+		out.gloom = mix(was.gloom, now.gloom);
+		out.sky_dark = mix(was.sky_dark, now.sky_dark);
+		out.stars = mix(was.stars, now.stars);
+		return out;
+	}
+
+	float wind_bearing(uint32_t zone, uint32_t name)
+	{
+		const weather_kind *k = weather_by_name(name);
+		float x = 0.0f, z = 0.0f;
+		for (const zone_wind &w : kZoneWinds)
+		{
+			if (w.zone != zone)
+				continue;
+			const uint32_t n = weather_name(w.name);
+			if (n == name || (k != nullptr && (n == weather_name(k->name) || n == weather_name(k->second))))
+				return w.bearing * 0.017453293f;
+			x += std::sin(w.bearing * 0.017453293f);
+			z += std::cos(w.bearing * 0.017453293f);
+		}
+		return x * x + z * z > 1e-6f ? std::atan2(x, z) : kWindDefault * 0.017453293f;
+	}
+
+	float wind_bearing(uint32_t zone, const weather &w)
+	{
+		const float now = wind_bearing(zone, w.known ? w.name : 0u);
+		if (!w.known || w.before == 0 || w.change >= 1.0f)
+			return now;
+		const float was = wind_bearing(zone, w.before), f = std::clamp(w.change, 0.0f, 1.0f);
+		const float x = std::sin(was) * (1.0f - f) + std::sin(now) * f, z = std::cos(was) * (1.0f - f) + std::cos(now) * f;
+		return x * x + z * z > 1e-6f ? std::atan2(x, z) : now;
+	}
+
+	// The colours as the zone is lit now. The sky's own colours (the record's gradient: its horizon's and, a third of the
+	// way up, its sky's, bytes) say how bright it is out there, by day or night; the record's sun (or moon, by night: the
+	// game's light then) its colour. A cloud's top where the light reaches it is the horizon's colour with that light on
+	// it, a little brighter than the sky by day, dim grey-blue by night; its underside the horizon's, greyer, as dark as
+	// the weather's; dust and sand their own colours at the sky's brightness, gloom's fog the game's fog darkened and greyed.
+	// Without a sky (a zone with none, or the record not read) the game's fog stands for the horizon.
+	void weather_look(const weather &w, const look::sky_dome &dome, look::weather_fx &wx)
+	{
+		const weather_kind_fx k = weather_fx_of(w);
+		wx.cloud_cover = k.cover;
+		wx.cloud_thick = k.thick;
+		wx.cloud_veil = k.veil;
+		wx.wind_strength = k.wind;
+		wx.dust = k.dust;
+		wx.streaks = k.streaks;
+		wx.gloom = k.gloom;
+		wx.heat = k.heat;
+		wx.aurora = k.aurora;
+		wx.sky_dark = k.sky_dark;
+		wx.star_boost = k.stars;
+		wx.leaves = k.leaves;
+		float fog[3] = { 0.55f, 0.58f, 0.62f };
+		for (int i = 0; i < 3; ++i)
+			fog[i] = w.fog ? w.fog_color[i] : w.record ? w.record_fog_color[i] : fog[i];
+		float horizon[3], high[3];
+		const bool sky = dome.on && dome.segments > 2;
+		if (sky)
+		{
+			sky_gradient(dome, 0.02f, horizon);
+			sky_gradient(dome, 0.33f, high);
+			for (int i = 0; i < 3; ++i)
+			{
+				horizon[i] = std::clamp(horizon[i] / 255.0f, 0.0f, 1.0f);
+				high[i] = std::clamp(high[i] / 255.0f, 0.0f, 1.0f);
+			}
+		}
+		else
+			for (int i = 0; i < 3; ++i)
+				horizon[i] = high[i] = fog[i];
+		// (the light's colour, its brightest part 1: how bright comes from the sky)
+		float light[3] = { 1.0f, 0.97f, 0.92f };
+		if (w.record)
+		{
+			const float most = std::max({ w.sun_color[0], w.sun_color[1], w.sun_color[2], 0.05f });
+			for (int i = 0; i < 3; ++i)
+				light[i] = w.sun_color[i] / most;
+		}
+		const float bright = std::clamp(std::pow(std::max(luma(horizon), 0.0f), 1.5f) * 1.8f, 0.02f, 1.1f);
+		const float grey_h = luma(horizon);
+		for (int i = 0; i < 3; ++i)
+		{
+			const float shade = (horizon[i] + (grey_h - horizon[i]) * 0.5f) * (0.95f - 0.75f * k.dark);
+			const float lit = std::min(horizon[i] * 0.55f + light[i] * bright * 0.7f, 1.0f);
+			wx.cloud_shade[i] = shade;
+			wx.cloud_lit[i] = lit + (shade - lit) * 0.65f * k.dark;
+			wx.veil_colour[i] = horizon[i] + (fog[i] - horizon[i]) * 0.5f;
+		}
+		// Dust (brown-grey) and sand (tan) at the sky's brightness, a little of the fog's colour in them; the clouds take
+		// some of their colour too
+		static const float dust_albedo[3] = { 0.62f, 0.54f, 0.43f }, sand_albedo[3] = { 0.82f, 0.69f, 0.47f };
+		const float sky_bright = std::clamp(luma(high) * 0.4f + luma(horizon) * 0.6f, 0.03f, 1.0f) / 0.62f;
+		for (int i = 0; i < 3; ++i)
+		{
+			const float albedo = dust_albedo[i] + (sand_albedo[i] - dust_albedo[i]) * std::clamp(k.sand, 0.0f, 1.0f);
+			wx.dust_colour[i] = std::clamp(albedo * sky_bright * 0.8f + fog[i] * 0.2f, 0.0f, 1.0f);
+			const float tint = std::min(k.dust, 1.0f) * 0.6f;
+			wx.cloud_lit[i] += (wx.dust_colour[i] * 1.1f - wx.cloud_lit[i]) * tint;
+			wx.cloud_shade[i] += (wx.dust_colour[i] * 0.8f - wx.cloud_shade[i]) * tint;
+			wx.veil_colour[i] += (wx.dust_colour[i] - wx.veil_colour[i]) * tint;
+		}
+		// Gloom's fog: the game's own fog, darker and greyer
+		const float grey_f = luma(fog);
+		for (int i = 0; i < 3; ++i)
+		{
+			wx.gloom_colour[i] = (fog[i] + (grey_f - fog[i]) * 0.4f) * 0.8f;
+			wx.leaf_light[i] = std::clamp(horizon[i] * 0.5f + light[i] * bright * 0.6f, 0.03f, 1.2f);
+		}
+	}
+
 	bool read_blade_file(const wchar_t *path, blade_file &out, std::string &error, const char *magic, uint32_t stride)
 	{
 		FILE *f = nullptr;
@@ -724,6 +1044,43 @@ namespace grass
 			out = {};
 		}
 		return ok;
+	}
+
+	bool read_sea_file(const wchar_t *path, blade_file &out, uint32_t &sheets, std::string &error)
+	{
+		out = {};
+		sheets = 0;
+		FILE *f = nullptr;
+		if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr)
+		{
+			error = "no file for this zone";
+			return false;
+		}
+		struct header
+		{
+			char magic[4];
+			uint32_t zone, sheets, corners;
+		} h = {};
+		bool ok = fread(&h, sizeof(h), 1, f) == 1 && std::memcmp(h.magic, "SEA1", 4) == 0 && h.corners >= 3 && h.corners % 3 == 0 &&
+			h.corners < 16000000 && h.sheets != 0;
+		if (ok)
+		{
+			out.blades.resize(size_t(h.corners) * 8);
+			ok = fread(out.blades.data(), 32, h.corners, f) == h.corners;
+		}
+		fclose(f);
+		for (size_t i = 0; ok && i < out.blades.size(); ++i)
+			ok = std::isfinite(out.blades[i]) && std::fabs(out.blades[i]) < 1e6f;
+		if (!ok)
+		{
+			error = "the file is damaged";
+			out = {};
+			return false;
+		}
+		out.zone = h.zone;
+		out.stride = 8;
+		sheets = h.sheets;
+		return true;
 	}
 
 	bool read_wet_file(const wchar_t *path, wet_file &out, std::string &error)
@@ -1187,6 +1544,7 @@ namespace grass
 	{
 		unload();
 		unload_water();
+		unload_sea();
 		unload_wet();
 		unload_rain();
 		release(_ground.buffer);
@@ -1229,6 +1587,12 @@ namespace grass
 		for (pso_entry &e : _water_debug_psos)
 			release(e.pso);
 		_water_debug_psos.clear();
+		for (std::vector<pso_entry> *v : { &_water_whole_psos, &_sea_psos, &_water_fading_psos })
+		{
+			for (pso_entry &e : *v)
+				release(e.pso);
+			v->clear();
+		}
 		for (pso_entry &e : _firefly_psos)
 			release(e.pso);
 		_firefly_psos.clear();
@@ -1241,6 +1605,15 @@ namespace grass
 		for (pso_entry &e : _snow_psos)
 			release(e.pso);
 		_snow_psos.clear();
+		for (pso_entry &e : _leaf_psos)
+			release(e.pso);
+		_leaf_psos.clear();
+		for (pso_entry &e : _air_psos)
+			release(e.pso);
+		_air_psos.clear();
+		for (pso_entry &e : _flash_psos)
+			release(e.pso);
+		_flash_psos.clear();
 		release(_root);
 	}
 
@@ -1358,15 +1731,16 @@ namespace grass
 		if (FAILED(hr))
 			return false;
 
-		// GPU time: three timestamps a frame (start, after the shading, end), four frames in turn
+		// GPU time: a timestamp at each section's marker and one at the end (kTimingMarks at most a frame), four frames
+		// in turn
 		D3D12_QUERY_HEAP_DESC qd = {};
 		qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-		qd.Count = 3 * kTimingSlots;
+		qd.Count = kTimingMarks * kTimingSlots;
 		D3D12_HEAP_PROPERTIES heap = {};
 		heap.Type = D3D12_HEAP_TYPE_READBACK;
 		D3D12_RESOURCE_DESC desc_rb = {};
 		desc_rb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc_rb.Width = 8 * 3 * kTimingSlots;
+		desc_rb.Width = 8 * kTimingMarks * kTimingSlots;
 		desc_rb.Height = 1;
 		desc_rb.DepthOrArraySize = 1;
 		desc_rb.MipLevels = 1;
@@ -1386,33 +1760,76 @@ namespace grass
 		return true;
 	}
 
-	// The GPU time of a frame's work (ms), from timestamps resolved a few frames ago (smoothed)
-	void renderer::finish_timing(ID3D12GraphicsCommandList *list, bool shaded)
+	// A section starting (see grass_render.hpp): the GPU crash report's marker, and a timestamp (the last place kept for
+	// the end's)
+	void renderer::section(ID3D12GraphicsCommandList *list, const wchar_t *name)
 	{
+		gpu_crash::mark(list, name);
 		if (_queries == nullptr || _times == nullptr)
 			return;
-		const UINT base = _time_slot * 3;
-		if (!shaded)
-			list->EndQuery(_queries, D3D12_QUERY_TYPE_TIMESTAMP, base + 1);
-		list->EndQuery(_queries, D3D12_QUERY_TYPE_TIMESTAMP, base + 2);
-		list->ResolveQueryData(_queries, D3D12_QUERY_TYPE_TIMESTAMP, base, 3, _times, UINT64(base) * 8);
+		UINT &n = _mark_count[_time_slot];
+		if (n + 1 >= kTimingMarks)
+			return;
+		_mark_names[_time_slot][n] = name;
+		list->EndQuery(_queries, D3D12_QUERY_TYPE_TIMESTAMP, _time_slot * kTimingMarks + n);
+		++n;
+	}
+
+	// The GPU time of a frame's work (ms), from timestamps resolved a few frames ago (smoothed): all of it split at
+	// where the copies and shading part ended (no shading: all of it was), and each section's
+	void renderer::finish_timing(ID3D12GraphicsCommandList *list, bool shaded)
+	{
+		(void)shaded; // (where the shading part ended is kept by draw: _shade_end)
+		if (_queries == nullptr || _times == nullptr)
+			return;
+		const UINT slot = _time_slot, n = _mark_count[slot];
+		if (n == 0)
+			return;
+		_mark_names[slot][n] = nullptr;
+		list->EndQuery(_queries, D3D12_QUERY_TYPE_TIMESTAMP, slot * kTimingMarks + n);
+		_mark_count[slot] = n + 1;
+		list->ResolveQueryData(_queries, D3D12_QUERY_TYPE_TIMESTAMP, slot * kTimingMarks, n + 1, _times, UINT64(slot) * kTimingMarks * 8);
 		_time_slot = (_time_slot + 1) % kTimingSlots;
 		// (the oldest slot: written kTimingSlots - 1 frames ago, done by now as a rule)
 		if (_frequency == 0 || ++_timed < kTimingSlots)
 			return;
-		const UINT old = _time_slot * 3;
-		const D3D12_RANGE range = { SIZE_T(old) * 8, SIZE_T(old + 3) * 8 };
+		const UINT old = _time_slot, m = _mark_count[old];
+		if (m < 2)
+			return;
+		const D3D12_RANGE range = { SIZE_T(old) * kTimingMarks * 8, (SIZE_T(old) * kTimingMarks + m) * 8 };
 		void *mapped = nullptr;
 		if (FAILED(_times->Map(0, &range, &mapped)))
 			return;
 		const uint64_t *t = reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(mapped) + range.Begin);
-		if (t[1] >= t[0] && t[2] >= t[1] && t[2] - t[0] < _frequency)
+		bool in_order = t[m - 1] - t[0] < _frequency;
+		for (UINT i = 1; i < m && in_order; ++i)
+			in_order = t[i] >= t[i - 1];
+		if (in_order)
 		{
-			const float shading = float(double(t[1] - t[0]) * 1000.0 / double(_frequency));
-			const float grass = float(double(t[2] - t[1]) * 1000.0 / double(_frequency));
+			const double to_ms = 1000.0 / double(_frequency);
+			const UINT split = std::min(_shade_end[old], m - 1);
+			const float shading = float(double(t[split] - t[0]) * to_ms);
+			const float grass = float(double(t[m - 1] - t[split]) * to_ms);
 			_shading_ms = _shading_ms * 0.9f + shading * 0.1f;
 			_last_shading_ms = shading;
 			_grass_ms = _grass_ms * 0.9f + grass * 0.1f;
+			_frames_timed++;
+			for (UINT i = 0; i + 1 < m; ++i)
+			{
+				const wchar_t *const name = _mark_names[old][i];
+				const float ms = float(double(t[i + 1] - t[i]) * to_ms);
+				gpu_section *sec = nullptr;
+				for (gpu_section &g : _sections)
+					if (g.name == name)
+						sec = &g;
+				if (sec == nullptr)
+				{
+					_sections.push_back({ name, ms, 0 });
+					sec = &_sections.back();
+				}
+				sec->ms = sec->frames == 0 ? ms : sec->ms * 0.95f + ms * 0.05f;
+				sec->frames++;
+			}
 		}
 		const D3D12_RANGE none = { 0, 0 };
 		_times->Unmap(0, &none);
@@ -1441,7 +1858,7 @@ namespace grass
 		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 		desc.NumRenderTargets = 1;
 		desc.RTVFormats[0] = t.rtv_format;
-		desc.DSVFormat = DXGI_FORMAT_D32_FLOAT; // (the blades' own depth buffer)
+		desc.DSVFormat = kBladeDepthFormat; // (the blades' own depth buffer)
 		desc.SampleDesc = rt_desc.SampleDesc;
 
 		ID3D12PipelineState *pso = nullptr;
@@ -1455,7 +1872,7 @@ namespace grass
 			return nullptr;
 		}
 		pso->SetName(L"worldfx: grass pipeline");
-		_psos.push_back({ t.rtv_format, DXGI_FORMAT_D32_FLOAT, rt_desc.SampleDesc, pso });
+		_psos.push_back({ t.rtv_format, kBladeDepthFormat, rt_desc.SampleDesc, pso });
 		return pso;
 	}
 
@@ -1475,7 +1892,7 @@ namespace grass
 	{
 		std::vector<uint8_t> *const into[kShaderEntryCount] = { &_vs, &_ps, &_shade_vs, &_shade_ps, &_sun_ps, &_shadow_vs, &_shadow_ps,
 			&_water_vs, &_water_ps, &_water_debug_vs, &_water_debug_ps, &_firefly_vs, &_firefly_ps, &_rain_vs, &_rain_ps,
-			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps };
+			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps };
 		if (code.blobs.size() != kShaderEntryCount)
 			return;
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
@@ -1500,6 +1917,12 @@ namespace grass
 			_old.push_back({ e.pso, 0 });
 		for (pso_entry &e : _water_debug_psos)
 			_old.push_back({ e.pso, 0 });
+		for (std::vector<pso_entry> *v : { &_water_whole_psos, &_sea_psos, &_water_fading_psos })
+		{
+			for (pso_entry &e : *v)
+				_old.push_back({ e.pso, 0 });
+			v->clear();
+		}
 		for (pso_entry &e : _firefly_psos)
 			_old.push_back({ e.pso, 0 });
 		for (pso_entry &e : _rain_psos)
@@ -1508,6 +1931,15 @@ namespace grass
 			_old.push_back({ e.pso, 0 });
 		for (pso_entry &e : _snow_psos)
 			_old.push_back({ e.pso, 0 });
+		for (pso_entry &e : _leaf_psos)
+			_old.push_back({ e.pso, 0 });
+		for (pso_entry &e : _air_psos)
+			_old.push_back({ e.pso, 0 });
+		for (pso_entry &e : _flash_psos)
+			_old.push_back({ e.pso, 0 });
+		_leaf_psos.clear();
+		_air_psos.clear();
+		_flash_psos.clear();
 		_psos.clear();
 		_shade_psos.clear();
 		_water_psos.clear();
@@ -1780,7 +2212,7 @@ namespace grass
 		if (pso == nullptr)
 			return 0;
 		const size_t i = size_t(slot - _vis_slots);
-		gpu_crash::mark(list, L"worldfx: visibility tests");
+		section(list, L"worldfx: visibility tests");
 		list->SetGraphicsRootSignature(_root);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
@@ -1846,7 +2278,7 @@ namespace grass
 		desc.DepthStencilState.DepthEnable = TRUE;
 		desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
 		desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-		desc.DSVFormat = DXGI_FORMAT_D32_FLOAT; // (the blades' depth buffer)
+		desc.DSVFormat = kBladeDepthFormat; // (the blades' depth buffer)
 		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 		desc.NumRenderTargets = 1;
 		desc.RTVFormats[0] = t.rtv_format;
@@ -1861,7 +2293,7 @@ namespace grass
 			return nullptr;
 		}
 		pso->SetName(L"worldfx: firefly pipeline");
-		_firefly_psos.push_back({ t.rtv_format, DXGI_FORMAT_D32_FLOAT, rt_desc.SampleDesc, pso });
+		_firefly_psos.push_back({ t.rtv_format, kBladeDepthFormat, rt_desc.SampleDesc, pso });
 		return pso;
 	}
 
@@ -1870,13 +2302,13 @@ namespace grass
 	ID3D12PipelineState *renderer::rain_pipeline_for(const target &t, fall kind, std::string &error)
 	{
 		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
-		std::vector<pso_entry> &psos = kind == fall::splash ? _splash_psos : kind == fall::snow ? _snow_psos : _rain_psos;
+		std::vector<pso_entry> &psos = kind == fall::splash ? _splash_psos : kind == fall::snow ? _snow_psos : kind == fall::leaf ? _leaf_psos : _rain_psos;
 		for (const pso_entry &e : psos)
 			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
 				return e.pso;
-		const std::vector<uint8_t> &vs = kind == fall::splash ? _splash_vs : kind == fall::snow ? _snow_vs : _rain_vs;
-		const std::vector<uint8_t> &ps = kind == fall::splash ? _splash_ps : kind == fall::snow ? _snow_ps : _rain_ps;
-		const char *const what = kind == fall::splash ? "splash" : kind == fall::snow ? "snow" : "rain";
+		const std::vector<uint8_t> &vs = kind == fall::splash ? _splash_vs : kind == fall::snow ? _snow_vs : kind == fall::leaf ? _leaf_vs : _rain_vs;
+		const std::vector<uint8_t> &ps = kind == fall::splash ? _splash_ps : kind == fall::snow ? _snow_ps : kind == fall::leaf ? _leaf_ps : _rain_ps;
+		const char *const what = kind == fall::splash ? "splash" : kind == fall::snow ? "snow" : kind == fall::leaf ? "leaf" : "rain";
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
 		desc.pRootSignature = _root;
 		desc.VS = { vs.data(), vs.size() };
@@ -1898,7 +2330,7 @@ namespace grass
 		desc.DepthStencilState.DepthEnable = TRUE;
 		desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
 		desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-		desc.DSVFormat = DXGI_FORMAT_D32_FLOAT; // (the blades' depth buffer)
+		desc.DSVFormat = kBladeDepthFormat; // (the blades' depth buffer)
 		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 		desc.NumRenderTargets = 1;
 		desc.RTVFormats[0] = t.rtv_format;
@@ -1912,8 +2344,57 @@ namespace grass
 			error = text;
 			return nullptr;
 		}
-		pso->SetName(kind == fall::splash ? L"worldfx: splash pipeline" : kind == fall::snow ? L"worldfx: snow pipeline" : L"worldfx: rain pipeline");
-		psos.push_back({ t.rtv_format, DXGI_FORMAT_D32_FLOAT, rt_desc.SampleDesc, pso });
+		pso->SetName(kind == fall::splash ? L"worldfx: splash pipeline" : kind == fall::snow ? L"worldfx: snow pipeline" :
+			kind == fall::leaf ? L"worldfx: leaf pipeline" : L"worldfx: rain pipeline");
+		psos.push_back({ t.rtv_format, kBladeDepthFormat, rt_desc.SampleDesc, pso });
+		return pso;
+	}
+
+	// The air pass (dust, sand and wind streaks, gloom's fog banks): a full-screen triangle over the world as everything has
+	// been drawn into it, blended with two of its pixel's outputs (dual-source): the world times the second plus the first
+	// (a fog's colour over what it hides). The lightning's flash (flash): the world plus the world times its pixel's
+	// colour, up to twice as bright (the factors a pixel gives are kept to 0..1 on the world's UNORM target: the world
+	// times more than 1 can't be had any other way). No depth: their pixels read the depth copy. The world's alpha is left
+	// alone.
+	ID3D12PipelineState *renderer::air_pipeline_for(const target &t, bool flash, std::string &error)
+	{
+		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
+		std::vector<pso_entry> &psos = flash ? _flash_psos : _air_psos;
+		for (const pso_entry &e : psos)
+			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
+				return e.pso;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _shade_vs.data(), _shade_vs.size() };
+		desc.PS = flash ? D3D12_SHADER_BYTECODE { _flash_ps.data(), _flash_ps.size() } : D3D12_SHADER_BYTECODE { _air_ps.data(), _air_ps.size() };
+		D3D12_RENDER_TARGET_BLEND_DESC &b = desc.BlendState.RenderTarget[0];
+		b.BlendEnable = TRUE;
+		b.SrcBlend = flash ? D3D12_BLEND_DEST_COLOR : D3D12_BLEND_ONE;
+		b.DestBlend = flash ? D3D12_BLEND_ONE : D3D12_BLEND_SRC1_COLOR;
+		b.BlendOp = D3D12_BLEND_OP_ADD;
+		b.SrcBlendAlpha = D3D12_BLEND_ZERO;
+		b.DestBlendAlpha = D3D12_BLEND_ONE;
+		b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 1;
+		desc.RTVFormats[0] = t.rtv_format;
+		desc.SampleDesc = rt_desc.SampleDesc;
+		ID3D12PipelineState *pso = nullptr;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		if (FAILED(hr))
+		{
+			char text[96];
+			std::snprintf(text, sizeof(text), "%s pipeline failed (0x%08lX, format %u)", flash ? "flash" : "air", static_cast<unsigned long>(hr), static_cast<unsigned>(t.rtv_format));
+			error = text;
+			return nullptr;
+		}
+		pso->SetName(flash ? L"worldfx: flash pipeline" : L"worldfx: air pipeline");
+		psos.push_back({ t.rtv_format, DXGI_FORMAT_UNKNOWN, rt_desc.SampleDesc, pso });
 		return pso;
 	}
 
@@ -2021,10 +2502,24 @@ namespace grass
 		return true;
 	}
 
-	ID3D12PipelineState *renderer::water_pipeline_for(const target &t, bool debug, std::string &error)
+	// The water's pipelines. plain: the water (a zone without a sea), written whole (its pixels work out what's under them
+	// from the copy of the world), with the blades' depth buffer so the nearest water is the one kept. With a sea, three:
+	// whole, the baked water's pixels it draws at their whole (its pixel shader leaves the rest: blade.z 1), each marked in
+	// the stencil as it's written (from the clear's 0 down, wrapping); sea, the sea's sheets only where the stencil isn't marked;
+	// fading, the baked water's pixels it fades in at (its shore, round what stands in it, toward its distance: blade.z 2),
+	// blended over what's there by then (the sea, or the game's own), its depth tested but not written. So the two never
+	// stack, the baked water keeps its fades and flow, and where it fades out by the sea it fades into the sea, not into the
+	// game's own. (The stencil reference is the game's, set or not: none is set here, so the game's isn't changed. The sea's
+	// test passes wherever the stencil is 0 whatever the reference, and fails where it's marked unless that is 255, or
+	// 254 for water drawn twice over itself, and so on.) debug: the
+	// collision drawn over the world with alpha, no depth buffer (the pixel shader tests against the depth copy). The
+	// world's alpha is left alone.
+	ID3D12PipelineState *renderer::water_pipeline_for(const target &t, water_kind kind, std::string &error)
 	{
 		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
-		std::vector<pso_entry> &psos = debug ? _water_debug_psos : _water_psos;
+		const bool debug = kind == water_kind::debug;
+		std::vector<pso_entry> &psos = kind == water_kind::debug ? _water_debug_psos : kind == water_kind::whole ? _water_whole_psos :
+			kind == water_kind::sea ? _sea_psos : kind == water_kind::fading ? _water_fading_psos : _water_psos;
 		for (const pso_entry &e : psos)
 			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
 				return e.pso;
@@ -2033,7 +2528,7 @@ namespace grass
 		desc.VS = debug ? D3D12_SHADER_BYTECODE { _water_debug_vs.data(), _water_debug_vs.size() } : D3D12_SHADER_BYTECODE { _water_vs.data(), _water_vs.size() };
 		desc.PS = debug ? D3D12_SHADER_BYTECODE { _water_debug_ps.data(), _water_debug_ps.size() } : D3D12_SHADER_BYTECODE { _water_ps.data(), _water_ps.size() };
 		D3D12_RENDER_TARGET_BLEND_DESC &b = desc.BlendState.RenderTarget[0];
-		if (debug)
+		if (debug || kind == water_kind::fading)
 		{
 			b.BlendEnable = TRUE;
 			b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
@@ -2043,12 +2538,29 @@ namespace grass
 			b.DestBlendAlpha = D3D12_BLEND_ONE;
 			b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 		}
-		else
+		if (!debug)
 		{
-			desc.DepthStencilState.DepthEnable = TRUE;
-			desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-			desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-			desc.DSVFormat = DXGI_FORMAT_D32_FLOAT; // (the blades' depth buffer)
+			D3D12_DEPTH_STENCIL_DESC &ds = desc.DepthStencilState;
+			ds.DepthEnable = TRUE;
+			ds.DepthWriteMask = kind == water_kind::fading ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+			ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			if (kind == water_kind::whole || kind == water_kind::sea)
+			{
+				ds.StencilEnable = TRUE;
+				ds.StencilReadMask = 0xFF;
+				ds.StencilWriteMask = kind == water_kind::whole ? 0xFF : 0x00;
+				D3D12_DEPTH_STENCILOP_DESC op = {};
+				op.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+				op.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+				// (a mark: one less, wrapping: 0 to 255 the first time, 254 where the collision overlaps itself and it's
+				// drawn twice, and so on; an inversion turned a second mark back to 0, the sea then drawn over it. The
+				// reference against the stencil: ref >= 0 always, ref >= 255 only for a reference of 255)
+				op.StencilPassOp = kind == water_kind::whole ? D3D12_STENCIL_OP_DECR : D3D12_STENCIL_OP_KEEP;
+				op.StencilFunc = kind == water_kind::whole ? D3D12_COMPARISON_FUNC_ALWAYS : D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+				ds.FrontFace = op;
+				ds.BackFace = op;
+			}
+			desc.DSVFormat = kBladeDepthFormat; // (the blades' depth buffer)
 			desc.RasterizerState.MultisampleEnable = rt_desc.SampleDesc.Count > 1;
 		}
 		b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
@@ -2062,15 +2574,18 @@ namespace grass
 		desc.SampleDesc = rt_desc.SampleDesc;
 		ID3D12PipelineState *pso = nullptr;
 		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		const char *const what = debug ? "water view" : kind == water_kind::whole ? "water (whole)" : kind == water_kind::sea ? "sea" :
+			kind == water_kind::fading ? "water (fading)" : "water";
 		if (FAILED(hr))
 		{
 			char text[96];
-			std::snprintf(text, sizeof(text), "water%s pipeline failed (0x%08lX, format %u)", debug ? " view" : "", static_cast<unsigned long>(hr), static_cast<unsigned>(t.rtv_format));
+			std::snprintf(text, sizeof(text), "%s pipeline failed (0x%08lX, format %u)", what, static_cast<unsigned long>(hr), static_cast<unsigned>(t.rtv_format));
 			error = text;
 			return nullptr;
 		}
-		pso->SetName(debug ? L"worldfx: water view pipeline" : L"worldfx: water pipeline");
-		psos.push_back({ t.rtv_format, debug ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_D32_FLOAT, rt_desc.SampleDesc, pso });
+		pso->SetName(debug ? L"worldfx: water view pipeline" : kind == water_kind::whole ? L"worldfx: water pipeline (whole, marked)" :
+			kind == water_kind::sea ? L"worldfx: sea pipeline" : kind == water_kind::fading ? L"worldfx: water pipeline (fading)" : L"worldfx: water pipeline");
+		psos.push_back({ t.rtv_format, debug ? DXGI_FORMAT_UNKNOWN : kBladeDepthFormat, rt_desc.SampleDesc, pso });
 		return pso;
 	}
 
@@ -2131,6 +2646,66 @@ namespace grass
 		_water_zone = 0;
 		_water_corners = 0;
 		_water_cells.clear();
+	}
+
+	// The sea's sheets into an upload buffer, as the water's corners (no cells: all of them are drawn)
+	bool renderer::upload_sea(const blade_file &file, std::string &error)
+	{
+		unload_sea();
+		if (file.blade_count() < 3 || file.stride != 8)
+		{
+			error = "the sea file has no triangles";
+			return false;
+		}
+		const UINT64 size = UINT64(file.blade_count() / 3 * 3) * 32;
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+		D3D12_RESOURCE_DESC desc = {};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		desc.Width = size;
+		desc.Height = 1;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.SampleDesc.Count = 1;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		ID3D12Resource *buffer = nullptr;
+		HRESULT hr = _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer));
+		void *mapped = nullptr;
+		const D3D12_RANGE none = { 0, 0 };
+		if (SUCCEEDED(hr))
+			hr = buffer->Map(0, &none, &mapped);
+		if (FAILED(hr))
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "sea buffer failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			release(buffer);
+			return false;
+		}
+		std::memcpy(mapped, file.blades.data(), static_cast<size_t>(size));
+		buffer->Unmap(0, nullptr);
+		buffer->SetName(L"worldfx: sea");
+		_sea = buffer;
+		_sea_corners = file.blade_count() / 3 * 3;
+		_sea_box[0] = _sea_box[1] = 1e30f;
+		_sea_box[2] = _sea_box[3] = -1e30f;
+		for (uint32_t i = 0; i < _sea_corners; ++i)
+		{
+			const float x = file.blades[size_t(i) * 8], z = file.blades[size_t(i) * 8 + 2];
+			_sea_box[0] = std::min(_sea_box[0], x);
+			_sea_box[1] = std::min(_sea_box[1], z);
+			_sea_box[2] = std::max(_sea_box[2], x);
+			_sea_box[3] = std::max(_sea_box[3], z);
+		}
+		return true;
+	}
+
+	void renderer::unload_sea()
+	{
+		if (_sea != nullptr)
+			_old.push_back({ _sea, 0 }); // (as the water)
+		_sea = nullptr;
+		_sea_corners = 0;
 	}
 
 	bool renderer::upload_wet(const wet_file &file, std::string &error)
@@ -2511,7 +3086,7 @@ namespace grass
 			_old.push_back({ _shadow_staging, 0 });
 			_shadow_staging = nullptr;
 		}
-		gpu_crash::mark(list, L"worldfx: sun shadow map");
+		section(list, L"worldfx: sun shadow map");
 		list->SetGraphicsRootSignature(_root);
 		list->SetPipelineState(pso);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2882,11 +3457,11 @@ namespace grass
 			desc.Height = rt_desc.Height;
 			desc.DepthOrArraySize = 1;
 			desc.MipLevels = 1;
-			desc.Format = DXGI_FORMAT_D32_FLOAT;
+			desc.Format = kBladeDepthFormat;
 			desc.SampleDesc = rt_desc.SampleDesc;
 			desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
 			D3D12_CLEAR_VALUE clear = {};
-			clear.Format = DXGI_FORMAT_D32_FLOAT;
+			clear.Format = kBladeDepthFormat;
 			clear.DepthStencil.Depth = 1.0f;
 			hr = _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&_blade_depth));
 		}
@@ -2944,7 +3519,20 @@ namespace grass
 		bool dome = l.dome.on && l.dome.segments > 2;
 		for (int i = 0; i < 8 && dome; ++i)
 			dome = std::isfinite(l.dome.stops[i][3]) && std::isfinite(l.dome.stops[i][0]) && std::isfinite(l.dome.stops[i][1]) && std::isfinite(l.dome.stops[i][2]);
-		const bool shading_wanted = l.ao_strength > 0.0f || l.relief > 0.0f || sun_shadow > 0.0f || lamp_count != 0 || dome;
+		// The weather of its own (look::wx): its parts in the sky (with the dome: clouds, the veil, the flash and the bolt,
+		// the aurora, a darker or starrier sky, dust and gloom over it), the heat's shimmer in the shading pass, the air pass
+		// at the end (dust, streaks, fog banks, the flash), the grass bent by the wind, the leaves (with the rain map)
+		auto part = [](float v, float most) { return std::isfinite(v) ? std::clamp(v, 0.0f, most) : 0.0f; };
+		const look::weather_fx &wx = l.wx;
+		const float wx_flash = part(wx.flash, 4.0f), wx_bolt = part(wx.bolt, 4.0f), wx_dust = part(wx.dust, 2.0f), wx_streaks = part(wx.streaks, 2.0f);
+		const float wx_gloom = part(wx.gloom, 2.0f), wx_heat = part(wx.heat, 2.0f), wx_wind = part(wx.wind_strength, 3.0f), wx_leaves = part(wx.leaves, 2.0f);
+		const float wx_stars = std::isfinite(wx.star_boost) ? std::clamp(wx.star_boost, 0.0f, 4.0f) : 1.0f;
+		const bool wx_sky = dome && (part(wx.cloud_cover, 1.0f) > 0.0f || part(wx.cloud_veil, 1.0f) > 0.0f || wx_flash > 0.0f || wx_bolt > 0.0f ||
+			part(wx.aurora, 2.0f) > 0.0f || part(wx.sky_dark, 1.0f) > 0.0f || wx_stars != 1.0f || wx_dust > 0.0f || wx_gloom > 0.0f);
+		const bool shimmer = wx_heat > 0.0f;
+		const bool air_wanted = wx_flash > 0.0f || wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f; // (the flash's pass with it)
+		const bool leaves = wx_leaves > 0.0f && !_rain.q.empty();
+		const bool shading_wanted = l.ao_strength > 0.0f || l.relief > 0.0f || sun_shadow > 0.0f || lamp_count != 0 || dome || shimmer;
 		// The game's fog, when it makes sense (ending past where it starts)
 		const bool haze = l.haze && std::isfinite(l.haze_start) && std::isfinite(l.haze_end) && l.haze_end > l.haze_start + 0.01f && l.haze_end > 0.0f &&
 			std::isfinite(l.haze_color[0]) && std::isfinite(l.haze_color[1]) && std::isfinite(l.haze_color[2]);
@@ -2954,8 +3542,13 @@ namespace grass
 		// The wet look on path and stone, with the zone's mask loaded (it's read in the shading pass)
 		const bool wet = std::isfinite(l.wet) && l.wet > 0.0f && _wet != nullptr;
 		const bool shading = shading_wanted || wet;
-		const bool water_shade = l.water && _water != nullptr;
-		const bool water = (l.water || l.water_debug) && _water != nullptr;
+		// The sea (the zone's sea sheets, with the water): the water then reaches as far as it does (its distance), so the
+		// baked water doesn't fade out where the sea goes on
+		const bool sea = l.water && l.sea && _sea != nullptr;
+		const bool water_shade = l.water && (_water != nullptr || sea);
+		const bool water = (l.water || l.water_debug) && (_water != nullptr || sea);
+		const float sea_reach = std::isfinite(l.sea_distance) ? std::clamp(l.sea_distance, 0.0f, 20000.0f) : 0.0f;
+		const float water_reach = sea ? std::max(l.water_distance, sea_reach) : l.water_distance;
 		const bool fireflies = l.fireflies > 0.0f && l.night > 0.0f && _buffer != nullptr;
 		// Rain, with the zone's rain map: how hard (the share of the columns with drops in them)
 		const float rain_amount = std::isfinite(l.rain) ? std::clamp(l.rain, 0.0f, 2.0f) : 0.0f;
@@ -2963,7 +3556,7 @@ namespace grass
 		// Snow, with the same map: how hard (the share of the columns with flakes in them)
 		const float snow_amount = std::isfinite(l.snow) ? std::clamp(l.snow, 0.0f, 2.0f) : 0.0f;
 		const bool snow = snow_amount > 0.0f && !_rain.q.empty();
-		const bool falling = rain || snow;
+		const bool falling = rain || snow || leaves;
 		// The grass's wear: with the blades drawn, a clock, and wear to show or a cut to make
 		const bool wearing = grass && std::isfinite(l.clock) && l.clock > 0.0 &&
 			((std::isfinite(l.wear) && l.wear > 0.0f) || (l.cuts != nullptr && l.cut_count != 0));
@@ -2971,13 +3564,23 @@ namespace grass
 		bool vis = false;
 		for (const vis_slot &s : _vis_slots)
 			vis = vis || s.state == vis_slot::state_t::set;
-		if (!grass && !shading && !water && !fireflies && !falling && !vis)
+		// (the weather's parameters go to the passes with anything of it to draw, the grass's wind too)
+		const bool wx_any = wx_sky || shimmer || air_wanted || leaves || (grass && wx_wind > 0.0f);
+		if (!grass && !shading && !water && !fireflies && !falling && !vis && !air_wanted)
 			return stats;
 
 		float eye[3];
 		eye_from_view(cam.view, eye);
 		if (!std::isfinite(eye[0]) || !std::isfinite(eye[1]) || !std::isfinite(eye[2]))
 			return stats;
+		// (the sea drawn with any of its sheets within the water's reach: not with the camera far from all of them)
+		bool sea_here = false;
+		if (sea && water_shade)
+		{
+			const float dx = std::max({ _sea_box[0] - eye[0], eye[0] - _sea_box[2], 0.0f });
+			const float dz = std::max({ _sea_box[1] - eye[2], eye[2] - _sea_box[3], 0.0f });
+			sea_here = dx * dx + dz * dz <= water_reach * water_reach;
+		}
 
 		// The cells that reach within the draw distance of the camera (across the ground), merged into runs
 		// Far grass is thinner: tufts are whole within 40% of the distance, half to 70%, a quarter beyond, each
@@ -3006,7 +3609,7 @@ namespace grass
 		// The water cells within its distance, merged into runs (corners in a row)
 		cell_run water_runs[256];
 		uint32_t water_run_count = 0;
-		const float water_reach2 = l.water_distance * l.water_distance;
+		const float water_reach2 = water_reach * water_reach;
 		for (const blade_file::cell &c : _water_cells)
 		{
 			if (!water)
@@ -3040,16 +3643,16 @@ namespace grass
 			else if (firefly_run_count < 256)
 				firefly_runs[firefly_run_count++] = { c.first, c.count, firefly_stride };
 		}
-		if (run_count == 0 && !shading && water_run_count == 0 && firefly_run_count == 0 && !falling && !vis)
+		if (run_count == 0 && !shading && water_run_count == 0 && !sea_here && firefly_run_count == 0 && !falling && !vis && !air_wanted)
 			return stats;
 
 		ID3D12PipelineState *pso = run_count != 0 ? pipeline_for(t, error) : nullptr;
 		if (run_count != 0 && pso == nullptr)
 			return stats;
 
-		gpu_crash::mark(list, L"worldfx: begin (copies of the world)");
-		if (_queries != nullptr)
-			list->EndQuery(_queries, D3D12_QUERY_TYPE_TIMESTAMP, _time_slot * 3);
+		_mark_count[_time_slot] = 0;
+		_shade_end[_time_slot] = kTimingMarks;
+		section(list, L"worldfx: begin (copies of the world)");
 
 		// The world so far into a buffer, for the ground's colour under each blade (RGBA8/BGRA8, one sample)
 		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
@@ -3102,7 +3705,7 @@ namespace grass
 		ID3D12Resource *actor_buffer = nullptr;
 		float *actor_data = nullptr;
 		const bool sun_map = l.sun_map && sun_shadow > 0.0f && _shadow_geo != nullptr && shading;
-		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing)
+		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any)
 		{
 			const uint32_t slot = _actor_slot++ % kActorSlots;
 			if (_actors[slot] == nullptr)
@@ -3224,6 +3827,13 @@ namespace grass
 			for (int i = 0; i < 8; ++i)
 				for (int k = 0; k < 3; ++k)
 					params[64 + i * 4 + k] = std::isfinite(slopes[i][k]) ? slopes[i][k] : 0.0f;
+			// (in the slopes' spare fourth places: the moon's lit side in view space, then how much of it is lit)
+			float side[3];
+			for (int i = 0; i < 3; ++i)
+				side[i] = d.moon_side[0] * cam.view[0 * 4 + i] + d.moon_side[1] * cam.view[1 * 4 + i] + d.moon_side[2] * cam.view[2 * 4 + i];
+			for (int i = 0; i < 3; ++i)
+				params[64 + i * 4 + 3] = std::isfinite(side[i]) ? side[i] : 0.0f;
+			params[64 + 3 * 4 + 3] = amount(d.moon_lit, 1.0f);
 			std::memcpy(actor_data + kMaxActors * 4 + kSunMapParams + kLampParams + kHazeParams + kWetParams, params, sizeof(params));
 		}
 		// The grass's wear after the sky's (rule bit 256), its times on the memory's clock: seconds since the memory was
@@ -3262,8 +3872,61 @@ namespace grass
 		}
 		if (std::isfinite(l.clock) && l.clock > 0.0)
 			_last_clock = l.clock;
+		// The weather of its own's after the shadow map's drawings before the last (rule bit 512): grass.hlsl kWx has the
+		// layout (each part as look::weather_fx has it, kept to its range; what isn't a number, none)
+		const bool wx_written = wx_any && actor_data != nullptr;
+		if (wx_written)
+		{
+			auto finite = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+			auto colour = [](const float *c, int i) { return std::isfinite(c[i]) ? std::clamp(c[i], 0.0f, 2.0f) : 0.0f; };
+			float params[kWxParams] = {};
+			const float wl = std::sqrt(wx.wind[0] * wx.wind[0] + wx.wind[1] * wx.wind[1]);
+			const bool wind_ok = std::isfinite(wl) && wl > 1e-3f;
+			params[0] = (wind_ok ? wx.wind[0] / wl : 1.0f) * wx_wind;
+			params[1] = (wind_ok ? wx.wind[1] / wl : 0.0f) * wx_wind;
+			params[2] = wx_wind;
+			for (int i = 0; i < 3; ++i)
+			{
+				params[4 + i] = cam.view[i];
+				params[8 + i] = cam.view[8 + i];
+			}
+			params[7] = finite(wx.ground_y, eye[1] + 2.0f); // (y is down: the ground under the camera, below it)
+			params[11] = l.time;
+			params[12] = part(wx.cloud_cover, 1.0f);
+			params[13] = part(wx.cloud_thick, 1.0f);
+			params[14] = part(wx.cloud_veil, 1.0f);
+			params[15] = wx_stars;
+			for (int i = 0; i < 4; ++i)
+				params[16 + i] = finite(wx.cloud_drift[i], 0.0f);
+			for (int i = 0; i < 3; ++i)
+			{
+				params[20 + i] = colour(wx.cloud_lit, i);
+				params[24 + i] = colour(wx.cloud_shade, i);
+				params[28 + i] = colour(wx.veil_colour, i);
+				params[40 + i] = colour(wx.dust_colour, i);
+				params[48 + i] = colour(wx.gloom_colour, i);
+			}
+			params[23] = part(wx.sky_dark, 1.0f);
+			params[27] = part(wx.aurora, 2.0f);
+			params[32] = wx_flash;
+			params[33] = wx_bolt;
+			params[34] = finite(wx.bolt_bearing, 0.0f);
+			params[35] = std::clamp(finite(wx.bolt_top, 0.3f), 0.05f, 1.2f);
+			params[36] = finite(wx.bolt_seed, 0.0f);
+			params[43] = wx_dust;
+			params[44] = wx_streaks;
+			params[45] = 3.0f + 4.0f * wx_wind; // (how fast the streaks blow along the ground: yalms a second)
+			params[51] = wx_gloom;
+			params[52] = wx_heat;
+			params[53] = 35.0f; // (the shimmer from 35 yalms off, whole by 110)
+			params[54] = 110.0f;
+			params[56] = finite(wx.bank_drift[0], 0.0f);
+			params[57] = finite(wx.bank_drift[1], 0.0f);
+			std::memcpy(actor_data + kWxOffset, params, sizeof(params));
+			stats.weather = true;
+		}
 		const uint32_t rules = (l.rule_in_front ? 1u : 0u) | (l.rule_outliers ? 2u : 0u) | (l.sun_characters ? 4u : 0u) | (lamps_written != 0 ? 16u : 0u) |
-			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u);
+			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u);
 		const uint32_t crowd = actor_count | (rules << 16);
 		std::memcpy(&constants[32], &crowd, 4);
 		// Toward the sun in view space (row vectors: v * the view's rotation)
@@ -3301,6 +3964,40 @@ namespace grass
 		}
 		const D3D12_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(rt_desc.Width), static_cast<float>(rt_desc.Height), 0.0f, 1.0f };
 		const D3D12_RECT scissor = { 0, 0, static_cast<LONG>(rt_desc.Width), static_cast<LONG>(rt_desc.Height) };
+		// The air pass (dust, sand and wind streaks, gloom's fog banks), then the lightning's flash, last of all: over the
+		// world as everything has been drawn into it (the grass, the water, the rain), so all of it is in the same air and
+		// light; the grass learned its colours before them (the copy after the shading pass), so none of it is fogged or
+		// lit twice. Their pixels read the depth copy (t3), the parameters (t2) and the world's copy for names facelift drew
+		// (t1: names are left as they are, as the shading pass leaves them).
+		auto air_pass = [&]() {
+			if (!air_wanted || !wx_written || depth_kind == 0)
+				return;
+			const bool air = wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f;
+			ID3D12PipelineState *const air_pso = air ? air_pipeline_for(t, false, error) : nullptr;
+			ID3D12PipelineState *const flash_pso = wx_flash > 0.0f ? air_pipeline_for(t, true, error) : nullptr;
+			if (air_pso == nullptr && flash_pso == nullptr)
+				return;
+			section(list, L"worldfx: air");
+			stats.bound = true;
+			list->SetGraphicsRootSignature(_root);
+			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			list->OMSetRenderTargets(1, &world_rtv, FALSE, nullptr);
+			list->RSSetViewports(1, &viewport);
+			list->RSSetScissorRects(1, &scissor);
+			list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
+			// (t0 isn't read: the depth copy's address; t1 without a copy of the world isn't read either, ground.w being 0)
+			list->SetGraphicsRootShaderResourceView(1, _depth.buffer->GetGPUVirtualAddress());
+			list->SetGraphicsRootShaderResourceView(2, (ground_kind != 0 ? _ground.buffer : _depth.buffer)->GetGPUVirtualAddress());
+			list->SetGraphicsRootShaderResourceView(4, actor_buffer->GetGPUVirtualAddress());
+			list->SetGraphicsRootShaderResourceView(5, _depth.buffer->GetGPUVirtualAddress());
+			for (ID3D12PipelineState *pso : { air_pso, flash_pso })
+				if (pso != nullptr)
+				{
+					list->SetPipelineState(pso);
+					list->DrawInstanced(3, 1, 0, 0);
+				}
+			stats.air = true;
+		};
 
 		// The shading pass: ambient occlusion, surface relief and the sun's shadows into the world, from the
 		// copies; then the world copied again, so the grass learns its colours from the shaded ground. The sun's
@@ -3345,7 +4042,7 @@ namespace grass
 			list->SetGraphicsRootShaderResourceView(5, _depth.buffer->GetGPUVirtualAddress());
 			if (sun_pso != nullptr)
 			{
-				gpu_crash::mark(list, L"worldfx: sun shadows");
+				section(list, L"worldfx: sun shadows");
 				// (t0: the shadow map's copy; without it, still a valid address, the depth copy's, never read)
 				list->SetGraphicsRootShaderResourceView(1, (stats.sun_map ? _sun_map_copy : _depth.buffer)->GetGPUVirtualAddress());
 				const UINT half_w = UINT((rt_desc.Width + 1) / 2), half_h = (rt_desc.Height + 1) / 2;
@@ -3362,7 +4059,7 @@ namespace grass
 				list->ResourceBarrier(1, &written);
 				stats.sun = true;
 			}
-			gpu_crash::mark(list, L"worldfx: shading pass");
+			section(list, L"worldfx: shading pass");
 			// (t0 in the shading pass: the wet mask when it's read; else as the sun pass left it, or still unread)
 			if (wet_written)
 				list->SetGraphicsRootShaderResourceView(1, _wet->GetGPUVirtualAddress());
@@ -3377,14 +4074,20 @@ namespace grass
 			stats.lamps = lamps_written;
 			stats.wet = wet_written;
 			stats.sky = sky_written;
-			if ((run_count != 0 || (water_shade && water_run_count != 0)) && copy_out(list, _ground, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)
+			stats.shimmer = shimmer && wx_written;
+			if ((run_count != 0 || (water_shade && (water_run_count != 0 || sea_here))) && copy_out(list, _ground, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)
 				transition(list, t.rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		}
 		// The water: on the surface rebuilt over the zone's water collision (tools/bake_water.py), each pixel
 		// worked out from the copies (what the game drew there and around it) and written whole, so where the
-		// collision overlaps itself, drawing it twice comes out the same
-		if (water_shade && water_run_count != 0 && ground_kind != 0 && depth_kind != 0 && blade_depth_for(rt_desc, error))
-			if (ID3D12PipelineState *const water_pso = water_pipeline_for(t, false, error))
+		// collision overlaps itself, drawing it twice comes out the same. With a sea: the baked water's whole pixels
+		// (marked), the sea where they aren't, the baked water's fading ones over that (water_pipeline_for)
+		ID3D12PipelineState *const water_pso = water_shade && (water_run_count != 0 || sea_here) && ground_kind != 0 && depth_kind != 0 &&
+			blade_depth_for(rt_desc, error) ? water_pipeline_for(t, sea_here ? water_kind::whole : water_kind::plain, error) : nullptr;
+		ID3D12PipelineState *const sea_pso = water_pso != nullptr && sea_here ? water_pipeline_for(t, water_kind::sea, error) : nullptr;
+		ID3D12PipelineState *const fading_pso = sea_pso != nullptr ? water_pipeline_for(t, water_kind::fading, error) : nullptr;
+		if (water_pso != nullptr)
+			if (!sea_here || fading_pso != nullptr)
 			{
 				// Its parameters, into this frame's slot (they go round: earlier frames may still read theirs)
 				if (_water_params == nullptr)
@@ -3420,7 +4123,7 @@ namespace grass
 					float params[kWaterParamBytes / 4] = {
 						l.sun[0], l.sun[1], l.sun[2], l.glint * weather_sun,
 						l.sky[0], l.sky[1], l.sky[2], l.water_reflect,
-						l.water_ripples, l.water_tint, l.time, l.water_distance,
+						l.water_ripples, l.water_tint, l.time, water_reach,
 						l.sun_color[0], l.sun_color[1], l.sun_color[2], float((l.fog_known ? 1 : 0) | 2 | (haze ? 4 : 0)),
 						l.fog[0], l.fog[1], l.fog[2], 0.0f,
 						float(ripple_count), l.water_rings, rain ? rain_amount * std::clamp(l.rain_rings, 0.0f, 2.0f) : 0.0f, 0.0f,
@@ -3429,40 +4132,62 @@ namespace grass
 					if (ripple_count != 0)
 						std::memcpy(&params[32], l.ripples, size_t(ripple_count) * 8 * sizeof(float));
 					std::memcpy(_water_param_data + size_t(slot) * kWaterParamBytes, params, sizeof(params));
-					gpu_crash::mark(list, L"worldfx: water");
+					section(list, L"worldfx: water");
 					stats.bound = true;
 					const D3D12_CPU_DESCRIPTOR_HANDLE water_dsv = _dsv_heap->GetCPUDescriptorHandleForHeapStart();
-					list->ClearDepthStencilView(water_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+					list->ClearDepthStencilView(water_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 					list->SetGraphicsRootSignature(_root);
-					list->SetPipelineState(water_pso);
 					list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 					list->OMSetRenderTargets(1, &world_rtv, FALSE, &water_dsv);
 					list->RSSetViewports(1, &viewport);
 					list->RSSetScissorRects(1, &scissor);
 					list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
-					list->SetGraphicsRootShaderResourceView(1, _water->GetGPUVirtualAddress());
 					list->SetGraphicsRootShaderResourceView(2, _ground.buffer->GetGPUVirtualAddress());
 					list->SetGraphicsRootShaderResourceView(4, _water_params->GetGPUVirtualAddress() + UINT64(slot) * kWaterParamBytes);
 					list->SetGraphicsRootShaderResourceView(5, _depth.buffer->GetGPUVirtualAddress());
-					// (SV_VertexID counts from 0 in every draw, whatever its start vertex, on WARP and the GPU alike:
-					// each run's first corner goes in as a constant, blade.w)
-					for (uint32_t i = 0; i < water_run_count; ++i)
+					// The baked water's runs with blade.z its part (0 all of it; with a sea 1 its whole pixels, 2 its fading
+					// ones: grass.hlsl water_ps). (SV_VertexID counts from 0 in every draw, whatever its start vertex, on
+					// WARP and the GPU alike: each run's first corner goes in as a constant, blade.w)
+					auto baked = [&](ID3D12PipelineState *pso, float part, bool count) {
+						if (_water == nullptr || water_run_count == 0)
+							return;
+						UINT bits = 0;
+						std::memcpy(&bits, &part, 4);
+						list->SetPipelineState(pso);
+						list->SetGraphicsRootShaderResourceView(1, _water->GetGPUVirtualAddress());
+						list->SetGraphicsRoot32BitConstant(0, bits, kFirstBladeConstant - 1);
+						for (uint32_t i = 0; i < water_run_count; ++i)
+						{
+							list->SetGraphicsRoot32BitConstant(0, water_runs[i].first, kFirstBladeConstant);
+							list->DrawInstanced(water_runs[i].count, 1, 0, 0);
+							if (count)
+								stats.water_corners += water_runs[i].count;
+						}
+					};
+					baked(water_pso, sea_here ? 1.0f : 0.0f, true);
+					if (sea_here)
 					{
-						list->SetGraphicsRoot32BitConstant(0, water_runs[i].first, kFirstBladeConstant);
-						list->DrawInstanced(water_runs[i].count, 1, 0, 0);
-						stats.water_corners += water_runs[i].count;
+						// The sea's sheets, whole (they're few), where the baked water didn't mark the stencil
+						section(list, L"worldfx: sea");
+						list->SetPipelineState(sea_pso);
+						list->SetGraphicsRootShaderResourceView(1, _sea->GetGPUVirtualAddress());
+						list->SetGraphicsRoot32BitConstant(0, 0u, kFirstBladeConstant - 1);
+						list->SetGraphicsRoot32BitConstant(0, 0u, kFirstBladeConstant);
+						list->DrawInstanced(_sea_corners, 1, 0, 0);
+						stats.sea_corners = _sea_corners;
+						baked(fading_pso, 2.0f, false);
 					}
 				}
 			}
 		// The water view: the zone's water collision over the world, each spot tinted by whether what the game
 		// drew there is at the water (blue, cyan) or in front of it (red)
 		if (l.water_debug && water_run_count != 0 && depth_kind != 0)
-			if (ID3D12PipelineState *const water_pso = water_pipeline_for(t, true, error))
+			if (ID3D12PipelineState *const debug_pso = water_pipeline_for(t, water_kind::debug, error))
 			{
-				gpu_crash::mark(list, L"worldfx: water view");
+				section(list, L"worldfx: water view");
 				stats.bound = true;
 				list->SetGraphicsRootSignature(_root);
-				list->SetPipelineState(water_pso);
+				list->SetPipelineState(debug_pso);
 				list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 				list->OMSetRenderTargets(1, &world_rtv, FALSE, nullptr);
 				list->RSSetViewports(1, &viewport);
@@ -3479,11 +4204,11 @@ namespace grass
 						stats.water_corners += water_runs[i].count;
 				}
 			}
-		if (_queries != nullptr)
-			list->EndQuery(_queries, D3D12_QUERY_TYPE_TIMESTAMP, _time_slot * 3 + 1);
+		_shade_end[_time_slot] = _mark_count[_time_slot]; // (the copies and shading part ends at the next marker)
 		// (no grass, fireflies or rain without the depth copy: it's their test against the world)
 		if ((run_count == 0 && firefly_run_count == 0 && !falling) || depth_kind == 0 || !blade_depth_for(rt_desc, error))
 		{
+			air_pass();
 			transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
 			gpu_crash::mark(list, L"worldfx: end");
 			finish_timing(list, true);
@@ -3524,7 +4249,7 @@ namespace grass
 				_zeros->SetName(L"worldfx: zeros");
 			}
 
-			gpu_crash::mark(list, L"worldfx: grass");
+			section(list, L"worldfx: grass");
 			stats.bound = true;
 			list->SetGraphicsRootSignature(_root);
 			list->SetPipelineState(pso);
@@ -3572,7 +4297,7 @@ namespace grass
 		if (firefly_run_count != 0)
 			if (ID3D12PipelineState *const firefly_pso = firefly_pipeline_for(t, error))
 			{
-				gpu_crash::mark(list, L"worldfx: fireflies");
+				section(list, L"worldfx: fireflies");
 				stats.bound = true;
 				float firefly_constants[kConstants];
 				std::memcpy(firefly_constants, constants, sizeof(constants));
@@ -3618,7 +4343,7 @@ namespace grass
 			ID3D12PipelineState *const splash_pso = rain_pso != nullptr && l.rain_splashes > 0.0f ? rain_pipeline_for(t, fall::splash, error) : nullptr;
 			if (rain_pso != nullptr)
 			{
-				gpu_crash::mark(list, L"worldfx: rain");
+				section(list, L"worldfx: rain");
 				stats.bound = true;
 				stats.rain_map_moved = moved;
 				float rain_constants[kConstants];
@@ -3657,7 +4382,7 @@ namespace grass
 				stats.rain_drops = columns * columns * kRainLayers;
 				if (splash_pso != nullptr)
 				{
-					gpu_crash::mark(list, L"worldfx: splashes");
+					section(list, L"worldfx: splashes");
 					rain_constants[19] = kSplashRadius;
 					std::memcpy(&rain_constants[27], &splash_columns, 4);
 					list->SetPipelineState(splash_pso);
@@ -3676,7 +4401,7 @@ namespace grass
 			ID3D12PipelineState *const snow_pso = rain_window_for(eye, moved, error) ? rain_pipeline_for(t, fall::snow, error) : nullptr;
 			if (snow_pso != nullptr)
 			{
-				gpu_crash::mark(list, L"worldfx: snow");
+				section(list, L"worldfx: snow");
 				stats.bound = true;
 				stats.rain_map_moved = stats.rain_map_moved || moved;
 				float snow_constants[kConstants];
@@ -3714,6 +4439,57 @@ namespace grass
 			}
 		}
 
+		// Leaves in wind and gales: in the rain's columns (the same map and people), blown far across as they fall, near
+		// the ground only, hidden as the snow; the snow's constants with the leaves' speed, the wind's slant, their light
+		// and amount (grass.hlsl, "Leaves")
+		if (leaves && actor_buffer != nullptr)
+		{
+			bool moved = false;
+			ID3D12PipelineState *const leaf_pso = rain_window_for(eye, moved, error) ? rain_pipeline_for(t, fall::leaf, error) : nullptr;
+			if (leaf_pso != nullptr)
+			{
+				section(list, L"worldfx: leaves");
+				stats.bound = true;
+				stats.rain_map_moved = stats.rain_map_moved || moved;
+				float leaf_constants[kConstants];
+				std::memcpy(leaf_constants, constants, sizeof(constants));
+				auto finite = [](float v, float lo, float hi) { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; };
+				const UINT columns = static_cast<UINT>(std::ceil(2.0f * kLeafRadius / kRainSpacing));
+				// (blown across as they fall: 3 yalms for each yalm fallen in a wind, about 4 in gales, toward where it blows)
+				const float wl = std::sqrt(wx.wind[0] * wx.wind[0] + wx.wind[1] * wx.wind[1]);
+				const float across = std::isfinite(wl) && wl > 1e-3f ? (2.0f + std::min(wx_wind, 2.0f)) / wl : 0.0f;
+				leaf_constants[19] = kLeafRadius;
+				for (int i = 0; i < 3; ++i)
+					leaf_constants[20 + i] = finite(wx.leaf_light[i], 0.0f, 2.0f);
+				leaf_constants[24] = kLeafSpeed;
+				leaf_constants[25] = finite(wx.wind[0] * across, -6.0f, 6.0f);
+				leaf_constants[26] = finite(wx.wind[1] * across, -6.0f, 6.0f);
+				std::memcpy(&leaf_constants[27], &columns, 4);
+				leaf_constants[33] = _rain.x0 + float(_rain_window_i) * _rain.square;
+				leaf_constants[34] = _rain.z0 + float(_rain_window_j) * _rain.square;
+				leaf_constants[35] = _rain.square;
+				leaf_constants[48] = std::min(wx_leaves * kLeafShare, 1.0f);
+				leaf_constants[49] = 0.6f; // (how far they tumble about their path: yalms)
+				leaf_constants[50] = kRainSpacing;
+				leaf_constants[51] = 1.0f;
+				list->SetGraphicsRootSignature(_root);
+				list->SetPipelineState(leaf_pso);
+				list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+				list->OMSetRenderTargets(1, &world_rtv, FALSE, &blade_dsv);
+				list->RSSetViewports(1, &viewport);
+				list->RSSetScissorRects(1, &scissor);
+				list->SetGraphicsRoot32BitConstants(0, kConstants, leaf_constants, 0);
+				list->SetGraphicsRootShaderResourceView(1, _rain_window->GetGPUVirtualAddress());
+				// (t1 isn't read)
+				list->SetGraphicsRootShaderResourceView(2, ground_kind != 0 ? _ground.buffer->GetGPUVirtualAddress() : _rain_window->GetGPUVirtualAddress());
+				list->SetGraphicsRootShaderResourceView(4, actor_buffer->GetGPUVirtualAddress());
+				list->SetGraphicsRootShaderResourceView(5, _depth.buffer->GetGPUVirtualAddress());
+				list->DrawInstanced(6, columns * columns * kLeafLayers, 0, 0);
+				stats.leaves = columns * columns * kLeafLayers;
+			}
+		}
+
+		air_pass();
 		transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
 		gpu_crash::mark(list, L"worldfx: end");
 		finish_timing(list, true);

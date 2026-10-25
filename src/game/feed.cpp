@@ -106,6 +106,23 @@ namespace hifi::game::feed
 		};
 		weather_state g_weather;
 
+		// The moon (research/ffxi-re/notes-moon-phase.md): the game's Vana'diel clock, Earth seconds since 2002-01-01 JST,
+		// as its clock function (1039E0, `call seconds; add eax, [offset]; ret`) has it: [[the clock object] + 0xC], the
+		// whole seconds the client counts (0DC080: `mov eax, [object]; mov eax, [eax+0Ch]; ret`), plus the offset the
+		// server set. The game's moon is (clock / 24192) mod 12 (18BDE0 -> 103B60) and its 84-day light (103BA0) from
+		// it; World FX works those out (worldfx_moon). Read each frame, never called; the clock object is 0 until the
+		// client starts it (the title screen, logging in): nothing sent then.
+		constexpr const char *kMoonClock = "E8????????0305????????C3";
+		const uint8_t kMoonSeconds[] = { 0xA1, 0, 0, 0, 0, 0x8B, 0x40, 0x0C, 0xC3 }; // (0: any byte)
+		struct moon_state
+		{
+			uintptr_t object = 0, offset = 0; // (where the game keeps them)
+			const char *why = "not looked for yet";
+			uint32_t clock = 0; // (the last read; 0 none)
+			uint32_t sent = 0;
+		};
+		moon_state g_moon;
+
 		// The lens flare: hidden unless HiFi XI's "Hide the lens flare" setting is off. Its draw (in its object's update,
 		// FFXiMain 0548D0) is skipped when its visibility test says hidden; this makes that jump (0x54AF1, je -> jmp)
 		// always taken, so the flare is never drawn. The test itself still runs. Put back on unload.
@@ -213,6 +230,7 @@ namespace hifi::game::feed
 		struct wanted
 		{
 			int flare = -1, water = -1, rain = -1;
+			bool drawing = false; // (World FX drawing into the game's world, at the last look)
 		};
 		wanted g_wanted;
 
@@ -586,6 +604,66 @@ namespace hifi::game::feed
 			g_weather.sent++;
 		}
 
+		// Moon
+
+		void find_moon()
+		{
+			if (std::strcmp(g_moon.why != nullptr ? g_moon.why : "", "not looked for yet") != 0)
+				return;
+			g_moon.why = "the game's Vana'diel clock wasn't found";
+			const uintptr_t m = find(kMoonClock);
+			const uintptr_t seconds = m != 0 ? rel_target(m) : 0;
+			uint8_t head[10] = {}, reader[sizeof(kMoonSeconds)] = {};
+			if (seconds == 0 || !read(seconds, head, sizeof(head)) || head[0] != 0xE8 || head[5] != 0xE9)
+				return;
+			const uintptr_t at = rel_target(seconds + 5);
+			if (at == 0 || !read(at, reader, sizeof(reader)))
+				return;
+			for (size_t i = 0; i < sizeof(reader); ++i)
+				if (kMoonSeconds[i] != 0 && reader[i] != kMoonSeconds[i])
+					return;
+			g_moon.object = word(at + 1);
+			g_moon.offset = word(m + 7);
+			g_moon.why = g_moon.object != 0 && g_moon.offset != 0 ? nullptr : "the game's Vana'diel clock wasn't found";
+		}
+
+		// The clock now (0: not running yet, or not read)
+		uint32_t read_moon_clock()
+		{
+			if (g_moon.why != nullptr)
+				return 0;
+			const uint32_t object = word(g_moon.object);
+			uint32_t seconds = 0, offset = 0;
+			if (object == 0 || !read(object + 0xC, seconds) || !read(g_moon.offset, offset))
+				return 0;
+			return seconds + offset;
+		}
+
+		void send_moon()
+		{
+			g_moon.clock = read_moon_clock();
+			if (g_moon.clock == 0)
+				return;
+			worldfx_moon(g_moon.clock);
+			g_moon.sent++;
+		}
+
+		std::string moon_status()
+		{
+			if (g_moon.why != nullptr)
+				return std::string("not read: ") + g_moon.why;
+			if (g_moon.clock == 0)
+				return "the game's clock isn't running yet (logging in)";
+			// (the game's own sums: 103B60, 103BA0)
+			const uint32_t day = g_moon.clock / 3456 % 84, phase = g_moon.clock / 24192 % 12;
+			const double x = (double(day) - 4.0) * (200.0 / 84.0);
+			const int lit = day < 4 ? int(-x + 0.5) : day <= 46 ? int(x + 0.5) : 200 - int(x + 0.5);
+			char line[160];
+			std::snprintf(line, sizeof(line), "the game's clock %u: day %u of the 84, phase %u of 12, %d%% lit (%s)", g_moon.clock, day, phase, lit,
+				day >= 4 && day < 46 ? "waxing" : "waning");
+			return line;
+		}
+
 		float floated(uint32_t bits)
 		{
 			float f = 0.0f;
@@ -814,7 +892,8 @@ namespace hifi::game::feed
 		// Every half second: the calls follow World FX's VisTest setting (tried once each time it's turned on)
 		void update_vis()
 		{
-			const bool want = setting_on("VisTest", true);
+			// (only while World FX draws: it answers them)
+			const bool want = setting_on("VisTest", true) && worldfx_drawing() != 0;
 			if (want && g_vis.sites.empty() && !g_vis.tried)
 			{
 				g_vis.tried = true;
@@ -849,8 +928,14 @@ namespace hifi::game::feed
 		}
 
 		// The patches the settings ask for (each tried again only when its setting changes)
+		// What the game's own effects HiFi XI replaces (its water, its weather, its character shadows) are left out
+		// with: only while World FX draws into the game's world (worldfx_drawing). On another output (DXVK, dgVoodoo's
+		// Direct3D 11) HiFi XI's hooks go in all the same, on a device of their own, but nothing of World FX is drawn:
+		// the game keeps its own. (The lens flare isn't replaced, only left out: its setting alone says.)
 		void follow_settings()
 		{
+			const bool drawing = worldfx_drawing() != 0;
+			g_wanted.drawing = drawing;
 			const int flare = setting_on("HideFlare", true) ? 1 : 0;
 			if (flare != g_wanted.flare)
 			{
@@ -863,7 +948,7 @@ namespace hifi::game::feed
 			// The game's character shadows: out while World FX casts its own (checked every time: the sun sets, a zone
 			// without open sky)
 			{
-				const bool want = setting_on("HideGameShadows", true) && worldfx_casts_characters() != 0;
+				const bool want = drawing && setting_on("HideGameShadows", true) && worldfx_casts_characters() != 0;
 				std::string shadows_why;
 				if (want != g_shadows.off && !set_shadows(want, shadows_why))
 					g_shadows.why = shadows_why;
@@ -872,13 +957,13 @@ namespace hifi::game::feed
 			}
 			// (why one couldn't be routed: in its own status, from its next update)
 			std::string why;
-			const int water = setting_on("HideGameWater", true) ? 1 : 0;
+			const int water = drawing && setting_on("HideGameWater", true) ? 1 : 0;
 			if (water != g_wanted.water)
 			{
 				g_wanted.water = water;
 				gamewater::route(water == 1, why);
 			}
-			const int rain = setting_on("HideGameRain", true) ? 1 : 0;
+			const int rain = drawing && setting_on("HideGameRain", true) ? 1 : 0;
 			if (rain != g_wanted.rain)
 			{
 				g_wanted.rain = rain;
@@ -906,6 +991,7 @@ namespace hifi::game::feed
 		send_lamps();
 		glows::frame(e, now);
 		send_weather();
+		send_moon();
 		gamewater::count_frame();
 		gamerain::count_frame();
 		if (now < g_zone.next_check)
@@ -914,6 +1000,7 @@ namespace hifi::game::feed
 		find_lamps();
 		glows::find_code();
 		find_weather();
+		find_moon();
 		// (0 while zoning: the last zone stays, so World FX doesn't load its files again for nothing)
 		uint32_t zone = p.zone;
 		if (zone != 0 && g_zone.mog_house != 0)
@@ -963,6 +1050,7 @@ namespace hifi::game::feed
 		g_cuts = cuts_state();
 		g_lamps = lamps_state();
 		g_weather = weather_state();
+		g_moon = moon_state();
 		g_flare = flare_state();
 		g_shadows = shadows_state();
 		g_vis = vis_state();
@@ -1003,11 +1091,19 @@ namespace hifi::game::feed
 		}
 		out.push_back("glows: " + glows::status());
 		out.push_back("weather: " + weather_status());
+		out.push_back("moon: " + moon_status());
 		out.push_back(std::string("lens flare: ") + (!g_flare.why.empty() ? "shown (" + g_flare.why + ")" : g_flare.off ? "hidden" : "shown"));
+		// (World FX not drawing here: the game keeps all its own)
+		if (!g_wanted.drawing)
+		{
+			out.push_back("the game's water, weather and character shadows, and its visibility tests: its own (World FX isn't drawing "
+				"into the game's world: it needs dgVoodoo's Direct3D 12 output, OutputAPI = d3d12_fl11_0)");
+			return out;
+		}
 		out.push_back(std::string("the game's character shadows: ") + (!g_shadows.why.empty() ? "drawn (" + g_shadows.why + ")"
 			: g_shadows.off ? "left out (HiFi XI casts characters' shadows)" : "drawn (HiFi XI isn't casting characters' shadows here now)"));
 		out.push_back("the game's water: " + gamewater::status());
-		out.push_back("the game's rain and snow: " + gamerain::status());
+		out.push_back("the game's weather: " + gamerain::status());
 		out.push_back("visibility tests (glows, lamps, the flare, doors): " + vis_status());
 		return out;
 	}
