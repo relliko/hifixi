@@ -396,11 +396,44 @@ namespace hifi::ui
 			draw_lines(g, "What it's doing", game::drawcull::status());
 		}
 
+		// Weather (debug): World FX's own weather forced to any weather (worldfx::force_weather, as /hifi weather), a
+		// button each, the one forced picked; back to the real weather; a flash of lightning now. Not saved.
+		void draw_weather_debug(const gui &g)
+		{
+			heading(g, "Weather (debug)");
+			g.text_wrapped("Draws World FX's own weather as another weather's, whatever the zone's real one, fading over as a "
+				"weather change does. Only World FX's drawing changes: the zone's light and fog still follow the real weather. "
+				"Not saved: off at every start.");
+			const std::string forced = worldfx::forced_weather();
+			g.push_id("weather-debug"); // (its buttons apart from the settings named the same: Rain, Snow, Clouds)
+			if (g.toggle_button("Off: the real weather", forced.empty()))
+				worldfx::force_weather("off");
+			g.tooltip("World FX's own weather follows the zone's real weather again (/hifi weather off).");
+			size_t n = 0;
+			const worldfx::weather_choice *c = worldfx::weather_choices(n);
+			for (size_t i = 0; i < n; ++i)
+			{
+				if (i % 5 != 0)
+					g.same_line();
+				if (g.toggle_button(c[i].label, forced == c[i].name))
+					worldfx::force_weather(c[i].name);
+				char tip[96];
+				std::snprintf(tip, sizeof(tip), "World FX's own weather drawn as %s (/hifi weather %s).", c[i].label, c[i].name);
+				g.tooltip(tip);
+			}
+			if (g.button("Flash lightning now"))
+				worldfx::flash_lightning();
+			g.tooltip("A flash of lightning with its bolt now, whatever the weather (/hifi weather flash), while World FX draws the zone's weather.");
+			g.pop_id();
+			g.text_wrapped(worldfx::forced_weather_text().c_str());
+		}
+
 		// The world's settings, then the zone files HiFi XI makes from the game's own (once a zone, the first time you
 		// enter it; or all at once)
 		void draw_world(const gui &g)
 		{
 			draw_tab_settings(g, settings::tab::world);
+			draw_weather_debug(g);
 			heading(g, "Zone files");
 			g.text_wrapped("Grass, water, rain, wet ground, the sun's shadow map and the lamps come from each zone's own files in "
 				"your game, made the first time you enter a zone (a few seconds, in the background). Or make them all now:");

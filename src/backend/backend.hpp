@@ -53,4 +53,6 @@ namespace hifi::backend
 
 	// What the backend knows, for /hifi status
 	std::vector<std::string> status();
+	// The zone's end markers seen in Direct3D 12 since the start (src/game/slotmark.hpp)
+	uint64_t zone_ends_seen();
 }

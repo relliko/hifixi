@@ -22,6 +22,7 @@
  *   build\bake1_test.exe 104 121      (those zones only)
  *   build\bake1_test.exe rain 102     (one kind: the peak memory then is that kind's)
  *   build\bake1_test.exe --no-python  (the Python's last files, from %TEMP%\hifixi_bake1_test\py)
+ *   build\bake1_test.exe --any-weather 239  (wet and rain whatever the zone's own weather: bake_wet/bake_rain.py --any-weather)
  *
  * Exit code: the number of failures.
  */
@@ -163,6 +164,8 @@ namespace
 		return double(m.PeakPagefileUsage) / 1048576.0;
 	}
 
+	bool any_weather = false; // (--any-weather)
+
 	bool bake(const std::string &kind, uint32_t zone, const std::string &cpp, hifi::bake::result &r)
 	{
 		const std::wstring out = wide(cpp + kind + "\\" + std::to_string(zone) + ".bin");
@@ -171,8 +174,8 @@ namespace
 		if (kind == "water")
 			return hifi::bake::water(zone, out, r);
 		if (kind == "wet")
-			return hifi::bake::wet(zone, out, r);
-		return hifi::bake::rain(zone, out, wide(cpp + "water\\" + std::to_string(zone) + ".bin"), r);
+			return hifi::bake::wet(zone, out, r, any_weather);
+		return hifi::bake::rain(zone, out, wide(cpp + "water\\" + std::to_string(zone) + ".bin"), r, any_weather);
 	}
 
 	// One bake here against the Python's
@@ -221,6 +224,8 @@ int main(int argc, char **argv)
 	{
 		if (std::strcmp(argv[i], "--no-python") == 0)
 			python = false;
+		else if (std::strcmp(argv[i], "--any-weather") == 0)
+			any_weather = true;
 		else if (argv[i][0] >= '0' && argv[i][0] <= '9')
 			zones.push_back(uint32_t(std::strtoul(argv[i], nullptr, 10)));
 		else
@@ -256,7 +261,7 @@ int main(int argc, char **argv)
 
 	if (python)
 	{
-		std::string command = "python \"" + root + "tests\\bake1_oracle.py\" \"" + folder + "py\"";
+		std::string command = "python \"" + root + "tests\\bake1_oracle.py\" \"" + folder + "py\"" + (any_weather ? " --any-weather" : "");
 		for (const uint32_t z : zones)
 			command += " " + std::to_string(z);
 		command += " > \"" + folder + "oracle.log\" 2>&1";

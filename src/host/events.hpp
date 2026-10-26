@@ -28,6 +28,7 @@ namespace hifi::host
 		void (*clear_depth)(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, UINT count, const D3D12_RECT *rects) = nullptr;
 		void (*clear_target)(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT count, const D3D12_RECT *rects) = nullptr;
 		void (*draw)(ID3D12GraphicsCommandList *list, uint64_t vertices) = nullptr;
+		void (*heaps)(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps) = nullptr; // (after)
 		// The queue: lists submitted (after)
 		void (*execute)(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists) = nullptr;
 		// The device: a render target or depth view made (resource null: a null view), and views copied

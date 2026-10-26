@@ -827,30 +827,522 @@ float3 star_field(float3 d, float px, float time, float many)
 	return tint * bright * twinkle * exp(-0.5 * apart * apart / (size * size));
 }
 
-// Clouds (weather_sky): a layer seen along the view ray, its point there (w.xz / up: wider apart toward the horizon) in
-// the noise's units (kCloudScale of them for a ray 45 degrees up; kCloudPeriod a repeat of the broadest octave)
-static const float kCloudScale = 0.9, kCloudPeriod = 64.0;
+// Clouds of their own (crowd.x rule bit 1024, with the weather of its own and the sky): a slab of them some hundreds of
+// yalms over the camera, on a shell round a world kCloudEarth yalms across (so a ray toward the horizon meets them a few
+// thousand yalms off rather than never), seen through by cloud_ps at a quarter of the world's width and height into the
+// sun mask's buffer (u1, after the mask: two pictures, this frame's and the last's, a uint2 a pixel: their light and how
+// much of what's behind them shows, as f16s; 2 there: no sky to work out). A quarter of the picture's pixels are marched
+// each frame (in a 2 x 2 order), the rest carried over from the last frame's picture turned with the camera (the clouds
+// are far enough off that its turning is all that moves them on the screen). The shading pass reads the picture between
+// its pixels where the sky shows (cloud_at). t2 after the weather's (grass_render.cpp kCloudParams):
+// [kCloud] .. [kCloud + 2] the last frame's view rows (a world direction into its view space: its first, second and
+// third), w: its projection's _11, _22, then this frame's turn in the 2 x 2 order (0..3); [kCloud + 3] x: 1 when the last
+// frame's picture can be carried over (0: every pixel marched now), y, z: where this frame's and the last's pictures
+// start in u1 (bytes, uint bits), w: the picture's width (uint bits); [kCloud + 4] x: its height (uint bits), y: steps
+// along a view ray, z: steps toward the light, w: the frames so far (the steps' jitter turns with them); [kCloud + 5] x, y:
+// the slab's bottom and top (yalms over the camera), z: its shape (0 heaps .. 1 a flat deck), w: how strongly the sun or
+// moon lights them; [kCloud + 6] toward the light (the world's, y down), w: how much the fine noise eats their edges;
+// [kCloud + 7] x: how dense they are (light taken out a yalm, in the thickest), y: their style (0 game-like: thin, soft,
+// stretched layers in the sky's own colours, as the game's are; 1 volumetric heaps, lit by the sun); [kCloud + 8],
+// [kCloud + 9]: their shadows' map (cloud_shadow_ps, below).
+static const uint kCloud = kWx + 16;
+bool own_clouds() { return ((crowd.x >> 16) & 1024) != 0; }
 
-// The clouds' noise at q (fbm: the broad shapes drifting by drift.xy, the detail by drift.zw, faster, so they change as
-// they go), each octave left out (as its mean) where its cells are under a couple of pixels (fine: the noise's units a
-// pixel), so they don't sparkle toward the horizon
-float cloud_noise(float2 q, float4 drift, float fine, int octaves)
+// The clouds' noise (t0 in cloud_ps, grass_render.cpp make_cloud_noise): the broad one, kNoiseBase texels a side (a
+// Perlin-Worley mix for billowing masses), then the fine one, kNoiseDetail a side (Worley: what eats away their edges),
+// both repeating. Each word is a texel and its neighbours along x, z and both, a byte each, so a blend of the eight
+// texels round a point is two reads. A texel of the broad one is kBaseTexel yalms (across, up, across), of the fine one
+// kDetailTexel.
+ByteAddressBuffer cloud_noise : register(t0);
+static const uint kNoiseBase = 64, kNoiseDetail = 32, kNoiseDetailAt = 64 * 64 * 64;
+static const float3 kBaseTexel = float3(25.0, 15.0, 25.0);
+static const float kDetailTexel = 5.0;
+// The shell's world (yalms from its middle to the camera), and how far along a view ray the march goes at most
+static const float kCloudEarth = 12000.0, kCloudReach = 2400.0;
+// ... and how long a step along it is at most (yalms: further in than the steps reach, a low ray sees no more)
+static const float kCloudStep = 35.0;
+
+// One of the noises at t (in its texels, repeating every n: a power of two), between its texels
+float cloud_tex(float3 t, uint n, uint at)
 {
-	float sum = 0.0, total = 0.0, amp = 0.5, scale = 1.0, period = kCloudPeriod;
-	[unroll] for (int k = 0; k < 5; ++k)
+	float3 i = floor(t), f = t - i;
+	uint3 a = uint3(int3(i) & int(n - 1));
+	uint w0 = cloud_noise.Load((at + (a.y * n + a.z) * n + a.x) * 4);
+	uint w1 = cloud_noise.Load((at + (((a.y + 1) & (n - 1)) * n + a.z) * n + a.x) * 4);
+	float4 v = lerp(float4(w0 & 255, (w0 >> 8) & 255, (w0 >> 16) & 255, w0 >> 24), float4(w1 & 255, (w1 >> 8) & 255, (w1 >> 16) & 255, w1 >> 24), f.y);
+	return lerp(lerp(v.x, v.y, f.x), lerp(v.z, v.w, f.x), f.z) / 255.0;
+}
+
+// How far along a view ray (up: its height's sine) the shell `over` yalms above the camera is (the root of the sphere's
+// equation, written so nothing large is taken from something large)
+float shell_at(float up, float over)
+{
+	float k = over * (2.0 * kCloudEarth + over);
+	return k / (kCloudEarth * up + sqrt(kCloudEarth * kCloudEarth * up * up + k));
+}
+
+// How high over the camera a point d from it is (the world's axes, y down), on the shell's curve
+float altitude(float3 d)
+{
+	float r = length(float3(d.x, d.y - kCloudEarth, d.z));
+	return (dot(d, d) - 2.0 * kCloudEarth * d.y) / (r + kCloudEarth);
+}
+
+// Where the clouds gather: a broad noise over the ground (800 yalms a cell), drifting with the broad shapes and
+// repeating where their drift does (the drift wraps at 64 of the broad noise's units, 16 texels each)
+float cloud_patches(float2 xz, float4 drift)
+{
+	float2 a = (xz - drift.xy * (16.0 * kBaseTexel.x)) / 800.0;
+	return 0.65 * noise_wrap(a, 32.0) + 0.35 * noise_wrap(a * 2.0 + 17.0, 64.0);
+}
+
+// How much cloud the broad noise makes at t (its texels), h of the way up the slab (0 its bottom .. 1 its top), where
+// the clouds cover c of the sky: the noise shaped by the height (heaps: a flat base, thinning toward rounded tops; a
+// deck: nearly square), then cut by the cover, so only its strongest parts are cloud when there's little (small heaps
+// apart), and nearly all of it when the sky is covered
+float cloud_shape(float3 t, float h, float c, float shape)
+{
+	float profile = saturate(h / lerp(0.06, 0.12, shape)) * saturate((1.0 - h) / lerp(0.8, 0.3, shape));
+	float x = cloud_tex(t, kNoiseBase, 0) * profile;
+	return saturate((x - (1.0 - c)) / max(0.7 * c, 0.25));
+}
+
+// The same eaten away by the fine noise: wisps low down, billows (its cells turned inside out: rounded bulges) higher up;
+// the thinnest of it gone, the thick hardly touched; inside, denser in the billows' middles than between them, so they
+// shade each other (cauliflower)
+float cloud_erode(float d, float detail, float h, float erosion)
+{
+	float billow = lerp(detail, 1.0 - detail, saturate(h * 3.0));
+	float e = billow * erosion * 0.85;
+	return saturate((d - e) / max(1.0 - e, 1e-3)) * lerp(1.0, 0.4 + 1.2 * (1.0 - billow), 0.6 * erosion);
+}
+
+// The slab as this frame has it ([kCloud + 5], [kCloud + 6], the weather's): its bottom and depth (yalms over the
+// camera), its shape (0 heaps .. 1 a deck) and how much of a rain deck it is (deck: 0 none .. 1 a solid deck, with rolls
+// and a ragged base), the cover and how far it varies, the broad noise's drift (its texels) and the same in yalms, and
+// across which way the deck's rolls lie (the wind's way: they run across it). In the game-like style ([kCloud + 7].y 0)
+// half as deep, a third as dense (a rain deck as it is) and softer-edged, the broad noise stretched two and a half times along the wind
+// (streaks and veils rather than heaps).
+struct cloud_slab
+{
+	float bottom, depth, shape, deck, cover, spread, dense, erosion;
+	float3 drift_base;
+	float2 drift_yalms, along;
+	bool game;
+};
+// How far a deck's ragged base hangs below the slab at most (yalms)
+static const float kScud = 70.0;
+
+cloud_slab slab_now()
+{
+	cloud_slab s;
+	float4 c5 = actors[kCloud + 5], drift = actors[kWx + 4], wind = actors[kWx];
+	s.bottom = c5.x;
+	s.depth = max(c5.y - c5.x, 1.0);
+	s.shape = c5.z;
+	s.cover = actors[kWx + 3].x;
+	s.deck = saturate((c5.z - 0.55) / 0.3) * saturate(s.cover * 2.0 - 1.0);
+	s.spread = 0.7 * (1.0 - 0.6 * s.cover); // (an overcast sky opens up less)
+	s.dense = actors[kCloud + 7].x;
+	s.erosion = actors[kCloud + 6].w;
+	s.drift_base = float3(drift.x, 0.0, drift.y) * 16.0;
+	s.drift_yalms = drift.xy * (16.0 * kBaseTexel.x);
+	float wl = length(wind.xy);
+	s.along = wl > 1e-3 ? wind.xy / wl : float2(1.0, 0.0);
+	s.game = actors[kCloud + 7].y < 0.5;
+	[flatten] if (s.game) // (a rain deck stays a deck)
 	{
-		if (k < octaves)
-		{
-			float keep = saturate(1.5 - fine * scale * 3.0);
-			float2 at = (q + (k < 2 ? drift.xy : drift.zw) + float2(k * 13.7, k * 7.3)) * scale;
-			sum += amp * lerp(0.5, noise_wrap(at, period), keep);
-			total += amp;
-		}
-		amp *= 0.5;
-		scale *= 2.0;
-		period *= 2.0;
+		s.depth *= lerp(0.5, 1.0, s.deck);
+		s.dense *= lerp(0.35, 1.0, s.deck);
+		s.erosion *= 0.4;
 	}
-	return sum / total;
+	return s;
+}
+
+// The weather's cover where the clouds are over xz, as the broad noise has it: a little of it cloud at the least, all
+// of it overcast; more or less where the clouds gather
+float cover_at(cloud_slab s, float2 xz, float4 drift)
+{
+	return saturate(0.15 + 0.85 * s.cover + (cloud_patches(xz, drift) - 0.5) * s.spread);
+}
+
+// The broad cloud at d from the camera (the world's axes, y down; c the cover there): h how far up the slab it is
+// (from a deck's ragged base: in patches it hangs down to kScud below it, scud under the deck), P its point (the world's
+// x, z; y its height over the camera). A deck lies in rolls across the wind, 400 yalms apart and wavering: denser and
+// darker, then thinner and lighter (roll: 1 the densest). Its drifting ground coordinates repeat with the drift (the patches' periods).
+float cloud_base(cloud_slab s, float3 d, float c, out float h, out float3 P, out float roll)
+{
+	float alt = altitude(d);
+	P = float3(eye.x + d.x, alt, eye.z + d.z);
+	float lowest = s.bottom;
+	roll = 0.5;
+	[branch] if (s.deck > 0.0)
+	{
+		float2 g = P.xz - s.drift_yalms;
+		float rag = 0.6 * noise_wrap(g / 160.0, 160.0) + 0.4 * noise_wrap(g / 80.0 + 7.3, 320.0);
+		lowest -= s.deck * kScud * saturate(1.8 * rag - 0.6);
+		roll = 0.5 + 0.5 * sin(6.2831853 * dot(g, s.along) / 400.0 + 3.0 * noise_wrap(g / 400.0 + 3.1, 64.0));
+	}
+	h = (alt - lowest) / (s.depth + s.bottom - lowest);
+	if (h <= 0.0 || h >= 1.0)
+		return 0.0;
+	float cc = saturate(c * lerp(1.0, 0.85 + 0.25 * roll, s.deck));
+	float3 tb = P / kBaseTexel - s.drift_base;
+	[flatten] if (s.game)
+		tb.xz = float2(dot(tb.xz, s.along) * 0.4, dot(tb.xz, float2(-s.along.y, s.along.x)));
+	return cloud_shape(tb, h, cc, s.shape) * lerp(1.0, 0.45 + 1.1 * roll, s.deck);
+}
+
+// The Henyey-Greenstein phase (1 for light scattered evenly every way): how much of the light comes on toward the eye
+// at mu, the cosine between the view ray and the way to the light; g > 0 forward
+float phase_hg(float mu, float g)
+{
+	float k = 1.0 + g * g - 2.0 * g * mu;
+	return (1.0 - g * g) / (k * sqrt(k));
+}
+
+// What the clouds along a view ray w (the world's, y down; up: its height's sine) give: their light (rgb) and how much
+// of what's behind them still shows (a).
+// Marched from where the ray enters the slab (a deck's ragged base below it) to where it leaves (at most kCloudReach
+// on), each step's point a share `jitter` (0..1) into it. At each point with cloud, a few steps toward the sun or moon,
+// growing in length, for how much of its light gets there (Beer-Lambert, with two fainter terms for light scattered many
+// times over, which reaches deeper; the first step's cloud with its fine noise, so the billows shade each other), times
+// the phase toward the eye (mostly forward, with a silver lining on what's thin toward the light; on an overcast deck
+// light comes through spread out, without the glow toward the sun) and a powder term (light gets into the dense parts
+// more than the wisps: they darken looking away from the light); and the sky's light round it, the record's gradient's,
+// more at the top than underneath. Lit as the weather lights them (their colour where lit, [kWx + 5], underneath,
+// [kWx + 6]: the record's gradient and sun colour); by the moon's light ([kSky + 13].w) a cool grey. Far off they fade
+// toward the sky's own colour, and at the horizon into it.
+float4 cloud_march(float3 w, float up, float jitter)
+{
+	cloud_slab sl = slab_now();
+	float4 c4 = actors[kCloud + 4], c5 = actors[kCloud + 5], c6 = actors[kCloud + 6];
+	float4 drift = actors[kWx + 4];
+	float darker = actors[kWx + 5].w;
+	float3 lit = actors[kWx + 5].rgb, shade = actors[kWx + 6].rgb;
+	float moon = actors[kSky + 13].w;
+	lit = lerp(lit, luma(lit) * float3(0.84, 0.9, 1.0), 0.85 * moon);
+	shade = lerp(shade, luma(shade) * float3(0.86, 0.91, 1.0), 0.7 * moon);
+	// (under a veil, mist's, the light on them dimmer: a haze, not bright heaps)
+	float strength = c5.w * (1.0 - 0.5 * actors[kWx + 3].z);
+	float3 L = c6.xyz;
+	uint steps = max(uint(c4.y), 1u), light_steps = uint(c4.z);
+	float t0 = shell_at(up, sl.bottom - kScud * sl.deck), t1 = min(shell_at(up, sl.bottom + sl.depth), t0 + min(kCloudReach, steps * kCloudStep));
+	float cover0 = cover_at(sl, eye.xz + w.xz * t0, drift), cover1 = cover_at(sl, eye.xz + w.xz * t1, drift);
+	float mu = dot(w, L);
+	float forward = 0.8 * phase_hg(mu, 0.55) + 0.2 * phase_hg(mu, -0.25) + 0.025 * phase_hg(mu, 0.9);
+	float softer = 0.7 * phase_hg(mu, 0.3) + 0.3 * phase_hg(mu, -0.15);
+	float flat = max(sl.deck, saturate(sl.cover * 1.5 - 0.5)); // (how much of an overcast it is)
+	forward = lerp(forward, softer, 0.85 * flat);
+	float toward = saturate(mu * 0.5 + 0.5);
+	float3 sky_high = sky_gradient(0.35) / 255.0 * (1.0 - darker);
+	// (the sky's light on them: the weather's underside colour, some of the sky's own hue in it, brighter higher up)
+	float3 sky_hue = sky_high / max(luma(sky_high), 0.03) * luma(shade);
+	sky_hue = lerp(sky_hue, luma(sky_hue) * float3(0.86, 0.91, 1.0), 0.7 * moon);
+	float hue = lerp(0.3, 0.12, sl.deck);
+	float3 base_light = lerp(shade, sky_hue, hue) * lerp(0.5, 0.75, sl.deck), top_light = lerp(shade, sky_hue, hue) * 0.85;
+	float3 drift_fine = float3(drift.z, 0.0, drift.w) * 64.0;
+	// Two speeds: long steps through clear air, and once one lands in cloud, back most of a step and on in quarter steps
+	// (a heap's light is all in its first few yalms), back to long steps after six quarter steps clear
+	float dt = (t1 - t0) / steps, dt_fine = 0.25 * dt;
+	float3 sum = 0.0;
+	float T = 1.0, far = 0.0, seen = 0.0; // (how far off the cloud seen is: each step's distance by how much of it shows)
+	float t = t0 + dt * jitter;
+	bool fine = false;
+	uint clear_run = 0;
+	[loop] for (uint i = 0; i < steps * 4 && t < t1; ++i)
+	{
+		float3 d = w * t;
+		float c = lerp(cover0, cover1, saturate((t - t0) / max(t1 - t0, 1e-3)));
+		float h, roll;
+		float3 P;
+		float dens = cloud_base(sl, d, c, h, P, roll);
+		[branch] if (!fine)
+		{
+			[branch] if (dens > 0.0)
+			{
+				fine = true;
+				clear_run = 0;
+				t = max(t - 0.75 * dt, t0);
+			}
+			else
+				t += dt;
+			continue;
+		}
+		[branch] if (dens > 0.0)
+			dens = cloud_erode(dens, cloud_tex(P / kDetailTexel - drift_fine, kNoiseDetail, kNoiseDetailAt), h, sl.erosion);
+		[branch] if (dens > 0.0)
+		{
+			clear_run = 0;
+			float sigma = dens * sl.dense;
+			float od = 0.0, s = 0.0, ds = 8.0;
+			[loop] for (uint k = 0; k < light_steps; ++k)
+			{
+				float3 q = d + L * (s + 0.5 * ds);
+				float qh, qroll;
+				float3 qP;
+				float qd = cloud_base(sl, q, c, qh, qP, qroll);
+				[branch] if (k == 0 && qd > 0.0)
+					qd = cloud_erode(qd, cloud_tex(qP / kDetailTexel - drift_fine, kNoiseDetail, kNoiseDetailAt), qh, sl.erosion);
+				else
+					qd *= 1.0 - 0.3 * sl.erosion;
+				od += qd * sl.dense * ds;
+				s += ds;
+				ds *= 2.2;
+			}
+			float through = exp(-od) * forward + 0.5 * exp(-0.4 * od) * softer + 0.25 * exp(-0.15 * od);
+			float powder = lerp(1.0 - exp(-sigma * 45.0), 1.0, 0.25 + 0.75 * toward * toward);
+			// (the sky's light reaches less far in where much cloud lies toward the light: a deck's dense rolls and a heap's
+			// creases darker)
+			float sky_in = lerp(0.65, 1.0, exp(-0.06 * od));
+			// (a deck's thinner rolls lighter underneath, its dense ones darker)
+			float rolls = lerp(1.0, 1.45 - 0.9 * roll, sl.deck);
+			float3 S = min((1.5 * lit * strength * through * powder + lerp(base_light, top_light, saturate(h)) * sky_in) * rolls, 8.0);
+			float a = exp(-sigma * dt_fine);
+			sum += T * S * (1.0 - a);
+			far += T * (1.0 - a) * t;
+			seen += T * (1.0 - a);
+			T *= a;
+			if (T < 0.015)
+				break;
+		}
+		else if (++clear_run >= 6)
+			fine = false;
+		t += dt_fine;
+	}
+	far = seen > 1e-4 ? far / seen : t0;
+	float fade = exp(-max(far - 300.0, 0.0) / 3500.0) * smoothstep(0.0, 0.06, up);
+	float3 sky_at = sky_gradient(asin(saturate(up)) / 1.5707963) / 255.0 * (1.0 - darker);
+	float a = 1.0 - T;
+	// The game-like style: the sky's own colour lifted a little with some of their own light in it (more by day, and a
+	// rain deck's grey most), never much brighter than the sky round them (by night hardly at all), and never quite
+	// opaque (the sun, moon and stars glimmer through)
+	[branch] if (sl.game)
+	{
+		float3 own = a > 1e-3 ? sum / a : 0.0;
+		float mix_own = lerp(lerp(0.6, 0.2, moon), 0.85, sl.deck);
+		float3 most = lerp(sky_at * 1.6 + 0.15, sky_at * 1.2 + 0.02, moon);
+		float3 base = lerp(sky_at * 1.08 + 0.02, sky_at * 1.04 + 0.008, moon);
+		float3 tinted = min(lerp(base, own, mix_own), most);
+		a *= lerp(0.85, 1.0, sl.deck);
+		sum = tinted * a;
+		T = 1.0 - a;
+	}
+	// By the moon's light, either style: no brighter than the night sky round them by much (they don't glow)
+	sum = lerp(sum, min(sum, (sky_at * 1.4 + 0.03) * a), moon);
+	// (the brightest of them eased toward white rather than cut off at it: a soft knee from 0.75)
+	float3 over = max(sum - 0.75, 0.0);
+	sum = min(sum, 0.75) + 0.25 * (1.0 - exp(-over / 0.25));
+	return float4(lerp(sky_at * (1.0 - T), sum, fade), T);
+}
+
+// The clouds' picture at u1 + at: a pixel (its light and how much of what's behind shows: two words of f16s), or
+// between its pixels at s (its pixels' units, their middles at whole numbers), from those of them that hold clouds (none
+// worked out there: 2), weighed by nearness; held: how much of that weight there was (0: none, the clear sky returned)
+float4 cloud_read(uint at, uint2 q, uint width)
+{
+	uint2 v = sun_mask.Load2(at + (q.y * width + q.x) * 8);
+	return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+}
+
+float4 cloud_between(uint at, float2 s, uint2 size, out float held)
+{
+	float2 i = floor(s), f = s - i;
+	float4 sum = 0.0;
+	held = 0.0;
+	[unroll] for (int k = 0; k < 4; ++k)
+	{
+		int2 p = int2(i) + int2(k & 1, k >> 1);
+		float wk = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);
+		bool on = all(p >= 0) && all(p < int2(size));
+		float4 v = cloud_read(at, uint2(clamp(p, int2(0, 0), int2(size) - 1)), size.x);
+		bool ok = on && v.a <= 1.5;
+		sum += ok ? v * wk : 0.0;
+		held += ok ? wk : 0.0;
+	}
+	return held > 1e-4 ? sum / held : float4(0.0, 0.0, 0.0, 1.0);
+}
+
+// The same through a Catmull-Rom spline (sharper: the last frame's picture is carried over again and again, and a blend
+// between four pixels each time would blur it as the camera turns), kept within the four nearest's range; between four
+// as above where any of the sixteen holds none
+float4 cloud_sharp(uint at, float2 s, uint2 size, out float held)
+{
+	float2 i = floor(s), f = s - i;
+	float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f), w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+	float4 sum = 0.0, lo = 1e9, hi = -1e9;
+	bool whole = true;
+	[unroll] for (int k = 0; k < 16; ++k)
+	{
+		int2 o = int2(k & 3, k >> 2);
+		int2 p = int2(i) + o - 1;
+		bool on = all(p >= 0) && all(p < int2(size));
+		float4 v = cloud_read(at, uint2(clamp(p, int2(0, 0), int2(size) - 1)), size.x);
+		whole = whole && on && v.a <= 1.5;
+		float wx = o.x == 0 ? w0.x : o.x == 1 ? w1.x : o.x == 2 ? w2.x : w3.x;
+		float wy = o.y == 0 ? w0.y : o.y == 1 ? w1.y : o.y == 2 ? w2.y : w3.y;
+		sum += v * (wx * wy);
+		bool inner = (o.x == 1 || o.x == 2) && (o.y == 1 || o.y == 2);
+		lo = inner ? min(lo, v) : lo;
+		hi = inner ? max(hi, v) : hi;
+	}
+	[branch] if (!whole)
+		return cloud_between(at, s, size, held);
+	held = 1.0;
+	return clamp(sum, lo, hi);
+}
+
+// Value noise (0..1) at p, from a hash of the lattice's corners: the clouds' edges' finest grain, worked out per pixel
+float hash3(int3 p)
+{
+	uint n = uint(p.x) * 1597334677u ^ uint(p.y) * 3812015801u ^ uint(p.z) * 2798796415u;
+	n = (n ^ (n >> 16)) * 2246822519u;
+	n ^= n >> 13;
+	return float(n & 0xFFFFFFu) / 16777215.0;
+}
+
+float value_noise3(float3 p)
+{
+	int3 i = int3(floor(p));
+	float3 f = p - floor(p);
+	float3 u = f * f * (3.0 - 2.0 * f);
+	float a = lerp(hash3(i), hash3(i + int3(1, 0, 0)), u.x), b = lerp(hash3(i + int3(0, 1, 0)), hash3(i + int3(1, 1, 0)), u.x);
+	float c = lerp(hash3(i + int3(0, 0, 1)), hash3(i + int3(1, 0, 1)), u.x), d = lerp(hash3(i + int3(0, 1, 1)), hash3(i + int3(1, 1, 1)), u.x);
+	return lerp(lerp(a, b, u.y), lerp(c, d, u.y), u.z);
+}
+
+// The clouds over the sky at a pixel of the world (xy: its middle, w its view ray in the world), from this frame's
+// picture; in the volumetric style, at their edges (neither clear nor whole) sharpened at the world's own size: how much of what's behind shows
+// pushed toward clear or whole by a fine noise where this pixel's own ray meets the slab's bottom (drifting with their
+// fine noise; the same frame to frame), so the quarter-size picture's soft edges come out crisp and ragged, their light
+// kept in step
+float4 cloud_at(float2 xy, float3 w)
+{
+	float4 c3 = actors[kCloud + 3];
+	float held;
+	float4 c = cloud_between(asuint(c3.y), xy / 4.0 - 0.5, uint2(asuint(c3.w), asuint(actors[kCloud + 4].x)), held);
+	float a = 1.0 - c.a;
+	[branch] if (a > 0.003 && a < 0.997 && actors[kCloud + 7].y > 0.5) // (the volumetric style's: the game-like's stay soft)
+	{
+		float4 drift = actors[kWx + 4];
+		float3 P = eye.xyz + w * shell_at(max(-w.y, 0.0), actors[kCloud + 5].x) - float3(drift.z, 0.0, drift.w) * (64.0 * kDetailTexel);
+		float n = 0.6 * value_noise3(P / 9.0) + 0.4 * value_noise3(P / 4.0 + 31.7);
+		float sharp = saturate((a - 0.5 + (n - 0.5) * 0.6) * 1.5 + 0.5);
+		c.rgb *= min(sharp / a, 3.0);
+		c.a = 1.0 - sharp;
+	}
+	return c;
+}
+
+// The clouds' picture, a pixel for each 4 x 4 of the world's (the pass's viewport that size): none where those show no
+// sky (2); else carried over from the last frame's picture where the camera's turn puts this direction in it, and marched
+// again on this pixel's turn (one frame in four: the 2 x 2 order) or where there's nothing to carry over (just come into
+// view, or the picture new), then blended half and half with what was carried over (each march's jitter differs: over a
+// few frames they average out)
+void cloud_ps(float4 pos : SV_Position)
+{
+	int2 q = int2(pos.xy);
+	float4 c3 = actors[kCloud + 3], c4 = actors[kCloud + 4];
+	uint2 size = uint2(asuint(c3.w), asuint(c4.x));
+	if (any(uint2(q) >= size))
+		return;
+	uint now_at = asuint(c3.y);
+	bool sky = false;
+	[unroll] for (int k = 0; k < 16; ++k)
+		sky = sky || drawn_depth(q * 4 + int2(k & 3, k >> 2)) > kSkyDepth;
+	float2 xy = (float2(q) + 0.5) * 4.0;
+	float2 ndc = float2(xy.x / ground.y * 2.0 - 1.0, 1.0 - xy.y / ground.z * 2.0);
+	float3 v = normalize(float3(ndc.x / lin.z, ndc.y / lin.w, up_row.w));
+	float3 w = normalize(float3(dot(actors[kSky + 11].xyz, v), dot(up_row.xyz, v), dot(actors[kSky + 12].xyz, v)));
+	float up = -w.y;
+	float4 c = float4(0.0, 0.0, 0.0, 2.0);
+	[branch] if (sky && up > -0.03)
+	{
+		float4 r0 = actors[kCloud], r1 = actors[kCloud + 1], r2 = actors[kCloud + 2];
+		float3 was = w.x * r0.xyz + w.y * r1.xyz + w.z * r2.xyz; // (into the last frame's view space)
+		float ahead = was.z * up_row.w;
+		float held = 0.0;
+		float4 kept = float4(0.0, 0.0, 0.0, 1.0);
+		[branch] if (c3.x > 0.5 && ahead > 0.05)
+		{
+			float2 n = was.xy * float2(r0.w, r1.w) / ahead;
+			float2 s = float2((n.x * 0.5 + 0.5) * ground.y, (0.5 - n.y * 0.5) * ground.z) / 4.0 - 0.5;
+			kept = cloud_sharp(asuint(c3.z), s, size, held);
+		}
+		static const uint kOrder[4] = { 0, 2, 3, 1 };
+		bool turn = kOrder[(uint(q.x) & 1u) | ((uint(q.y) & 1u) << 1)] == uint(r2.w);
+		c = kept;
+		[branch] if (held < 0.5 || turn)
+		{
+			float jitter = frac(frac(52.9829189 * frac(dot(float2(q), float2(0.06711056, 0.00583715)))) + asuint(c4.w) * 0.618034);
+			float4 m = cloud_march(w, up, jitter);
+			c = held >= 0.5 ? lerp(kept, m, 0.5) : m;
+		}
+	}
+	sun_mask.Store2(now_at + (uint(q.y) * size.x + uint(q.x)) * 8, uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b) | (f32tof16(c.a) << 16)));
+}
+
+// The clouds' shadows on the ground (crowd.x rule bit 2048, with the clouds): a map of how much sunlight (or moonlight)
+// gets through them, [kCloud + 9].x texels a side round the camera, worked out each frame by cloud_shadow_ps after the
+// clouds' pictures in u1 (a float a texel), for the ground at the camera's ground height ([kWx + 1].w), each texel's ray
+// toward the light marched through the slab's broad cloud in ten steps. [kCloud + 8] x, y: its corner (the world's x and
+// z, least), z: its texel (yalms), w: where it starts in u1 (bytes, uint bits); [kCloud + 9] x: its texels a side (uint
+// bits), y: how strongly a shadow takes the sun's share of the light (the sun's shadows' strength, less the more the
+// sky is covered: an overcast's light is the game's dim light already).
+bool cloud_shadows() { return ((crowd.x >> 16) & 2048) != 0; }
+
+void cloud_shadow_ps(float4 pos : SV_Position)
+{
+	uint2 q = uint2(pos.xy);
+	float4 m = actors[kCloud + 8], m2 = actors[kCloud + 9];
+	uint n = asuint(m2.x);
+	if (any(q >= n))
+		return;
+	cloud_slab sl = slab_now();
+	float4 drift = actors[kWx + 4];
+	float3 L = actors[kCloud + 6].xyz;
+	float3 d0 = float3(m.x + (q.x + 0.5) * m.z, actors[kWx + 1].w, m.y + (q.y + 0.5) * m.z) - eye.xyz;
+	float lit = 1.0;
+	[branch] if (L.y < -0.03)
+	{
+		float a0 = altitude(d0), rise = -L.y;
+		float s0 = max((sl.bottom - kScud * sl.deck - a0) / rise, 0.0);
+		float s1 = min((sl.bottom + sl.depth - a0) / rise, s0 + 1500.0);
+		float ds = max(s1 - s0, 0.0) / 10.0;
+		float c = cover_at(sl, eye.xz + d0.xz + L.xz * (0.5 * (s0 + s1)), drift);
+		float od = 0.0;
+		[loop] for (uint k = 0; k < 10; ++k)
+		{
+			float h, roll;
+			float3 P;
+			od += cloud_base(sl, d0 + L * (s0 + (k + 0.5) * ds), c, h, P, roll) * sl.dense * (1.0 - 0.3 * sl.erosion) * ds;
+		}
+		lit = exp(-od);
+	}
+	sun_mask.Store(asuint(m.w) + (q.y * n + q.x) * 4, asuint(lit));
+}
+
+// How much sunlight the clouds let through to a point of the world drawn (P in view space), from their shadow map: the
+// point on its ray toward the light at the map's ground height (within 300 yalms), between the map's texels; whole
+// past the map's edge (faded over its last eighth)
+float cloud_shadow_at(float3 P)
+{
+	float4 m = actors[kCloud + 8], m2 = actors[kCloud + 9];
+	uint n = asuint(m2.x);
+	float3 L = actors[kCloud + 6].xyz;
+	float3 W = eye.xyz + float3(dot(actors[kWx + 1].xyz, P), dot(up_row.xyz, P), dot(actors[kWx + 2].xyz, P));
+	float along = L.y < -0.03 ? clamp((actors[kWx + 1].w - W.y) / L.y, -300.0, 300.0) : 0.0;
+	float2 s = (W.xz + L.xz * along - m.xy) / m.z - 0.5;
+	float2 i = floor(s), f = s - i;
+	float sum = 0.0;
+	[unroll] for (int k = 0; k < 4; ++k)
+	{
+		int2 p = clamp(int2(i) + int2(k & 1, k >> 1), int2(0, 0), int2(n, n) - 1);
+		float wk = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);
+		sum += wk * asfloat(sun_mask.Load(asuint(m.w) + (uint(p.y) * n + uint(p.x)) * 4));
+	}
+	float2 edge = min(s, float(n) - 1.0 - s) / (0.125 * n);
+	return lerp(1.0, sum, saturate(min(edge.x, edge.y)));
 }
 
 // An aurora's light along w (the world, y down; up: how high it is): curtains hanging in the sky, sheets that wave slowly
@@ -916,13 +1408,12 @@ float bolt_light(float az, float el, float bearing, float top, float seed, float
 }
 
 // The sky's weather (weather_fx) over the gradient at this pixel (sky; w its view ray in the world, y down, up its
-// height's sine, v in view space; behind: the sun or moon and the stars, which the clouds hide): an aurora's curtains, a
-// veil over all of it (mist), the clouds lit by the sun or moon (light: toward it in view space, sun its strength, disc
-// its colour; at night the moon's), dust and gloom over them low down, the lightning's flash lighting the clouds most and
-// its bolt in front of them
-float3 weather_sky(float3 w, float3 v, float up, float3 sky, float3 behind, float px, float4 light, float sun, float3 disc)
+// height's sine, v in view space, xy the pixel's middle; behind: the sun or moon and the stars, which the clouds hide): an
+// aurora's curtains, a veil over all of it (mist), the clouds (own_clouds: cloud_ps's, lit by the sun or moon), dust and
+// gloom over them low down, the lightning's flash lighting the clouds most and its bolt in front of them
+float3 weather_sky(float2 xy, float3 w, float3 v, float up, float3 sky, float3 behind, float px)
 {
-	float4 clouds = actors[kWx + 3], drift = actors[kWx + 4], lit = actors[kWx + 5], shade_c = actors[kWx + 6], veil_c = actors[kWx + 7];
+	float4 clouds = actors[kWx + 3], shade_c = actors[kWx + 6], veil_c = actors[kWx + 7];
 	float4 flash = actors[kWx + 8], bolt = actors[kWx + 9], dust = actors[kWx + 10], gloom = actors[kWx + 12];
 	float t = actors[kWx + 2].w;
 	float3 colour = sky + behind;
@@ -930,26 +1421,14 @@ float3 weather_sky(float3 w, float3 v, float up, float3 sky, float3 behind, floa
 		colour += aurora_light(w, up, t) * shade_c.w * saturate(1.2 - 4.0 * luma(sky));
 	float veil = clouds.z * (0.55 + 0.45 * (1.0 - up));
 	colour = lerp(colour, veil_c.rgb, veil);
+	// The clouds (cloud_ps's picture, read between its pixels): what's behind them (the sky, the sun or moon, the stars)
+	// showing through as much as they let it, their own light over it
 	float cover = 0.0;
-	[branch] if (clouds.x > 0.0 && clouds.y > 0.0)
+	[branch] if (own_clouds())
 	{
-		float2 q = w.xz / (up + 0.06) * kCloudScale;
-		float fine = kCloudScale * px / ((up + 0.06) * (up + 0.06)); // (the layer's units a pixel there)
-		float n = cloud_noise(q, drift, fine, 5);
-		float from = lerp(0.74, -0.08, clouds.x); // (where the noise is cloud: more of it, the more they cover)
-		float d = smoothstep(from, from + 0.2, n);
-		// Lit where it thins toward the light (the noise a little way toward it lower), in shade where it thickens
-		float3 toward = float3(dot(actors[kWx + 1].xyz, light.xyz), dot(up_row.xyz, light.xyz), dot(actors[kWx + 2].xyz, light.xyz));
-		float2 lean = toward.xz / max(length(toward.xz), 1e-3) * 0.35;
-		float n2 = cloud_noise(q + lean, drift, fine, 3);
-		float litness = saturate(0.55 + (n - n2) * 4.0) * saturate(0.35 - toward.y * 2.0);
-		float3 cc = lerp(shade_c.rgb, lit.rgb, litness);
-		// (a bright rim on thin cloud near the sun; toward the horizon they fade into the sky's own colour)
-		float apart = acos(clamp(dot(v, light.xyz), -1.0, 1.0));
-		cc += disc * sun * exp(-apart / 0.12) * 4.0 * d * (1.0 - d) * 0.8;
-		cc = lerp(cc, sky, 0.5 * (1.0 - smoothstep(0.0, 0.3, up)));
-		cover = d * clouds.y * smoothstep(0.0, 0.08, up);
-		colour = lerp(colour, cc, cover);
+		float4 c = cloud_at(xy, w);
+		colour = colour * c.a + c.rgb;
+		cover = 1.0 - c.a;
 	}
 	[branch] if (dust.w > 0.0)
 		colour = lerp(colour, dust.rgb, saturate(dust.w * (0.2 + 0.5 * (1.0 - up) * (1.0 - up))));
@@ -993,19 +1472,21 @@ float3 sky_paint(float2 xy, float3 col)
 		sky *= 1.0 - actors[kWx + 5].w;
 		boost = actors[kWx + 3].w;
 	}
-	// The sun (or the moon): a disc about one and a half times the real one's, and a glow around it; the moon's smaller and
-	// fainter. Cut by the horizon (soft by a pixel). The moon in its phase (the game's: [kSky + 16..18].w its lit side in
-	// view space, [kSky + 19].w how much of it is lit, 0 new .. 1 full): a sphere lit from the side by as much, the
-	// terminator soft by about a pixel, the dark part just a faint earthshine; its glow as bright as its lit share.
+	// The sun (or the moon): a disc about one and a half times the real one's, and a glow around it. The moon as the game
+	// draws its own: big (about seven times the sun's, 6 degrees across), soft-edged, its face mottled with darker seas
+	// (a noise on the disc), tinted by the sky round it (pink at dusk, blue at night) and a soft glow about it. Cut by the
+	// horizon (soft by a pixel). The moon in its phase (the game's: [kSky + 16..18].w its lit side in view space, [kSky +
+	// 19].w how much of it is lit, 0 new .. 1 full): a sphere lit from the side by as much, the terminator soft, the dark
+	// part just a faint earthshine; its glow as bright as its lit share.
 	float3 add = 0.0;
-	float shine = row2.w; // (the sun's or moon's strength as the clouds are lit by it)
 	[branch] if (row2.w > 0.0)
 	{
 		float apart = acos(clamp(dot(v, light.xyz), -1.0, 1.0));
-		float radius = lerp(0.008, 0.007, light.w);
-		float body = 1.0 - smoothstep(radius - px, radius + px, apart);
+		float radius = lerp(0.008, 0.055, light.w);
+		float soft = max(px, lerp(0.0, 0.12 * radius, light.w));
+		float body = 1.0 - smoothstep(radius - soft, radius + px, apart);
 		float lit = actors[kSky + 19].w;
-		float phase = 1.0;
+		float phase = 1.0, face = 1.0;
 		[branch] if (light.w > 0.0 && body > 0.0)
 		{
 			float3 side = float3(actors[kSky + 16].w, actors[kSky + 17].w, actors[kSky + 18].w);
@@ -1017,13 +1498,20 @@ float3 sky_paint(float2 xy, float3 col)
 			float z = sqrt(saturate(1.0 - x * x - y * y)); // (toward the eye)
 			// (the sun from the side by the phase angle: a share lit of (1 + cos a) / 2 = lit)
 			float c = 2.0 * saturate(lit) - 1.0, s = sqrt(saturate(1.0 - c * c));
-			float edge = max(1.5 * px / radius, 0.04);
+			float edge = max(1.5 * px / radius, 0.08);
 			phase = lerp(0.04, 1.0, smoothstep(-edge, edge, x * s + z * c));
+			// (its seas: broad darker patches, finer mottling in them)
+			float2 m = float2(x, y);
+			float seas = 0.55 * noise2(m * 2.3 + 5.1) + 0.3 * noise2(m * 5.7 + 11.3) + 0.15 * noise2(m * 13.0 + 2.7);
+			face = 1.0 - 0.38 * smoothstep(0.42, 0.68, seas);
 		}
 		float glow_share = lerp(1.0, 0.08 + 0.92 * saturate(lit), light.w);
-		float glow = lerp(0.45 * exp(-apart / 0.035) + 0.16 * exp(-apart / 0.25), 0.22 * exp(-apart / 0.03) + 0.05 * exp(-apart / 0.15), light.w);
-		add += disc.rgb * (body * lerp(1.0, 0.85 * phase, light.w) + glow * glow_share) * row2.w * smoothstep(-px, px, up);
-		shine *= glow_share;
+		float beyond = max(apart - radius, 0.0);
+		float glow = lerp(0.45 * exp(-apart / 0.035) + 0.16 * exp(-apart / 0.25), 0.16 * exp(-beyond / 0.03) + 0.05 * exp(-beyond / 0.15), light.w);
+		// (the moon's light the sky's hue a little: kept to a sensible range, so a near-black sky doesn't make it garish)
+		float3 hue = clamp(sky / max(luma(sky), 0.03), 0.6, 1.5);
+		float3 tint = lerp(1.0, hue, 0.3 * light.w);
+		add += disc.rgb * tint * (body * lerp(1.0, 0.85 * phase * face, light.w) + glow * glow_share) * row2.w * smoothstep(-px, px, up);
 	}
 	// The stars, turned about the pole (35 degrees up in the north) by the hour; fewer near the horizon and none on a sky
 	// still bright (twilight)
@@ -1037,7 +1525,7 @@ float3 sky_paint(float2 xy, float3 col)
 	}
 	float3 seen = sky + add;
 	[branch] if (weather)
-		seen = weather_sky(w, v, up, sky, add, px, light, shine, disc.rgb);
+		seen = weather_sky(xy, w, v, up, sky, add, px);
 	float noise = frac(52.9829189 * frac(dot(xy, float2(0.06711056, 0.00583715)))) - 0.5;
 	float3 painted = lerp(col, seen + noise / 255.0, bare);
 	return misc.y > 0.5 ? lerp(painted, lerp(float3(1.0, 0.0, 0.0), float3(1.0, 0.0, 1.0), bare), 0.3) : painted;
@@ -1097,7 +1585,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	float steep = 1.0;
 	bool lamps = ((crowd.x >> 16) & 16) != 0;
 	bool wetting = wet();
-	if (shade.x > 0.0 || shade.w > 0.0 || lamps || wetting)
+	bool cloud_shade = cloud_shadows();
+	if (shade.x > 0.0 || shade.w > 0.0 || lamps || wetting || cloud_shade)
 		n = surface_normal(p, P, steep);
 	float noise = frac(52.9829189 * frac(dot(pos.xy, float2(0.06711056, 0.00583715))));
 
@@ -1184,6 +1673,10 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		float2 s = weight > 0.0 ? sum / weight : nearest_shadow;
 		sunlit = 1.0 - shade.w * max(s.x * share, s.y);
 	}
+	// The clouds' shadows (cloud_shadow_at): what they keep off the sun's share of this surface's light, as strong as
+	// [kCloud + 9].y says
+	[branch] if (cloud_shade)
+		sunlit *= 1.0 - actors[kCloud + 9].y * sun_share(dot(n, sun_in_view())) * (1.0 - cloud_shadow_at(P));
 	// Lamps lit near (lamp_light): their glow on top, darkened by the ambient occlusion like the rest
 	float3 glow = 0.0;
 	[branch] if (lamps)
@@ -2897,4 +3390,187 @@ void vis_ps(float4 pos : SV_Position)
 		}
 	}
 	vis_points.Store((b * 64 + k) * 4, passed);
+}
+
+// The look (grass_render.cpp, "The look"): tone mapping, bloom and a colour grade over the world as it ends, before the
+// interface. The world's copy (t1) is its last picture; the look's buffer (u1) holds the bright parts at a quarter of its
+// width and height and smaller (the bloom's levels, each half the one before: rgb the bright light, a its log2
+// luminance, both as halves), and the exposure the world is shown at (log2, adapting over seconds) after them. Names
+// facelift drew (alpha 1) aren't part of it: left out of the light measured and the bloom, and left as drawn.
+//   view_proj[0]: the grade's gain (rgb, linear: white balance), its saturation
+//   view_proj[1]: its lift (rgb: the shadows tinted toward it), its contrast (around 0.3 as the screen shows it)
+//   view_proj[2]: the bloom's strength (over its levels' count), unused, seconds since the last frame (< 0: the exposure
+//                 set at once), the light the scene is exposed for (its mean luminance's key)
+//   view_proj[3]: the exposure's least and most (times), the bloom's threshold and knee (linear)
+//   eye (uint bits): where the pass reads (bytes into the buffer), where it writes, the size it reads (w, h)
+//   color (uint bits): the size it writes (w, h), where the exposure is, which parts are on (1 tone mapping, 2 bloom,
+//                 4 the grade)
+//   blade (uint bits): where the bloom's first level is, its size (w, h)
+RWByteAddressBuffer look_buf : register(u1);
+
+float3 srgb_to_linear(float3 c)
+{
+	c = saturate(c);
+	return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+float3 linear_to_srgb(float3 c)
+{
+	c = saturate(c);
+	return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+float look_luma(float3 l) { return dot(l, float3(0.2126, 0.7152, 0.0722)); }
+
+float4 look_read(uint at, int2 q, uint2 size)
+{
+	q = clamp(q, int2(0, 0), int2(size) - 1);
+	uint2 v = look_buf.Load2(at + (uint(q.y) * size.x + uint(q.x)) * 8);
+	return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+}
+void look_write(uint at, int2 q, uint width, float4 c)
+{
+	look_buf.Store2(at + (uint(q.y) * width + uint(q.x)) * 8, uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b) | (f32tof16(c.a) << 16)));
+}
+// A level read between its texels (q: texel coordinates, their centres whole)
+float4 look_between(uint at, float2 q, uint2 size)
+{
+	float2 f = q - floor(q);
+	int2 i = int2(floor(q));
+	return lerp(lerp(look_read(at, i, size), look_read(at, i + int2(1, 0), size), f.x),
+		lerp(look_read(at, i + int2(0, 1), size), look_read(at, i + int2(1, 1), size), f.x), f.y);
+}
+
+// The filmic curve (linear in, linear out, each channel): mid-grey (0.18) kept, a little more contrast through the
+// shadows (a power of 1.06 under it) and the middle (a slope of 1.1 over it), then from 0.6 a shoulder rolling toward
+// 1.3, so what's brighter than white (the exposure or the bloom pushing it) runs smoothly into white rather than
+// clipping; white itself comes out at about 0.96 (0.98 as the screen shows it)
+float3 look_tone(float3 v)
+{
+	const float p = 0.18, c = 1.1, k = 0.6, w = 1.3;
+	const float kk = p + (k - p) * c;
+	v = max(v, 0.0);
+	float3 lo = p * pow(v / p + 1e-7, 1.06);
+	float3 mid = p + (v - p) * c;
+	float3 hi = kk + (w - kk) * (1.0 - exp(-c * (v - k) / (w - kk)));
+	return v < p ? lo : (v < k ? mid : hi);
+}
+
+// The first level: each texel a 4 x 4 block of the world's pixels: the light over the bloom's threshold (a soft knee),
+// averaged with less weight for the brightest (a lone bright pixel doesn't flicker), and the block's mean log2 luminance
+void look_first_ps(float4 pos : SV_Position)
+{
+	int2 q = int2(pos.xy);
+	int2 base = q * 4;
+	float thr = view_proj[3].z, knee = max(view_proj[3].w, 1e-3);
+	float3 sum = 0.0;
+	float weights = 0.0, logs = 0.0, n = 0.0;
+	[unroll] for (int j = 0; j < 4; ++j)
+		[unroll] for (int i = 0; i < 4; ++i)
+		{
+			int2 p = min(base + int2(i, j), int2(ground.yz) - 1);
+			uint v = world.Load((uint(p.y) * ground.x + uint(p.x)) * 4);
+			if ((v >> 24) != 1u) // (not a name)
+			{
+				float3 c = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0;
+				float3 l = srgb_to_linear(ground.w == 2 ? c.bgr : c);
+				float y = look_luma(l);
+				logs += log2(y + 1e-3);
+				n += 1.0;
+				float b = max(l.r, max(l.g, l.b));
+				float rq = clamp(b - thr + knee, 0.0, 2.0 * knee);
+				rq = rq * rq / (4.0 * knee);
+				float share = max(rq, b - thr) / max(b, 1e-4);
+				float k = 1.0 / (1.0 + y);
+				sum += l * share * k;
+				weights += k;
+			}
+		}
+	look_write(asuint(eye.y), q, asuint(color.x), float4(weights > 0.0 ? sum / weights : 0.0, n > 0.0 ? logs / n : log2(0.07)));
+}
+
+// A level from the one before (twice its size): a 4 x 4 tent (1 3 3 1 each way) around the texels it covers
+void look_down_ps(float4 pos : SV_Position)
+{
+	int2 q = int2(pos.xy);
+	uint2 size = uint2(asuint(eye.z), asuint(eye.w));
+	const float w4[4] = { 1.0, 3.0, 3.0, 1.0 };
+	float4 s = 0.0;
+	[unroll] for (int j = 0; j < 4; ++j)
+		[unroll] for (int i = 0; i < 4; ++i)
+			s += look_read(asuint(eye.x), q * 2 - 1 + int2(i, j), size) * (w4[i] * w4[j]);
+	look_write(asuint(eye.y), q, asuint(color.x), s / 64.0);
+}
+
+// The exposure (one pixel): the scene's mean log2 luminance from the smallest level, the middle of the screen counting
+// most; the exposure that wants (a share of the way to the key, kept between the least and the most); and the exposure
+// moving toward it over a couple of seconds (log2, kept after the levels with the mean; set at once when asked, or
+// when there's none yet)
+void look_exposure_ps(float4 pos : SV_Position)
+{
+	uint2 size = uint2(asuint(eye.z), asuint(eye.w));
+	float sum = 0.0, weights = 0.0;
+	[loop] for (uint y = 0; y < size.y; ++y)
+		[loop] for (uint x = 0; x < size.x; ++x)
+		{
+			float2 d = ((float2(x, y) + 0.5) / float2(size) - 0.5) * 2.0;
+			float w = 1.0 - 0.75 * saturate(dot(d, d) * 0.5);
+			sum += look_read(asuint(eye.x), int2(x, y), size).a * w;
+			weights += w;
+		}
+	float key = log2(max(view_proj[2].w, 1e-3));
+	float mean = weights > 0.0 ? sum / weights : key;
+	const float kShare = 0.3, kSeconds = 2.5;
+	float want = clamp(kShare * (key - mean), log2(max(view_proj[3].x, 1e-3)), log2(max(view_proj[3].y, 1e-3)));
+	uint at = asuint(color.z);
+	float was = asfloat(look_buf.Load(at));
+	float dt = view_proj[2].z;
+	bool known = abs(was) < 4.0; // (not a number, or what a new buffer held: not known)
+	float now = dt < 0.0 || !known ? want : was + (want - was) * (1.0 - exp(-dt / kSeconds));
+	look_buf.Store2(at, uint2(asuint(now), asuint(mean)));
+}
+
+// A level with the next smaller one added (between its texels): from the smallest up, each level ends up holding the
+// bright light blurred over all the sizes under it
+void look_up_ps(float4 pos : SV_Position)
+{
+	int2 q = int2(pos.xy);
+	uint2 here = uint2(asuint(color.x), asuint(color.y));
+	float4 me = look_read(asuint(eye.y), q, here);
+	float3 up = look_between(asuint(eye.x), (float2(q) + 0.5) * 0.5 - 0.5, uint2(asuint(eye.z), asuint(eye.w))).rgb;
+	look_write(asuint(eye.y), q, here.x, float4(me.rgb + up, me.a));
+}
+
+// The world as it's shown: its pixel in linear light, the bloom added (from the first level, between its texels), the
+// grade's white balance, the exposure and the filmic curve; back to the screen's values, the grade's saturation,
+// contrast (around 0.3: the game's pictures are dark, a flatter grade mustn't wash out their shadows) and lift there, and a dither of half a step (no bands in the sky). Names are left as drawn, and the world's
+// alpha (the pipeline writes rgb alone).
+float4 look_ps(float4 pos : SV_Position) : SV_Target
+{
+	int2 p = int2(pos.xy);
+	uint v = world.Load((uint(p.y) * ground.x + uint(p.x)) * 4);
+	if ((v >> 24) == 1u)
+		discard;
+	float3 c = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0;
+	float3 l = srgb_to_linear(ground.w == 2 ? c.bgr : c);
+	uint parts = asuint(color.w);
+	[branch] if ((parts & 2u) != 0u)
+	{
+		float2 q = (float2(p) + 0.5) * 0.25 - 0.5;
+		l += look_between(asuint(blade.x), q, uint2(asuint(blade.y), asuint(blade.z))).rgb * view_proj[2].x;
+	}
+	// (the grade's white balance and saturation weigh less on what's bright: a lamp's pool keeps its warmth at night)
+	float bright = smoothstep(0.08, 0.5, max(l.r, max(l.g, l.b)));
+	if ((parts & 4u) != 0u)
+		l *= lerp(view_proj[0].rgb, 1.0, 0.7 * bright);
+	[branch] if ((parts & 1u) != 0u)
+		l = look_tone(l * exp2(asfloat(look_buf.Load(asuint(color.z)))));
+	float3 s = linear_to_srgb(l);
+	if ((parts & 4u) != 0u)
+	{
+		float y = dot(s, float3(0.299, 0.587, 0.114));
+		s = lerp(y.xxx, s, lerp(view_proj[0].w, 1.0, 0.3 * bright));
+		s = (s - 0.3) * view_proj[1].w + 0.3;
+		s += view_proj[1].rgb * (1.0 - s);
+	}
+	s += (hash2(p) - 0.5) / 255.0;
+	return float4(saturate(s), 1.0);
 }

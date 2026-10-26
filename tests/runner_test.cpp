@@ -130,10 +130,11 @@ int main()
 	auto bin = [&](const wchar_t *kind, uint32_t zone) { return folder + kind + L"\\" + std::to_wstring(zone) + L".bin"; };
 	auto none = [&](const wchar_t *kind, uint32_t zone) { return folder + kind + L"\\" + std::to_wstring(zone) + L".none"; };
 	char line[200];
-	std::snprintf(line, sizeof(line), "zone 100: its grass, water, shadow map and lamps made (%.1f s); its wet ground, rain and sea marked none",
+	// (wet ground and rain for every zone the sun lights, whatever its own weather: West Ronfaure has no rain of its own)
+	std::snprintf(line, sizeof(line), "zone 100: its grass, water, wet ground, rain, shadow map and lamps made (%.1f s); its sea marked none",
 		seconds);
 	check(exists(bin(L"worldfx-grass", 100)) && exists(bin(L"worldfx-water", 100)) && exists(bin(L"worldfx-shadow", 100)) &&
-		exists(bin(L"worldfx-lamps", 100)) && exists(none(L"worldfx-wet", 100)) && exists(none(L"worldfx-rain", 100)) &&
+		exists(bin(L"worldfx-lamps", 100)) && exists(bin(L"worldfx-wet", 100)) && exists(bin(L"worldfx-rain", 100)) &&
 		exists(none(L"worldfx-sea", 100)) && !exists(bin(L"worldfx-sea", 100)), line);
 	check(g_reloads == 1, "World FX told to read zone 100's files again (it's the zone you're in)");
 
@@ -203,20 +204,29 @@ int main()
 		std::vector<uint8_t> water;
 		hifi::bake::read_file(bin(L"worldfx-water", 100), water);
 		DeleteFileW(mark.c_str());
-		const FILETIME rain_none_at = written(none(L"worldfx-rain", 100)), grass_now = written(bin(L"worldfx-grass", 100));
+		const FILETIME rain_none_at = written(bin(L"worldfx-rain", 100)), grass_now = written(bin(L"worldfx-grass", 100));
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		hifi::bake::runner::zone_entered(100);
 		check(wait_idle(60.0), "zone 100 entered with water from before the sea rule: done");
 		std::vector<uint8_t> again;
-		const FILETIME rain_none_again = written(none(L"worldfx-rain", 100)), grass_again2 = written(bin(L"worldfx-grass", 100));
-		check(exists(mark) && hifi::bake::read_file(bin(L"worldfx-water", 100), again) && again == water && exists(none(L"worldfx-rain", 100)) &&
+		const FILETIME rain_none_again = written(bin(L"worldfx-rain", 100)), grass_again2 = written(bin(L"worldfx-grass", 100));
+		check(exists(mark) && hifi::bake::read_file(bin(L"worldfx-water", 100), again) && again == water && exists(bin(L"worldfx-rain", 100)) &&
 				exists(none(L"worldfx-sea", 100)) && CompareFileTime(&rain_none_at, &rain_none_again) != 0 &&
 				CompareFileTime(&grass_now, &grass_again2) == 0,
-			"its water made again (the same bytes here, the mark back), its rain and sea looked at again (none), its grass left as it was");
+			"its water made again (the same bytes here, the mark back), its rain made again and its sea looked at again (none), its grass left as it was");
 		hifi::bake::runner::zone_entered(100);
 		const bool idle = wait_idle(10.0);
-		const FILETIME rain_none_third = written(none(L"worldfx-rain", 100));
+		const FILETIME rain_none_third = written(bin(L"worldfx-rain", 100));
 		check(idle && CompareFileTime(&rain_none_again, &rain_none_third) == 0, "and entered once more: nothing made");
+	}
+
+	// A rain none mark from before the any-weather rule (no <zone>.aw beside it) in a zone the sun lights: made again
+	{
+		DeleteFileW(bin(L"worldfx-rain", 100).c_str());
+		hifi::bake::write_file(none(L"worldfx-rain", 100), "", 0);
+		hifi::bake::runner::zone_entered(100);
+		check(wait_idle(60.0) && exists(bin(L"worldfx-rain", 100)) && !exists(none(L"worldfx-rain", 100)),
+			"zone 100 with a rain none mark from before (no 100.aw): its rain made, the mark gone");
 	}
 
 	// A Mog House (1000 + its room): nothing to make

@@ -194,6 +194,15 @@ namespace gpu_crash
 			return false;
 		}
 		debug->EnableDebugLayer();
+		// (HIFIXI_GBV=1, for offline probing: GPU-based validation too, which checks what shaders read and the states
+		// resources are really in; slow)
+		char gbv[4] = "";
+		ID3D12Debug1 *debug1 = nullptr;
+		if (GetEnvironmentVariableA("HIFIXI_GBV", gbv, sizeof(gbv)) != 0 && gbv[0] == '1' && SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(&debug1))))
+		{
+			debug1->SetEnableGPUBasedValidation(TRUE);
+			debug1->Release();
+		}
 		debug->Release();
 		status = "on (worldfx-d3d12-debug.txt)";
 		return true;

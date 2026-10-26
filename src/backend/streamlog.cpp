@@ -1,5 +1,6 @@
 #include <d3d12.h>
 #include "streamlog.hpp"
+#include "../game/slotmark.hpp"
 #include "../host/hooks.hpp"
 #include <share.h>
 #include <algorithm>
@@ -311,6 +312,14 @@ namespace hifi::backend::streamlog
 			case host::list_root_signature:
 				add(b, "SetGraphicsRootSignature %s", named(root_ids, 'S', a[0]).c_str());
 				break;
+			case host::list_heaps:
+			{
+				add(b, "SetDescriptorHeaps %u", unsigned(a[0]));
+				const uintptr_t *h = ptr<uintptr_t>(a[1]);
+				for (uint32_t i = 0; h != nullptr && i < a[0] && i < 2; ++i)
+					add(b, " 0x%llX", static_cast<unsigned long long>(h[i]));
+				break;
+			}
 			case host::list_root_table:
 				add(b, "SetGraphicsRootDescriptorTable [%u] 0x%llX", unsigned(a[0]), static_cast<unsigned long long>(a[1]));
 				break;
@@ -341,6 +350,10 @@ namespace hifi::backend::streamlog
 					: (flags & D3D12_CLEAR_FLAG_STENCIL) != 0 ? "stencil" : "nothing";
 				add(b, "ClearDepthStencilView %s %s, depth %g stencil %u", view(a[0]).c_str(), what, from_bits(a[2]), unsigned(a[3] & 0xFF));
 				rects_text(b, a[4], ptr<D3D12_RECT>(a[5]));
+				// (HiFi XI's own slot markers, slotmark.hpp: the game side's one-pixel stencil clears)
+				if (const D3D12_RECT *r = ptr<D3D12_RECT>(a[5]); r != nullptr)
+					if (slotmark::mark m; slotmark::read((flags & D3D12_CLEAR_FLAG_DEPTH) != 0, (flags & D3D12_CLEAR_FLAG_STENCIL) != 0, uint32_t(a[4]), r->left, r->top, r->right, r->bottom, m))
+						add(b, "  <- slot marker: %s, seq %u", slotmark::kind_name(m.kind), m.seq);
 				break;
 			}
 			case host::list_clear_target:

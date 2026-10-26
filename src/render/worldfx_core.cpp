@@ -35,6 +35,7 @@
 #include "lamp_glow.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -127,6 +128,14 @@ namespace
 		// Learnt from earlier frames
 		ID3D12Resource *world_rt = nullptr;
 		ID3D12Resource *world_ds = nullptr;
+		// The world as the game side's zone marker names it (on_world_marker): its depth, the target bound with it there;
+		// at which present the last one came, how many since the start. While they come, they decide the world, not the
+		// vertex counts (with the game's zone off, its UI outweighs what's left in the world).
+		ID3D12Resource *marker_rt = nullptr;
+		ID3D12Resource *marker_ds = nullptr;
+		uint64_t marker_present = 0; // (g.presents then)
+		uint64_t markers = 0;
+		bool marker_logged = false;
 		uint64_t world_vertices_last = 0; // the smallest of the recent frames' (what the share is of)
 		uint64_t recent[8] = {};
 		uint32_t recent_pos = 0, recent_count = 0;
@@ -216,6 +225,14 @@ namespace
 		// the add-on, from tools/sunlit_zones.py; without the file, every zone has)
 		float sun_shadows = 0.0f; // (off until its cost is known in game)
 		float moon_shadows = 0.6f; // by night, the moon's: this share of the sun's strength (0 off)
+		// The look over the world as it ends (look::post): tone mapping (with its exposure following the scene), the bloom's
+		// strength (0 none) and the colour grade's (0 none: by the hour and the weather); the zone the exposure was last
+		// set in at once (a new zone sets it again at once)
+		bool tonemap = true;
+		float bloom = 1.0f, colour_grade = 1.0f;
+		uint32_t look_zone = 0xFFFFFFFF;
+		// What the grade is made of now, for the status: the share of twilight, night, rain, gloom, heat, dust, snow and mist
+		float grade_parts[8] = {};
 		bool moon_now = false;     // (the moon's shadows drawn this frame: for the panel)
 		bool zone_sunlit = true;
 		// Where the sun is: as the game lights the world (its environment object: the light's direction at
@@ -314,6 +331,17 @@ namespace
 		grass::weather weather;
 		ULONGLONG weather_at = 0;
 		uint32_t weather_sends = 0;
+		// (debug: World FX's own weather forced to another, worldfx::force_weather. weather_real is the weather as sent;
+		// weather is it with the forced one over it (weather_forced_over). name 0: none forced; from: the weather it fades
+		// from (0: no fade left). Not saved: none at every start. A manual flash of lightning until flash_until.)
+		grass::weather weather_real;
+		struct forced_weather
+		{
+			uint32_t name = 0, from = 0;
+			ULONGLONG since = 0, fade_ms = 0;
+		} forced;
+		ULONGLONG flash_until = 0;
+		bool flash_bolt = false;
 		// The game's Vana'diel clock (Earth seconds; worldfx_moon, from HiFi XI's game side each frame) and when it came:
 		// the moon's phase (moon_phase); without it, the same clock from the PC's (moon_clock 0 or old)
 		uint32_t moon_clock = 0;
@@ -366,6 +394,8 @@ namespace
 		// gloom's fog banks (0 none, 1 as the weather has them, up to 2). Turning a part off only stops World FX's own: with
 		// WeatherOwn on, the game's weather stays left out.
 		bool weather_own = true, clouds_on = true, lightning_on = true;
+		int cloud_quality = 1; // (how finely the clouds are marched: 0 low .. 2 high, look::weather_fx::cloud_quality)
+		int cloud_style = 0;   // (0 game-like, 1 volumetric: look::weather_fx::cloud_style)
 		float weather_dust = 1.0f, weather_wind = 1.0f, heat_shimmer = 1.0f, aurora_amount = 1.0f, gloom_fog = 1.0f;
 		// What moves: how far the clouds have drifted (the broad shapes', the detail's: the noise's units, each wrapped to its
 		// period) and the fog banks (in theirs), when that was last worked out; the ground under the camera (the game's y),
@@ -400,6 +430,12 @@ namespace
 		// Status
 		const char *skip = "not tried yet";
 		grass::draw_stats last;
+		// The blades at the zone's end marker (on_zone_end): drawn there this frame (the world's end draws the rest), the
+		// frame's look worked out there, what they drew, how many times
+		bool blades_at_marker = false, look_at_marker = false;
+		bool last_at_marker = false; // (the last world's end drew the rest, its blades at the zone's end)
+		grass::draw_stats marker_blades;
+		uint64_t blades_at_markers = 0;
 		uint64_t at_vertices = 0;
 		uint64_t of_vertices = 0;
 		bool history[kHistory] = {};
@@ -1081,6 +1117,34 @@ namespace
 		return g.weather.known && GetTickCount64() - g.weather_at < kWeatherMs;
 	}
 
+	// (debug: worldfx::force_weather) The weather World FX draws by: the real one as sent, or with a forced weather's
+	// name over it, cross-faded from the one before as a change of the game's (before, change); the rest (the fog, the
+	// record: the zone's light and its sky's colours) stays the real weather's. Fading back to the real one, the real
+	// one's own change is left out until the fade is done. (mutex held)
+	grass::weather weather_forced_over(const grass::weather &real)
+	{
+		addon_state::forced_weather &f = g.forced;
+		if (f.name == 0 && f.from == 0)
+			return real;
+		grass::weather w = real;
+		const uint32_t target = f.name != 0 ? f.name : real.name;
+		const float share = f.fade_ms == 0 ? 1.0f : std::clamp(float(GetTickCount64() - f.since) / float(f.fade_ms), 0.0f, 1.0f);
+		if (share >= 1.0f || f.from == 0 || f.from == target || target == 0)
+		{
+			f.from = 0;
+			if (f.name == 0)
+				return real;
+			w.name = target;
+			w.before = 0;
+			w.change = 1.0f;
+			return w;
+		}
+		w.name = target;
+		w.before = f.from;
+		w.change = share;
+		return w;
+	}
+
 	std::string weather_name_text(uint32_t name)
 	{
 		char s[5] = {};
@@ -1098,6 +1162,8 @@ namespace
 		const grass::weather &w = g.weather;
 		std::string s = w.name != 0 ? weather_name_text(w.name) : "not read";
 		char part[200];
+		if (g.forced.name != 0 || g.forced.from != 0)
+			s += " (forced for World FX's own weather, debug: the real one " + (g.weather_real.name != 0 ? weather_name_text(g.weather_real.name) : std::string("not read")) + ")";
 		if (w.id != 0xFFFFFFFF)
 		{
 			std::snprintf(part, sizeof(part), " (id %u)", w.id);
@@ -1238,7 +1304,8 @@ namespace
 			f.pulse_strength[0] = 1.0f;
 			f.pulse_strength[1] = 0.5f + 0.5f * lightning_random();
 			f.pulse_strength[2] = 0.3f + 0.5f * lightning_random();
-			f.bolt = lightning_random() < 0.4f + 0.27f * storm;
+			f.bolt = lightning_random() < 0.4f + 0.27f * storm || g.flash_bolt; // (a manual flash, worldfx::flash_lightning: always its bolt)
+			g.flash_bolt = false;
 			const float aside = lightning_random() < 0.75f ? (lightning_random() - 0.5f) * 1.75f : (lightning_random() - 0.5f) * 6.2831853f;
 			f.bearing = g.cam_bearing + aside;
 			f.top = 0.18f + 0.2f * lightning_random();
@@ -1293,6 +1360,13 @@ namespace
 		x.wind[1] = std::cos(g.wind_bearing);
 		if (!g.clouds_on)
 			x.cloud_cover = x.cloud_thick = x.cloud_veil = 0.0f;
+		// (the clouds lit by the game's light as it stands: the sun, full a little way up, still catching them just after it
+		// sets (they're high); by night the moon, the more of it lit the more)
+		x.cloud_quality = std::clamp(g.cloud_quality, 0, 2);
+		x.cloud_style = std::clamp(g.cloud_style, 0, 1);
+		x.cloud_light = std::clamp((-g.look.sun[1] + 0.04f) / 0.12f, 0.0f, 1.0f);
+		if (g.hour_up < 0.0f)
+			x.cloud_light *= 0.35f + 0.65f * std::clamp(g.look.dome.moon_lit, 0.0f, 1.0f);
 		x.wind_strength *= g.weather_wind;
 		// (the streaks: a dust storm's by its setting, a wind's by the wind's)
 		x.streaks = k.streaks * (k.windy * g.weather_wind + (1.0f - k.windy) * g.weather_dust);
@@ -1314,7 +1388,8 @@ namespace
 			x.cloud_drift[i] = float(g.cloud_drift[i]);
 		x.bank_drift[0] = float(g.bank_drift[0]);
 		x.bank_drift[1] = float(g.bank_drift[1]);
-		next_flash(g.lightning_on ? k.flashes : 0.0f, now, x);
+		// (a manual flash, worldfx::flash_lightning: as in a thunderstorm while it lasts, the Lightning setting or not)
+		next_flash(now < g.flash_until ? std::max(k.flashes, 1.0f) : g.lightning_on ? k.flashes : 0.0f, now, x);
 		// The ground under the camera
 		float ground = eye[1] + 2.0f;
 		if (g.actor_count != 0 && now - g.actors_at < 500)
@@ -1364,6 +1439,7 @@ namespace
 	// weather now (mutex held). Logged when the weather shown changes.
 	void apply_weather()
 	{
+		g.weather = weather_forced_over(g.weather_real); // (a forced weather's fade moves on each frame)
 		const bool fresh = weather_fresh();
 		const grass::weather &w = g.weather;
 		g.look.haze = g.weather_fog && fresh && w.fog;
@@ -1485,6 +1561,27 @@ namespace
 			g.weather_logged = logged;
 			log_message(0, ("FFXI World FX: the weather: " + weather_text()).c_str());
 		}
+	}
+
+	// Whether the look (tone mapping, bloom, the colour grade) is on: it runs at the world's end with or without the rest
+	bool look_on()
+	{
+		return g.tonemap || g.bloom > 0.0f || g.colour_grade > 0.0f;
+	}
+
+	// The look over the world as it ends (mutex held; after place_sun, apply_weather and apply_weather_fx): its settings,
+	// the exposure kept from brightening anything by night (the night as the game has it), and the colour grade from the
+	// hour and the weather (grass::colour_grade). A new zone sets the exposure at once.
+	void place_look()
+	{
+		grass::look::look_pass &p = g.look.post;
+		p = grass::look::look_pass();
+		p.tonemap = g.tonemap;
+		p.bloom = std::isfinite(g.bloom) ? std::clamp(g.bloom, 0.0f, 2.0f) : 0.0f;
+		p.snap = g.zone != g.look_zone;
+		g.look_zone = g.zone;
+		p.exposure_max += (1.0f - p.exposure_max) * std::clamp(g.look.night, 0.0f, 1.0f);
+		grass::colour_grade(g.hour_up, g.look.night, g.zone_sunlit, weather_fresh() && g.weather.known ? &g.weather : nullptr, g.colour_grade, p, g.grade_parts);
 	}
 
 	// Whether the shading pass (ambient occlusion, surface relief, sun shadows, lamps) is on: it runs with or without grass
@@ -1791,71 +1888,10 @@ namespace
 	}
 
 	// Draws grass on the list into the world (bound through rtv and dsv), then binds dgVoodoo's state again (mutex held)
-	void inject(ID3D12GraphicsCommandList *list, list_data &d, uint64_t rtv, uint64_t dsv)
+	// The frame's look (mutex held): the clock, the sun and weather, those near, the grass's wear and cuts, ripples and
+	// lamps; once a frame, where the first of its draws is (the blades at the zone's end, else the world's end)
+	void frame_look(const grass::camera &cam)
 	{
-		g.tried = true;
-		g.passes_wanted++;
-		g_has_drawn = true; // (the world found: World FX draws into it here, whatever is on this frame)
-		if (!g.in_game)
-		{
-			g.skip = "not in the game (login, character select, zoning; or the worldfx Ashita addon isn't loaded)";
-			return;
-		}
-		if (g.passes >= kMaxPasses)
-		{
-			g.skip = "the world ended more than twice this frame (the rest skipped)";
-			return;
-		}
-		if (g.logging_moves && g.moves.size() < 1500)
-		{
-			// (with the world's states as this list knows them: the game may have changed them on another list)
-			char item[64];
-			std::snprintf(item, sizeof(item), " [GRASS rt 0x%X ds 0x%X]", static_cast<unsigned>(d.world_rt_state), static_cast<unsigned>(d.world_ds_state));
-			g.moves += item;
-		}
-		g.skip = nullptr;
-		const bool water_on = (g.look.water || g.look.water_debug) && g.renderer != nullptr && g.renderer->water_loaded();
-		const bool rain_on = (g.rain_on || g.snow_on) && g.renderer != nullptr && g.renderer->rain_loaded();
-		if (!g.enabled && !shading_on() && !water_on && g.look.fireflies <= 0.0f && !rain_on && !g.vis_on)
-		{
-			g.skip = "off";
-			return;
-		}
-		if (g.renderer == nullptr || !g.renderer->ready())
-		{
-			g.skip = "the renderer isn't ready";
-			return;
-		}
-		if (!g.renderer->loaded() && !shading_on() && !water_on && !rain_on && !g.vis_on)
-		{
-			g.skip = "no blades for this zone";
-			return;
-		}
-		if (d.state.root == nullptr || d.state.pipeline == nullptr)
-		{
-			g.skip = "dgVoodoo's root signature or pipeline wasn't seen on this list";
-			return;
-		}
-		grass::camera cam;
-		if (const char *why = read_camera(cam))
-		{
-			g.skip = why;
-			return;
-		}
-		g.passes++;
-
-		grass::target t;
-		t.rt = g.world_rt;
-		t.ds = g.world_ds;
-		t.rtv = { static_cast<SIZE_T>(rtv) };
-		t.rtv_format = view_format(rtv, g.world_rt);
-		t.dsv_format = view_format(dsv, g.world_ds);
-		t.rt_state = d.world_rt_state;
-		t.ds_state = d.world_ds_state;
-		if (!g.logged_first)
-			log_first(d, t);
-
-		std::string error;
 		g.look.time = static_cast<float>(GetTickCount64() % 3600000) / 1000.0f; // wraps hourly: floats stay precise
 		// (actors not sent for half a second: the Ashita addon is gone, nobody pushes)
 		const bool fresh = GetTickCount64() - g.actors_at < 500;
@@ -1869,6 +1905,7 @@ namespace
 			g.cam_bearing = std::atan2(-cam.view[2], -cam.view[10]);
 			apply_weather_fx(weather_fresh(), eye);
 		}
+		place_look();
 		g.look.actors = g.actors;
 		g.look.actor_count = fresh ? g.actor_count : 0;
 		// The grass's wear: trodden down by those near (more where they fight) and cut by the weapon skills sent lately
@@ -1902,6 +1939,79 @@ namespace
 		const bool people = fresh && g.actor_count > 0;
 		g.look.lamp_shadows = people ? g.lamp_shadows : 0.0f;
 		log_people(cam, people);
+	}
+
+	void inject(ID3D12GraphicsCommandList *list, list_data &d, uint64_t rtv, uint64_t dsv)
+	{
+		g.tried = true;
+		g.passes_wanted++;
+		g_has_drawn = true; // (the world found: World FX draws into it here, whatever is on this frame)
+		if (!g.in_game)
+		{
+			g.skip = "not in the game (login, character select, zoning; or the worldfx Ashita addon isn't loaded)";
+			return;
+		}
+		if (g.passes >= kMaxPasses)
+		{
+			g.skip = "the world ended more than twice this frame (the rest skipped)";
+			return;
+		}
+		if (g.logging_moves && g.moves.size() < 1500)
+		{
+			// (with the world's states as this list knows them: the game may have changed them on another list)
+			char item[64];
+			std::snprintf(item, sizeof(item), " [GRASS rt 0x%X ds 0x%X]", static_cast<unsigned>(d.world_rt_state), static_cast<unsigned>(d.world_ds_state));
+			g.moves += item;
+		}
+		g.skip = nullptr;
+		const bool water_on = (g.look.water || g.look.water_debug) && g.renderer != nullptr && g.renderer->water_loaded();
+		const bool rain_on = (g.rain_on || g.snow_on) && g.renderer != nullptr && g.renderer->rain_loaded();
+		if (!g.enabled && !shading_on() && !water_on && g.look.fireflies <= 0.0f && !rain_on && !g.vis_on && !look_on())
+		{
+			g.skip = "off";
+			return;
+		}
+		if (g.renderer == nullptr || !g.renderer->ready())
+		{
+			g.skip = "the renderer isn't ready";
+			return;
+		}
+		if (!g.renderer->loaded() && !shading_on() && !water_on && !rain_on && !g.vis_on && !look_on())
+		{
+			g.skip = "no blades for this zone";
+			return;
+		}
+		if (d.state.root == nullptr || d.state.pipeline == nullptr)
+		{
+			g.skip = "dgVoodoo's root signature or pipeline wasn't seen on this list";
+			return;
+		}
+		grass::camera cam;
+		if (const char *why = read_camera(cam))
+		{
+			g.skip = why;
+			return;
+		}
+		g.passes++;
+
+		grass::target t;
+		t.rt = g.world_rt;
+		t.ds = g.world_ds;
+		t.rtv = { static_cast<SIZE_T>(rtv) };
+		t.rtv_format = view_format(rtv, g.world_rt);
+		t.dsv_format = view_format(dsv, g.world_ds);
+		t.rt_state = d.world_rt_state;
+		t.ds_state = d.world_ds_state;
+		if (!g.logged_first)
+			log_first(d, t);
+
+		std::string error;
+		// (the frame's look: worked out at the zone's end when the blades went in there, else here)
+		const bool blades_went_in = g.blades_at_marker;
+		g.blades_at_marker = false;
+		if (!g.look_at_marker)
+			frame_look(cam);
+		g.look_at_marker = false;
 		// The shading pass's safeguard (kShadeMaxMs)
 		const ULONGLONG now = GetTickCount64();
 		if (g.renderer->shading_ms() > (g.test_shade_max_ms > 0.0f ? g.test_shade_max_ms : kShadeMaxMs) && now >= g.shading_paused_until)
@@ -1914,6 +2024,12 @@ namespace
 		}
 		g.shading_held = now < g.shading_paused_until ? "paused: it took too long on the GPU" : nullptr;
 		grass::look l = g.look;
+		// (the blades drawn at the zone's end this frame: the rest of it here, without them)
+		l.phase = blades_went_in ? grass::look::phase_t::rest : grass::look::phase_t::all;
+		g.last_at_marker = blades_went_in;
+		// (the look once a frame: at a second world end before the present it would tone the world twice)
+		if (g.passes > 1)
+			l.post = grass::look::look_pass();
 		if (g.shading_held != nullptr)
 		{
 			l.ao_strength = 0.0f;
@@ -1938,8 +2054,8 @@ namespace
 			addon_state::drawing &w = g.drawings[g.drawing_count++ % addon_state::kDrawings];
 			w.at = now;
 			w.frame = g.frames;
-			w.blades = g.last.blades;
-			w.draws = g.last.draws;
+			w.blades = g.last.blades + (blades_went_in ? g.marker_blades.blades : 0);
+			w.draws = g.last.draws + (blades_went_in ? g.marker_blades.draws : 0);
 			w.shaded = g.last.shaded;
 			w.held = g.shading_held != nullptr;
 			w.bound = g.last.bound;
@@ -1969,11 +2085,27 @@ namespace
 			log_message(2, ("FFXI World FX: grass turned off: " + error).c_str());
 			return;
 		}
-		if (g.last.draws == 0)
+		const uint32_t draws = g.last.draws + (blades_went_in ? g.marker_blades.draws : 0);
+		if (draws == 0)
 			g.skip = "no blades near the camera";
-		g.drew = g.last.draws != 0;
+		g.drew = draws != 0;
 		g.at_vertices = g.world_vertices;
 		g.of_vertices = g.world_vertices_last;
+	}
+
+	// Presents a zone marker keeps the world for: past them without one, the vertex counts decide again
+	constexpr uint32_t kMarkerPresents = 8;
+
+	// Whether the game side's zone markers name the world now (mutex held)
+	bool marked()
+	{
+		return g.marker_rt != nullptr && g.markers != 0 && g.presents - g.marker_present <= kMarkerPresents;
+	}
+
+	bool same_size(ID3D12Resource *a, ID3D12Resource *b)
+	{
+		const D3D12_RESOURCE_DESC x = a->GetDesc(), y = b->GetDesc();
+		return x.Width == y.Width && x.Height == y.Height && x.SampleDesc.Count == y.SampleDesc.Count;
 	}
 
 	void count_draw(list_data &d, uint64_t vertices)
@@ -2029,7 +2161,15 @@ namespace
 		for (const target_use &use : g.uses)
 			if (best == nullptr || use.vertices > best->vertices)
 				best = &use;
-		if (best != nullptr && best->vertices >= kMinWorldVertices)
+		if (marked())
+		{
+			// (the zone marker's world: its count still taken as the world's size where no clear said so)
+			if (!g.world_cleared)
+				for (const target_use &use : g.uses)
+					if (use.rt == g.world_rt && use.ds == g.world_ds)
+						learn_world_size(use.vertices);
+		}
+		else if (best != nullptr && best->vertices >= kMinWorldVertices)
 		{
 			if (best->rt != g.world_rt || best->ds != g.world_ds)
 				g.recent_count = 0;
@@ -2295,6 +2435,8 @@ namespace worldfx
 		g.zone_tried = false;
 		g.world_rt = nullptr;
 		g.world_ds = nullptr;
+		g.marker_rt = nullptr;
+		g.marker_ds = nullptr;
 		gpu_crash::watch(device, addon_folder() + L"worldfx-gpu-crash.txt", log_gpu_crash, crash_context);
 		log_message(0, ("FFXI World FX: the GPU: " + gpu_crash::gpu_name(device) + "; video memory: " + gpu_crash::gpu_memory(device)).c_str());
 	}
@@ -2314,6 +2456,8 @@ namespace worldfx
 		g.dev = nullptr;
 		g.world_rt = nullptr;
 		g.world_ds = nullptr;
+		g.marker_rt = nullptr;
+		g.marker_ds = nullptr;
 		g.uses.clear();
 	}
 
@@ -2542,6 +2686,110 @@ namespace worldfx
 		g.world_cleared = true;
 	}
 
+	void on_world_marker(list_data &d, uint64_t dsv)
+	{
+		ID3D12Resource *const ds = resource_of(dsv);
+		if (ds == nullptr)
+			return;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.blades_at_marker = false;
+		g.look_at_marker = false;
+		g.markers++;
+		g.marker_present = g.presents;
+		// The target: the one bound with this depth on this list (a list dgVoodoo has just reset has none bound: then
+		// the one found with it before)
+		ID3D12Resource *rt = nullptr;
+		if (d.ds == ds && d.rt0 != nullptr && same_size(d.rt0, ds))
+			rt = d.rt0;
+		else if (g.marker_ds == ds)
+			rt = g.marker_rt;
+		else if (g.world_ds == ds && g.world_rt != nullptr && same_size(g.world_rt, ds))
+			rt = g.world_rt;
+		g.marker_ds = ds;
+		g.marker_rt = rt;
+		if (rt == nullptr || (rt == g.world_rt && ds == g.world_ds))
+			return;
+		g.world_rt = rt;
+		g.world_ds = ds;
+		g.recent_count = 0;
+		// (its views: the ones bound now, else from its next bind)
+		if (d.rt0 == rt && d.state.rtv_count != 0)
+		{
+			g.world_rtv = uint64_t(d.state.rtvs[0].ptr);
+			g.world_dsv = dsv;
+		}
+		const D3D12_RESOURCE_DESC w = rt->GetDesc();
+		char text[160];
+		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %llux%u%s", static_cast<unsigned long long>(w.Width), w.Height,
+			g.marker_logged ? " (again: it had moved)" : "");
+		log_message(g.marker_logged ? 1 : 0, text);
+		g.marker_logged = true;
+	}
+
+	void on_zone_end(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, const D3D12_RESOURCE_STATES planes[2])
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.blades_at_marker = false;
+		ID3D12Resource *const ds = resource_of(dsv);
+		if (!g.in_game || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
+			return;
+		// (the world the markers named, its views still its own, D24S8 as the blades' depth; dgVoodoo's state seen)
+		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || g.world_rtv == 0 || resource_of(g.world_rtv) != g.world_rt ||
+			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT || d.state.root == nullptr || d.state.pipeline == nullptr)
+			return;
+		grass::camera cam;
+		if (read_camera(cam) != nullptr)
+			return;
+		frame_look(cam);
+		g.look_at_marker = true;
+		grass::look l = g.look;
+		l.phase = grass::look::phase_t::blades;
+		grass::target t;
+		t.rt = g.world_rt;
+		t.ds = ds;
+		t.rtv = { static_cast<SIZE_T>(g.world_rtv) };
+		t.rtv_format = view_format(g.world_rtv, g.world_rt);
+		t.dsv_format = view_format(dsv, ds);
+		t.rt_state = d.world_rt_state;
+		t.ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+		t.blades_into_world_depth = true;
+		// Both planes DEPTH_WRITE while the blades write the depth (and test it), then back as dgVoodoo had them
+		D3D12_RESOURCE_BARRIER b[2] = {};
+		UINT n = 0;
+		for (UINT k = 0; k < 2; ++k)
+			if (planes[k] != D3D12_RESOURCE_STATE_DEPTH_WRITE)
+			{
+				b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				b[n].Transition.pResource = ds;
+				b[n].Transition.Subresource = k;
+				b[n].Transition.StateBefore = planes[k];
+				b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+				++n;
+			}
+		if (n != 0)
+			list->ResourceBarrier(n, b);
+		std::string error;
+		g.marker_blades = g.renderer->draw(list, t, cam, l, error);
+		for (UINT k = 0; k < n; ++k)
+			std::swap(b[k].Transition.StateBefore, b[k].Transition.StateAfter);
+		if (n != 0)
+			list->ResourceBarrier(n, b);
+		if (g.marker_blades.bound)
+		{
+			d.state.restore(list);
+			gpu_crash::mark(list, L"worldfx: the game's state put back (the blades at the zone's end)");
+		}
+		if (!error.empty())
+		{
+			g.error = error;
+			g.enabled = false;
+			log_message(2, ("FFXI World FX: grass turned off: " + error).c_str());
+			return;
+		}
+		g.blades_at_marker = true;
+		g.blades_at_markers++;
+	}
+
 	void on_draw(list_data &d, uint64_t vertices)
 	{
 		count_draw(d, vertices);
@@ -2584,6 +2832,116 @@ namespace worldfx
 				check_shaders();
 			}
 		}
+	}
+
+	// ---- Weather debug: World FX's own weather forced (only its own drawing; nothing of the game's, the server's or
+	// its packets). The game's weather is left out as before (worldfx_weather_drawn follows the weather drawn).
+	namespace
+	{
+		const weather_choice kWeatherChoices[] = {
+			{ "fine", "Fine" }, { "suny", "Sunshine" }, { "clod", "Clouds" }, { "mist", "Mist" }, { "dryw", "Hot spell" },
+			{ "heat", "Heat wave" }, { "rain", "Rain" }, { "squl", "Squall" }, { "dust", "Dust storm" }, { "sand", "Sand storm" },
+			{ "wind", "Wind" }, { "stom", "Gales" }, { "snow", "Snow" }, { "bliz", "Blizzard" }, { "thdr", "Thunder" },
+			{ "bolt", "Thunderstorm" }, { "aura", "Auroras" }, { "ligt", "Stellar glare" }, { "fogd", "Gloom" }, { "dark", "Darkness" },
+		};
+
+		uint32_t name_word(const char *s)
+		{
+			uint32_t w = 0;
+			for (int i = 0; i < 4 && s[i] != 0; ++i)
+				w |= uint32_t(uint8_t(std::tolower(static_cast<unsigned char>(s[i])))) << (8 * i);
+			return w;
+		}
+
+		const weather_choice *choice_of(uint32_t name)
+		{
+			for (const weather_choice &c : kWeatherChoices)
+				if (name_word(c.name) == name)
+					return &c;
+			return nullptr;
+		}
+	}
+
+	const weather_choice *weather_choices(size_t &count)
+	{
+		count = sizeof(kWeatherChoices) / sizeof(kWeatherChoices[0]);
+		return kWeatherChoices;
+	}
+
+	bool force_weather(const char *name, float fade_seconds)
+	{
+		uint32_t want = 0;
+		if (name != nullptr && name[0] != 0 && _stricmp(name, "off") != 0)
+		{
+			const weather_choice *c = nullptr;
+			for (const weather_choice &k : kWeatherChoices)
+				if (_stricmp(name, k.name) == 0 || _stricmp(name, k.label) == 0)
+					c = &k;
+			if (c == nullptr)
+				return false;
+			want = name_word(c->name);
+		}
+		std::lock_guard<std::mutex> lock(g.mutex);
+		addon_state::forced_weather &f = g.forced;
+		if (want == f.name)
+			return true;
+		// (from the weather drawn now, the larger share of it while it changes)
+		const grass::weather now = weather_forced_over(g.weather_real);
+		const uint32_t from = now.before != 0 && now.change < 0.5f ? now.before : now.name;
+		f.name = want;
+		f.from = from;
+		f.since = GetTickCount64();
+		f.fade_ms = ULONGLONG(std::clamp(fade_seconds, 0.0f, 600.0f) * 1000.0f);
+		g.weather = weather_forced_over(g.weather_real);
+		log_message(0, ("FFXI World FX: weather debug: " + (want != 0 ? "forced to " + weather_name_text(want) : std::string("back to the real weather"))).c_str());
+		return true;
+	}
+
+	std::string forced_weather()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		return g.forced.name != 0 ? weather_name_text(g.forced.name) : std::string();
+	}
+
+	std::string forced_weather_text()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		const addon_state::forced_weather &f = g.forced;
+		if (f.name == 0 && f.from == 0)
+			return "World FX's own weather: the real weather (none forced).";
+		const weather_choice *c = choice_of(f.name);
+		std::string s = f.name != 0 ? "World FX's own weather forced to " + weather_name_text(f.name) + (c != nullptr ? std::string(" (") + c->label + ")" : std::string())
+			: std::string("World FX's own weather going back to the real one");
+		s += "; the real weather " + (g.weather_real.name != 0 ? weather_name_text(g.weather_real.name) : std::string("not read"));
+		if (g.weather.before != 0 && g.weather.change < 1.0f)
+		{
+			char part[80];
+			std::snprintf(part, sizeof(part), "; fading from %s, %.0f%% there", weather_name_text(g.weather.before).c_str(), g.weather.change * 100.0f);
+			s += part;
+		}
+		s += ". Debug only, not saved; the zone's light, fog and sky colours still follow the real weather";
+		if (!g.wx_on)
+			s += "; World FX isn't drawing the zone's weather here now (only its rain and snow, where it has them)";
+		return s + ".";
+	}
+
+	void flash_lightning()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		const ULONGLONG now = GetTickCount64();
+		g.flashes.next = now;
+		g.flash_until = now + 1200;
+		g.flash_bolt = true;
+	}
+
+	void weather_look_now(grass::look::weather_fx &out, grass::weather *drawn)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.weather = weather_forced_over(g.weather_real);
+		out = grass::look::weather_fx();
+		grass::weather_look(g.weather, g.look.dome, out);
+		if (drawn != nullptr)
+			*drawn = g.weather;
 	}
 }
 
@@ -2748,7 +3106,8 @@ extern "C" __declspec(dllexport) void __cdecl worldfx_glow_stats(uint32_t out[5]
 extern "C" __declspec(dllexport) void __cdecl worldfx_weather(const uint32_t *words, uint32_t count)
 {
 	std::lock_guard<std::mutex> lock(g.mutex);
-	grass::decode_weather(words, words != nullptr ? std::min(count, grass::kWeatherWords) : 0, g.weather);
+	grass::decode_weather(words, words != nullptr ? std::min(count, grass::kWeatherWords) : 0, g.weather_real);
+	g.weather = weather_forced_over(g.weather_real); // (debug: a forced weather over it, worldfx::force_weather)
 	g.weather_at = GetTickCount64();
 	g.weather_sends++;
 }
@@ -2880,7 +3239,8 @@ extern "C" __declspec(dllexport) uint32_t __cdecl worldfx_weather_drawn()
 // then (1, else 0), [1] the clouds' cover, [2] the lightning's flash, [3] its bolt, [4] the dust, [5] the wind, [6] the
 // heat, [7] the aurora, [8] gloom's fog banks, [9] the stars' boost (float bits: the look's, settings in them), [10] the
 // flashes since the add-on loaded, [11] ms until the next one comes (UINT32_MAX: none waited for), [12] what the last
-// drawing drew of it (1 its parameters went to the passes, 2 the air pass ran, 4 heat shimmer, 8 leaves), [13] the ground
+// drawing drew of it (1 its parameters went to the passes, 2 the air pass ran, 4 heat shimmer, 8 leaves, 16 the clouds'
+// own pass, 32 with the frame before's picture of them carried over), [13] the ground
 // under the camera (the game's y, float bits), [14] the streaks, [15] the leaves (float bits)
 extern "C" __declspec(dllexport) void __cdecl worldfx_weather_fx_stats(uint32_t out[16])
 {
@@ -2892,7 +3252,8 @@ extern "C" __declspec(dllexport) void __cdecl worldfx_weather_fx_stats(uint32_t 
 	out[10] = g.flashes.count;
 	const ULONGLONG now = GetTickCount64();
 	out[11] = g.flashes.next == 0 ? UINT32_MAX : g.flashes.next > now ? uint32_t(std::min<ULONGLONG>(g.flashes.next - now, UINT32_MAX - 1)) : 0u;
-	out[12] = (g.last.weather ? 1u : 0u) | (g.last.air ? 2u : 0u) | (g.last.shimmer ? 4u : 0u) | (g.last.leaves != 0 ? 8u : 0u);
+	out[12] = (g.last.weather ? 1u : 0u) | (g.last.air ? 2u : 0u) | (g.last.shimmer ? 4u : 0u) | (g.last.leaves != 0 ? 8u : 0u) |
+		(g.last.clouds ? 16u : 0u) | (g.last.clouds_carried ? 32u : 0u);
 	std::memcpy(out + 13, &x.ground_y, 4);
 	std::memcpy(out + 14, &x.streaks, 4);
 	std::memcpy(out + 15, &x.leaves, 4);
@@ -2934,11 +3295,23 @@ extern "C" __declspec(dllexport) void __cdecl worldfx_ripple_stats(uint32_t out[
 extern "C" __declspec(dllexport) void __cdecl worldfx_last_draw(uint32_t out[5])
 {
 	std::lock_guard<std::mutex> lock(g.mutex);
-	out[0] = g.last.blades;
-	out[1] = g.last.draws;
+	out[0] = g.last.blades + (g.last_at_marker ? g.marker_blades.blades : 0);
+	out[1] = g.last.draws + (g.last_at_marker ? g.marker_blades.draws : 0);
 	out[2] = g.last.shaded ? 1u : 0u;
 	out[3] = g.last.bound ? 1u : 0u;
 	out[4] = g.last.sun ? 1u : 0u;
+}
+
+// For the tests: the world found (width, height; 0 0 none), whether the zone markers name it now (1), how many
+// markers have come since the device was attached
+extern "C" __declspec(dllexport) void __cdecl worldfx_world(uint32_t out[4])
+{
+	std::lock_guard<std::mutex> lock(g.mutex);
+	const D3D12_RESOURCE_DESC w = g.world_rt != nullptr ? g.world_rt->GetDesc() : D3D12_RESOURCE_DESC {};
+	out[0] = uint32_t(w.Width);
+	out[1] = w.Height;
+	out[2] = marked() ? 1u : 0u;
+	out[3] = uint32_t(g.markers);
 }
 
 // For the end-to-end test: whether the last frame read the sun's shadow map, and how many times it was drawn
@@ -3101,6 +3474,14 @@ namespace
 static void status_lines(const worldfx::ui &u)
 {
 	static const float good[4] = { 0.55f, 0.85f, 0.45f, 1.0f }, warn[4] = { 0.95f, 0.75f, 0.3f, 1.0f };
+	if (g.world_rt != nullptr)
+	{
+		const D3D12_RESOURCE_DESC w = g.world_rt->GetDesc();
+		text(u, "The world: %llux%u, found %s", static_cast<unsigned long long>(w.Width), w.Height,
+			marked() ? "by the game's zone marker" : "by what's drawn most (no zone markers lately)");
+	}
+	else
+		u.text_disabled(g.markers != 0 ? "The world: not found yet (zone markers seen, but not yet with its target bound)" : "The world: not found yet");
 	{
 		const double h = vanadiel_hour();
 		text(u, "Vana'diel time %02d:%02d, sun %s%s; this zone: %s", int(h), int((h - int(h)) * 60.0),
@@ -3152,6 +3533,14 @@ static void status_lines(const worldfx::ui &u)
 	if (g.look.fog_known)
 		text(u, "Sky along the horizon (the zone's fog): %.2f %.2f %.2f", g.look.fog[0], g.look.fog[1], g.look.fog[2]);
 	text(u, "Fireflies: night %.0f%%, %u homes near the camera last frame", g.look.night * 100.0f, g.last.fireflies);
+	{
+		const grass::look::look_pass &p = g.look.post;
+		const float *k = g.grade_parts;
+		text(u, "The look: tone mapping %s, bloom %.2f, grade %.2f%s; last frame %s (%u levels); grade now: twilight %.2f, night %.2f, "
+			"rain %.2f, gloom %.2f, heat %.2f, dust %.2f, snow %.2f, mist %.2f (gain %.2f %.2f %.2f, saturation %.2f, contrast %.2f)",
+			g.tonemap ? "on" : "off", g.bloom, g.colour_grade, g.zone_sunlit ? "" : " (none here: no open sky)", g.last.look ? "drawn" : "not drawn",
+			g.last.look_levels, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], p.gain[0], p.gain[1], p.gain[2], p.saturation, p.contrast);
+	}
 	if (GetTickCount64() - g.actors_at < 500)
 	{
 		uint32_t fighting = 0;
@@ -3173,8 +3562,11 @@ static void status_lines(const worldfx::ui &u)
 		for (uint32_t i = 0; i < g.history_count; ++i)
 			drew += g.history[i] ? 1 : 0;
 		text_colored(u, drew != 0 && drew == g.history_count ? good : warn, "Drawn in %u of the last %u frames.", drew, g.history_count);
-		if (g.last.draws != 0)
-			text(u, "Last frame: %u blades in %u draws.", g.last.blades, g.last.draws);
+		const uint32_t last_blades = g.last.blades + (g.last_at_marker ? g.marker_blades.blades : 0);
+		const uint32_t last_draws = g.last.draws + (g.last_at_marker ? g.marker_blades.draws : 0);
+		if (last_draws != 0)
+			text(u, "Last frame: %u blades in %u draws%s.", last_blades, last_draws,
+				g.last_at_marker ? ", at the zone's end (before characters and effects, in the world's depth)" : "");
 		else
 			text(u, "Last frame: not drawn: %s.", g.skip != nullptr ? g.skip : "-");
 		text(u, "Camera: %s", g.game_global != 0 ? "found" : g.game_scanned ? "not found in FFXiMain.dll" : "not looked for yet");
@@ -3278,6 +3670,10 @@ void worldfx::draw_panel(const ui &u)
 		u.text_disabled("  each part below off: only World FX's goes, the game's stays left out");
 		if (u.checkbox("Clouds, as thick and dark as the weather has them, drifting with the wind", &g.clouds_on))
 			set_config("Clouds", g.clouds_on);
+		if (u.slider_int("Clouds' detail (0 low .. 2 high: steps through them)", &g.cloud_quality, 0, 2))
+			set_config("CloudQuality", g.cloud_quality);
+		if (u.slider_int("Clouds' style (0 game-like: soft, in the sky's colours; 1 volumetric heaps)", &g.cloud_style, 0, 1))
+			set_config("CloudStyle", g.cloud_style);
 		if (u.checkbox("Lightning in thunder and thunderstorms: flashes and bolts", &g.lightning_on))
 			set_config("Lightning", g.lightning_on);
 		if (u.slider_float("Dust and sand storms (0 = none)", &g.weather_dust, 0.0f, 2.0f, "%.2f"))
@@ -3449,12 +3845,17 @@ namespace
 			number("SkyStars", g.sky_stars, 0.0f, 2.0f);
 			flag("WeatherOwn", g.weather_own);
 			flag("Clouds", g.clouds_on);
+			whole("CloudQuality", g.cloud_quality, 0, 2);
+			whole("CloudStyle", g.cloud_style, 0, 1);
 			flag("Lightning", g.lightning_on);
 			number("WeatherDust", g.weather_dust, 0.0f, 2.0f);
 			number("WeatherWind", g.weather_wind, 0.0f, 2.0f);
 			number("HeatShimmer", g.heat_shimmer, 0.0f, 2.0f);
 			number("Aurora", g.aurora_amount, 0.0f, 2.0f);
 			number("GloomFog", g.gloom_fog, 0.0f, 2.0f);
+			flag("Tonemap", g.tonemap);
+			number("Bloom", g.bloom, 0.0f, 2.0f);
+			number("ColourGrade", g.colour_grade, 0.0f, 2.0f);
 			flag("VisTest", g.vis_option);
 			flag("GrassRuleInFront", g.look.rule_in_front);
 			flag("GrassRuleOutliers", g.look.rule_outliers);

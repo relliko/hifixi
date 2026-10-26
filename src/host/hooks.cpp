@@ -311,6 +311,17 @@ namespace hifi::host
 			if (const events *e = ev(); e != nullptr && e->scissors != nullptr)
 				e->scissors(self, n, r);
 		}
+		void STDMETHODCALLTYPE hk_heaps(ID3D12GraphicsCommandList *self, UINT n, ID3D12DescriptorHeap *const *h)
+		{
+			trace(list_heaps, self, n, h);
+			call<void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, ID3D12DescriptorHeap *const *)>(self, list_heaps, self, n, h);
+			if (!live())
+				return;
+			count(list_heaps);
+			note(self);
+			if (const events *e = ev(); e != nullptr && e->heaps != nullptr)
+				e->heaps(self, n, h);
+		}
 		void STDMETHODCALLTYPE hk_root_signature(ID3D12GraphicsCommandList *self, ID3D12RootSignature *rs)
 		{
 			trace(list_root_signature, self, rs);
@@ -557,7 +568,8 @@ namespace hifi::host
 			reinterpret_cast<void *>(&hk_root_cbv), reinterpret_cast<void *>(&hk_root_srv), reinterpret_cast<void *>(&hk_root_uav),
 			reinterpret_cast<void *>(&hk_clear_depth), reinterpret_cast<void *>(&hk_clear_target), reinterpret_cast<void *>(&hk_draw),
 			reinterpret_cast<void *>(&hk_draw_indexed), reinterpret_cast<void *>(&hk_execute_indirect), reinterpret_cast<void *>(&hk_execute_bundle),
-			reinterpret_cast<void *>(&hk_clear_state), reinterpret_cast<void *>(&hk_barrier7), reinterpret_cast<void *>(&hk_queue_execute),
+			reinterpret_cast<void *>(&hk_clear_state), reinterpret_cast<void *>(&hk_barrier7), reinterpret_cast<void *>(&hk_heaps),
+			reinterpret_cast<void *>(&hk_queue_execute),
 			reinterpret_cast<void *>(&hk_create_list), reinterpret_cast<void *>(&hk_create_rtv), reinterpret_cast<void *>(&hk_create_dsv),
 			reinterpret_cast<void *>(&hk_copy), reinterpret_cast<void *>(&hk_copy_simple),
 		};
@@ -669,7 +681,7 @@ namespace hifi::host
 			"IASetPrimitiveTopology", "RSSetViewports", "RSSetScissorRects", "SetGraphicsRootSignature", "SetGraphicsRootDescriptorTable",
 			"SetGraphicsRoot32BitConstant", "SetGraphicsRoot32BitConstants", "SetGraphicsRootConstantBufferView", "SetGraphicsRootShaderResourceView",
 			"SetGraphicsRootUnorderedAccessView", "ClearDepthStencilView", "ClearRenderTargetView", "DrawInstanced", "DrawIndexedInstanced",
-			"ExecuteIndirect", "ExecuteBundle", "ClearState", "Barrier (enhanced)", "ExecuteCommandLists",
+			"ExecuteIndirect", "ExecuteBundle", "ClearState", "Barrier (enhanced)", "SetDescriptorHeaps", "ExecuteCommandLists",
 			"CreateCommandList", "CreateRenderTargetView", "CreateDepthStencilView", "CopyDescriptors", "CopyDescriptorsSimple" };
 		return s < slot_count ? names[s] : "?";
 	}

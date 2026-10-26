@@ -2,6 +2,13 @@
 #include <dxgi1_4.h>
 #include "backend.hpp"
 #include "streamlog.hpp"
+#include "../game/slotmark.hpp"
+#include "../chars/marks.hpp" // (native characters)
+#include "../chars/charinject.hpp" // (native characters)
+#include "../zone/inject.hpp"
+#include "../zone/frame.hpp"
+#include "../zone/native.hpp"
+#include "../zone/zone_gpu.hpp"
 #include "../host/events.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
@@ -427,6 +434,8 @@ namespace hifi::backend
 		}
 		void ev_reset(ID3D12GraphicsCommandList *list)
 		{
+			zone::inject::on_reset(list);
+			chars::inject::on_reset(list); // (native characters)
 			worldfx::list_data *const d = data_of(list, true);
 			if (!g_attached.load(std::memory_order_acquire))
 			{
@@ -514,7 +523,13 @@ namespace hifi::backend
 			worldfx::list_data *const d = live(list);
 			if (d == nullptr)
 				return;
-			// (transitions only, as ReShade reports them: the resource and where it went)
+			// (the native zone renderer follows the world depth's planes, each of them)
+			zone::inject::on_barrier(count, barriers);
+			chars::inject::on_barrier(count, barriers); // (native characters: the same)
+			// (transitions only, as ReShade reports them: the resource and where it went. Of a subresource other than the
+			// first only when it's all of them: the core follows the world's depth plane, and the slot markers' stencil
+			// clears move the stencil plane (subresource 1) on its own, DEPTH_READ to DEPTH_WRITE and back at the next draw,
+			// which would otherwise read as the depth's state)
 			host::quiet q;
 			for (UINT done = 0; done < count;)
 			{
@@ -522,7 +537,8 @@ namespace hifi::backend
 				D3D12_RESOURCE_STATES after[32];
 				uint32_t n = 0;
 				for (; done < count && n < 32; ++done)
-					if (barriers[done].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+					if (barriers[done].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+						(barriers[done].Transition.Subresource == 0 || barriers[done].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))
 					{
 						res[n] = barriers[done].Transition.pResource;
 						after[n] = barriers[done].Transition.StateAfter;
@@ -532,11 +548,87 @@ namespace hifi::backend
 					worldfx::on_barrier(list, *d, n, res, after);
 			}
 		}
+		// The game side's slot markers (src/game/slotmark.hpp) as dgVoodoo hands them on: how many of each kind, how many
+		// came out of order (each zone begin, then its end with the same seq, then the next seq's begin), the last
+		std::atomic<uint64_t> marks_seen[slotmark::kinds] = {};
+		std::atomic<uint64_t> marks_out_of_order { 0 };
+		std::atomic<uint32_t> last_mark { 0xFFFFFFFFu }; // (kind << 8 | seq)
+		// The world's target as the markers find it (dgVoodoo's recording thread), and its view's format
+		ID3D12Resource *zone_rt = nullptr;
+		DXGI_FORMAT zone_rt_format = DXGI_FORMAT_UNKNOWN;
+
+		void on_mark(ID3D12GraphicsCommandList *list, worldfx::list_data &d, uint64_t dsv, const slotmark::mark &m)
+		{
+			marks_seen[m.kind].fetch_add(1, std::memory_order_relaxed);
+			// (native characters: their markers are checked on their own, and leave the zone's order check alone)
+			if (m.kind >= slotmark::chars_begin)
+				chars::marks::seen(m.kind, m.seq);
+			const uint32_t was = m.kind >= slotmark::chars_begin ? 0xFFFFFFFFu : last_mark.exchange(m.kind << 8 | m.seq);
+			if (was != 0xFFFFFFFFu && (m.kind == slotmark::zone_begin || m.kind == slotmark::zone_end))
+			{
+				const uint32_t wk = was >> 8, ws = was & 0xFF;
+				const bool in_order = m.kind == slotmark::zone_end ? (wk == slotmark::zone_begin && ws == m.seq) : (wk == slotmark::zone_end && ((ws + 1) & 15) == m.seq);
+				if (!in_order)
+					marks_out_of_order.fetch_add(1, std::memory_order_relaxed);
+			}
+			ID3D12Resource *const depth = port_resource_of_view(dsv);
+			zone::inject::on_marker(depth);
+			chars::inject::on_marker(depth); // (native characters)
+			if (m.kind == slotmark::zone_begin)
+				worldfx::on_world_marker(d, dsv);
+			// The world's target: the one bound with this depth on this list, else the one found with it before
+			if (depth != nullptr && d.ds == depth && d.rt0 != nullptr && d.state.rtv_count != 0)
+			{
+				zone_rt = d.rt0;
+				zone_rt_format = port_format_of_view(uint64_t(d.state.rtvs[0].ptr));
+			}
+			if (m.kind == slotmark::zone_end && depth != nullptr)
+			{
+				zone::inject::world w;
+				w.rt = zone_rt;
+				w.ds = depth;
+				w.rt_format = zone_rt_format;
+				w.ds_format = port_format_of_view(dsv);
+				w.rt_state = d.world_rt_state;
+				zone::inject::on_zone_end(list, d.state, w, m.seq);
+				// (then World FX's blades, written into the world's depth before the characters and effects)
+				D3D12_RESOURCE_STATES planes[2];
+				if (zone::inject::depth_planes(depth, planes))
+					worldfx::on_zone_end(list, d, dsv, planes);
+			}
+			// (native characters: the opaque models at their end marker, a see-through one at its own)
+			if ((m.kind == slotmark::chars_end || m.kind == slotmark::see_through) && depth != nullptr)
+			{
+				chars::inject::world w;
+				w.rt = zone_rt;
+				w.ds = depth;
+				w.rt_format = zone_rt_format;
+				w.ds_format = port_format_of_view(dsv);
+				w.rt_state = d.world_rt_state;
+				if (m.kind == slotmark::chars_end)
+					chars::inject::on_chars_end(list, d.state, w, m.seq);
+				else
+					chars::inject::on_see_through(list, d.state, w, m.seq);
+			}
+		}
+
 		void ev_clear_depth(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, UINT count, const D3D12_RECT *rects)
 		{
 			worldfx::list_data *const d = live(list);
-			if (d == nullptr || (flags & D3D12_CLEAR_FLAG_DEPTH) == 0)
+			if (d == nullptr)
 				return;
+			if ((flags & D3D12_CLEAR_FLAG_DEPTH) == 0)
+			{
+				// (a stencil-only clear: one of the game side's markers, when it's shaped like one on a view that's known)
+				slotmark::mark m;
+				if (rects != nullptr && count != 0 && slotmark::read(false, (flags & D3D12_CLEAR_FLAG_STENCIL) != 0, count, rects[0].left, rects[0].top, rects[0].right, rects[0].bottom, m) &&
+					port_resource_of_view(dsv.ptr) != nullptr)
+				{
+					host::quiet q;
+					on_mark(list, *d, dsv.ptr, m);
+				}
+				return;
+			}
 			// (a view not known isn't the world's: ReShade always knew which resource it was)
 			if (port_resource_of_view(dsv.ptr) == nullptr)
 				return;
@@ -549,6 +641,14 @@ namespace hifi::backend
 			{
 				host::quiet q;
 				worldfx::on_clear_target(*d, rtv.ptr, color, rects != nullptr ? count : 0, rects);
+			}
+		}
+		void ev_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps)
+		{
+			if (live(list) != nullptr)
+			{
+				zone::inject::on_heaps(list, count, heaps);
+				chars::inject::on_heaps(list, count, heaps); // (native characters)
 			}
 		}
 		void ev_draw(ID3D12GraphicsCommandList *list, uint64_t vertices)
@@ -639,6 +739,7 @@ namespace hifi::backend
 				x.clear_depth = ev_clear_depth;
 				x.clear_target = ev_clear_target;
 				x.draw = ev_draw;
+				x.heaps = ev_heaps;
 				x.execute = ev_execute;
 				x.view = ev_view;
 				x.copy = ev_copy;
@@ -824,6 +925,8 @@ namespace hifi::backend
 
 	void log(int level, const char *text) { write_log(level, text); }
 
+	uint64_t zone_ends_seen() { return marks_seen[slotmark::zone_end].load(std::memory_order_relaxed); }
+
 	void set_log_sink(void (*sink)(int level, const char *text)) { g_log_sink.store(sink); }
 
 	std::vector<std::string> status()
@@ -854,6 +957,11 @@ namespace hifi::backend
 		}
 		std::snprintf(line, sizeof(line), "lists followed: %zu", list_count);
 		out.push_back(line);
+		std::snprintf(line, sizeof(line), "slot markers seen in Direct3D 12: zone begin %llu, zone end %llu; out of order %llu",
+			static_cast<unsigned long long>(marks_seen[slotmark::zone_begin].load()), static_cast<unsigned long long>(marks_seen[slotmark::zone_end].load()),
+			static_cast<unsigned long long>(marks_out_of_order.load()));
+		out.push_back(line);
+		out.push_back(chars::marks::status()); // (native characters)
 		return out;
 	}
 
@@ -870,6 +978,105 @@ extern "C" __declspec(dllexport) int __cdecl hifixi_early_start(void *create_fac
 extern "C" __declspec(dllexport) void __cdecl hifixi_present()
 {
 	hifi::backend::present();
+}
+
+// For the offline probe (research/ffxi-re/tools/dgvprobe, native mode), which has no game: a zone pass as the game side
+// would publish it, for HiFi XI to draw at the zone's end marker on dgVoodoo's own list. `image`: an FFXiMain dump's bytes
+// (the key tables); the map's data loaded and put on the GPU over the first calls (0 until it's there); then every
+// placement of its MZB, as seen from view_proj (row vectors), a day's light. 1 when the pass is published under seq.
+namespace hifi::game
+{
+	void set_image(uintptr_t base, size_t size); // (src/game/game.hpp, whose export declarations this file defines)
+}
+
+extern "C" __declspec(dllexport) int __cdecl hifixi_zone_test(const void *image, uint32_t image_size, uint32_t map, uint32_t seq, const float *view_proj)
+{
+	namespace zm = hifi::bake::zonemesh;
+	ID3D12Device *const device = worldfx::attached();
+	if (device == nullptr || image == nullptr)
+		return 0;
+	static bool image_set = false;
+	if (!image_set)
+	{
+		hifi::game::set_image(reinterpret_cast<uintptr_t>(image), image_size);
+		image_set = true;
+	}
+	hifi::zone::native::frame(device, map, 0, true);
+	hifi::zone::gpu_zone *const gz = hifi::zone::native::ready_zone();
+	std::string why;
+	if (gz == nullptr || !hifi::zone::inject::prepare(device, why))
+		return 0;
+	const zm::zone &d = gz->data();
+	hifi::zone::frame &f = hifi::zone::frame_slot(seq);
+	f.native = true;
+	f.zone = gz;
+	f.map = map;
+	f.second = nullptr;
+	f.env_count = 1;
+	f.no_bump = GetEnvironmentVariableA("LOOK_NOBUMP", nullptr, 0) != 0; // (dgvprobe's look test: as its D3D8 replay draws)
+	std::memcpy(f.view_proj, view_proj, 64);
+	{
+		// The camera: where clip x, y and w are 0 ((p, 1) x the matrix's columns 0, 1 and 3; row vectors), by Cramer's rule
+		const float *m = view_proj;
+		const float a[3][3] = { { m[0], m[4], m[8] }, { m[1], m[5], m[9] }, { m[3], m[7], m[11] } }, b[3] = { -m[12], -m[13], -m[15] };
+		auto det = [](const float q[3][3]) {
+			return q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1]) - q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0]) + q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0]);
+		};
+		const float whole = det(a);
+		for (int k = 0; k < 3; ++k)
+		{
+			float q[3][3];
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 3; ++c)
+					q[r][c] = c == k ? b[r] : a[r][c];
+			f.camera[k] = whole != 0.0f ? det(q) / whole : 0.0f;
+		}
+	}
+	const float sd[3] = { 0.36f, -0.83f, 0.42f }, sun[3] = { 1.26f, 1.25f, 1.1f }, amb[3] = { 0.49f, 0.47f, 0.49f }, fog[3] = { 0.55f, 0.65f, 0.78f };
+	std::memcpy(f.sun_dir, sd, 12);
+	std::memcpy(f.sun, sun, 12);
+	std::memcpy(f.sun_bump, sun, 12);
+	std::memcpy(f.ambient, amb, 12);
+	std::memcpy(f.ambient_bump, amb, 12);
+	std::memcpy(f.fog, fog, 12);
+	f.fog_start = 150.0f;
+	f.fog_end = 600.0f;
+	f.fog_scale = 1.0f;
+	f.count = 0;
+	for (const zm::placement &p : d.placements)
+	{
+		if (f.count >= hifi::zone::kMaxObjects)
+			break;
+		hifi::zone::frame_object &o = f.objects[f.count++];
+		for (int k = 0; k < 3; ++k)
+		{
+			o.world[k * 4 + 0] = p.m[k];
+			o.world[k * 4 + 1] = p.m[3 + k];
+			o.world[k * 4 + 2] = p.m[6 + k];
+			o.world[k * 4 + 3] = p.t[k];
+		}
+		o.model = p.model;
+		o.flags = p.flags;
+		o.sway = 0.0f;
+		o.env = 0;
+		o.door_env = 0;
+		o.zone = 0;
+		for (uint32_t &l : o.lamps)
+			l = 0xFFFFFFFFu;
+	}
+	f.lamp_count = 0;
+	hifi::zone::publish(f, seq);
+	return 1;
+}
+
+// For the offline probe: the native zone renderer's status line (what it drew, why it couldn't)
+extern "C" __declspec(dllexport) void __cdecl hifixi_zone_status(char *out, uint32_t size)
+{
+	std::string all;
+	for (const auto &lines : { hifi::zone::inject::status(), hifi::zone::native::status() })
+		for (const std::string &line : lines)
+			all += (all.empty() ? "" : "; ") + line;
+	std::snprintf(out, size, "%s", all.c_str());
 }
 
 // For the worldfx Ashita addon (0.16): one of World FX's settings ([worldfx] in HiFi XI's settings file), as its text;

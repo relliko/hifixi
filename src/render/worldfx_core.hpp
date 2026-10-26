@@ -71,6 +71,30 @@ namespace worldfx
 	// The GPU time of each of World FX's sections, the costliest first (lines for /hifi gpu and the status)
 	std::vector<std::string> gpu_times();
 
+	// Weather debug (/hifi weather, the menu's "Weather (debug)"): World FX's own weather (its clouds, rain, snow,
+	// lightning, dust, wind, heat, aurora, gloom, stars, wet ground) drawn as another weather's, whatever the zone's real
+	// one, cross-faded over fade_seconds as a change of the game's. Only World FX's own drawing: nothing of the game's,
+	// the server's or its packets; the zone's light, fog and sky colours (the game's record) stay the real weather's,
+	// and the game's own weather stays left out as before. Not saved: none forced at every start.
+	struct weather_choice
+	{
+		const char *name;  // the game's 4-letter weather name ("rain")
+		const char *label; // what it is ("Rain")
+	};
+	// The weathers that can be forced, in the game's id order (fine .. dark)
+	const weather_choice *weather_choices(size_t &count);
+	// Forced to a weather (its 4-letter name or its label, any case), or back to the real one (nullptr, "" or "off");
+	// false for a name it doesn't know
+	bool force_weather(const char *name, float fade_seconds = 10.0f);
+	// The weather forced now, its 4-letter name ("" none), and a line on it (for /hifi status and the menu)
+	std::string forced_weather();
+	std::string forced_weather_text();
+	// Lightning flashes now, with its bolt, whatever the weather (while World FX draws the zone's weather)
+	void flash_lightning();
+	// For tests: the weather's own look now (grass::weather_look) from the weather World FX draws by (forced or real),
+	// and that weather
+	void weather_look_now(grass::look::weather_fx &out, grass::weather *drawn = nullptr);
+
 	// What dgVoodoo has bound on one command list: the host keeps one for each list, reset with the list
 	struct list_data
 	{
@@ -114,6 +138,13 @@ namespace worldfx
 	void on_clear_depth(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, bool depth, uint32_t rect_count, const D3D12_RECT *rects); // before
 	void on_clear_target(list_data &d, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects);                      // before
 	void on_draw(list_data &d, uint64_t vertices); // before (vertices or indices times instances)
+	// The game side's zone marker (src/game/slotmark.hpp), cleared on this depth view: the world is this depth and the
+	// target bound with it. While markers come they decide the world, not the vertex counts (the game's zone may be off).
+	void on_world_marker(list_data &d, uint64_t dsv);
+	// The game side's zone end marker (the world's depth through dsv; its planes' states as dgVoodoo left them, depth
+	// and stencil): the blades drawn there, into the world with its depth written, before the characters and effects
+	// (the world's end then draws the rest without them)
+	void on_zone_end(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, const D3D12_RESOURCE_STATES planes[2]);
 	// Each present, on the queue it's presented from (before it)
 	void on_present(ID3D12CommandQueue *queue);
 

@@ -841,12 +841,12 @@ namespace hifi::bake
 
 	namespace
 	{
-		bool bake_rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r)
+		bool bake_rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r, bool any_weather)
 		{
 			std::vector<uint8_t> dat;
 			if (!collision::read_zone(zone, dat, r))
 				return false;
-			if (!collision::rainy(dat, true))
+			if (!any_weather && !collision::rainy(dat, true))
 			{
 				r.none = true;
 				r.why = "no rainy or snowy weather";
@@ -1015,11 +1015,11 @@ namespace hifi::bake
 		}
 	}
 
-	bool rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r)
+	bool rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r, bool any_weather)
 	{
 		try
 		{
-			return bake_rain(zone, out, water_file, r);
+			return bake_rain(zone, out, water_file, r, any_weather);
 		}
 		catch (const std::bad_alloc &)
 		{

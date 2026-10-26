@@ -40,14 +40,20 @@ call "%~dp0build_engine.cmd" build\engine || exit /b 1
 rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hifps and drawcull did
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
 set "FEED=src\game\game.cpp src\game\feed.cpp src\game\glows.cpp src\game\gamewater.cpp src\game\gamerain.cpp"
-set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp"
-set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\sea.cpp"
+set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp src\game\zoneslot.cpp"
+set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
+rem The native zone renderer (src\zone): each zone's data on the GPU (the plugin alone)
+set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\game\zonedraw.cpp"
+rem The native character renderer (src\chars, src\game\charslot): the plugin alone
+set "CHARS=src\game\charslot.cpp src\chars\marks.cpp src\game\charmodel.cpp src\chars\charframe.cpp src\chars\cache.cpp src\chars\os2.cpp src\chars\tex.cpp"
+rem (its drawing on dgVoodoo's lists, with the engine's list_state: the plugin and the tests that draw)
+set "CHARS_DRAW=src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\chartest.cpp"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% build\engine\worldfx_engine.lib ^
+  %GAME% %ZONE% %CHARS% %CHARS_DRAW% build\engine\worldfx_engine.lib ^
   /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
 echo Built build\hifixi.dll
@@ -80,7 +86,7 @@ echo Built build\engine_check.exe
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib || exit /b 1
+  %GAME% %ZONE% %CHARS% %CHARS_DRAW% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\menu_test.exe
 
 rem The game side's feed on both FFXiMain dumps, World FX's functions stubbed: build\feed_test.exe
@@ -89,12 +95,60 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
 echo Built build\feed_test.exe
 
 rem The game side's pieces on both dumps, each against the addon it took over (its routines and patches byte for byte):
-rem build\glows_test.exe, gamewater_test, gamerain_test, drawcull_test; gamedraw_test (the off switches)
-for %%t in (glows gamewater gamerain drawcull gamedraw) do (
+rem build\glows_test.exe, gamewater_test, gamerain_test, drawcull_test; gamedraw_test (the off switches); zoneslot_test
+rem (the zone pass's slot markers)
+for %%t in (glows gamewater gamerain drawcull gamedraw zoneslot) do (
   cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
     tests\%%t_test.cpp src\game\%%t.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\%%t_test.exe" /link /NOLOGO user32.lib || exit /b 1
   echo Built build\%%t_test.exe
 )
+rem The character passes' slot markers on both dumps, and their reading on the Direct3D 12 side: build\charslot_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\charslot_test.cpp %CHARS% src\game\game.cpp /Fo"build\test\\" /Fe"build\charslot_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\charslot_test.exe
+rem The characters' data: the Os2 and texture decoders against research\ffxi-re\tools\chars.py and chartex.py
+rem (build\chars_data_test.exe build\test\chars_oracle.txt), and each model recorded at the game's model draw on both
+rem dumps with the cache uploading to WARP (build\charmodel_test.exe)
+python tests\chars_oracle.py build\test\chars_oracle.txt || exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\chars_data_test.cpp src\chars\os2.cpp src\chars\tex.cpp /Fo"build\test\\" /Fe"build\chars_data_test.exe" /link /NOLOGO || exit /b 1
+echo Built build\chars_data_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\charmodel_test.cpp %CHARS% src\game\game.cpp /Fo"build\test\\" /Fe"build\charmodel_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\charmodel_test.exe
+rem The character draw on a list recorded as dgVoodoo records (WARP, debug layer), the Mithra posed by chars.py:
+rem build\charinject_test.exe build\test\chars_pose.bin [out.bmp]
+python tests\chars_pose.py build\test\chars_pose.bin || exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
+  tests\charinject_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
+  /Fo"build\test\\" /Fe"build\charinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\charinject_test.exe
+rem The native zone renderer's zone data against tests\zonemesh_oracle.py: build\zonemesh_test.exe; and its offline
+rem picture of a zone through the GPU upload (needs the game closed, or --warp): build\zone_view.exe; the plugin's
+rem per-zone loading on WARP: build\zonenative_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\zonemesh_test.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\zonemesh_test.exe" ^
+  /link /NOLOGO user32.lib || exit /b 1
+echo Built build\zonemesh_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
+  /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\zone_view.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\zonenative_test.cpp src\zone\native.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  /Fo"build\test\\" /Fe"build\zonenative_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\zonenative_test.exe
+rem The zone's objects handed to the native renderer (17CBA8's stub run on both dumps, zone 100 on WARP): build\zonedraw_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\zonedraw_test.cpp src\game\zonedraw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  /Fo"build\test\\" /Fe"build\zonedraw_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\zonedraw_test.exe
+rem The native renderer drawing at the zone's end marker on a list recorded as dgVoodoo records (WARP, debug layer):
+rem build\zoneinject_test.exe [out.bmp]
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp ^
+  src\game\game.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\zoneinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\zoneinject_test.exe
 rem The visibility tests' answers (src\render\vistest.cpp): build\vistest_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\vistest_test.cpp src\render\vistest.cpp /Fo"build\test\\" /Fe"build\vistest_test.exe" /link /NOLOGO || exit /b 1

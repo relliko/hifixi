@@ -201,13 +201,17 @@ namespace grass
 	//   dust: dust or sand thick in the air (a storm's: 1), sand: 0 dust (brown-grey) .. 1 sand (tan);
 	//   flashes: lightning (thunder 0.7, thunderstorms 1), heat: heat shimmer (hot spells 0.5, heat waves 1), aurora: its
 	//   curtains, gloom: fog banks along the ground, sky_dark: how much darker the sky (0 as the record has it), stars: the
-	//   stars' brightness and number (1 as they are; stellar glare's more)
+	//   stars' brightness and number (1 as they are; stellar glare's more);
+	//   bottom, top: where its clouds' slab lies (yalms over the camera: fine weather's heaps high, rain's deck low and deep),
+	//   shape: 0 heaps (flat bases, rounded tops) .. 1 a flat deck, erosion: how much the fine noise eats their edges (wisps),
+	//   dense: how dense (1 fair weather's heaps; a rain deck's twice that, mist's a third)
 	struct weather_kind_fx
 	{
 		float cover = 0.0f, thick = 0.0f, dark = 0.0f, veil = 0.0f, speed = 0.0f;
 		float wind = 0.0f, windy = 0.0f, streaks = 0.0f, leaves = 0.0f;
 		float dust = 0.0f, sand = 0.0f;
 		float flashes = 0.0f, heat = 0.0f, aurora = 0.0f, gloom = 0.0f, sky_dark = 0.0f, stars = 1.0f;
+		float bottom = 250.0f, top = 400.0f, shape = 0.0f, erosion = 1.0f, dense = 1.0f;
 	};
 	weather_kind_fx weather_fx_of(uint32_t name);
 	// The same blended through a change (the one before's by the share left), as the game blends its records; nothing (all
@@ -234,6 +238,11 @@ namespace grass
 
 	struct look
 	{
+		// Which of the passes this draw makes: all of them (the world's end, as before); the blades alone, into the
+		// world's own depth (at the zone pass's end marker, before characters and effects, so they depth-test against
+		// them: target::world_dsv); or the rest without the blades (the world's end, after blades drawn at the marker)
+		enum class phase_t : uint8_t { all, blades, rest };
+		phase_t phase = phase_t::all;
 		float distance = 40.0f; // yalms from the camera
 		float height = 0.5f;    // yalms, before the per-blade variation
 		float width = 0.03f;    // half the base, yalms
@@ -376,6 +385,14 @@ namespace grass
 			float veil_colour[3] = { 0.6f, 0.62f, 0.66f };
 			float cloud_drift[4] = {};
 			float cloud_lit[3] = { 1.0f, 1.0f, 1.0f }, cloud_shade[3] = { 0.6f, 0.62f, 0.66f };
+			// ... their slab (weather_kind_fx's bottom, top, shape, erosion and dense), how strongly the sun or moon lights them (1
+			// the sun well up; less through twilight, the moon by its phase; 0 only the sky's light), and how finely they're
+			// marched (0 low: 16 steps along a ray, 3 toward the light; 1: 24 and 4; 2 high: 32 and 6)
+			float cloud_bottom = 250.0f, cloud_top = 400.0f, cloud_shape = 0.0f, cloud_erosion = 1.0f, cloud_dense = 1.0f, cloud_light = 1.0f;
+			int cloud_quality = 1;
+			// ... and their style: 0 game-like (thin, soft, stretched layers in the sky's own colours, as the game's are), 1
+			// volumetric (heaps lit by the sun, dark bases, bright edges)
+			int cloud_style = 0;
 			// Lightning: how bright its flash is now (0 none: the scene lit cool white for a moment, the sky and clouds with
 			// it), and its bolt's (0 none) with where it is: its bearing (radians from north toward east), how high it
 			// starts (radians over the horizon), its shape (a number of its own)
@@ -399,7 +416,40 @@ namespace grass
 			float leaves = 0.0f;
 			float leaf_light[3] = { 0.6f, 0.6f, 0.6f };
 		} wx;
+		// The look over the world as it ends, after everything else of World FX (the air pass too) and before the game's
+		// interface: only at the world's end (phase all or rest), never with the blades alone. Each part off by default here
+		// (the core turns them on from its settings); all off: the pass doesn't run and the world is left byte for byte.
+		//   tonemap: the world's exposure following the scene (a slow auto-exposure from its mean luminance at a small size,
+		//   a share of the way toward key, kept between exposure_min and exposure_max), then a filmic curve: highlights
+		//   rolled off into white, a little more contrast through the middle. snap: the exposure set at once this frame (a
+		//   new zone) rather than moving toward it over seconds (it's set at once too when the look's clock jumps).
+		//   bloom: how much light glows around what's brighter than the threshold (0 none, 1 subtle, up to 2), from a few
+		//   smaller sizes of it (a quarter of the world's and less).
+		//   grade: the colour grade on (the core works it out from the hour and the weather, its strength in it already):
+		//   gain (white balance, linear light), then as the screen shows it saturation (1 as is), contrast (1 as is, around
+		//   the middle) and lift (the shadows tinted toward it: rgb, 0 none)
+		struct look_pass
+		{
+			bool tonemap = false;
+			float bloom = 0.0f;
+			bool grade = false;
+			float gain[3] = { 1.0f, 1.0f, 1.0f };
+			float saturation = 1.0f, contrast = 1.0f;
+			float lift[3] = {};
+			float key = 0.07f, exposure_min = 0.78f, exposure_max = 1.06f;
+			float threshold = 0.55f, knee = 0.25f;
+			bool snap = false;
+		} post;
 	};
+
+	// The look's colour grade (look::post: gain, saturation, contrast, lift, grade) for the hour and the weather: sun_up the
+	// sine of the sun's height by the hour (below 0 at night), night how deep into it (0 day .. 1), sunlit whether the zone
+	// has open sky (none: no grade at all, the game lights interiors and dungeons itself), w the weather (nullptr: not
+	// known, the hour's alone), strength the setting (0 none, 1 subtle, up to 2). Each part's way from neutral times its
+	// share now: warm at dawn and dusk, cool and a little darker and less saturated by night, grey and desaturated in rain
+	// and gloom, a warm haze in heat and dust, cool in snow, flatter in mist. parts (8, optional): the shares of twilight,
+	// night, rain, gloom, heat, dust, snow and mist.
+	void colour_grade(float sun_up, float night, bool sunlit, const weather *w, float strength, look::look_pass &out, float *parts = nullptr);
 
 	// The weather of its own's colours and amounts from a weather and its record (weather_fx_of, then the clouds, dust and
 	// gloom lit as its record lights the zone, the veil in its fog's colour), into wx; what moves (the wind's direction,
@@ -473,10 +523,15 @@ namespace grass
 		bool weather = false;       // the weather of its own's parameters went to the passes (look::wx)
 		bool shimmer = false;       // heat shimmer in the shading pass
 		bool air = false;           // the air pass at the end (dust, streaks, fog banks) or the lightning's flash after it
+		bool clouds = false;        // the clouds' own pass ran (cloud_ps, at a quarter of the world's size)
+		bool clouds_carried = false; // ... carrying the last frame's picture over (false: every pixel of it marched)
+		bool cloud_shadows = false; // ... and their shadows' map made, for the shading pass
 		uint32_t leaves = 0;        // leaf places drawn (instances, as the snow's)
 		bool wear = false;          // the grass's wear (trodden down, cut, growing back) in the blades
 		uint32_t cuts = 0;          // weapon-skill cuts sent to the blades this frame
 		uint32_t vis_boxes = 0;     // the game's visibility tests answered from the depth copy this frame (vistest)
+		bool look = false;          // the look pass ran (look::post: tone mapping, bloom, the grade)
+		uint32_t look_levels = 0;   // ... with this many smaller sizes of the world (the bloom's and the exposure's)
 		bool bound = false;  // the renderer bound its own pipeline, root signature, targets and viewport in the list:
 		                     // the caller puts the game's back (D3D12 doesn't by itself)
 	};
@@ -494,6 +549,9 @@ namespace grass
 		DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN; // (the game's, for the log)
 		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		D3D12_RESOURCE_STATES ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE; // (of its depth plane)
+		// look::phase_t::blades: the blades drawn with ds itself as their depth (both planes DEPTH_WRITE meanwhile: the
+		// caller's), through a view of the renderer's own
+		bool blades_into_world_depth = false;
 	};
 
 	// The shaders compiled from a source: a blob for each of the renderer's entry points (vs_main, ps_main, shade_vs ...
@@ -589,6 +647,8 @@ namespace grass
 		// (for tests: the map's copy, two cascades of kSunMapSize rows of this many floats, the near one first)
 		ID3D12Resource *sun_map_copy() const { return _sun_map_copy; }
 		uint32_t sun_map_pitch() const { return _sun_map_pitch; }
+		// Forgets the clouds' last picture: the next frame marches every pixel of it again (as after a weather jump)
+		void forget_clouds() { _cloud_known = false; }
 		// Forgets the ground colours seen so far (each blade point remembers its own, see the shader)
 		bool forget_colours(std::string &error);
 		uint32_t zone() const { return _zone; }
@@ -617,19 +677,25 @@ namespace grass
 		void finish_timing(ID3D12GraphicsCommandList *list, bool shaded);
 		ID3D12PipelineState *shade_pipeline_for(const target &t, std::string &error);
 		ID3D12PipelineState *sun_pipeline(std::string &error);
-		bool sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
+		bool sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, UINT64 clouds, std::string &error);
+		ID3D12PipelineState *cloud_pipeline(std::string &error);
+		bool cloud_noise_for(std::string &error);
 		// The water's pipelines: the water alone (a zone without a sea), the debug view, and with a sea the baked water's
 		// whole pixels (marking them in the stencil), the sea where they aren't, the baked water's fading pixels over that
 		enum class water_kind { plain, debug, whole, sea, fading };
 		ID3D12PipelineState *water_pipeline_for(const target &t, water_kind kind, std::string &error);
 		ID3D12PipelineState *firefly_pipeline_for(const target &t, std::string &error);
 		ID3D12PipelineState *air_pipeline_for(const target &t, bool flash, std::string &error);
+		// The look pass (look::post) over the world, its target in RENDER_TARGET before and after; false when it didn't run
+		bool draw_look(ID3D12GraphicsCommandList *list, const target &t, const look &l, draw_stats &stats, std::string &error);
+		ID3D12PipelineState *look_pipeline_for(const target &t, std::string &error);
 		enum class fall { rain, splash, snow, leaf };
 		ID3D12PipelineState *rain_pipeline_for(const target &t, fall kind, std::string &error);
 		bool rain_window_for(const float eye[3], bool &moved, std::string &error);
 		uint32_t copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state);
 		bool blade_depth_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
 		bool world_rtv_for(const target &t, D3D12_CPU_DESCRIPTOR_HANDLE &rtv, std::string &error);
+		bool world_dsv_for(const target &t, D3D12_CPU_DESCRIPTOR_HANDLE &dsv, std::string &error);
 		bool sun_map_for(std::string &error);
 		ID3D12PipelineState *shadow_pipeline(std::string &error);
 		uint32_t draw_sun_map(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3], double clock, uint32_t &triangles, std::string &error);
@@ -650,7 +716,16 @@ namespace grass
 		std::vector<pso_entry> _psos, _shade_psos, _water_psos, _water_debug_psos, _firefly_psos, _rain_psos, _splash_psos, _snow_psos, _leaf_psos, _air_psos, _flash_psos;
 		std::vector<pso_entry> _water_whole_psos, _sea_psos, _water_fading_psos;
 		std::vector<uint8_t> _shade_vs, _shade_ps, _water_vs, _water_ps, _water_debug_vs, _water_debug_ps, _sun_ps, _shadow_vs, _shadow_ps, _firefly_vs, _firefly_ps;
-		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps, _leaf_vs, _leaf_ps, _air_ps, _flash_ps;
+		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps, _leaf_vs, _leaf_ps, _air_ps, _flash_ps, _cloud_ps, _cloud_shadow_ps;
+		// The look pass: its shaders, its pipelines (the small sizes' with no render target, made once; the world's by its
+		// format), its buffer (the exposure at its start, then the levels: kLookExposureBytes on) and the look's clock at
+		// its last frame (how far the exposure moves)
+		std::vector<uint8_t> _look_first_ps, _look_down_ps, _look_exposure_ps, _look_up_ps, _look_ps;
+		ID3D12PipelineState *_look_first_pso = nullptr, *_look_down_pso = nullptr, *_look_exposure_pso = nullptr, *_look_up_pso = nullptr;
+		std::vector<pso_entry> _look_psos;
+		ID3D12Resource *_look_buf = nullptr;
+		UINT64 _look_buf_size = 0;
+		double _look_clock = 0.0;
 		uint64_t _shader_key = 0;
 		bool _shaders_from_cache = false;
 		double _shader_seconds = 0.0;
@@ -662,6 +737,19 @@ namespace grass
 		ID3D12PipelineState *_sun_pso = nullptr; // the sun's shadows at half size (no render target: it writes _sun_mask)
 		ID3D12Resource *_sun_mask = nullptr;     // what it works out, a uint for each of the world's pixels in four (UAV)
 		UINT64 _sun_mask_size = 0;
+		// The clouds (cloud_ps, at a quarter of the world's width and height, no render target): their two pictures after
+		// the sun's mask in _sun_mask (this frame's and the last's, in turn), their noise (default heap, from its upload
+		// copy at the first draw with clouds), and what carrying the last picture over needs: whether there is one that
+		// fits (its size, the buffer, the slab close to this frame's), the last frame's view rows and projection, which
+		// picture is the last's, and the frames marched so far (the 2 x 2 order's turn, the jitter)
+		ID3D12PipelineState *_cloud_pso = nullptr, *_cloud_shadow_pso = nullptr;
+		ID3D12Resource *_cloud_noise = nullptr, *_cloud_noise_staging = nullptr;
+		bool _cloud_known = false;
+		UINT _cloud_w = 0, _cloud_h = 0;
+		ID3D12Resource *_cloud_buffer = nullptr;
+		float _cloud_key[5] = {};
+		float _cloud_view[16] = {}, _cloud_proj[2] = {};
+		uint32_t _cloud_picture = 0, _cloud_frames = 0;
 
 		// The sun's shadow map: two cascades side by side in one D32 texture (each kSunMapSize square, around the
 		// camera, the near one kSunMapReach[0] yalms each way, the far one kSunMapReach[1]), drawn from the zone's
@@ -710,7 +798,8 @@ namespace grass
 		                                            // the water pass marks the baked water's pixels in its stencil)
 		ID3D12DescriptorHeap *_dsv_heap = nullptr;  // its view
 		ID3D12DescriptorHeap *_rtv_heap = nullptr;  // the add-on's own view of the world's target (made each draw)
-		static constexpr UINT kTimingSlots = 4, kTimingMarks = 32;
+		ID3D12DescriptorHeap *_world_dsv_heap = nullptr; // ... and of its depth, for the blades drawn into it (look::phase_t::blades)
+		static constexpr UINT kTimingSlots = 8, kTimingMarks = 32; // (two draws a frame with the blades at the zone's end)
 		ID3D12QueryHeap *_queries = nullptr; // timestamps: one at each section's marker and one at the end; a frame's in each slot in turn
 		ID3D12Resource *_times = nullptr;    // where they're resolved (readback heap)
 		UINT _time_slot = 0, _timed = 0;
@@ -724,8 +813,9 @@ namespace grass
 		uint32_t _frames_timed = 0;
 		// A section starting: the GPU crash report's marker, and a timestamp
 		void section(ID3D12GraphicsCommandList *list, const wchar_t *name);
-		ID3D12Resource *_actors[4] = {};   // the actors near, a frame's in each in turn (upload heaps, mapped)
-		float *_actor_data[4] = {};
+		static constexpr UINT kActorSlots = 8; // upload buffers for the actors, used in turn (frames in flight; two draws a frame)
+		ID3D12Resource *_actors[kActorSlots] = {}; // the actors near, a draw's in each in turn (upload heaps, mapped)
+		float *_actor_data[kActorSlots] = {};
 		uint32_t _actor_slot = 0;
 		ID3D12Resource *_water_params = nullptr; // the water pass's parameters, a frame's in each 256 bytes in turn (upload heap, mapped)
 		uint8_t *_water_param_data = nullptr;
@@ -776,6 +866,11 @@ namespace grass
 		};
 		std::vector<old_buffer> _old;
 	};
+
+	// The clouds' noise as the GPU reads it (grass.hlsl cloud_tex): the broad one, 64 texels a side (a Perlin-Worley mix:
+	// billowing masses), then the fine one, 32 a side (Worley: what eats away their edges), both repeating; a word a texel
+	// (y, z, x order), holding its byte and its neighbours' along x, z and both. Made once (the same every time).
+	const std::vector<uint32_t> &cloud_noise();
 
 	// Matrix helpers (row vectors, D3D layout), shared with the test
 	void multiply(const float a[16], const float b[16], float out[16]);

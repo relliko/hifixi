@@ -27,7 +27,7 @@ namespace hifi::host
 		list_reset, list_close, list_barrier, list_om_targets, list_pipeline, list_topology, list_viewports, list_scissors,
 		list_root_signature, list_root_table, list_root_constant, list_root_constants, list_root_cbv, list_root_srv, list_root_uav,
 		list_clear_depth, list_clear_target, list_draw, list_draw_indexed,
-		list_execute_indirect, list_execute_bundle, list_clear_state, list_barrier7,
+		list_execute_indirect, list_execute_bundle, list_clear_state, list_barrier7, list_heaps,
 		queue_execute,
 		device_create_list, device_create_rtv, device_create_dsv, device_copy, device_copy_simple,
 		slot_count,

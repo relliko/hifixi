@@ -24,10 +24,12 @@ namespace hifi::bake
 	bool grass(uint32_t zone, const std::wstring &out, result &r);
 	// tools/bake_water.py: the water surface (WTR2)
 	bool water(uint32_t zone, const std::wstring &out, result &r);
-	// tools/bake_wet.py: where the ground looks wet in rain (WET1)
-	bool wet(uint32_t zone, const std::wstring &out, result &r);
-	// tools/bake_rain.py: where rain lands (RHM1); water_file: the zone's worldfx-water file, when it has one
-	bool rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r);
+	// tools/bake_wet.py: where the ground looks wet in rain (WET1); any_weather: made whatever the zone's own weather
+	// (bake_wet.py --any-weather), else only for a zone with rain of its own
+	bool wet(uint32_t zone, const std::wstring &out, result &r, bool any_weather = false);
+	// tools/bake_rain.py: where rain lands (RHM1); water_file: the zone's worldfx-water file, when it has one;
+	// any_weather: made whatever the zone's own weather (bake_rain.py --any-weather), else only with rain or snow of its own
+	bool rain(uint32_t zone, const std::wstring &out, const std::wstring &water_file, result &r, bool any_weather = false);
 	// tools/bake_shadow_geo.py: the zone's meshes for the sun's shadow map (compact SHD2)
 	bool shadow(uint32_t zone, const std::wstring &out, result &r);
 	// tools/bake_lamps.py: the zone's lamps (LMP2)

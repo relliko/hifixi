@@ -135,7 +135,12 @@ namespace hifi::bake
 			for (const kind k : kKinds)
 			{
 				const std::wstring out = file_of(folder, k, zone, L".bin"), none = file_of(folder, k, zone, L".none");
-				const bool redo = older_lamps(k, out) || (old_water && (k == kind::water || k == kind::rain || k == kind::sea));
+				// (rain and wet ground for every zone the sun lights, whatever its own weather, so a forced weather (/hifi
+				// weather) rains there too: a none mark made before that rule has no <zone>.aw beside it and is made again)
+				const bool any_weather = (k == kind::rain || k == kind::wet) && sunlit(folder, zone);
+				const std::wstring aw = file_of(folder, k, zone, L".aw");
+				const bool old_none = any_weather && exists(none) && !exists(aw);
+				const bool redo = older_lamps(k, out) || (old_water && (k == kind::water || k == kind::rain || k == kind::sea)) || old_none;
 				if (!redo && (exists(out) || exists(none)))
 					continue;
 				if (redo)
@@ -169,8 +174,8 @@ namespace hifi::bake
 					{
 					case kind::grass: ok = grass(zone, out, r); break;
 					case kind::water: ok = water(zone, out, r); break;
-					case kind::wet: ok = wet(zone, out, r); break;
-					case kind::rain: ok = rain(zone, out, file_of(folder, kind::water, zone, L".bin"), r); break;
+					case kind::wet: ok = wet(zone, out, r, any_weather); break;
+					case kind::rain: ok = rain(zone, out, file_of(folder, kind::water, zone, L".bin"), r, any_weather); break;
 					case kind::sea: ok = sea(zone, out, file_of(folder, kind::water, zone, L".bin"), r); break;
 					case kind::shadow: ok = shadow(zone, out, r); break;
 					case kind::lamps: ok = lamps(zone, out, r); break;
@@ -204,6 +209,8 @@ namespace hifi::bake
 				{
 					g.none++;
 					write_file(none, "", 0);
+					if (any_weather)
+						write_file(aw, "", 0);
 				}
 				else
 				{

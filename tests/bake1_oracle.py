@@ -29,6 +29,7 @@ import time
 TOOLS = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'reshade-worldfx', 'tools'))
 sys.path.insert(0, TOOLS)
 KINDS = ('grass', 'water', 'wet', 'rain')
+ANY_WEATHER = False  # (--any-weather: wet and rain made whatever the zone's own weather, as HiFi XI does for sunlit zones)
 
 
 def run(kind, zone, path, out):
@@ -36,6 +37,8 @@ def run(kind, zone, path, out):
     argv = [os.path.join(TOOLS, 'bake_%s.py' % kind), str(zone), path]
     if kind == 'rain':
         argv += ['--water', os.path.join(out, 'water')]
+    if ANY_WEATHER and kind in ('wet', 'rain'):
+        argv += ['--any-weather']
     said = io.StringIO()
     old = sys.argv
     sys.argv = argv
@@ -62,8 +65,11 @@ def run(kind, zone, path, out):
 
 
 def main():
-    out = sys.argv[1]
-    zones = [int(z) for z in sys.argv[2:]]
+    global ANY_WEATHER
+    args = [a for a in sys.argv[1:] if a != '--any-weather']
+    ANY_WEATHER = len(args) != len(sys.argv) - 1
+    out = args[0]
+    zones = [int(z) for z in args[1:]]
     lines = []
     for kind in KINDS:
         os.makedirs(os.path.join(out, kind), exist_ok=True)

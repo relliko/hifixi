@@ -35,6 +35,7 @@ namespace hifi::host
 		out[list_execute_bundle] = HIFI_SLOT(ID3D12GraphicsCommandList7Vtbl, ExecuteBundle);
 		out[list_clear_state] = HIFI_SLOT(ID3D12GraphicsCommandList7Vtbl, ClearState);
 		out[list_barrier7] = HIFI_SLOT(ID3D12GraphicsCommandList7Vtbl, Barrier);
+		out[list_heaps] = HIFI_SLOT(ID3D12GraphicsCommandList7Vtbl, SetDescriptorHeaps);
 		out[queue_execute] = HIFI_SLOT(ID3D12CommandQueueVtbl, ExecuteCommandLists);
 		out[device_create_list] = HIFI_SLOT(ID3D12DeviceVtbl, CreateCommandList);
 		out[device_create_rtv] = HIFI_SLOT(ID3D12DeviceVtbl, CreateRenderTargetView);

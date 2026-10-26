@@ -1,4 +1,6 @@
 #include "schema.hpp"
+#include "../chars/charoptions.hpp" // (native characters)
+#include "../zone/zoneoptions.hpp"
 #include <cmath>
 #include <cstring>
 
@@ -87,6 +89,18 @@ namespace hifi::settings
 				"The game's glowing fixtures light what's around them (0: off).", "%.2f", nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			{ "EffectGlow", tab::lighting, "Lamps and glows", "Spells, abilities and fires",
 				"Glowing effects light what's around them (0: off).", "%.2f", nullptr, false, { 0.0f, 0.6f, 0.8f, 1.0f } },
+			// The look over the world (on in every preset: Alex wants new looks on by default)
+			{ "Tonemap", tab::lighting, "Tone and colour", "Tone mapping",
+				"A filmic curve over the world: bright parts roll off smoothly into white instead of clipping, a little more "
+				"contrast through the middle, and an exposure that follows the scene slowly, so a bright noon isn't blown out "
+				"and the night stays dark. The interface isn't touched.", nullptr, nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
+			{ "Bloom", tab::lighting, "Tone and colour", "Bloom",
+				"A soft glow around the brightest things: the sun, lamps, glowing effects, a bright sky and the lit edges of "
+				"clouds (0: none, 1: subtle).", "%.2f", nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
+			{ "ColourGrade", tab::lighting, "Tone and colour", "Colour grade",
+				"The world's colours shift with the hour and the weather: warm at dawn and dusk, cool at night, grey in rain "
+				"and gloom, a warm haze in heat and dust (0: off, 1: subtle). Not under a roof or underground.", "%.2f",
+				nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
 
 			// The world: grass
 			{ "Grass", tab::world, "Grass", "Grass", "Blades of grass over the ground wherever the zone's ground is grass.",
@@ -142,6 +156,11 @@ namespace hifi::settings
 				"(they disturbed the shadows); their sound, light and fog stay.", nullptr, "Sky", false, { 0.0f, 0.0f, 1.0f, 1.0f } },
 			{ "Clouds", tab::world, "Weather", "Clouds", "Clouds of its own, as thick and dark as the weather has them, drifting "
 				"with the wind.", nullptr, "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
+			{ "CloudQuality", tab::world, "Weather", "Clouds' detail", "How finely the clouds are worked out (0 low .. 2 high): "
+				"more steps through them, a little more GPU time.", nullptr, "Clouds", false, { _, _, 1.0f, 2.0f } },
+			{ "CloudStyle", tab::world, "Weather", "Clouds' style", "0: game-like, thin soft layers in the sky's own colours as the "
+				"game's are. 1: volumetric heaps lit by the sun, with dark bases and bright edges.", nullptr, "Clouds", false,
+				{ 0.0f, 0.0f, 0.0f, 0.0f } },
 			{ "Lightning", tab::world, "Weather", "Lightning", "In thunder and thunderstorms, flashes that light everything for a "
 				"moment, and bolts in the sky.", nullptr, "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
 			{ "WeatherDust", tab::world, "Weather", "Dust and sand storms", "Dust and sand blown along the ground (0: none).",
@@ -198,6 +217,28 @@ namespace hifi::settings
 				"characters cast sun or moon shadows here: two at different angles looked like copies of one. Where HiFi XI casts "
 				"none (no open sky, the sun down and no moon), the game's are drawn as before.", nullptr, "SunCharacters", false,
 				{ 1.0f, 1.0f, 1.0f, 1.0f } },
+			{ "zone.native", tab::game, "Drawn by HiFi XI (experimental)", "The zone's scenery",
+				"HiFi XI draws the zone's buildings, ground and plants itself from your game's files, where the game drew them, "
+				"lit as the game lights them. What it doesn't have yet the game still draws. (/hifi nativezone)", nullptr, nullptr,
+				false, { 0.0f, zone::options::kNativeByDefault ? 1.0f : _, zone::options::kNativeByDefault ? 1.0f : _, zone::options::kNativeByDefault ? 1.0f : _ },
+				flag, 0.0f, 1.0f, zone::options::kNativeByDefault ? 1.0f : 0.0f },
+			{ "zone.perpixel", tab::game, "Drawn by HiFi XI (experimental)", "Light the scenery per pixel",
+				"The sun and lamps worked out at each pixel instead of at each corner, and the normal maps used, "
+				"for smoother light and sharper detail where a surface has one. (/hifi nativezone perpixel)", nullptr, "zone.native", false,
+				{ _, zone::options::kPerPixelByDefault ? 1.0f : _, zone::options::kPerPixelByDefault ? 1.0f : _, zone::options::kPerPixelByDefault ? 1.0f : _ },
+				flag, 0.0f, 1.0f, zone::options::kPerPixelByDefault ? 1.0f : 0.0f },
+			// (native characters: their default in src/chars/charoptions.hpp)
+			{ "chars.native", tab::game, "Drawn by HiFi XI (experimental)", "Characters and monsters",
+				"HiFi XI draws the characters, monsters and NPCs itself from what your game has loaded, where the game drew them, "
+				"posed and lit as the game poses and lights them. A model whose data isn't on the GPU yet the game still draws. "
+				"(/hifi nativechars)", nullptr, nullptr, false,
+				{ 0.0f, chars::options::kNativeByDefault ? 1.0f : _, chars::options::kNativeByDefault ? 1.0f : _, chars::options::kNativeByDefault ? 1.0f : _ },
+				flag, 0.0f, 1.0f, chars::options::kNativeByDefault ? 1.0f : 0.0f },
+			{ "chars.perpixel", tab::game, "Drawn by HiFi XI (experimental)", "Light the characters per pixel",
+				"The sun, moon and lamps on characters worked out at each pixel instead of at each corner: smoother light on "
+				"faces and folds. (/hifi nativechars perpixel)", nullptr, "chars.native", false,
+				{ _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _ },
+				flag, 0.0f, 1.0f, chars::options::kPerPixelByDefault ? 1.0f : 0.0f },
 
 			// Advanced
 			{ "GrassHue", tab::advanced, "Grass colour", "Grass colour where the ground hasn't been seen",
@@ -269,7 +310,8 @@ namespace hifi::settings
 	{
 		switch (p)
 		{
-		case preset::off: return "The game as it draws itself: no grass, shadows, water, rain or sky of HiFi XI's (its frame rate speed-ups stay on).";
+		case preset::off: return "The game as it draws itself: no grass, shadows, water, rain or sky of HiFi XI's (its frame rate speed-ups, "
+			"tone mapping, bloom and colour grade stay on).";
 		case preset::balanced: return "What costs little: grass near you, the sun's shadows, water, rain and snow, lamp glow.";
 		case preset::high: return "More of it, further: characters' shadows, the sky, lamp shadows, some ambient occlusion.";
 		case preset::ultra: return "Everything, at its furthest and thickest.";

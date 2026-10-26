@@ -22,7 +22,6 @@ namespace grass
 		// the ground colours remembered (u0) and the sun's shadows (u1), root UAVs: no descriptor heap
 		// needed, so the game's heaps stay bound
 		constexpr UINT kConstants = 52;
-		constexpr UINT kActorSlots = 4; // upload buffers for the actors, used in turn (frames in flight)
 		// A frame's water parameters: 8 float4s, then two for each ring (kMaxRipples), rounded up to 256 bytes
 		constexpr UINT kWaterParamBytes = (8 * 16 + kMaxRipples * 32 + 255) / 256 * 256;
 		constexpr UINT kFirstBladeConstant = 27;
@@ -61,7 +60,16 @@ namespace grass
 		// dust, the gloom and the heat
 		constexpr UINT kWxParams = 64;
 		constexpr UINT kWxOffset = kMaxActors * 4 + kSunMapParams + kLampParams + kHazeParams + kWetParams + kSkyParams + kWearParams + kSunMapPrevParams;
-		constexpr UINT kActorBytes = (kWxOffset + kWxParams) * 4;
+		// ... and after those the clouds' (grass.hlsl kCloud; rule bit 1024): the last frame's view rows and projection, the
+		// 2 x 2 order's turn, whether the last frame's picture is carried over and where the two pictures are, their size,
+		// the steps, the frame's count, the slab, toward the light, how dense
+		// ... and their shadows' map (kCloudShadowSize texels a side, kCloudShadowReach yalms each way from the camera)
+		constexpr UINT kCloudParams = 40;
+		constexpr UINT kCloudShadowSize = 128;
+		constexpr float kCloudShadowReach = 600.0f;
+		constexpr UINT kActorBytes = (kWxOffset + kWxParams + kCloudParams) * 4;
+		// The clouds' steps along a view ray and toward the light at each quality (look::weather_fx::cloud_quality)
+		constexpr UINT kCloudSteps[3][2] = { { 16, 3 }, { 24, 4 }, { 32, 6 } };
 		// Each point's memory (grass.hlsl kMemoryStride): its ground colour (12 bytes), then when its trampling wears off
 		// and when it has grown back from a cut (f32 seconds on the memory's clock, 0 never)
 		constexpr UINT kMemoryStride = 20;
@@ -116,7 +124,8 @@ namespace grass
 			{ "water_debug_vs", "vs_5_0" }, { "water_debug_ps", "ps_5_0" }, { "firefly_vs", "vs_5_0" }, { "firefly_ps", "ps_5_0" },
 			{ "rain_vs", "vs_5_0" }, { "rain_ps", "ps_5_0" }, { "splash_vs", "vs_5_0" }, { "splash_ps", "ps_5_0" },
 			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" }, { "leaf_vs", "vs_5_0" }, { "leaf_ps", "ps_5_0" },
-			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" } };
+			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" }, { "cloud_ps", "ps_5_0" }, { "cloud_shadow_ps", "ps_5_0" },
+			{ "look_first_ps", "ps_5_0" }, { "look_down_ps", "ps_5_0" }, { "look_exposure_ps", "ps_5_0" }, { "look_up_ps", "ps_5_0" }, { "look_ps", "ps_5_0" } };
 		constexpr size_t kShaderEntryCount = sizeof(kShaderEntries) / sizeof(kShaderEntries[0]);
 		constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
@@ -437,6 +446,38 @@ namespace grass
 			{ 1.0f, 1.0f, 0.9f, 0.45f, 0.6f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.55f, 1.0f },    // darkness
 		};
 		static_assert(sizeof(kWeatherFx) / sizeof(kWeatherFx[0]) == sizeof(kWeathers) / sizeof(kWeathers[0]), "a look for each weather");
+
+		// Each weather's clouds' slab (weather_kind_fx's bottom, top, shape, erosion and dense), by id as kWeathers: fine weather and
+		// sunshine small heaps high up with clear sky between (their cover above), clouds a broken layer a little lower and
+		// flatter; rain, squalls and thunder a low, deep, near-solid deck (thunder's with heaped tops); snow and blizzards a
+		// grey deck; mist a thin low veil; dust and sand a hazy layer; gloom and darkness a heavy low one
+		struct cloud_slab
+		{
+			float bottom, top, shape, erosion, dense;
+		};
+		const cloud_slab kCloudSlabs[] = {
+			{ 240.0f, 480.0f, 0.0f, 1.0f, 1.0f },  // fine
+			{ 220.0f, 480.0f, 0.05f, 1.0f, 1.0f }, // sunshine
+			{ 200.0f, 400.0f, 0.45f, 0.8f, 1.3f }, // clouds
+			{ 110.0f, 210.0f, 1.0f, 0.3f, 0.12f }, // mist
+			{ 300.0f, 420.0f, 0.0f, 1.0f, 0.8f },  // hot spell
+			{ 320.0f, 430.0f, 0.0f, 1.0f, 0.7f },  // heat wave
+			{ 120.0f, 380.0f, 0.85f, 0.5f, 2.2f }, // rain
+			{ 110.0f, 390.0f, 0.75f, 0.6f, 2.2f }, // squall
+			{ 200.0f, 360.0f, 0.6f, 0.7f, 1.0f },  // dust storm
+			{ 200.0f, 360.0f, 0.65f, 0.7f, 1.0f }, // sand storm
+			{ 230.0f, 390.0f, 0.2f, 1.0f, 1.0f },  // wind
+			{ 200.0f, 380.0f, 0.4f, 0.9f, 1.2f },  // gales
+			{ 140.0f, 380.0f, 0.85f, 0.5f, 1.4f }, // snow
+			{ 110.0f, 390.0f, 0.9f, 0.5f, 1.8f },  // blizzard
+			{ 110.0f, 430.0f, 0.7f, 0.6f, 2.4f },  // thunder
+			{ 100.0f, 440.0f, 0.65f, 0.6f, 2.4f }, // thunderstorm
+			{ 280.0f, 400.0f, 0.0f, 1.0f, 0.8f },  // aurora
+			{ 300.0f, 400.0f, 0.0f, 1.0f, 0.8f },  // stellar glare
+			{ 100.0f, 380.0f, 0.9f, 0.5f, 2.0f },  // gloom
+			{ 90.0f, 390.0f, 0.95f, 0.5f, 2.4f },  // darkness
+		};
+		static_assert(sizeof(kCloudSlabs) / sizeof(kCloudSlabs[0]) == sizeof(kWeathers) / sizeof(kWeathers[0]), "a slab for each weather");
 
 		float luma(const float c[3]) { return 0.3f * c[0] + 0.59f * c[1] + 0.11f * c[2]; }
 
@@ -864,7 +905,16 @@ namespace grass
 	weather_kind_fx weather_fx_of(uint32_t name)
 	{
 		const weather_kind *k = weather_by_name(name);
-		return k != nullptr ? kWeatherFx[k - kWeathers] : weather_kind_fx();
+		if (k == nullptr)
+			return weather_kind_fx();
+		weather_kind_fx out = kWeatherFx[k - kWeathers];
+		const cloud_slab &s = kCloudSlabs[k - kWeathers];
+		out.bottom = s.bottom;
+		out.top = s.top;
+		out.shape = s.shape;
+		out.erosion = s.erosion;
+		out.dense = s.dense;
+		return out;
 	}
 
 	weather_kind_fx weather_fx_of(const weather &w)
@@ -897,6 +947,14 @@ namespace grass
 		out.gloom = mix(was.gloom, now.gloom);
 		out.sky_dark = mix(was.sky_dark, now.sky_dark);
 		out.stars = mix(was.stars, now.stars);
+		// (the clouds' slab: a weather with no clouds keeps the other's, so it doesn't sink or rise as they thin away)
+		const float c0 = was.cover * (1.0f - f), c1 = now.cover * f;
+		const float g = c0 + c1 > 0.0f ? c1 / (c0 + c1) : f;
+		out.bottom = was.bottom + (now.bottom - was.bottom) * g;
+		out.top = was.top + (now.top - was.top) * g;
+		out.shape = was.shape + (now.shape - was.shape) * g;
+		out.erosion = was.erosion + (now.erosion - was.erosion) * g;
+		out.dense = was.dense + (now.dense - was.dense) * g;
 		return out;
 	}
 
@@ -933,12 +991,72 @@ namespace grass
 	// it, a little brighter than the sky by day, dim grey-blue by night; its underside the horizon's, greyer, as dark as
 	// the weather's; dust and sand their own colours at the sky's brightness, gloom's fog the game's fog darkened and greyed.
 	// Without a sky (a zone with none, or the record not read) the game's fog stands for the horizon.
+	void colour_grade(float sun_up, float night, bool sunlit, const weather *w, float strength, look::look_pass &p, float *out_parts)
+	{
+		float gain[3] = {}, lift[3] = {}, sat = 0.0f, contrast = 0.0f;
+		auto add = [&](float share, float r, float gr, float b, float s, float c, float lr, float lg, float lb) {
+			share = std::isfinite(share) ? std::clamp(share, 0.0f, 1.0f) : 0.0f;
+			gain[0] += share * r;
+			gain[1] += share * gr;
+			gain[2] += share * b;
+			sat += share * s;
+			contrast += share * c;
+			lift[0] += share * lr;
+			lift[1] += share * lg;
+			lift[2] += share * lb;
+		};
+		float parts[8] = {};
+		if (sunlit)
+		{
+			const float up = std::isfinite(sun_up) ? sun_up : 1.0f;
+			parts[0] = std::exp(-((up - 0.05f) / 0.16f) * ((up - 0.05f) / 0.16f)); // (twilight: the sun just over the horizon)
+			parts[1] = std::isfinite(night) ? std::clamp(night, 0.0f, 1.0f) : 0.0f;
+			if (w != nullptr && w->known)
+			{
+				const weather_kind_fx x = weather_fx_of(*w);
+				parts[2] = std::min(weather_rain(*w), 1.0f);
+				parts[3] = std::min(x.gloom, 1.0f);
+				parts[4] = std::min(x.heat, 1.0f);
+				parts[5] = std::min(x.dust, 1.0f);
+				parts[6] = std::min(weather_snowfall(*w) / 0.6f, 1.0f);
+				parts[7] = std::min(x.veil, 1.0f) * (1.0f - parts[2]);
+			}
+			//  share     gain: r   g       b       sat     contrast  lift: r g       b
+			add(parts[0], 0.06f, 0.0f, -0.10f, 0.06f, 0.0f, 0.012f, 0.006f, 0.0f);        // dawn and dusk: warm
+			add(parts[1], -0.07f, -0.04f, 0.03f, -0.10f, 0.02f, 0.0f, 0.002f, 0.008f);    // night: cool, a little darker
+			add(parts[2], -0.06f, -0.04f, -0.01f, -0.22f, -0.05f, 0.006f, 0.007f, 0.009f); // rain: grey, dimmer
+			add(parts[3], -0.04f, -0.03f, 0.0f, -0.28f, -0.04f, 0.004f, 0.004f, 0.006f);  // gloom: grey, dim
+			add(parts[4], 0.06f, 0.01f, -0.10f, -0.05f, -0.05f, 0.02f, 0.014f, 0.004f);   // heat: a warm haze
+			add(parts[5], 0.05f, 0.0f, -0.10f, -0.10f, -0.06f, 0.02f, 0.015f, 0.006f);    // dust and sand: a warm haze
+			add(parts[6], -0.03f, -0.01f, 0.04f, -0.10f, 0.0f, 0.0f, 0.0f, 0.004f);       // snow: cool
+			add(parts[7], 0.0f, 0.0f, 0.0f, -0.10f, -0.04f, 0.006f, 0.006f, 0.006f);      // mist: flatter
+		}
+		if (out_parts != nullptr)
+			std::memcpy(out_parts, parts, sizeof(parts));
+		const float k = std::isfinite(strength) ? std::clamp(strength, 0.0f, 2.0f) : 0.0f;
+		float off = std::fabs(sat) + std::fabs(contrast);
+		for (int i = 0; i < 3; ++i)
+		{
+			p.gain[i] = std::clamp(1.0f + k * gain[i], 0.5f, 1.5f);
+			p.lift[i] = std::clamp(k * lift[i], 0.0f, 0.1f);
+			off += std::fabs(gain[i]) + std::fabs(lift[i]);
+		}
+		p.saturation = std::clamp(1.0f + k * sat, 0.3f, 1.5f);
+		p.contrast = std::clamp(1.0f + k * contrast, 0.7f, 1.3f);
+		p.grade = k > 0.0f && off > 1e-4f;
+	}
+
 	void weather_look(const weather &w, const look::sky_dome &dome, look::weather_fx &wx)
 	{
 		const weather_kind_fx k = weather_fx_of(w);
 		wx.cloud_cover = k.cover;
 		wx.cloud_thick = k.thick;
 		wx.cloud_veil = k.veil;
+		wx.cloud_bottom = k.bottom;
+		wx.cloud_top = k.top;
+		wx.cloud_shape = k.shape;
+		wx.cloud_erosion = k.erosion;
+		wx.cloud_dense = k.dense;
 		wx.wind_strength = k.wind;
 		wx.dust = k.dust;
 		wx.streaks = k.streaks;
@@ -1004,6 +1122,149 @@ namespace grass
 			wx.gloom_colour[i] = (fog[i] + (grey_f - fog[i]) * 0.4f) * 0.8f;
 			wx.leaf_light[i] = std::clamp(horizon[i] * 0.5f + light[i] * bright * 0.6f, 0.03f, 1.2f);
 		}
+	}
+
+	namespace
+	{
+		// The clouds' noise: a hash of a lattice point (the caller wraps it, so the noise repeats)
+		uint32_t lattice_hash(int x, int y, int z, uint32_t seed)
+		{
+			uint32_t h = seed ^ (uint32_t(x) * 0x8DA6B343u) ^ (uint32_t(y) * 0xD8163841u) ^ (uint32_t(z) * 0xCB1AB31Fu);
+			h ^= h >> 15;
+			h *= 0x2C1B3C6Du;
+			h ^= h >> 12;
+			h *= 0x297A2D39u;
+			h ^= h >> 15;
+			return h;
+		}
+		float unit_of(uint32_t h) { return float(h & 0xFFFFFFu) / 16777216.0f; }
+		int wrapped(int i, int n) { return ((i % n) + n) % n; }
+
+		// Gradient (Perlin) noise at p (lattice units), repeating every n: about -1..1
+		float perlin(const float p[3], int n, uint32_t seed)
+		{
+			static const float grads[12][3] = { { 1, 1, 0 }, { -1, 1, 0 }, { 1, -1, 0 }, { -1, -1, 0 }, { 1, 0, 1 }, { -1, 0, 1 },
+				{ 1, 0, -1 }, { -1, 0, -1 }, { 0, 1, 1 }, { 0, -1, 1 }, { 0, 1, -1 }, { 0, -1, -1 } };
+			int i[3];
+			float f[3], u[3];
+			for (int k = 0; k < 3; ++k)
+			{
+				const float fl = std::floor(p[k]);
+				i[k] = int(fl);
+				f[k] = p[k] - fl;
+				u[k] = f[k] * f[k] * f[k] * (f[k] * (f[k] * 6.0f - 15.0f) + 10.0f);
+			}
+			float corner[8];
+			for (int c = 0; c < 8; ++c)
+			{
+				const int d[3] = { c & 1, (c >> 1) & 1, (c >> 2) & 1 };
+				const float *g = grads[lattice_hash(wrapped(i[0] + d[0], n), wrapped(i[1] + d[1], n), wrapped(i[2] + d[2], n), seed) % 12];
+				corner[c] = g[0] * (f[0] - d[0]) + g[1] * (f[1] - d[1]) + g[2] * (f[2] - d[2]);
+			}
+			auto mix = [](float a, float b, float s) { return a + (b - a) * s; };
+			const float x00 = mix(corner[0], corner[1], u[0]), x10 = mix(corner[2], corner[3], u[0]);
+			const float x01 = mix(corner[4], corner[5], u[0]), x11 = mix(corner[6], corner[7], u[0]);
+			return mix(mix(x00, x10, u[1]), mix(x01, x11, u[1]), u[2]);
+		}
+
+		// Worley noise at p (cell units), repeating every n cells, a point somewhere in each: 1 on a point, falling to 0 a
+		// cell's width from the nearest
+		float worley(const float p[3], int n, uint32_t seed)
+		{
+			const int ix = int(std::floor(p[0])), iy = int(std::floor(p[1])), iz = int(std::floor(p[2]));
+			float best = 9.0f;
+			for (int dz = -1; dz <= 1; ++dz)
+				for (int dy = -1; dy <= 1; ++dy)
+					for (int dx = -1; dx <= 1; ++dx)
+					{
+						const int cx = ix + dx, cy = iy + dy, cz = iz + dz;
+						const uint32_t h = lattice_hash(wrapped(cx, n), wrapped(cy, n), wrapped(cz, n), seed);
+						const float px = cx + unit_of(h), py = cy + unit_of(h * 0x9E3779B1u + 1u), pz = cz + unit_of(h * 0x85EBCA77u + 7u);
+						const float x = px - p[0], y = py - p[1], z = pz - p[2];
+						best = std::min(best, x * x + y * y + z * z);
+					}
+			return std::clamp(1.0f - std::sqrt(best), 0.0f, 1.0f);
+		}
+
+		// A volume of n^3 values stretched to 0..1 (from just above its least to just below its most: a few stray texels
+		// don't squash the rest), packed for the GPU: each texel's byte with its neighbours' along x, z and both
+		void pack_noise(std::vector<float> &v, int n, std::vector<uint32_t> &out)
+		{
+			std::vector<float> sorted(v);
+			std::sort(sorted.begin(), sorted.end());
+			const float lo = sorted[sorted.size() / 200], hi = sorted[sorted.size() - 1 - sorted.size() / 500];
+			std::vector<uint8_t> b(v.size());
+			for (size_t i = 0; i < v.size(); ++i)
+				b[i] = uint8_t(std::lround(std::clamp((v[i] - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f) * 255.0f));
+			auto at = [&](int x, int y, int z) { return uint32_t(b[(size_t(wrapped(y, n)) * n + wrapped(z, n)) * n + wrapped(x, n)]); };
+			for (int y = 0; y < n; ++y)
+				for (int z = 0; z < n; ++z)
+					for (int x = 0; x < n; ++x)
+						out.push_back(at(x, y, z) | at(x + 1, y, z) << 8 | at(x, y, z + 1) << 16 | at(x + 1, y, z + 1) << 24);
+		}
+
+		std::vector<uint32_t> make_cloud_noise()
+		{
+			std::vector<uint32_t> out;
+			out.reserve(64 * 64 * 64 + 32 * 32 * 32);
+			// The broad one: Perlin noise (three octaves) lifted where Worley's cells are (4 across: billowing masses),
+			// then cut back by finer Worley noise (8, 16 and 32 across), as Schneider's "Nubis" clouds have it
+			{
+				const int n = 64;
+				std::vector<float> v(size_t(n) * n * n);
+				for (int y = 0; y < n; ++y)
+					for (int z = 0; z < n; ++z)
+						for (int x = 0; x < n; ++x)
+						{
+							const float u[3] = { (x + 0.5f) / n, (y + 0.5f) / n, (z + 0.5f) / n };
+							float perl = 0.0f, amp = 1.0f, total = 0.0f;
+							for (int o = 0, freq = 4; o < 3; ++o, freq *= 2, amp *= 0.5f)
+							{
+								const float q[3] = { u[0] * freq, u[1] * freq, u[2] * freq };
+								perl += amp * perlin(q, freq, 11u + o);
+								total += amp;
+							}
+							perl = std::clamp(perl / total * 0.75f + 0.5f, 0.0f, 1.0f);
+							float w[4];
+							for (int o = 0, freq = 4; o < 4; ++o, freq *= 2)
+							{
+								const float q[3] = { u[0] * freq, u[1] * freq, u[2] * freq };
+								w[o] = worley(q, freq, 101u + o);
+							}
+							const float pw = w[0] + perl * (1.0f - w[0]);
+							const float fbm = 0.625f * w[1] + 0.25f * w[2] + 0.125f * w[3];
+							v[(size_t(y) * n + z) * n + x] = (pw + 1.0f - fbm) / (2.0f - fbm);
+						}
+				pack_noise(v, n, out);
+			}
+			// The fine one: Worley noise 4, 8 and 16 cells across
+			{
+				const int n = 32;
+				std::vector<float> v(size_t(n) * n * n);
+				for (int y = 0; y < n; ++y)
+					for (int z = 0; z < n; ++z)
+						for (int x = 0; x < n; ++x)
+						{
+							const float u[3] = { (x + 0.5f) / n, (y + 0.5f) / n, (z + 0.5f) / n };
+							float sum = 0.0f;
+							const float weights[3] = { 0.625f, 0.25f, 0.125f };
+							for (int o = 0, freq = 4; o < 3; ++o, freq *= 2)
+							{
+								const float q[3] = { u[0] * freq, u[1] * freq, u[2] * freq };
+								sum += weights[o] * worley(q, freq, 201u + o);
+							}
+							v[(size_t(y) * n + z) * n + x] = sum;
+						}
+				pack_noise(v, n, out);
+			}
+			return out;
+		}
+	}
+
+	const std::vector<uint32_t> &cloud_noise()
+	{
+		static const std::vector<uint32_t> noise = make_cloud_noise();
+		return noise;
 	}
 
 	bool read_blade_file(const wchar_t *path, blade_file &out, std::string &error, const char *magic, uint32_t stride)
@@ -1552,9 +1813,14 @@ namespace grass
 		release(_blade_depth);
 		release(_dsv_heap);
 		release(_rtv_heap);
+		release(_world_dsv_heap);
 		release(_depth.buffer);
 		release(_sun_mask);
 		release(_sun_pso);
+		release(_cloud_pso);
+		release(_cloud_shadow_pso);
+		release(_cloud_noise);
+		release(_cloud_noise_staging);
 		release(_vis_pso);
 		release(_vis_points);
 		release(_vis_read);
@@ -1614,6 +1880,12 @@ namespace grass
 		for (pso_entry &e : _flash_psos)
 			release(e.pso);
 		_flash_psos.clear();
+		for (ID3D12PipelineState **pso : { &_look_first_pso, &_look_down_pso, &_look_exposure_pso, &_look_up_pso })
+			release(*pso);
+		for (pso_entry &e : _look_psos)
+			release(e.pso);
+		_look_psos.clear();
+		release(_look_buf);
 		release(_root);
 	}
 
@@ -1892,7 +2164,8 @@ namespace grass
 	{
 		std::vector<uint8_t> *const into[kShaderEntryCount] = { &_vs, &_ps, &_shade_vs, &_shade_ps, &_sun_ps, &_shadow_vs, &_shadow_ps,
 			&_water_vs, &_water_ps, &_water_debug_vs, &_water_debug_ps, &_firefly_vs, &_firefly_ps, &_rain_vs, &_rain_ps,
-			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps };
+			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps, &_cloud_ps, &_cloud_shadow_ps,
+			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps };
 		if (code.blobs.size() != kShaderEntryCount)
 			return;
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
@@ -1904,9 +2177,24 @@ namespace grass
 		if (_vis_pso != nullptr)
 			_old.push_back({ _vis_pso, 0 });
 		_vis_pso = nullptr;
+		if (_cloud_pso != nullptr)
+			_old.push_back({ _cloud_pso, 0 });
+		_cloud_pso = nullptr;
+		if (_cloud_shadow_pso != nullptr)
+			_old.push_back({ _cloud_shadow_pso, 0 });
+		_cloud_shadow_pso = nullptr;
 		if (_shadow_pso != nullptr)
 			_old.push_back({ _shadow_pso, 0 });
 		_shadow_pso = nullptr;
+		for (ID3D12PipelineState **pso : { &_look_first_pso, &_look_down_pso, &_look_exposure_pso, &_look_up_pso })
+		{
+			if (*pso != nullptr)
+				_old.push_back({ *pso, 0 });
+			*pso = nullptr;
+		}
+		for (pso_entry &e : _look_psos)
+			_old.push_back({ e.pso, 0 });
+		_look_psos.clear();
 		for (cascade &c : _cascades)
 			c.forget(); // (drawn again with the new shaders)
 		for (pso_entry &e : _psos)
@@ -2013,11 +2301,12 @@ namespace grass
 	}
 
 	// The mask the sun's shadows go into: a uint for each pixel of the world at half its width and height
-	// (rounded up), made again when the world's size grows. Buffers start in COMMON and go back to it after
-	// each list: the passes use it as a UAV straight away (a buffer is promoted to that by itself).
-	bool renderer::sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error)
+	// (rounded up), and after it `clouds` bytes for the clouds' two pictures, made again when that grows. Buffers start
+	// in COMMON and go back to it after each list: the passes use it as a UAV straight away (a buffer is promoted to
+	// that by itself).
+	bool renderer::sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, UINT64 clouds, std::string &error)
 	{
-		const UINT64 size = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 4;
+		const UINT64 size = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 4 + clouds;
 		if (_sun_mask != nullptr && _sun_mask_size >= size)
 			return true;
 		if (_sun_mask != nullptr)
@@ -2046,6 +2335,98 @@ namespace grass
 		}
 		_sun_mask->SetName(L"worldfx: sun shadows");
 		_sun_mask_size = size;
+		return true;
+	}
+
+	// The clouds at a quarter of the world's size, and their shadows' map: full-screen triangles with no render target
+	// (their pixels write the picture and the map after the sun's mask). Both made at once; the clouds' returned.
+	ID3D12PipelineState *renderer::cloud_pipeline(std::string &error)
+	{
+		if (_cloud_pso != nullptr && _cloud_shadow_pso != nullptr)
+			return _cloud_pso;
+		release(_cloud_pso);
+		release(_cloud_shadow_pso);
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _shade_vs.data(), _shade_vs.size() };
+		desc.PS = { _cloud_shadow_ps.data(), _cloud_shadow_ps.size() };
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 0;
+		desc.SampleDesc.Count = 1;
+		if (FAILED(_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&_cloud_shadow_pso))))
+		{
+			error = "cloud shadow pipeline failed";
+			_cloud_shadow_pso = nullptr;
+			return nullptr;
+		}
+		_cloud_shadow_pso->SetName(L"worldfx: cloud shadow pipeline");
+		desc.PS = { _cloud_ps.data(), _cloud_ps.size() };
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 0;
+		desc.SampleDesc.Count = 1;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&_cloud_pso));
+		if (FAILED(hr))
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "cloud pipeline failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			_cloud_pso = nullptr;
+			return nullptr;
+		}
+		_cloud_pso->SetName(L"worldfx: cloud pipeline");
+		return _cloud_pso;
+	}
+
+	// The clouds' noise (cloud_noise): into an upload buffer, copied into a default-heap one at the next draw (the pass
+	// reads it many times a pixel), once for the renderer
+	bool renderer::cloud_noise_for(std::string &error)
+	{
+		if (_cloud_noise != nullptr)
+			return true;
+		const std::vector<uint32_t> &noise = cloud_noise();
+		D3D12_HEAP_PROPERTIES upload = {}, local = {};
+		upload.Type = D3D12_HEAP_TYPE_UPLOAD;
+		local.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC desc = {};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		desc.Width = UINT64(noise.size()) * 4;
+		desc.Height = 1;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.SampleDesc.Count = 1;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		ID3D12Resource *staging = nullptr, *buffer = nullptr;
+		void *mapped = nullptr;
+		const D3D12_RANGE none = { 0, 0 };
+		HRESULT hr = _device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging));
+		if (SUCCEEDED(hr) && SUCCEEDED(hr = staging->Map(0, &none, &mapped)))
+		{
+			std::memcpy(mapped, noise.data(), noise.size() * 4);
+			staging->Unmap(0, nullptr);
+		}
+		if (SUCCEEDED(hr))
+			hr = _device->CreateCommittedResource(&local, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buffer));
+		if (FAILED(hr))
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "cloud noise buffer failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			release(staging);
+			release(buffer);
+			return false;
+		}
+		staging->SetName(L"worldfx: cloud noise (upload)");
+		buffer->SetName(L"worldfx: cloud noise");
+		_cloud_noise_staging = staging;
+		_cloud_noise = buffer;
 		return true;
 	}
 
@@ -2396,6 +2777,247 @@ namespace grass
 		pso->SetName(flash ? L"worldfx: flash pipeline" : L"worldfx: air pipeline");
 		psos.push_back({ t.rtv_format, DXGI_FORMAT_UNKNOWN, rt_desc.SampleDesc, pso });
 		return pso;
+	}
+
+	// The look
+
+	namespace
+	{
+		// The look's buffer: the exposure (log2) and the scene's mean log2 luminance at its start, the levels after it; at
+		// most kLookLevels levels, the smallest no more than kLookSmallest texels a side (the exposure reads all of it); the
+		// bloom from the first kLookBloomLevels (a quarter of the world's size down to a 128th); kLookBloom: the bloom at
+		// its setting's 1, over all its levels
+		constexpr UINT64 kLookExposureBytes = 256;
+		constexpr uint32_t kLookLevels = 10, kLookSmallest = 16, kLookBloomLevels = 6;
+		constexpr float kLookBloom = 0.6f;
+	}
+
+	// The look's pipelines at the small sizes: full-screen triangles with no render target (their pixels write the look's
+	// buffer), made once
+	ID3D12PipelineState *renderer::look_pipeline_for(const target &t, std::string &error)
+	{
+		struct small_pass
+		{
+			ID3D12PipelineState **pso;
+			const std::vector<uint8_t> *ps;
+			const wchar_t *name;
+		};
+		for (const small_pass &s : { small_pass { &_look_first_pso, &_look_first_ps, L"worldfx: look pipeline (first level)" },
+			small_pass { &_look_down_pso, &_look_down_ps, L"worldfx: look pipeline (levels)" },
+			small_pass { &_look_exposure_pso, &_look_exposure_ps, L"worldfx: look pipeline (exposure)" },
+			small_pass { &_look_up_pso, &_look_up_ps, L"worldfx: look pipeline (bloom)" } })
+		{
+			if (*s.pso != nullptr)
+				continue;
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+			desc.pRootSignature = _root;
+			desc.VS = { _shade_vs.data(), _shade_vs.size() };
+			desc.PS = { s.ps->data(), s.ps->size() };
+			desc.SampleMask = UINT_MAX;
+			desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			desc.RasterizerState.DepthClipEnable = TRUE;
+			desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			desc.NumRenderTargets = 0;
+			desc.SampleDesc.Count = 1;
+			const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(s.pso));
+			if (FAILED(hr))
+			{
+				char text[64];
+				std::snprintf(text, sizeof(text), "look pipeline failed (0x%08lX)", static_cast<unsigned long>(hr));
+				error = text;
+				*s.pso = nullptr;
+				return nullptr;
+			}
+			(*s.pso)->SetName(s.name);
+		}
+		// The world's: every pixel written whole (rgb: the world's alpha is left as it is), no blending, no depth
+		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
+		for (const pso_entry &e : _look_psos)
+			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
+				return e.pso;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _shade_vs.data(), _shade_vs.size() };
+		desc.PS = { _look_ps.data(), _look_ps.size() };
+		desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 1;
+		desc.RTVFormats[0] = t.rtv_format;
+		desc.SampleDesc = rt_desc.SampleDesc;
+		ID3D12PipelineState *pso = nullptr;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		if (FAILED(hr))
+		{
+			char text[96];
+			std::snprintf(text, sizeof(text), "look pipeline failed (0x%08lX, format %u)", static_cast<unsigned long>(hr), static_cast<unsigned>(t.rtv_format));
+			error = text;
+			return nullptr;
+		}
+		pso->SetName(L"worldfx: look pipeline");
+		_look_psos.push_back({ t.rtv_format, DXGI_FORMAT_UNKNOWN, rt_desc.SampleDesc, pso });
+		return pso;
+	}
+
+	// The look pass (look::post; grass.hlsl, "The look"): the world copied as it ends; its first level (4 x 4 pixels a
+	// texel: the light over the bloom's threshold, the log2 luminance), each smaller level from the one before; the
+	// exposure from the smallest; the bloom's levels added up from the smallest; then the world drawn again whole from its
+	// copy, with the bloom, the grade, the exposure and the filmic curve. A UAV barrier between each pass over the buffer.
+	// The world's target is in RENDER_TARGET before and after (in COPY_SOURCE for its copy between).
+	bool renderer::draw_look(ID3D12GraphicsCommandList *list, const target &t, const look &l, draw_stats &stats, std::string &error)
+	{
+		const look::look_pass &p = l.post;
+		auto finite = [](float v, float lo, float hi, float fallback) { return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback; };
+		const float bloom = finite(p.bloom, 0.0f, 2.0f, 0.0f);
+		if (l.phase == look::phase_t::blades || (!p.tonemap && bloom <= 0.0f && !p.grade))
+			return false;
+		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
+		const DXGI_FORMAT f = rt_desc.Format;
+		const bool rgba = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		const bool bgra = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+			f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_B8G8R8X8_TYPELESS || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+		if (!(rgba || bgra) || rt_desc.SampleDesc.Count != 1 || rt_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rt_desc.Width < 8 || rt_desc.Height < 8)
+			return false;
+		// The levels: a quarter of the world's width and height (rounded up), each next half of the one before
+		uint32_t sizes[kLookLevels][2] = {};
+		UINT64 at[kLookLevels] = {};
+		uint32_t levels = 0;
+		UINT64 bytes = kLookExposureBytes;
+		for (uint32_t w = uint32_t((rt_desc.Width + 3) / 4), h = (rt_desc.Height + 3) / 4; levels < kLookLevels; w = (w + 1) / 2, h = (h + 1) / 2)
+		{
+			sizes[levels][0] = w;
+			sizes[levels][1] = h;
+			at[levels] = bytes;
+			bytes += UINT64(w) * h * 8;
+			levels++;
+			if (w <= kLookSmallest && h <= kLookSmallest)
+				break;
+		}
+		const uint32_t bloom_levels = std::min(levels, kLookBloomLevels);
+		if (_look_buf == nullptr || _look_buf_size < bytes)
+		{
+			if (_look_buf != nullptr)
+				_old.push_back({ _look_buf, 0 }); // (a list recorded this frame may still use it)
+			_look_buf = nullptr;
+			_look_buf_size = 0;
+			D3D12_HEAP_PROPERTIES heap = {};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			D3D12_RESOURCE_DESC desc = {};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			desc.Width = bytes;
+			desc.Height = 1;
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			const HRESULT hr = _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_look_buf));
+			if (FAILED(hr))
+			{
+				char text[64];
+				std::snprintf(text, sizeof(text), "look buffer failed (0x%08lX)", static_cast<unsigned long>(hr));
+				error = text;
+				_look_buf = nullptr;
+				return false;
+			}
+			_look_buf->SetName(L"worldfx: the look's levels");
+			_look_buf_size = bytes;
+		}
+		ID3D12PipelineState *const final_pso = look_pipeline_for(t, error);
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+		if (final_pso == nullptr || !world_rtv_for(t, rtv, error))
+			return false;
+
+		// The world as it ends
+		section(list, L"worldfx: look (copy and levels)");
+		const uint32_t pitch = copy_out(list, _ground, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		if (pitch == 0)
+			return false;
+		transition(list, t.rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+		// The constants (grass.hlsl "The look" has them)
+		float c[kConstants] = {};
+		const bool grade = p.grade;
+		for (int i = 0; i < 3; ++i)
+		{
+			c[i] = grade ? finite(p.gain[i], 0.25f, 4.0f, 1.0f) : 1.0f;
+			c[4 + i] = grade ? finite(p.lift[i], -0.25f, 0.25f, 0.0f) : 0.0f;
+		}
+		c[3] = grade ? finite(p.saturation, 0.0f, 2.0f, 1.0f) : 1.0f;
+		c[7] = grade ? finite(p.contrast, 0.5f, 1.5f, 1.0f) : 1.0f;
+		c[8] = bloom * kLookBloom / float(bloom_levels);
+		// (the time since the look's last frame: none, a jump of over a second or a snap set the exposure at once)
+		const double dt = std::isfinite(l.clock) && l.clock > 0.0 && _look_clock > 0.0 ? l.clock - _look_clock : -1.0;
+		c[10] = p.snap || dt < 0.0 || dt > 1.0 ? -1.0f : float(dt);
+		_look_clock = std::isfinite(l.clock) ? l.clock : 0.0;
+		c[11] = finite(p.key, 0.005f, 1.0f, 0.07f);
+		c[12] = finite(p.exposure_min, 0.25f, 1.0f, 0.78f);
+		c[13] = finite(p.exposure_max, 1.0f, 4.0f, 1.06f);
+		c[14] = finite(p.threshold, 0.0f, 4.0f, 0.55f);
+		c[15] = finite(p.knee, 0.01f, 1.0f, 0.25f);
+		auto put = [&c](int i, uint32_t v) { std::memcpy(&c[i], &v, 4); };
+		const uint32_t parts = (p.tonemap ? 1u : 0u) | (bloom > 0.0f ? 2u : 0u) | (grade ? 4u : 0u);
+		put(22, 0u); // (the exposure at the buffer's start)
+		put(23, parts);
+		put(24, uint32_t(at[0]));
+		put(25, sizes[0][0]);
+		put(26, sizes[0][1]);
+		const uint32_t ground_info[4] = { pitch, static_cast<uint32_t>(rt_desc.Width), rt_desc.Height, rgba ? 1u : 2u };
+		std::memcpy(&c[28], ground_info, sizeof(ground_info));
+
+		stats.bound = true;
+		list->SetGraphicsRootSignature(_root);
+		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		list->SetGraphicsRoot32BitConstants(0, kConstants, c, 0);
+		// (t0, t2 and t3 aren't read: the copy's address)
+		const D3D12_GPU_VIRTUAL_ADDRESS world = _ground.buffer->GetGPUVirtualAddress();
+		list->SetGraphicsRootShaderResourceView(1, world);
+		list->SetGraphicsRootShaderResourceView(2, world);
+		list->SetGraphicsRootShaderResourceView(4, world);
+		list->SetGraphicsRootShaderResourceView(5, world);
+		list->SetGraphicsRootUnorderedAccessView(6, _look_buf->GetGPUVirtualAddress());
+		list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+		D3D12_RESOURCE_BARRIER written = {};
+		written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		written.UAV.pResource = _look_buf;
+		// A pass at a level's size: what it reads (where, its size) and writes (where, its size)
+		auto pass = [&](ID3D12PipelineState *pso, UINT64 from, const uint32_t *from_size, UINT64 to, const uint32_t *to_size) {
+			const uint32_t pass_info[6] = { uint32_t(from), uint32_t(to), from_size[0], from_size[1], to_size[0], to_size[1] };
+			list->SetGraphicsRoot32BitConstants(0, 6, pass_info, 16);
+			const D3D12_VIEWPORT viewport = { 0.0f, 0.0f, float(to_size[0]), float(to_size[1]), 0.0f, 1.0f };
+			const D3D12_RECT scissor = { 0, 0, LONG(to_size[0]), LONG(to_size[1]) };
+			list->SetPipelineState(pso);
+			list->RSSetViewports(1, &viewport);
+			list->RSSetScissorRects(1, &scissor);
+			list->DrawInstanced(3, 1, 0, 0);
+			list->ResourceBarrier(1, &written);
+		};
+		const uint32_t world_size[2] = { uint32_t(rt_desc.Width), rt_desc.Height }, one[2] = { 1, 1 };
+		pass(_look_first_pso, 0, world_size, at[0], sizes[0]);
+		for (uint32_t i = 1; i < levels; ++i)
+			pass(_look_down_pso, at[i - 1], sizes[i - 1], at[i], sizes[i]);
+		if (p.tonemap)
+			pass(_look_exposure_pso, at[levels - 1], sizes[levels - 1], 0, one);
+		if (bloom > 0.0f)
+			for (uint32_t i = bloom_levels - 1; i-- > 0;)
+				pass(_look_up_pso, at[i + 1], sizes[i + 1], at[i], sizes[i]);
+
+		// The world drawn again from its copy
+		section(list, L"worldfx: look");
+		const D3D12_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(rt_desc.Width), static_cast<float>(rt_desc.Height), 0.0f, 1.0f };
+		const D3D12_RECT scissor = { 0, 0, static_cast<LONG>(rt_desc.Width), static_cast<LONG>(rt_desc.Height) };
+		list->SetPipelineState(final_pso);
+		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		list->RSSetViewports(1, &viewport);
+		list->RSSetScissorRects(1, &scissor);
+		list->DrawInstanced(3, 1, 0, 0);
+		stats.look = true;
+		stats.look_levels = levels;
+		return true;
 	}
 
 	bool renderer::upload_rain(rain_file &&file, std::string &error)
@@ -3505,18 +4127,50 @@ namespace grass
 		return true;
 	}
 
+	// The world's depth as the blades' (look::phase_t::blades): a view of the renderer's own, made each draw, in the
+	// blades' depth format (D24S8: the world's as dgVoodoo makes it; anything else isn't drawn into)
+	bool renderer::world_dsv_for(const target &t, D3D12_CPU_DESCRIPTOR_HANDLE &dsv, std::string &error)
+	{
+		const D3D12_RESOURCE_DESC ds_desc = t.ds->GetDesc();
+		if ((ds_desc.Format != kBladeDepthFormat && ds_desc.Format != DXGI_FORMAT_R24G8_TYPELESS) || ds_desc.SampleDesc.Count != t.rt->GetDesc().SampleDesc.Count)
+		{
+			error = "the world's depth isn't D24S8 like the blades' (or its samples differ)";
+			return false;
+		}
+		if (_world_dsv_heap == nullptr)
+		{
+			D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+			hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+			hd.NumDescriptors = 1;
+			if (FAILED(_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_world_dsv_heap))))
+			{
+				_world_dsv_heap = nullptr;
+				error = "no descriptor heap for the world's depth view";
+				return false;
+			}
+		}
+		D3D12_DEPTH_STENCIL_VIEW_DESC vd = {};
+		vd.Format = kBladeDepthFormat;
+		vd.ViewDimension = ds_desc.SampleDesc.Count > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+		dsv = _world_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+		_device->CreateDepthStencilView(t.ds, &vd, dsv);
+		return true;
+	}
+
 	draw_stats renderer::draw(ID3D12GraphicsCommandList *list, const target &t, const camera &cam, const look &l, std::string &error)
 	{
 		draw_stats stats;
 		if (_root == nullptr || t.rt == nullptr || t.ds == nullptr)
 			return stats;
-		const bool grass = l.grass && _buffer != nullptr && _memory != nullptr;
+		// (look::phase_t: the blades alone at the zone's end; the rest without them at the world's end)
+		const bool only_blades = l.phase == look::phase_t::blades;
+		const bool grass = l.grass && l.phase != look::phase_t::rest && _buffer != nullptr && _memory != nullptr;
 		const uint32_t lamp_count = l.lamps != nullptr ? std::min<uint32_t>(l.lamp_count, kMaxLamps) : 0;
 		// (the sun's shadows and glints as the weather leaves them: none under an overcast sky, the sun pass skipped)
 		const float weather_sun = std::isfinite(l.weather_sun) ? std::clamp(l.weather_sun, 0.0f, 1.0f) : 1.0f;
 		const float sun_shadow = l.sun_shadow * weather_sun;
 		// A sky of its own: with the record's sky known and a dome to repaint
-		bool dome = l.dome.on && l.dome.segments > 2;
+		bool dome = !only_blades && l.dome.on && l.dome.segments > 2;
 		for (int i = 0; i < 8 && dome; ++i)
 			dome = std::isfinite(l.dome.stops[i][3]) && std::isfinite(l.dome.stops[i][0]) && std::isfinite(l.dome.stops[i][1]) && std::isfinite(l.dome.stops[i][2]);
 		// The weather of its own (look::wx): its parts in the sky (with the dome: clouds, the veil, the flash and the bolt,
@@ -3529,10 +4183,10 @@ namespace grass
 		const float wx_stars = std::isfinite(wx.star_boost) ? std::clamp(wx.star_boost, 0.0f, 4.0f) : 1.0f;
 		const bool wx_sky = dome && (part(wx.cloud_cover, 1.0f) > 0.0f || part(wx.cloud_veil, 1.0f) > 0.0f || wx_flash > 0.0f || wx_bolt > 0.0f ||
 			part(wx.aurora, 2.0f) > 0.0f || part(wx.sky_dark, 1.0f) > 0.0f || wx_stars != 1.0f || wx_dust > 0.0f || wx_gloom > 0.0f);
-		const bool shimmer = wx_heat > 0.0f;
-		const bool air_wanted = wx_flash > 0.0f || wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f; // (the flash's pass with it)
-		const bool leaves = wx_leaves > 0.0f && !_rain.q.empty();
-		const bool shading_wanted = l.ao_strength > 0.0f || l.relief > 0.0f || sun_shadow > 0.0f || lamp_count != 0 || dome || shimmer;
+		const bool shimmer = !only_blades && wx_heat > 0.0f;
+		const bool air_wanted = !only_blades && (wx_flash > 0.0f || wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f); // (the flash's pass with it)
+		const bool leaves = !only_blades && wx_leaves > 0.0f && !_rain.q.empty();
+		const bool shading_wanted = !only_blades && (l.ao_strength > 0.0f || l.relief > 0.0f || sun_shadow > 0.0f || lamp_count != 0 || dome || shimmer);
 		// The game's fog, when it makes sense (ending past where it starts)
 		const bool haze = l.haze && std::isfinite(l.haze_start) && std::isfinite(l.haze_end) && l.haze_end > l.haze_start + 0.01f && l.haze_end > 0.0f &&
 			std::isfinite(l.haze_color[0]) && std::isfinite(l.haze_color[1]) && std::isfinite(l.haze_color[2]);
@@ -3540,22 +4194,22 @@ namespace grass
 			haze ? std::clamp(l.haze_color[2], 0.0f, 1.0f) : 0.0f, haze ? 1.0f : 0.0f,
 			l.haze_start, l.haze_end, haze ? 1.0f / (l.haze_end - l.haze_start) : 0.0f, 0.0f };
 		// The wet look on path and stone, with the zone's mask loaded (it's read in the shading pass)
-		const bool wet = std::isfinite(l.wet) && l.wet > 0.0f && _wet != nullptr;
+		const bool wet = !only_blades && std::isfinite(l.wet) && l.wet > 0.0f && _wet != nullptr;
 		const bool shading = shading_wanted || wet;
 		// The sea (the zone's sea sheets, with the water): the water then reaches as far as it does (its distance), so the
 		// baked water doesn't fade out where the sea goes on
-		const bool sea = l.water && l.sea && _sea != nullptr;
-		const bool water_shade = l.water && (_water != nullptr || sea);
-		const bool water = (l.water || l.water_debug) && (_water != nullptr || sea);
+		const bool sea = !only_blades && l.water && l.sea && _sea != nullptr;
+		const bool water_shade = !only_blades && l.water && (_water != nullptr || sea);
+		const bool water = !only_blades && (l.water || l.water_debug) && (_water != nullptr || sea);
 		const float sea_reach = std::isfinite(l.sea_distance) ? std::clamp(l.sea_distance, 0.0f, 20000.0f) : 0.0f;
 		const float water_reach = sea ? std::max(l.water_distance, sea_reach) : l.water_distance;
-		const bool fireflies = l.fireflies > 0.0f && l.night > 0.0f && _buffer != nullptr;
+		const bool fireflies = !only_blades && l.fireflies > 0.0f && l.night > 0.0f && _buffer != nullptr;
 		// Rain, with the zone's rain map: how hard (the share of the columns with drops in them)
 		const float rain_amount = std::isfinite(l.rain) ? std::clamp(l.rain, 0.0f, 2.0f) : 0.0f;
-		const bool rain = rain_amount > 0.0f && !_rain.q.empty();
+		const bool rain = !only_blades && rain_amount > 0.0f && !_rain.q.empty();
 		// Snow, with the same map: how hard (the share of the columns with flakes in them)
 		const float snow_amount = std::isfinite(l.snow) ? std::clamp(l.snow, 0.0f, 2.0f) : 0.0f;
-		const bool snow = snow_amount > 0.0f && !_rain.q.empty();
+		const bool snow = !only_blades && snow_amount > 0.0f && !_rain.q.empty();
 		const bool falling = rain || snow || leaves;
 		// The grass's wear: with the blades drawn, a clock, and wear to show or a cut to make
 		const bool wearing = grass && std::isfinite(l.clock) && l.clock > 0.0 &&
@@ -3563,11 +4217,25 @@ namespace grass
 		// The game's visibility tests set for this frame (set_vis_boxes): they need the depth copy alone
 		bool vis = false;
 		for (const vis_slot &s : _vis_slots)
-			vis = vis || s.state == vis_slot::state_t::set;
+			vis = vis || (!only_blades && s.state == vis_slot::state_t::set);
 		// (the weather's parameters go to the passes with anything of it to draw, the grass's wind too)
 		const bool wx_any = wx_sky || shimmer || air_wanted || leaves || (grass && wx_wind > 0.0f);
-		if (!grass && !shading && !water && !fireflies && !falling && !vis && !air_wanted)
+		// The look over the world as it ends (look::post), last of all; with nothing else of World FX's to draw, alone
+		const bool look_on = !only_blades && (l.post.tonemap || (std::isfinite(l.post.bloom) && l.post.bloom > 0.0f) || l.post.grade);
+		auto look_alone = [&]() {
+			if (!look_on)
+				return stats;
+			_mark_count[_time_slot] = 0;
+			_shade_end[_time_slot] = kTimingMarks;
+			transition(list, t.rt, t.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			draw_look(list, t, l, stats, error);
+			transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
+			gpu_crash::mark(list, L"worldfx: end");
+			finish_timing(list, false);
 			return stats;
+		};
+		if (!grass && !shading && !water && !fireflies && !falling && !vis && !air_wanted)
+			return look_alone();
 
 		float eye[3];
 		eye_from_view(cam.view, eye);
@@ -3644,7 +4312,7 @@ namespace grass
 				firefly_runs[firefly_run_count++] = { c.first, c.count, firefly_stride };
 		}
 		if (run_count == 0 && !shading && water_run_count == 0 && !sea_here && firefly_run_count == 0 && !falling && !vis && !air_wanted)
-			return stats;
+			return look_alone();
 
 		ID3D12PipelineState *pso = run_count != 0 ? pipeline_for(t, error) : nullptr;
 		if (run_count != 0 && pso == nullptr)
@@ -3925,8 +4593,88 @@ namespace grass
 			std::memcpy(actor_data + kWxOffset, params, sizeof(params));
 			stats.weather = true;
 		}
+		// The clouds of their own (cloud_ps, rule bit 1024): with the sky and the weather's parameters, cloud to show, and
+		// the copies to work from. Their picture a quarter of the world's width and height, two of them after the sun's mask
+		// (this frame's, the last's, in turn); the last carried over when it fits this one (the same size and buffer, the
+		// weather's clouds near enough the same, drawn the frame before): else every pixel of it is marched now.
+		const UINT cloud_w = UINT((rt_desc.Width + 3) / 4), cloud_h = (rt_desc.Height + 3) / 4;
+		const UINT64 cloud_bytes = UINT64(cloud_w) * cloud_h * 8;
+		const UINT64 cloud_all = 2 * cloud_bytes + UINT64(kCloudShadowSize) * kCloudShadowSize * 4; // (and their shadows' map)
+		const UINT64 mask_bytes = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 4;
+		const bool clouds = dome && part(wx.cloud_cover, 1.0f) > 0.0f && part(wx.cloud_thick, 1.0f) > 0.0f && wx_written && sky_written &&
+			ground_kind != 0 && depth_kind != 0 && cloud_pipeline(error) != nullptr && cloud_noise_for(error) &&
+			sun_mask_for(rt_desc, cloud_all, error);
+		bool clouds_carried = false, cloud_shade = false;
+		float cloud_key[5] = {};
+		if (!clouds)
+			_cloud_known = false;
+		else
+		{
+			const float cover = part(wx.cloud_cover, 1.0f), thick = part(wx.cloud_thick, 1.0f);
+			const float bottom = std::isfinite(wx.cloud_bottom) ? std::clamp(wx.cloud_bottom, 20.0f, 2000.0f) : 250.0f;
+			const float top = std::isfinite(wx.cloud_top) ? std::clamp(wx.cloud_top, bottom + 20.0f, 3000.0f) : bottom + 150.0f;
+			const float shape = part(wx.cloud_shape, 1.0f), erosion = part(wx.cloud_erosion, 1.0f);
+			const float key[5] = { cover, thick, bottom, top, shape };
+			const float most_off[5] = { 0.03f, 0.03f, 8.0f, 8.0f, 0.05f }; // (a weather's change, a step a frame, is far less)
+			clouds_carried = _cloud_known && _cloud_w == cloud_w && _cloud_h == cloud_h && _cloud_buffer == _sun_mask;
+			for (int i = 0; i < 5; ++i)
+			{
+				clouds_carried = clouds_carried && std::fabs(key[i] - _cloud_key[i]) <= most_off[i];
+				cloud_key[i] = key[i];
+			}
+			if (!clouds_carried)
+				_cloud_frames = 0; // (a picture marched whole comes out the same each time: its jitter from the first frame's)
+			const int quality = std::clamp(wx.cloud_quality, 0, 2);
+			const float sl = std::sqrt(l.sun[0] * l.sun[0] + l.sun[1] * l.sun[1] + l.sun[2] * l.sun[2]);
+			const bool light_ok = std::isfinite(sl) && sl > 0.5f;
+			const uint32_t last = _cloud_picture, now_at = uint32_t(mask_bytes + cloud_bytes * (1 - last)), was_at = uint32_t(mask_bytes + cloud_bytes * last);
+			const uint32_t size[2] = { cloud_w, cloud_h }, frames = _cloud_frames;
+			float *c = actor_data + kWxOffset + kWxParams;
+			for (int i = 0; i < 3; ++i)
+				for (int k = 0; k < 3; ++k)
+					c[i * 4 + k] = _cloud_view[i * 4 + k];
+			c[3] = _cloud_proj[0];
+			c[7] = _cloud_proj[1];
+			c[11] = float(frames % 4);
+			c[12] = clouds_carried ? 1.0f : 0.0f;
+			std::memcpy(&c[13], &now_at, 4);
+			std::memcpy(&c[14], &was_at, 4);
+			std::memcpy(&c[15], &size[0], 4);
+			std::memcpy(&c[16], &size[1], 4);
+			c[17] = float(kCloudSteps[quality][0]);
+			c[18] = float(kCloudSteps[quality][1]);
+			std::memcpy(&c[19], &frames, 4);
+			c[20] = bottom;
+			c[21] = top;
+			c[22] = shape;
+			c[23] = light_ok ? part(wx.cloud_light, 2.0f) : 0.0f;
+			for (int i = 0; i < 3; ++i)
+				c[24 + i] = light_ok ? l.sun[i] / sl : (i == 1 ? -1.0f : 0.0f);
+			c[27] = erosion;
+			// (light taken out a yalm in the thickest cloud: 30 yalms into a heap lets almost none through; a rain deck's denser,
+			// mist's a thin veil)
+			c[28] = 0.15f * thick * (std::isfinite(wx.cloud_dense) ? std::clamp(wx.cloud_dense, 0.05f, 4.0f) : 1.0f);
+			c[29] = wx.cloud_style == 1 ? 1.0f : 0.0f; // (the style: 0 game-like, 1 volumetric)
+			c[30] = c[31] = 0.0f;
+			// Their shadows' map round the camera (its texels on a grid fixed in the world, so the map doesn't crawl as the
+			// camera moves), as strong as the sun's shadows are, less the more the sky is covered (an overcast's light is the
+			// game's dim light already); none with the sun's shadows off or the light down
+			const float texel = 2.0f * kCloudShadowReach / kCloudShadowSize;
+			const float corner[2] = { std::floor(eye[0] / texel) * texel - kCloudShadowReach, std::floor(eye[2] / texel) * texel - kCloudShadowReach };
+			const float shadow_strength = std::clamp(sun_shadow, 0.0f, 1.0f) * (1.0f - cover * cover);
+			cloud_shade = light_ok && shadow_strength > 0.001f && std::isfinite(corner[0]) && std::isfinite(corner[1]);
+			const uint32_t map_at = uint32_t(mask_bytes + 2 * cloud_bytes), map_size = kCloudShadowSize;
+			c[32] = corner[0];
+			c[33] = corner[1];
+			c[34] = texel;
+			std::memcpy(&c[35], &map_at, 4);
+			std::memcpy(&c[36], &map_size, 4);
+			c[37] = cloud_shade ? shadow_strength : 0.0f;
+			c[38] = c[39] = 0.0f;
+		}
 		const uint32_t rules = (l.rule_in_front ? 1u : 0u) | (l.rule_outliers ? 2u : 0u) | (l.sun_characters ? 4u : 0u) | (lamps_written != 0 ? 16u : 0u) |
-			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u);
+			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u) |
+			(clouds ? 1024u : 0u) | (cloud_shade ? 2048u : 0u);
 		const uint32_t crowd = actor_count | (rules << 16);
 		std::memcpy(&constants[32], &crowd, 4);
 		// Toward the sun in view space (row vectors: v * the view's rotation)
@@ -4006,7 +4754,7 @@ namespace grass
 		if (shading && ground_kind != 0 && depth_kind != 0)
 		{
 			ID3D12PipelineState *shade_pso = shade_pipeline_for(t, error);
-			if (shade_pso == nullptr || !sun_mask_for(rt_desc, error))
+			if (shade_pso == nullptr || !sun_mask_for(rt_desc, clouds ? cloud_all : 0, error))
 			{
 				transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
 				finish_timing(list, false);
@@ -4040,6 +4788,53 @@ namespace grass
 			// (no actors: t2 still gets a valid address, the depth copy's, never read)
 			list->SetGraphicsRootShaderResourceView(4, actor_buffer != nullptr ? actor_buffer->GetGPUVirtualAddress() : _depth.buffer->GetGPUVirtualAddress());
 			list->SetGraphicsRootShaderResourceView(5, _depth.buffer->GetGPUVirtualAddress());
+			// The clouds' picture first (t0 the clouds' noise there; the sun pass and the shading pass set their own)
+			if (clouds)
+			{
+				if (_cloud_noise_staging != nullptr) // (the noise into its default-heap buffer, once)
+				{
+					list->CopyBufferRegion(_cloud_noise, 0, _cloud_noise_staging, 0, UINT64(cloud_noise().size()) * 4);
+					transition(list, _cloud_noise, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+					_old.push_back({ _cloud_noise_staging, 0 });
+					_cloud_noise_staging = nullptr;
+				}
+				section(list, L"worldfx: clouds");
+				list->SetGraphicsRootShaderResourceView(1, _cloud_noise->GetGPUVirtualAddress());
+				const D3D12_VIEWPORT cloud_viewport = { 0.0f, 0.0f, static_cast<float>(cloud_w), static_cast<float>(cloud_h), 0.0f, 1.0f };
+				const D3D12_RECT cloud_scissor = { 0, 0, static_cast<LONG>(cloud_w), static_cast<LONG>(cloud_h) };
+				list->SetPipelineState(_cloud_pso);
+				list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+				list->RSSetViewports(1, &cloud_viewport);
+				list->RSSetScissorRects(1, &cloud_scissor);
+				list->DrawInstanced(3, 1, 0, 0);
+				if (cloud_shade) // (their shadows' map, after the picture: its own small viewport)
+				{
+					const D3D12_VIEWPORT map_viewport = { 0.0f, 0.0f, float(kCloudShadowSize), float(kCloudShadowSize), 0.0f, 1.0f };
+					const D3D12_RECT map_scissor = { 0, 0, LONG(kCloudShadowSize), LONG(kCloudShadowSize) };
+					list->SetPipelineState(_cloud_shadow_pso);
+					list->RSSetViewports(1, &map_viewport);
+					list->RSSetScissorRects(1, &map_scissor);
+					list->DrawInstanced(3, 1, 0, 0);
+					stats.cloud_shadows = true;
+				}
+				D3D12_RESOURCE_BARRIER written = {};
+				written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+				written.UAV.pResource = _sun_mask;
+				list->ResourceBarrier(1, &written);
+				stats.clouds = true;
+				stats.clouds_carried = clouds_carried;
+				// (what the next frame carries this picture over with)
+				std::memcpy(_cloud_view, cam.view, sizeof(_cloud_view));
+				_cloud_proj[0] = cam.proj[0];
+				_cloud_proj[1] = cam.proj[5];
+				_cloud_picture ^= 1u;
+				_cloud_frames++;
+				_cloud_known = true;
+				_cloud_w = cloud_w;
+				_cloud_h = cloud_h;
+				_cloud_buffer = _sun_mask;
+				std::memcpy(_cloud_key, cloud_key, sizeof(_cloud_key));
+			}
 			if (sun_pso != nullptr)
 			{
 				section(list, L"worldfx: sun shadows");
@@ -4209,6 +5004,8 @@ namespace grass
 		if ((run_count == 0 && firefly_run_count == 0 && !falling) || depth_kind == 0 || !blade_depth_for(rt_desc, error))
 		{
 			air_pass();
+			if (look_on)
+				draw_look(list, t, l, stats, error);
 			transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
 			gpu_crash::mark(list, L"worldfx: end");
 			finish_timing(list, true);
@@ -4216,6 +5013,15 @@ namespace grass
 		}
 		const D3D12_CPU_DESCRIPTOR_HANDLE blade_dsv = _dsv_heap->GetCPUDescriptorHandleForHeapStart();
 		list->ClearDepthStencilView(blade_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+		// (at the zone's end: the blades into the world's own depth, tested against it and written, so the characters
+		// and effects drawn after them are hidden behind blades or drawn over them by depth)
+		D3D12_CPU_DESCRIPTOR_HANDLE grass_dsv = blade_dsv;
+		if (run_count != 0 && only_blades && t.blades_into_world_depth && !world_dsv_for(t, grass_dsv, error))
+		{
+			transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
+			finish_timing(list, true);
+			return stats;
+		}
 		if (run_count != 0)
 		{
 			// A new colour memory starts at zero (nothing known). A new buffer isn't reliably zeroed (WARP hands
@@ -4254,7 +5060,7 @@ namespace grass
 			list->SetGraphicsRootSignature(_root);
 			list->SetPipelineState(pso);
 			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			list->OMSetRenderTargets(1, &world_rtv, FALSE, &blade_dsv);
+			list->OMSetRenderTargets(1, &world_rtv, FALSE, &grass_dsv);
 			list->RSSetViewports(1, &viewport);
 			list->RSSetScissorRects(1, &scissor);
 			list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
@@ -4490,6 +5296,8 @@ namespace grass
 		}
 
 		air_pass();
+		if (look_on)
+			draw_look(list, t, l, stats, error);
 		transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
 		gpu_crash::mark(list, L"worldfx: end");
 		finish_timing(list, true);

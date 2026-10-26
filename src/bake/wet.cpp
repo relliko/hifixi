@@ -61,14 +61,14 @@ namespace hifi::bake
 
 	namespace
 	{
-		bool bake_wet(uint32_t zone, const std::wstring &out, result &r)
+		bool bake_wet(uint32_t zone, const std::wstring &out, result &r, bool any_weather)
 		{
 			collision::reader rd;
 			{
 				std::vector<uint8_t> dat;
 				if (!collision::read_zone(zone, dat, r))
 					return false;
-				if (!collision::rainy(dat, false))
+				if (!any_weather && !collision::rainy(dat, false))
 				{
 					r.none = true;
 					r.why = "no rainy weather";
@@ -202,11 +202,11 @@ namespace hifi::bake
 		}
 	}
 
-	bool wet(uint32_t zone, const std::wstring &out, result &r)
+	bool wet(uint32_t zone, const std::wstring &out, result &r, bool any_weather)
 	{
 		try
 		{
-			return bake_wet(zone, out, r);
+			return bake_wet(zone, out, r, any_weather);
 		}
 		catch (const std::bad_alloc &)
 		{

@@ -21,6 +21,7 @@
 #include <vector>
 
 extern "C" int __cdecl worldfx_setting(const char *key, char *out, uint32_t size);
+extern "C" void __cdecl worldfx_weather(const uint32_t *words, uint32_t count);
 
 namespace
 {
@@ -330,6 +331,49 @@ int main()
 	fake::click = "Ultra";
 	draw();
 	check(hifi::game::option_number("drawcull", "world", 0.0f) == 7.0f, "Ultra leaves the view distance as it is");
+
+	// 8. Weather (debug): the World tab's buttons force World FX's own weather; the look follows it, off restores the real one
+	{
+		uint32_t words[grass::kWeatherWords] = {};
+		words[1] = grass::weather_name("fine");
+		words[3] = 0x3F800000u; // (change 1.0)
+		words[7] = 4;           // (the weather object read)
+		worldfx_weather(words, grass::kWeatherWords);
+		grass::look::weather_fx real, x;
+		grass::weather w;
+		worldfx::weather_look_now(real, &w);
+		hifi::ui::show_tab(hifi::settings::tab::world);
+		const bool balanced = draw();
+		check(balanced && fake::has("Weather (debug)") && fake::has("[Off: the real weather]*") && fake::has("[Thunderstorm]") && fake::has("[Flash lightning now]") &&
+			fake::has("light and fog still follow the real weather"), "the World tab: Weather (debug), Off picked, a button each, the lightning, light and fog said to stay real");
+		fake::click = "Thunderstorm";
+		draw();
+		draw();
+		worldfx::weather_look_now(x, &w);
+		check(worldfx::forced_weather() == "bolt" && fake::has("[Thunderstorm]*") && !fake::has("[Off: the real weather]*") && fake::has("forced to bolt"),
+			"Thunderstorm clicked: forced, shown picked and said");
+		check(w.name == grass::weather_name("bolt") && w.before == grass::weather_name("fine") && w.change < 0.5f, "it fades over from the real weather (fine)");
+		worldfx::force_weather("off", 0.0f);
+		worldfx::force_weather("bolt", 0.0f);
+		worldfx::weather_look_now(x, &w);
+		check(w.name == grass::weather_name("bolt") && w.change == 1.0f && x.cloud_cover == 1.0f && real.cloud_cover < 0.5f && x.sky_dark > real.sky_dark,
+			"forced: weather_look gives the thunderstorm's clouds, not the real weather's");
+		fake::click = "Off: the real weather";
+		draw();
+		worldfx::weather_look_now(x, &w);
+		check(worldfx::forced_weather().empty() && w.name == grass::weather_name("fine") && w.before == grass::weather_name("bolt") && w.change < 0.5f,
+			"Off clicked: fading back to the real weather");
+		worldfx::force_weather("bolt", 0.0f);
+		worldfx::force_weather("off", 0.0f);
+		worldfx::weather_look_now(x, &w);
+		check(w.name == grass::weather_name("fine") && w.before == 0 && x.cloud_cover == real.cloud_cover && x.sky_dark == real.sky_dark &&
+			x.wind_strength == real.wind_strength, "off: weather_look the real weather's again");
+		check(!worldfx::force_weather("nope") && worldfx::forced_weather().empty() && worldfx::force_weather("Gales") && worldfx::forced_weather() == "stom",
+			"a name it doesn't know refused; a label works as a name");
+		worldfx::force_weather("off", 0.0f);
+		fake::click = "Flash lightning now";
+		check(draw() && fake::click.empty(), "Flash lightning now clicked");
+	}
 
 	check(read_all(reshade_ini) == old_ini, "ReShade.ini as it was, at the end");
 	std::printf(failures == 0 ? "\nall passed\n" : "\n%d failed\n", failures);
