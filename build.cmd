@@ -44,7 +44,7 @@ set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.
 set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 rem The native zone renderer (src\zone): each zone's data on the GPU (the plugin alone)
-set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\game\zonedraw.cpp"
+set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\game\zonedraw.cpp"
 rem The native character renderer (src\chars, src\game\charslot): the plugin alone
 set "CHARS=src\game\charslot.cpp src\chars\marks.cpp src\game\charmodel.cpp src\chars\charframe.cpp src\chars\cache.cpp src\chars\os2.cpp src\chars\tex.cpp"
 rem (its drawing on dgVoodoo's lists, with the engine's list_state: the plugin and the tests that draw)
@@ -146,7 +146,7 @@ echo Built build\zonedraw_test.exe
 rem The native renderer drawing at the zone's end marker on a list recorded as dgVoodoo records (WARP, debug layer):
 rem build\zoneinject_test.exe [out.bmp]
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
-  tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp ^
+  tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp ^
   src\game\game.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\zoneinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zoneinject_test.exe
 rem The visibility tests' answers (src\render\vistest.cpp): build\vistest_test.exe

@@ -3687,8 +3687,36 @@ namespace grass
 	{
 		const bool timed = std::isfinite(clock) && clock > 0.0;
 		const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
-		if (!(len > 0.5f) || _shadow_cells.empty())
+		if (!(len > 0.5f))
 			return 0;
+		// What the zone's casters come from: the host's zone (set_zone_casters) when it has one, else the uploaded
+		// meshes; the cascades drawn again from scratch whenever that changes (another zone, its data coming in)
+		constexpr uint64_t kFromMeshes = uint64_t(1) << 63;
+		float lo[3], hi[3];
+		uint64_t source = 0;
+		const bool host = _zone_bounds != nullptr && _zone_draw != nullptr && _zone_bounds(_zone_casters_context, lo, hi, &source);
+		if (!host)
+		{
+			if (_shadow_cells.empty())
+			{
+				_map_bounds = false;
+				return 0;
+			}
+			std::memcpy(lo, _shadow_lo, 12);
+			std::memcpy(hi, _shadow_hi, 12);
+			source = kFromMeshes | _shadow_zone;
+		}
+		source &= host ? ~kFromMeshes : ~uint64_t(0);
+		if (source != _map_source)
+		{
+			for (cascade &c : _cascades)
+				c.forget();
+			_map_source = source;
+		}
+		std::memcpy(_map_lo, lo, 12);
+		std::memcpy(_map_hi, hi, 12);
+		_map_bounds = true;
+		_map_host = host;
 		const float f[3] = { sun[0] / len, sun[1] / len, sun[2] / len };
 		float r[3], u[3];
 		sun_basis(f, r, u);
@@ -3711,20 +3739,22 @@ namespace grass
 		}
 		if (todo == 0)
 			return 0;
-		ID3D12PipelineState *const pso = sun_map_for(error) ? shadow_pipeline(error) : nullptr;
-		if (pso == nullptr)
+		if (!sun_map_for(error))
+			return 0;
+		ID3D12PipelineState *const pso = host ? nullptr : shadow_pipeline(error);
+		if (!host && pso == nullptr)
 			return 0;
 
 		// (the zone along the rays, a yalm to spare each end)
 		float middle = 0.0f, half = 0.0f;
 		for (int i = 0; i < 3; ++i)
 		{
-			middle += 0.5f * (_shadow_lo[i] + _shadow_hi[i]) * f[i];
-			half += 0.5f * (_shadow_hi[i] - _shadow_lo[i]) * std::fabs(f[i]);
+			middle += 0.5f * (_map_lo[i] + _map_hi[i]) * f[i];
+			half += 0.5f * (_map_hi[i] - _map_lo[i]) * std::fabs(f[i]);
 		}
 		const float nearest = middle + half + 1.0f, span = 2.0f * half + 2.0f;
 
-		if (_shadow_staging != nullptr) // (the triangles into their default-heap buffer, once)
+		if (!host && _shadow_staging != nullptr) // (the triangles into their default-heap buffer, once)
 		{
 			transition(list, _shadow_geo, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
 			list->CopyBufferRegion(_shadow_geo, 0, _shadow_staging, 0, UINT64(_shadow_triangles) * 48);
@@ -3733,16 +3763,19 @@ namespace grass
 			_shadow_staging = nullptr;
 		}
 		section(list, L"worldfx: sun shadow map");
-		list->SetGraphicsRootSignature(_root);
-		list->SetPipelineState(pso);
-		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		list->SetGraphicsRootShaderResourceView(1, _shadow_geo->GetGPUVirtualAddress());
-		// (no cut-outs: t1 still gets a valid address, the triangles', never read)
-		list->SetGraphicsRootShaderResourceView(2, (_shadow_masks != nullptr ? _shadow_masks : _shadow_geo)->GetGPUVirtualAddress());
 		const D3D12_VIEWPORT viewport = { 0.0f, 0.0f, float(kSunMapSize), float(kSunMapSize), 0.0f, 1.0f };
 		const D3D12_RECT scissor = { 0, 0, LONG(kSunMapSize), LONG(kSunMapSize) };
-		list->RSSetViewports(1, &viewport);
-		list->RSSetScissorRects(1, &scissor);
+		if (!host)
+		{
+			list->SetGraphicsRootSignature(_root);
+			list->SetPipelineState(pso);
+			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			list->SetGraphicsRootShaderResourceView(1, _shadow_geo->GetGPUVirtualAddress());
+			// (no cut-outs: t1 still gets a valid address, the triangles', never read)
+			list->SetGraphicsRootShaderResourceView(2, (_shadow_masks != nullptr ? _shadow_masks : _shadow_geo)->GetGPUVirtualAddress());
+			list->RSSetViewports(1, &viewport);
+			list->RSSetScissorRects(1, &scissor);
+		}
 		const UINT step = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 		std::vector<cell_run> runs;
 		for (uint32_t k = 0; k < 2; ++k)
@@ -3782,6 +3815,16 @@ namespace grass
 			m[15] = 1.0f;
 			for (int i = 0; i < 3; ++i)
 				c.sun[i] = f[i];
+			if (host)
+			{
+				// (the host draws what it has in the cascade, and sets the list as it needs)
+				D3D12_CPU_DESCRIPTOR_HANDLE dsv = _sun_map_heap->GetCPUDescriptorHandleForHeapStart();
+				dsv.ptr += SIZE_T(k) * step;
+				list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+				triangles += _zone_draw(_zone_casters_context, list, m, dsv, kSunMapSize);
+				c.valid = true;
+				continue;
+			}
 			runs.clear();
 			for (size_t i = 0; i < _shadow_cells.size(); ++i)
 			{
@@ -3910,7 +3953,7 @@ namespace grass
 	bool renderer::draw_casters(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3])
 	{
 		const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
-		if (_casters == nullptr || _caster_map == nullptr || _sun_map_copy == nullptr || !(len > 0.5f) || _shadow_cells.empty())
+		if (_casters == nullptr || _caster_map == nullptr || _sun_map_copy == nullptr || !(len > 0.5f) || !_map_bounds)
 			return false;
 		const float f[3] = { sun[0] / len, sun[1] / len, sun[2] / len };
 		float r[3], u[3];
@@ -3918,8 +3961,8 @@ namespace grass
 		float middle = 0.0f, half = 0.0f;
 		for (int i = 0; i < 3; ++i)
 		{
-			middle += 0.5f * (_shadow_lo[i] + _shadow_hi[i]) * f[i];
-			half += 0.5f * (_shadow_hi[i] - _shadow_lo[i]) * std::fabs(f[i]);
+			middle += 0.5f * (_map_lo[i] + _map_hi[i]) * f[i];
+			half += 0.5f * (_map_hi[i] - _map_lo[i]) * std::fabs(f[i]);
 		}
 		const float nearest = middle + half + 1.0f, span = 2.0f * half + 2.0f;
 		const float reach = kCasterReach, texel = 2.0f * reach / kSunMapSize;
@@ -4885,6 +4928,7 @@ namespace grass
 			if (sun_pso != nullptr && sun_map && actor_data != nullptr)
 			{
 				stats.sun_map_cascades = draw_sun_map(list, eye, l.sun, l.clock, stats.sun_map_triangles, error);
+				stats.sun_map_host = _map_host;
 				if (_cascades[0].valid && _cascades[1].valid && _sun_map_copy != nullptr)
 				{
 					float *const prev = actor_data + kMaxActors * 4 + kSunMapParams + kLampParams + kHazeParams + kWetParams + kSkyParams + kWearParams;

@@ -78,7 +78,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.35;
+	constexpr double kVersion = 0.36;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -236,6 +236,7 @@ class hifixi final : public IPlugin
 	bool m_zoneslot_refused = false; // (the zone slot couldn't be marked: not tried again until its option goes off and on)
 	bool m_native_refused = false;   // (likewise the native zone draw)
 	bool m_casters_set = false;      // (the characters' sun shadows handed to World FX: worldfx::set_casters)
+	bool m_zone_casters_set = false; // (the zone's sun shadow cascades handed to World FX: worldfx::set_zone_casters)
 	bool m_charslot_refused = false; // (native characters: likewise the character slots)
 	bool m_chardata_refused = false; // (native characters: likewise the model draw's stub)
 	bool m_nativechars_refused = false; // (native characters: likewise their renderer)
@@ -533,6 +534,12 @@ class hifixi final : public IPlugin
 	void follow_native()
 	{
 		std::string why;
+		// (the sun's shadow cascades from the zone this draws, once it draws one: World FX asks each frame it draws them)
+		if (!m_zone_casters_set)
+		{
+			worldfx::set_zone_casters(hifi::zone::inject::zone_bounds_hook(), hifi::zone::inject::zone_draw_hook(), nullptr);
+			m_zone_casters_set = true;
+		}
 		const bool want = hifi::game::option_on("zone", "native", hifi::zone::options::kNativeByDefault);
 		ID3D12Device *const device = worldfx::attached();
 		if (want && !hifi::game::zonedraw::in() && !m_native_refused && device != nullptr && hifi::game::zoneslot::in())

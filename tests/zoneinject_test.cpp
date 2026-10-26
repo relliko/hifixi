@@ -414,6 +414,9 @@ int main(int argc, char **argv)
 	w.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	fill(5, true);
+	float zlo[3] = {}, zhi[3] = {};
+	uint64_t zgen = 0;
+	const bool bounds_before = inj::zone_bounds(zlo, zhi, zgen);
 	inj::on_zone_end(list, bound, w, 5);
 	const D3D12_RECT pixel = { 16, 0, 17, 1 };
 	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &pixel); // (the marker itself)
@@ -421,6 +424,57 @@ int main(int argc, char **argv)
 	inj::on_zone_end(list, bound, w, 5);
 	fill(6, false);
 	inj::on_zone_end(list, bound, w, 6);
+	// World FX's sun shadow cascade from the zone just drawn (record_zone_casters): the sun overhead, a D32 map over the
+	// whole of what the zone places (x across, z down, depth by height), then the game's state back as World FX does
+	const bool bounds_after = inj::zone_bounds(zlo, zhi, zgen);
+	constexpr UINT kMap = 2048;
+	const float m_reach = 0.5f * std::max(zhi[0] - zlo[0], zhi[2] - zlo[2]) + 1.0f, m_x = 0.5f * (zlo[0] + zhi[0]), m_z = 0.5f * (zlo[2] + zhi[2]);
+	const float m_top = zlo[1] - 1.0f, m_span = (zhi[1] - zlo[1]) + 2.0f;
+	const float sun_m[16] = { 1.0f / m_reach, 0, 0, 0, 0, 0, 1.0f / m_span, 0, 0, -1.0f / m_reach, 0, 0, -m_x / m_reach, m_z / m_reach, -m_top / m_span, 1 };
+	ID3D12Resource *sun_map = nullptr, *sun_back = nullptr;
+	ID3D12DescriptorHeap *sun_heap = nullptr;
+	{
+		D3D12_RESOURCE_DESC cd = {};
+		cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		cd.Width = kMap;
+		cd.Height = kMap;
+		cd.DepthOrArraySize = 1;
+		cd.MipLevels = 1;
+		cd.Format = DXGI_FORMAT_D32_FLOAT;
+		cd.SampleDesc.Count = 1;
+		cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = DXGI_FORMAT_D32_FLOAT;
+		cv.DepthStencil.Depth = 1.0f;
+		D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT }, rh = { D3D12_HEAP_TYPE_READBACK };
+		device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&sun_map));
+		D3D12_DESCRIPTOR_HEAP_DESC sd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+		device->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&sun_heap));
+		device->CreateDepthStencilView(sun_map, nullptr, sun_heap->GetCPUDescriptorHandleForHeapStart());
+		D3D12_RESOURCE_DESC b = {};
+		b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		b.Width = UINT64(kMap) * kMap * 4;
+		b.Height = 1;
+		b.DepthOrArraySize = 1;
+		b.MipLevels = 1;
+		b.SampleDesc.Count = 1;
+		b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		device->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sun_back));
+	}
+	const D3D12_CPU_DESCRIPTOR_HANDLE sun_dsv = sun_heap->GetCPUDescriptorHandleForHeapStart();
+	list->ClearDepthStencilView(sun_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+	const uint32_t sun_triangles = bounds_after ? inj::record_zone_casters(list, sun_m, sun_dsv, kMap) : 0;
+	bound.restore(list);
+	barrier(list, sun_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	{
+		D3D12_TEXTURE_COPY_LOCATION sdst = {}, ssrc = {};
+		sdst.pResource = sun_back;
+		sdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		sdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_TYPELESS, kMap, kMap, 1, kMap * 4 };
+		ssrc.pResource = sun_map;
+		ssrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		list->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
+	}
 	// dgVoodoo's next draw, nothing bound again (the planes moved on as it moves them)
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 	barrier(list, Az, 0, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -473,7 +527,7 @@ int main(int argc, char **argv)
 			nearer += (dz[size_t(y) * W + x] & 0xFFFFFF) < 0xFFFFFF;
 		}
 	const double share = double(not_sky) / (W * H), depth_share = double(nearer) / (W * H);
-	char line[160];
+	char line[400];
 	std::snprintf(line, sizeof(line), "the zone in the target (%.0f%% of it not the sky) and its depth (%.0f%% nearer than the far plane)", share * 100, depth_share * 100);
 	check(share > 0.5 && depth_share > 0.5, line);
 	// (the character: the quad in the lower right, x 0.5..0.9 -> 600..760, y -0.5..-0.9 -> 337..427)
@@ -482,6 +536,42 @@ int main(int argc, char **argv)
 	check(c[0] == 0xE0 && c[1] == 0x80 && c[2] == 0x20, line);
 	const std::vector<std::string> st = inj::status();
 	check(!st.empty() && st[0].find("1 passes drawn, 0 couldn't be") != std::string::npos, "one pass drawn, the repeat and the game's left alone: " + st[0]);
+	// The sun's cascade from the zone's data: nothing before a zone was drawn; then the town seen from above: its streets,
+	// plazas and gate (18% of the box: walls seen from straight above are edge on, and the box holds the whole layout),
+	// its depths over the box's height
+	{
+		float *sz = nullptr;
+		sun_back->Map(0, nullptr, reinterpret_cast<void **>(&sz));
+		uint32_t covered = 0, low = 0, high = 0;
+		for (size_t i = 0; i < size_t(kMap) * kMap; ++i)
+		{
+			const float d = sz[i];
+			if (!(d < 1.0f))
+				continue;
+			covered++;
+			low += d > 0.5f;
+			high += d < 0.5f;
+		}
+		const double share = double(covered) / (double(kMap) * kMap);
+		std::snprintf(line, sizeof(line), "the zone's sun cascade from its data: no zone before it was drawn (%s), its box %.0f..%.0f x %.0f..%.0f x %.0f..%.0f; %u triangles, %.0f%% of the map covered (%u deeper half, %u nearer)",
+			bounds_before ? "had one" : "none", zlo[0], zhi[0], zlo[1], zhi[1], zlo[2], zhi[2], sun_triangles, share * 100, low, high);
+		check(!bounds_before && bounds_after && sun_triangles > 10000 && share > 0.12 && low > 0 && high > 0, line);
+		// (a picture of it for a look, 512 square, nearer brighter, nothing black: build\zone_sun_map.pgm)
+		if (FILE *pf = nullptr; fopen_s(&pf, "build\\zone_sun_map.pgm", "wb") == 0 && pf != nullptr)
+		{
+			std::fprintf(pf, "P5 512 512 255\n");
+			for (UINT y = 0; y < 512; ++y)
+				for (UINT x = 0; x < 512; ++x)
+				{
+					const float d = sz[size_t(y * 4) * kMap + x * 4];
+					const uint8_t v = d < 1.0f ? uint8_t(40 + 215 * (1.0f - std::min(d, 1.0f))) : 0;
+					std::fwrite(&v, 1, 1, pf);
+				}
+			std::fclose(pf);
+		}
+		sun_back->Unmap(0, nullptr);
+		check(st.size() > 1 && st[1].find("1 drawn") != std::string::npos, "counted: " + (st.size() > 1 ? st[1] : std::string()));
+	}
 	if (argc > 1)
 	{
 		FILE *f = nullptr;

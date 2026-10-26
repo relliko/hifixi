@@ -114,6 +114,9 @@ namespace
 		// The host's shadow casters (set_casters), given to each renderer made
 		grass::renderer::caster_fn casters = nullptr;
 		void *casters_context = nullptr;
+		grass::renderer::zone_bounds_fn zone_bounds = nullptr;
+		grass::renderer::zone_draw_fn zone_draw = nullptr;
+		void *zone_casters_context = nullptr;
 
 		// Settings ([FFXI_WORLDFX] in ReShade.ini, through the host)
 		bool enabled = true;
@@ -2417,6 +2420,16 @@ namespace worldfx
 			g.renderer->set_casters(fn, context);
 	}
 
+	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.zone_bounds = bounds;
+		g.zone_draw = draw;
+		g.zone_casters_context = context;
+		if (g.renderer != nullptr)
+			g.renderer->set_zone_casters(bounds, draw, context);
+	}
+
 	void attach(ID3D12Device *device)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
@@ -2426,6 +2439,7 @@ namespace worldfx
 		g_has_drawn = false;
 		g.renderer = std::make_unique<grass::renderer>();
 		g.renderer->set_casters(g.casters, g.casters_context);
+		g.renderer->set_zone_casters(g.zone_bounds, g.zone_draw, g.zone_casters_context);
 		g.shader_stamp = 0; // (a new renderer starts from the built-in shaders: worldfx.hlsl is loaded again)
 		g.shader_status = "built in";
 		g.error.clear();

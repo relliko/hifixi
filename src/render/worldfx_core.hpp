@@ -119,6 +119,8 @@ namespace worldfx
 	// Shadow casters the host draws itself into the sun's shadow map (grass::renderer::set_casters), for this renderer and
 	// any made later. Called under the core's mutex: it mustn't call back into the core.
 	void set_casters(grass::renderer::caster_fn fn, void *context);
+	// The zone's casters the host draws itself (grass::renderer::set_zone_casters), likewise
+	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context);
 	// At process exit: the device may be gone, its objects are left to the process's end
 	void shutdown();
 

@@ -10,6 +10,7 @@
 #include "draw.hpp"
 #include "frame.hpp"
 #include "zone_gpu.hpp"
+#include "zoneshadow.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -35,6 +36,15 @@ namespace hifi::zone::inject
 			std::mutex mutex;
 			ID3D12Device *device = nullptr;
 			std::unique_ptr<zone_renderer> renderer; // (made and let go outside the mutex: see prepare)
+			// The zone last drawn, and when (GetTickCount64): what the shadow cascades are drawn from while fresh
+			gpu_zone *last_zone = nullptr;
+			ULONGLONG last_zone_at = 0;
+			// The shadow pass under a mutex of its own, never taken in the hooks: it makes resources (a zone's placements)
+			// on dgVoodoo's thread, and with the debug layer a device call under the hooks' mutex deadlocks
+			std::mutex shadow_mutex;
+			std::unique_ptr<zone_shadow> shadow; // (made and let go outside both)
+			std::atomic<uint64_t> shadow_frames { 0 }, shadow_triangles { 0 };
+			std::atomic<bool> shadow_up { false };
 			std::atomic<bool> per_pixel { false };
 			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
 			// The world's depth and its planes' states as recorded (dgVoodoo's one thread)
@@ -125,6 +135,7 @@ namespace hifi::zone::inject
 				return true;
 		}
 		std::unique_ptr<zone_renderer> made;
+		std::unique_ptr<zone_shadow> made_shadow;
 		if (device != nullptr)
 		{
 			made = std::make_unique<zone_renderer>();
@@ -133,18 +144,30 @@ namespace hifi::zone::inject
 				made->release();
 				made.reset();
 			}
+			std::string shadow_why;
+			made_shadow = std::make_unique<zone_shadow>();
+			if (!made_shadow->init(device, shadow_why))
+				made_shadow.reset(); // (the zone still draws: its shadows come from the bake then)
 		}
 		std::unique_ptr<zone_renderer> old;
+		std::unique_ptr<zone_shadow> old_shadow;
 		ID3D12DescriptorHeap *old_rtv = nullptr, *old_dsv = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			old = std::move(g.renderer);
 			g.renderer = std::move(made);
+			g.last_zone = nullptr;
 			old_rtv = g.rtv_heap;
 			old_dsv = g.dsv_heap;
 			g.rtv_heap = g.dsv_heap = nullptr;
 			g.view_rt = g.view_ds = nullptr;
 			g.device = device;
+		}
+		{
+			std::lock_guard<std::mutex> lock(g.shadow_mutex);
+			old_shadow = std::move(g.shadow);
+			g.shadow = std::move(made_shadow);
+			g.shadow_up = g.shadow != nullptr;
 		}
 		if (old != nullptr)
 			old->release();
@@ -157,10 +180,12 @@ namespace hifi::zone::inject
 	void release()
 	{
 		std::unique_ptr<zone_renderer> old;
+		std::unique_ptr<zone_shadow> old_shadow;
 		ID3D12DescriptorHeap *old_rtv = nullptr, *old_dsv = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			old = std::move(g.renderer);
+			g.last_zone = nullptr;
 			old_rtv = g.rtv_heap;
 			old_dsv = g.dsv_heap;
 			g.rtv_heap = g.dsv_heap = nullptr;
@@ -169,6 +194,11 @@ namespace hifi::zone::inject
 			g.lists.clear();
 			g.depth = nullptr;
 			g.plane[0] = g.plane[1] = kUnknown;
+		}
+		{
+			std::lock_guard<std::mutex> lock(g.shadow_mutex);
+			old_shadow = std::move(g.shadow);
+			g.shadow_up = false;
 		}
 		if (old != nullptr)
 			old->release();
@@ -196,6 +226,9 @@ namespace hifi::zone::inject
 		std::snprintf(line, sizeof(line), "native zone renderer: %s; %llu passes drawn, %llu couldn't be%s%s; the last: %u objects, %u draws, %u triangles",
 			g.renderer != nullptr && g.renderer->ready() ? "up" : "not made", static_cast<unsigned long long>(g.drawn), static_cast<unsigned long long>(g.failed),
 			g.why.empty() ? "" : " (the last: ", g.why.empty() ? "" : (g.why + ")").c_str(), g.last.objects, g.last.draws, g.last.triangles);
+		lines.push_back(line);
+		std::snprintf(line, sizeof(line), "native zone renderer: sun shadow cascades from its data: %s; %llu drawn, %llu triangles in all",
+			g.shadow_up ? "up" : "not made", static_cast<unsigned long long>(g.shadow_frames.load()), static_cast<unsigned long long>(g.shadow_triangles.load()));
 		lines.push_back(line);
 		return lines;
 	}
@@ -303,5 +336,64 @@ namespace hifi::zone::inject
 			list->SetDescriptorHeaps(known->second.count, known->second.h);
 		bound.restore(list);
 		g.drawn++;
+		g.last_zone = f->zone;
+		g.last_zone_at = GetTickCount64();
+	}
+
+	namespace
+	{
+		constexpr ULONGLONG kZoneFreshMs = 250;
+
+		// The zone drawn lately, else nullptr; and the list's heaps (count 0: not known)
+		gpu_zone *fresh_zone(ID3D12GraphicsCommandList *list, heaps &h)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			if (list != nullptr)
+				if (const auto known = g.lists.find(list); known != g.lists.end())
+					h = known->second;
+			if (g.last_zone == nullptr || GetTickCount64() - g.last_zone_at > kZoneFreshMs)
+				return nullptr;
+			return g.last_zone;
+		}
+	}
+
+	bool zone_bounds(float lo[3], float hi[3], uint64_t &generation)
+	{
+		heaps h;
+		gpu_zone *const z = fresh_zone(nullptr, h);
+		std::lock_guard<std::mutex> lock(g.shadow_mutex);
+		if (z == nullptr || g.shadow == nullptr || !g.shadow->bounds(*z, lo, hi))
+			return false;
+		generation = (uint64_t(reinterpret_cast<uintptr_t>(z)) << 16) ^ z->data().map;
+		return true;
+	}
+
+	uint32_t record_zone_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
+	{
+		heaps h;
+		gpu_zone *const z = fresh_zone(list, h);
+		if (z == nullptr || h.count == 0)
+			return 0;
+		std::lock_guard<std::mutex> lock(g.shadow_mutex);
+		if (g.shadow == nullptr)
+			return 0;
+		const uint32_t triangles = g.shadow->record(list, *z, world_to_clip, dsv, size);
+		// (the game's heaps back: World FX binds none of its own)
+		list->SetDescriptorHeaps(h.count, h.h);
+		g.shadow_frames++;
+		g.shadow_triangles += triangles;
+		return triangles;
+	}
+
+	grass::renderer::zone_bounds_fn zone_bounds_hook()
+	{
+		return [](void *, float lo[3], float hi[3], uint64_t *generation) { return zone_bounds(lo, hi, *generation); };
+	}
+
+	grass::renderer::zone_draw_fn zone_draw_hook()
+	{
+		return [](void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
+			return record_zone_casters(list, world_to_clip, dsv, size);
+		};
 	}
 }

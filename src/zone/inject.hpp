@@ -51,4 +51,14 @@ namespace hifi::zone::inject
 	bool depth_planes(ID3D12Resource *depth, D3D12_RESOURCE_STATES out[2]);
 	// The zone's end marker: the pass published under that seq drawn there when it's HiFi XI's
 	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+
+	// World FX's sun shadow cascades from the zone this draws (zoneshadow.hpp; grass::renderer::set_zone_casters): the
+	// zone drawn here in the last kZoneFreshMs (only then: a zone left is let go 240 presents on), the box around what it
+	// places and a number that changes with its data; and its placements, depth only, into a cascade (the game's
+	// descriptor heaps put back after; nothing drawn when they aren't known). Triangles drawn.
+	bool zone_bounds(float lo[3], float hi[3], uint64_t &generation);
+	uint32_t record_zone_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
+	// Both as World FX takes them
+	grass::renderer::zone_bounds_fn zone_bounds_hook();
+	grass::renderer::zone_draw_fn zone_draw_hook();
 }

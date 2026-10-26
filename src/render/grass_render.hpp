@@ -511,6 +511,7 @@ namespace grass
 		float sun_map_fade[2] = { 1.0f, 1.0f }; // how far each cascade's last drawing has faded in over the one before
 		uint32_t sun_map_triangles = 0; // triangles drawn into them
 		bool casters = false;           // the host's casters drew into their map, read with it (set_casters)
+		bool sun_map_host = false;      // the cascades are the host's zone casters' (set_zone_casters), not the uploaded meshes'
 		uint32_t water_corners = 0; // of the water drawn (the water, or the debug view)
 		uint32_t sea_corners = 0;   // of the sea's sheets drawn
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
@@ -659,6 +660,18 @@ namespace grass
 			_casters = fn;
 			_casters_context = context;
 		}
+		// The zone's casters the host draws itself (HiFi XI: its native zone data), in place of the uploaded meshes
+		// (upload_shadow) whenever bounds says it has them: the box around what it draws (world) and a number that
+		// changes with its data (the cascades are drawn again when it does), then draw into a cascade as caster_fn does
+		// (world_to_clip, its view cleared to 1, its size), returning the triangles drawn. nullptr: none.
+		using zone_bounds_fn = bool (*)(void *context, float lo[3], float hi[3], uint64_t *generation);
+		using zone_draw_fn = uint32_t (*)(void *context, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
+		void set_zone_casters(zone_bounds_fn bounds, zone_draw_fn draw, void *context)
+		{
+			_zone_bounds = bounds;
+			_zone_draw = draw;
+			_zone_casters_context = context;
+		}
 		// Forgets the clouds' last picture: the next frame marches every pixel of it again (as after a weather jump)
 		void forget_clouds() { _cloud_known = false; }
 		// Forgets the ground colours seen so far (each blade point remembers its own, see the shader)
@@ -805,6 +818,15 @@ namespace grass
 		// sun map heap's third), copied after the sun map's two halves in its copy; its matrix this frame, whether drawn
 		caster_fn _casters = nullptr;
 		void *_casters_context = nullptr;
+		// The host's zone casters (set_zone_casters), and what the cascades were last drawn from: its data's number, or
+		// the uploaded meshes' (kFromMeshes), and the box the map's depth spans (the zone's)
+		zone_bounds_fn _zone_bounds = nullptr;
+		zone_draw_fn _zone_draw = nullptr;
+		void *_zone_casters_context = nullptr;
+		uint64_t _map_source = 0;
+		float _map_lo[3] = {}, _map_hi[3] = {};
+		bool _map_bounds = false;
+		bool _map_host = false;
 		ID3D12Resource *_caster_map = nullptr;
 		float _caster_world_to_clip[16] = {};
 

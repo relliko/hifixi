@@ -1006,6 +1006,13 @@ extern "C" __declspec(dllexport) int __cdecl hifixi_zone_test(const void *image,
 	std::string why;
 	if (gz == nullptr || !hifi::zone::inject::prepare(device, why))
 		return 0;
+	// (the sun's shadow cascades from it, as the plugin hands them to World FX)
+	static bool zone_casters_set = false;
+	if (!zone_casters_set)
+	{
+		worldfx::set_zone_casters(hifi::zone::inject::zone_bounds_hook(), hifi::zone::inject::zone_draw_hook(), nullptr);
+		zone_casters_set = true;
+	}
 	const zm::zone &d = gz->data();
 	hifi::zone::frame &f = hifi::zone::frame_slot(seq);
 	f.native = true;
