@@ -143,6 +143,13 @@ extern "C" __declspec(dllexport) int __cdecl hifixi_chars_test(const char *pose_
 		return 0;
 	if (trace)
 		hifi::backend::log(0, "chars: test frame: prepared");
+	// (their sun shadows from their meshes, as the plugin hands them to World FX)
+	static bool casters_set = false;
+	if (!casters_set)
+	{
+		worldfx::set_casters(ch::inject::caster_hook(), nullptr);
+		casters_set = true;
+	}
 	for (const ch::cache::key &k : g_mithra.keys)
 		ch::cache::mesh(k);
 	for (const ch::cache::key &k : g_mithra.texture_keys)

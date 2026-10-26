@@ -510,6 +510,7 @@ namespace grass
 		uint32_t sun_map_cascades = 0;  // cascades of the shadow map drawn again this frame (bits: 1 near, 2 far)
 		float sun_map_fade[2] = { 1.0f, 1.0f }; // how far each cascade's last drawing has faded in over the one before
 		uint32_t sun_map_triangles = 0; // triangles drawn into them
+		bool casters = false;           // the host's casters drew into their map, read with it (set_casters)
 		uint32_t water_corners = 0; // of the water drawn (the water, or the debug view)
 		uint32_t sea_corners = 0;   // of the sea's sheets drawn
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
@@ -647,6 +648,17 @@ namespace grass
 		// (for tests: the map's copy, two cascades of kSunMapSize rows of this many floats, the near one first)
 		ID3D12Resource *sun_map_copy() const { return _sun_map_copy; }
 		uint32_t sun_map_pitch() const { return _sun_map_pitch; }
+		// Shadow casters the host draws itself (HiFi XI: the characters and monsters from their own meshes), into a map of
+		// their own each frame the sun's shadow map is read: called in the shading pass with the list, the map's
+		// world-to-clip matrix (the sun's rays down its depth, as the cascades'), its depth view (cleared to 1, in
+		// DEPTH_WRITE) and its size in texels; it draws depth only and returns whether it drew anything. It may change
+		// any of the list's state, its descriptor heaps too if it puts the game's back. nullptr: none.
+		using caster_fn = bool (*)(void *context, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
+		void set_casters(caster_fn fn, void *context)
+		{
+			_casters = fn;
+			_casters_context = context;
+		}
 		// Forgets the clouds' last picture: the next frame marches every pixel of it again (as after a weather jump)
 		void forget_clouds() { _cloud_known = false; }
 		// Forgets the ground colours seen so far (each blade point remembers its own, see the shader)
@@ -700,6 +712,8 @@ namespace grass
 		ID3D12PipelineState *shadow_pipeline(std::string &error);
 		uint32_t draw_sun_map(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3], double clock, uint32_t &triangles, std::string &error);
 		void sun_map_params(const camera &cam, double clock, float out[32], float prev[32]) const;
+		bool draw_casters(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3]);
+		void caster_params(const camera &cam, float out[16]) const;
 		ID3D12PipelineState *vis_pipeline(std::string &error);
 		bool vis_buffers(std::string &error);
 		uint32_t draw_vis(ID3D12GraphicsCommandList *list, const float *constants, std::string &error);
@@ -787,6 +801,12 @@ namespace grass
 		};
 		cascade _cascades[2];
 		uint32_t _sun_map_turn = 0; // (counts the map's frames: the far cascade's turn on every other one)
+		// The host's casters (set_casters): their map (D32, kSunMapSize square, DEPTH_WRITE between draws; its view the
+		// sun map heap's third), copied after the sun map's two halves in its copy; its matrix this frame, whether drawn
+		caster_fn _casters = nullptr;
+		void *_casters_context = nullptr;
+		ID3D12Resource *_caster_map = nullptr;
+		float _caster_world_to_clip[16] = {};
 
 		ID3D12Resource *_buffer = nullptr;
 		ID3D12Resource *_memory = nullptr; // the ground colour each blade point remembers (12 bytes a point)

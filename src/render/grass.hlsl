@@ -2007,6 +2007,35 @@ float sun_from_map(float3 P, float3 n, float3 to_sun, out float covered, out flo
 	return shadow;
 }
 
+// The host's casters' map (rule bit 4096; grass_render.cpp draw_casters: HiFi XI's characters and monsters drawn from
+// their own meshes, each frame): one more drawing in the shadow map's copy, as a cascade's, kCasterReach yalms each way
+// around the camera. [kCaster..+2] its rows for a view-space point, [kCaster + 3] its depth a yalm, where it starts
+// (uints, as bits), a texel's size (yalms). Where it covers a point, the characters' shadows come from it, not from
+// actor_shadow's capsules and silhouettes.
+static const uint kCaster = kCloud + 10;
+bool casters_mapped() { return ((crowd.x >> 16) & 4096) != 0; }
+
+// How much of the sun the casters block at P (n its facing); covered: 1 well inside the map, fading out over its last
+// twentieth
+float casters_from_map(float3 P, float3 n, float3 to_sun, out float covered)
+{
+	float4 info = actors[kCaster + 3];
+	float size = actors[kSunMap + 6].x;
+	uint pitch = uint(actors[kSunMap + 6].w);
+	float texel = info.z;
+	float4 q = float4(P + n * (1.5 * texel) + to_sun * texel, 1.0);
+	float2 t = float2(dot(q, actors[kCaster]), dot(q, actors[kCaster + 1]));
+	covered = saturate(min(min(t.x, t.y), size - max(t.x, t.y)) / (0.05 * size));
+	float shadow = 0.0;
+	[branch] if (covered > 0.0)
+	{
+		shadow = map_drawing(q, kCaster, info.x, asuint(info.y), texel, size, pitch).x;
+		if (kSunMapEdge > 0.0)
+			shadow = smoothstep(kSunMapEdge, 1.0 - kSunMapEdge, shadow);
+	}
+	return shadow;
+}
+
 // Sun shadows, for the world's even rows and columns (a pixel in four), into u1 for shade_ps to blur, a uint each:
 // how much of the sun is blocked (8 bits, 0..1: the march's and the map's, to be taken by the surface's sun share)
 // | the map's shadow from well above on a surface seen too nearly edge on to tell its facing (8 bits, taken whole)
@@ -2051,6 +2080,7 @@ void sun_ps(float4 pos : SV_Position)
 	bool on_actor = false;
 	float3 chest = P;
 	uint self = 32u; // (which one: none)
+	float self_radius = 0.0;
 	[unroll] for (uint k = 0; k < 32; ++k)
 	{
 		if (k < min(crowd.x & 0xFFFF, 32u))
@@ -2060,6 +2090,7 @@ void sun_ps(float4 pos : SV_Position)
 			bool here = !on_actor && z < 1e8 && inside(b, P, world_up) && dot(P - b.feet, world_up) > 0.15;
 			chest = here ? b.feet + world_up * (0.6 * b.height) : chest;
 			self = here ? k : self;
+			self_radius = here ? b.radius : self_radius;
 			on_actor = on_actor || here;
 		}
 	}
@@ -2074,10 +2105,16 @@ void sun_ps(float4 pos : SV_Position)
 	float covered = 0.0, mapped = 0.0, above = 0.0;
 	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && ((crowd.x >> 16) & 8) != 0)
 		mapped = sun_from_map(P, n, to_sun, covered, above);
+	// The characters and monsters from their meshes (casters_from_map): on one of them, from just past their own body
+	// toward the sun (their chest outward by their capsule's radius and a bit: the map has their own body too, and it
+	// was never meant to shade itself here, as the march from the chest leaves it out); elsewhere at the surface
+	float cast = 0.0, cast_covered = 0.0;
+	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && casters_mapped())
+		cast = casters_from_map(on_actor ? P + to_sun * (self_radius + 0.3) : P, n, to_sun, cast_covered);
 	// (at the share a surface facing up would lose: not all of it. Ground seen at a grazing angle is "unsure" from
 	// about 10 yalms off when the camera is low, so taken whole it was shaded twice as dark as the same ground nearer
 	// at a low sun, along a line that moved with the camera)
-	whole = unsure ? above * covered * sun_share(dot(world_up, to_sun)) : 0.0;
+	whole = unsure ? max(above * covered, cast * cast_covered) * sun_share(dot(world_up, to_sun)) : 0.0;
 	// (any surface the sun reaches at all: what a shadow takes from it comes down to nothing as the sun grazes it)
 	if (z < 1e8 && facing > 0.0)
 	{
@@ -2161,10 +2198,12 @@ void sun_ps(float4 pos : SV_Position)
 			t *= kGrow;
 		}
 		shadow = max(shadow, mapped * covered);
+		shadow = max(shadow, cast * cast_covered);
 		// The characters' and monsters' own shadows, when asked for (actor_shadow): from where the march starts, past
-		// the surface's own bumps; on someone, from their chest, all but their own
-		[branch] if (((crowd.x >> 16) & 4) != 0 && count > 0)
-			shadow = max(shadow, actor_shadow(from, to_sun, self, t_min));
+		// the surface's own bumps; on someone, from their chest, all but their own. Where the casters' map covers the
+		// point, from it instead (above), faded over its edge.
+		[branch] if (((crowd.x >> 16) & 4) != 0 && count > 0 && cast_covered < 1.0)
+			shadow = max(shadow, actor_shadow(from, to_sun, self, t_min) * (1.0 - cast_covered));
 	}
 	if (on_actor)
 	{

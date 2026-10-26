@@ -151,6 +151,18 @@ float4 ps(v2p i) : SV_Target
 	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb, i.fog), a);
 }
 
+// Depth only into a sun shadow map (record_casters): the model draw's alpha test, nothing written but depth
+void sps(v2p i)
+{
+	if ((flags & 1) == 0)
+	{
+		const model_t m = models[min(model_index, (uint)options.y - 1)];
+		const float a0 = saturate(2 * colour_map.Sample(clamp_linear, i.uv).a * m.tfactor.a);
+		if (saturate(4 * a0 * m.tfactor.a) * 255 <= 69.5)
+			discard;
+	}
+}
+
 // The see-through composite: one full-target triangle; T's texel MODULATE2X the actor colour
 float4 unpack(uint c) { return float4((c >> 16) & 255, (c >> 8) & 255, c & 255, c >> 24) / 255.0; }
 struct c2p { float4 pos : SV_Position; };
@@ -201,7 +213,10 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 			float options[4];
 		};
 		static_assert(sizeof(gpu_constants) <= kConstantsBytes);
-		constexpr UINT64 kSlotBytes = (kConstantsBytes + UINT64(kMaxModels) * sizeof(gpu_model) + 255) & ~UINT64(255);
+		// (a slot: the frame's draw's constants and models, then its shadow's: record_casters may come while the GPU has yet
+		// to read the draw's)
+		constexpr UINT64 kHalfSlotBytes = (kConstantsBytes + UINT64(kMaxModels) * sizeof(gpu_model) + 255) & ~UINT64(255);
+		constexpr UINT64 kSlotBytes = 2 * kHalfSlotBytes;
 		constexpr UINT64 kModelsAt = kConstantsBytes;
 
 		template <typename T>
@@ -278,12 +293,13 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 			if (p.second != nullptr)
 				p.second->Release();
 		_pipelines.clear();
+		drop(_shadow_pso);
 		if (_ring != nullptr && _mapped != nullptr)
 			_ring->Unmap(0, nullptr);
 		_mapped = nullptr;
 		drop(_ring);
 		drop(_root);
-		for (void **b : { &_vs, &_ps, &_cvs, &_cps, &_cps_ms })
+		for (void **b : { &_vs, &_ps, &_cvs, &_cps, &_cps_ms, &_sps })
 		{
 			if (*b != nullptr)
 				static_cast<ID3DBlob *>(*b)->Release();
@@ -309,7 +325,7 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 			const char *name, *target;
 			void **out;
 		};
-		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms } };
+		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps } };
 		for (const entry &e : entries)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
@@ -364,6 +380,29 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 			return false;
 		}
 		blob->Release();
+
+		// The shadow pipeline: depth only into a D32 map, LESS, no culling (as the character pass)
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = {};
+		sd.pRootSignature = _root;
+		sd.VS = { static_cast<ID3DBlob *>(_vs)->GetBufferPointer(), static_cast<ID3DBlob *>(_vs)->GetBufferSize() };
+		sd.PS = { static_cast<ID3DBlob *>(_sps)->GetBufferPointer(), static_cast<ID3DBlob *>(_sps)->GetBufferSize() };
+		sd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		sd.NumRenderTargets = 0;
+		sd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+		sd.SampleDesc.Count = 1;
+		sd.SampleMask = UINT_MAX;
+		sd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		sd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		sd.RasterizerState.DepthClipEnable = TRUE;
+		sd.DepthStencilState.DepthEnable = TRUE;
+		sd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		sd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+		if (FAILED(device->CreateGraphicsPipelineState(&sd, IID_PPV_ARGS(&_shadow_pso))))
+		{
+			why = "the characters' shadow pipeline couldn't be made";
+			release();
+			return false;
+		}
 
 		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
 		D3D12_RESOURCE_DESC bd = {};
@@ -431,17 +470,13 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		return pso;
 	}
 
-	bool char_renderer::begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o)
+	// The frame's constants (seen through view_proj) and its models' into half `part` of its seq's slot; its GPU address
+	D3D12_GPU_VIRTUAL_ADDRESS char_renderer::write_frame(const frame &f, const char_options &o, const float view_proj[16], uint32_t part)
 	{
-		ID3D12DescriptorHeap *const heap = cache::heap();
-		ID3D12PipelineState *const pso = pipeline(t, kModel);
-		if (_root == nullptr || heap == nullptr || pso == nullptr || !f.camera || f.models == 0)
-			return false;
-		// The frame's constants (rewritten for each draw of the frame: the same values) and its models'
 		const uint32_t seq = f.seq.load(std::memory_order_acquire);
-		const UINT64 slot = UINT64(seq % kFrames) * kSlotBytes;
+		const UINT64 slot = UINT64(seq % kFrames) * kSlotBytes + UINT64(part) * kHalfSlotBytes;
 		gpu_constants c = {};
-		std::memcpy(c.view_proj, f.view_proj, sizeof(c.view_proj));
+		std::memcpy(c.view_proj, view_proj, sizeof(c.view_proj));
 		const float span = f.fog_end - f.fog_start;
 		c.fog[0] = f.fog[0];
 		c.fog[1] = f.fog[1];
@@ -454,7 +489,17 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		gpu_model *gm = reinterpret_cast<gpu_model *>(_mapped + slot + kModelsAt);
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
 			model_constants(f.model[i], gm[i]);
-		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
+		return _ring->GetGPUVirtualAddress() + slot;
+	}
+
+	bool char_renderer::begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o)
+	{
+		ID3D12DescriptorHeap *const heap = cache::heap();
+		ID3D12PipelineState *const pso = pipeline(t, kModel);
+		if (_root == nullptr || heap == nullptr || pso == nullptr || !f.camera || f.models == 0)
+			return false;
+		// The frame's constants (rewritten for each draw of the frame: the same values) and its models'
+		const D3D12_GPU_VIRTUAL_ADDRESS base = write_frame(f, o, f.view_proj, 0);
 
 		list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
 		const D3D12_VIEWPORT vp = { t.offset, t.offset, t.width, t.height, 0.0f, 1.0f };
@@ -560,6 +605,37 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		if (model >= std::min(f.models, kMaxModels) || !begin(list, t, f, o))
 			return st;
 		draw_model(list, t, f, model, st);
+		return st;
+	}
+
+	char_stats char_renderer::record_casters(ID3D12GraphicsCommandList *list, const frame &f, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size)
+	{
+		char_stats st;
+		ID3D12DescriptorHeap *const heap = cache::heap();
+		const uint32_t models = std::min(f.models, kMaxModels);
+		if (_root == nullptr || _shadow_pso == nullptr || heap == nullptr || models == 0)
+			return st;
+		bool any = false;
+		for (uint32_t i = 0; i < models && !any; ++i)
+			any = (f.model[i].flags & kNative) != 0 && (f.model[i].colour >> 24) != 0;
+		if (!any)
+			return st;
+		const D3D12_GPU_VIRTUAL_ADDRESS base = write_frame(f, char_options(), world_to_clip, 1);
+		list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+		const D3D12_VIEWPORT vp = { 0.0f, 0.0f, float(size), float(size), 0.0f, 1.0f };
+		const D3D12_RECT sc = { 0, 0, LONG(size), LONG(size) };
+		list->RSSetViewports(1, &vp);
+		list->RSSetScissorRects(1, &sc);
+		list->SetDescriptorHeaps(1, &heap);
+		list->SetGraphicsRootSignature(_root);
+		list->SetGraphicsRootConstantBufferView(0, base);
+		list->SetGraphicsRootShaderResourceView(3, base + kModelsAt);
+		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		list->SetPipelineState(_shadow_pso);
+		const char_target none;
+		for (uint32_t i = 0; i < models; ++i)
+			if ((f.model[i].flags & kNative) != 0 && (f.model[i].colour >> 24) != 0)
+				draw_model(list, none, f, i, st);
 		return st;
 	}
 

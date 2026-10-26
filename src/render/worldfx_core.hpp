@@ -116,6 +116,9 @@ namespace worldfx
 	void attach(ID3D12Device *device);
 	void detach(ID3D12Device *device);
 	ID3D12Device *attached();
+	// Shadow casters the host draws itself into the sun's shadow map (grass::renderer::set_casters), for this renderer and
+	// any made later. Called under the core's mutex: it mustn't call back into the core.
+	void set_casters(grass::renderer::caster_fn fn, void *context);
 	// At process exit: the device may be gone, its objects are left to the process's end
 	void shutdown();
 

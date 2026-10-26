@@ -67,7 +67,13 @@ namespace grass
 		constexpr UINT kCloudParams = 40;
 		constexpr UINT kCloudShadowSize = 128;
 		constexpr float kCloudShadowReach = 600.0f;
-		constexpr UINT kActorBytes = (kWxOffset + kWxParams + kCloudParams) * 4;
+		// ... and after the clouds' the host's casters' map (grass.hlsl kCaster; rule bit 4096: set_casters): its rows for a
+		// view-space point, then its depth a yalm, where it starts in the copy (uints, as bits), a texel's size (yalms)
+		constexpr UINT kCasterParams = 16;
+		constexpr UINT kCasterOffset = kWxOffset + kWxParams + kCloudParams;
+		constexpr UINT kActorBytes = (kCasterOffset + kCasterParams) * 4;
+		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
+		constexpr float kCasterReach = 32.0f;
 		// The clouds' steps along a view ray and toward the light at each quality (look::weather_fx::cloud_quality)
 		constexpr UINT kCloudSteps[3][2] = { { 16, 3 }, { 24, 4 }, { 32, 6 } };
 		// Each point's memory (grass.hlsl kMemoryStride): its ground colour (12 bytes), then when its trampling wears off
@@ -1830,6 +1836,7 @@ namespace grass
 		release(_vis_boxes);
 		unload_shadow();
 		release(_sun_map);
+		release(_caster_map);
 		release(_sun_map_heap);
 		release(_sun_map_copy);
 		release(_shadow_pso);
@@ -3503,17 +3510,20 @@ namespace grass
 	// The shadow map: one D32 texture array (the near cascade, then the far one, kSunMapSize square each, in
 	// DEPTH_WRITE between draws), a view of each, and the buffer they're copied into: two halves, each the near
 	// cascade's texels then the far one's, a cascade's latest drawing in one half and the one before in the other
-	// (draw_sun_map), made once
+	// (draw_sun_map), then the host's casters' map (draw_casters: its own D32 texture, the heap's third view), made once
 	bool renderer::sun_map_for(std::string &error)
 	{
-		if (_sun_map != nullptr && _sun_map_copy != nullptr)
+		if (_sun_map != nullptr && _sun_map_copy != nullptr && _caster_map != nullptr)
 			return true;
+		release(_sun_map);
+		release(_sun_map_copy);
+		release(_caster_map);
 		HRESULT hr = S_OK;
 		if (_sun_map_heap == nullptr)
 		{
 			D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 			hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-			hd.NumDescriptors = 2;
+			hd.NumDescriptors = 3;
 			hr = _device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_sun_map_heap));
 		}
 		D3D12_HEAP_PROPERTIES heap = {};
@@ -3530,8 +3540,14 @@ namespace grass
 		D3D12_CLEAR_VALUE clear = {};
 		clear.Format = DXGI_FORMAT_D32_FLOAT;
 		clear.DepthStencil.Depth = 1.0f;
-		if (SUCCEEDED(hr) && _sun_map == nullptr)
+		if (SUCCEEDED(hr))
 			hr = _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&_sun_map));
+		if (SUCCEEDED(hr))
+		{
+			D3D12_RESOURCE_DESC one = desc;
+			one.DepthOrArraySize = 1;
+			hr = _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &one, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&_caster_map));
+		}
 		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2] = {};
 		UINT64 size = 0;
 		if (SUCCEEDED(hr))
@@ -3544,7 +3560,7 @@ namespace grass
 			_sun_map_offset[1] = footprints[1].Offset;
 			D3D12_RESOURCE_DESC bd = {};
 			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			bd.Width = 2 * _sun_map_half;
+			bd.Width = 3 * _sun_map_half; // (the two halves, then the casters' map: one cascade's layout)
 			bd.Height = 1;
 			bd.DepthOrArraySize = 1;
 			bd.MipLevels = 1;
@@ -3562,9 +3578,11 @@ namespace grass
 			error = text;
 			release(_sun_map);
 			release(_sun_map_copy);
+			release(_caster_map);
 			return false;
 		}
 		_sun_map->SetName(L"worldfx: sun shadow map");
+		_caster_map->SetName(L"worldfx: casters' shadow map");
 		_sun_map_copy->SetName(L"worldfx: sun shadow map (copy)");
 		_sun_map_copy_state = D3D12_RESOURCE_STATE_COMMON;
 		_sun_map_pitch = footprints[0].Footprint.RowPitch / 4;
@@ -3580,6 +3598,12 @@ namespace grass
 			h.ptr += SIZE_T(k) * step;
 			_device->CreateDepthStencilView(_sun_map, &vd, h);
 		}
+		D3D12_DEPTH_STENCIL_VIEW_DESC cv = {};
+		cv.Format = DXGI_FORMAT_D32_FLOAT;
+		cv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+		D3D12_CPU_DESCRIPTOR_HANDLE ch = _sun_map_heap->GetCPUDescriptorHandleForHeapStart();
+		ch.ptr += SIZE_T(2) * step;
+		_device->CreateDepthStencilView(_caster_map, &cv, ch);
 		for (cascade &c : _cascades)
 			c.forget();
 		return true;
@@ -3876,6 +3900,98 @@ namespace grass
 		out[30] = start(1, _cascades[1].slot);
 		out[31] = start(0, _cascades[0].slot);
 		prev[30] = prev[31] = 0.0f;
+	}
+
+	// The host's casters (set_casters) into their own map, each frame the sun's shadow map is read: looking down the sun's
+	// rays as the cascades do (the same depth: 0 at the zone's nearest corner along them, 1 at its farthest), kCasterReach
+	// yalms each way around the camera, on its own texel grid, toward the sun now (not a cascade's last drawing's: the
+	// casters move every frame anyway). Copied after the sun map's two halves. Returns whether the host drew anything;
+	// the list's state is the host's afterwards.
+	bool renderer::draw_casters(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3])
+	{
+		const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+		if (_casters == nullptr || _caster_map == nullptr || _sun_map_copy == nullptr || !(len > 0.5f) || _shadow_cells.empty())
+			return false;
+		const float f[3] = { sun[0] / len, sun[1] / len, sun[2] / len };
+		float r[3], u[3];
+		sun_basis(f, r, u);
+		float middle = 0.0f, half = 0.0f;
+		for (int i = 0; i < 3; ++i)
+		{
+			middle += 0.5f * (_shadow_lo[i] + _shadow_hi[i]) * f[i];
+			half += 0.5f * (_shadow_hi[i] - _shadow_lo[i]) * std::fabs(f[i]);
+		}
+		const float nearest = middle + half + 1.0f, span = 2.0f * half + 2.0f;
+		const float reach = kCasterReach, texel = 2.0f * reach / kSunMapSize;
+		const float cx = std::round((eye[0] * r[0] + eye[1] * r[1] + eye[2] * r[2]) / texel) * texel;
+		const float cy = std::round((eye[0] * u[0] + eye[1] * u[1] + eye[2] * u[2]) / texel) * texel;
+		float *m = _caster_world_to_clip;
+		for (int i = 0; i < 3; ++i)
+		{
+			m[i * 4 + 0] = r[i] / reach;
+			m[i * 4 + 1] = u[i] / reach;
+			m[i * 4 + 2] = -f[i] / span;
+			m[i * 4 + 3] = 0.0f;
+		}
+		m[12] = -cx / reach;
+		m[13] = -cy / reach;
+		m[14] = nearest / span;
+		m[15] = 1.0f;
+		D3D12_CPU_DESCRIPTOR_HANDLE dsv = _sun_map_heap->GetCPUDescriptorHandleForHeapStart();
+		dsv.ptr += SIZE_T(2) * _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+		section(list, L"worldfx: casters' shadow map");
+		list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+		if (!_casters(_casters_context, list, m, dsv, kSunMapSize))
+			return false;
+		const D3D12_RESOURCE_DESC desc = _caster_map->GetDesc();
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+		_device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
+		transition(list, _sun_map_copy, _sun_map_copy_state, D3D12_RESOURCE_STATE_COPY_DEST);
+		transition(list, _caster_map, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+		dst.pResource = _sun_map_copy;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint = footprint;
+		dst.PlacedFootprint.Offset = 2 * _sun_map_half;
+		src.pResource = _caster_map;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.SubresourceIndex = 0;
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		transition(list, _caster_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		transition(list, _sun_map_copy, D3D12_RESOURCE_STATE_COPY_DEST, readable);
+		_sun_map_copy_state = readable;
+		return true;
+	}
+
+	// The sun pass's parameters for the casters' map (kCasterParams floats, after the clouds'): three float4s taking a
+	// view-space point (x, y, z, 1) to its texel's column and row and its depth there, as a cascade's; then its depth a
+	// yalm, where it starts in the copy (uints, as bits), a texel's size (yalms)
+	void renderer::caster_params(const camera &cam, float out[16]) const
+	{
+		const float *v = cam.view;
+		float inv[16] = {};
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 3; ++j)
+				inv[i * 4 + j] = v[j * 4 + i];
+		for (int j = 0; j < 3; ++j)
+			inv[12 + j] = -(v[12] * v[j * 4 + 0] + v[13] * v[j * 4 + 1] + v[14] * v[j * 4 + 2]);
+		inv[15] = 1.0f;
+		const float n = float(kSunMapSize);
+		float s[16];
+		multiply(inv, _caster_world_to_clip, s);
+		for (int i = 0; i < 4; ++i)
+		{
+			out[i] = s[i * 4 + 0] * 0.5f * n + (i == 3 ? 0.5f * n : 0.0f);
+			out[4 + i] = -s[i * 4 + 1] * 0.5f * n + (i == 3 ? 0.5f * n : 0.0f);
+			out[8 + i] = s[i * 4 + 2];
+		}
+		const float *m = _caster_world_to_clip;
+		out[12] = std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
+		const uint32_t start = uint32_t(2 * _sun_map_half / 4);
+		std::memcpy(&out[13], &start, 4);
+		out[14] = 2.0f * kCasterReach / n;
+		out[15] = 0.0f;
 	}
 
 	bool renderer::upload(const blade_file &file, std::string &error)
@@ -4775,7 +4891,15 @@ namespace grass
 					sun_map_params(cam, l.clock, actor_data + kMaxActors * 4, prev);
 					stats.sun_map_fade[0] = prev[24];
 					stats.sun_map_fade[1] = prev[25];
-					const uint32_t with_map = crowd | (8u << 16);
+					uint32_t with_map = crowd | (8u << 16);
+					// (the host's casters: drawn into their own map now, read with the cascades; only when the characters'
+					// shadows are asked for, rule bit 4, as actor_shadow's)
+					if (((crowd >> 16) & 4u) != 0 && draw_casters(list, eye, l.sun))
+					{
+						caster_params(cam, actor_data + kCasterOffset);
+						with_map |= 4096u << 16;
+						stats.casters = true;
+					}
 					std::memcpy(&constants[32], &with_map, 4);
 					stats.sun_map = true;
 				}

@@ -70,18 +70,24 @@ namespace hifi::chars
 		// One model into `t` as it is (the see-through path's first half: the caller has bound T's view as t.rtv and
 		// cleared it)
 		char_stats record_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, const char_options &o);
+		// The frame's models HiFi XI draws (kNative, opaque and see-through), depth only, into a sun shadow map (`dsv`, D32,
+		// size texels square, already cleared) seen through world_to_clip: the same skinning and alpha test, no colour.
+		// Its constants and models go into the slot's second half (the frame's own draw may still read the first).
+		char_stats record_casters(ID3D12GraphicsCommandList *list, const frame &f, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size);
 		// T (an SRV of it in `srv`, a descriptor of the cache's heap) laid over the world's target as the game does
 		void record_composite(ID3D12GraphicsCommandList *list, const char_target &world, D3D12_GPU_DESCRIPTOR_HANDLE srv, uint32_t colour);
 
 	private:
 		bool begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o);
+		D3D12_GPU_VIRTUAL_ADDRESS write_frame(const frame &f, const char_options &o, const float view_proj[16], uint32_t part);
 		void draw_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, char_stats &st);
 		ID3D12PipelineState *pipeline(const char_target &t, int kind);
 
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
-		void *_vs = nullptr, *_ps = nullptr, *_cvs = nullptr, *_cps = nullptr, *_cps_ms = nullptr; // (ID3DBlob)
-		ID3D12Resource *_ring = nullptr; // upload: kFrames slots of the frame's constants and its models'
+		void *_vs = nullptr, *_ps = nullptr, *_cvs = nullptr, *_cps = nullptr, *_cps_ms = nullptr, *_sps = nullptr; // (ID3DBlob)
+		ID3D12PipelineState *_shadow_pso = nullptr; // (depth only, D32: made in init, not under the injection's mutex)
+		ID3D12Resource *_ring = nullptr; // upload: kFrames slots, each two halves of the frame's constants and its models' (its draw; its shadow)
 		uint8_t *_mapped = nullptr;
 		std::unordered_map<uint64_t, ID3D12PipelineState *> _pipelines;
 	};

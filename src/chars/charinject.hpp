@@ -38,10 +38,16 @@ namespace hifi::chars::inject
 	// The characters' end marker (kind 3) and each see-through marker (kind 4), with the seq they carry
 	void on_chars_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
 	void on_see_through(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	// World FX's casters (grass::renderer::set_casters): the last frame drawn's models, depth only, into a sun shadow map
+	// seen through world_to_clip; the game's descriptor heaps put back after. Whether any was drawn.
+	bool record_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
+	// record_casters as World FX takes it (worldfx::set_casters(caster_hook(), nullptr))
+	grass::renderer::caster_fn caster_hook();
 
 	struct counts
 	{
 		uint64_t frames = 0, models = 0, see_through = 0, failed = 0;
+		uint64_t caster_frames = 0, caster_models = 0; // (drawn into the sun's casters' map)
 	};
 	counts get_counts();
 }

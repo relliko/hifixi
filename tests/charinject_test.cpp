@@ -736,6 +736,50 @@ int main(int argc, char **argv)
 	const D3D12_RECT st_pixel = { 64 + 5, 0, 64 + 6, 1 };
 	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &st_pixel);
 	inj::on_see_through(list, bound, w, seq & 15); // (a second see-through marker: there's no second model)
+	// World FX's casters' pass (its shading pass calls record_casters): the sun straight overhead, a D32 map
+	// kCasterSize square looking down on all four (x across, z down the map, depth by height: the top of the box
+	// nearest), then the game's state put back as World FX does after its pass
+	constexpr UINT kCasterSize = 2048;
+	const float c_reach = 0.5f * ((hi[0] + 2 * kShift) - (lo[0] - kShift)) + 0.5f, c_x = 0.5f * ((hi[0] + 2 * kShift) + (lo[0] - kShift)), c_z = 0.5f * (lo[2] + hi[2]);
+	const float c_top = lo[1] - 1.0f, c_span = (hi[1] - lo[1]) + 2.0f;
+	const float caster_m[16] = { 1.0f / c_reach, 0, 0, 0, 0, 0, 1.0f / c_span, 0, 0, -1.0f / c_reach, 0, 0, -c_x / c_reach, c_z / c_reach, -c_top / c_span, 1 };
+	ID3D12Resource *caster_map = nullptr, *caster_back = nullptr;
+	ID3D12DescriptorHeap *caster_heap = nullptr;
+	{
+		D3D12_RESOURCE_DESC cd = {};
+		cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		cd.Width = kCasterSize;
+		cd.Height = kCasterSize;
+		cd.DepthOrArraySize = 1;
+		cd.MipLevels = 1;
+		cd.Format = DXGI_FORMAT_D32_FLOAT;
+		cd.SampleDesc.Count = 1;
+		cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = DXGI_FORMAT_D32_FLOAT;
+		cv.DepthStencil.Depth = 1.0f;
+		device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&caster_map));
+		D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+		device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&caster_heap));
+		device->CreateDepthStencilView(caster_map, nullptr, caster_heap->GetCPUDescriptorHandleForHeapStart());
+		D3D12_RESOURCE_DESC cb = bd;
+		cb.Width = UINT64(kCasterSize) * kCasterSize * 4;
+		device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &cb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&caster_back));
+	}
+	const D3D12_CPU_DESCRIPTOR_HANDLE caster_dsv = caster_heap->GetCPUDescriptorHandleForHeapStart();
+	list->ClearDepthStencilView(caster_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+	const bool casters_drawn = inj::record_casters(list, caster_m, caster_dsv, kCasterSize);
+	bound.restore(list);
+	barrier(list, caster_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	{
+		D3D12_TEXTURE_COPY_LOCATION cdst = {}, csrc = {};
+		cdst.pResource = caster_back;
+		cdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		cdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_TYPELESS, kCasterSize, kCasterSize, 1, kCasterSize * 4 };
+		csrc.pResource = caster_map;
+		csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		list->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
+	}
 	// dgVoodoo's next draw, nothing bound again
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 	list->DrawInstanced(4, 1, 0, 0);
@@ -902,6 +946,34 @@ int main(int argc, char **argv)
 	check(c[0] == 0xE0 && c[1] == 0x80 && c[2] == 0x20, line);
 	const inj::counts n = inj::get_counts();
 	check(n.frames == 1 && n.models == 2 && n.see_through == 1 && n.failed == 0, "drawn: 1 frame, 2 opaque models, 1 see-through: " + inj::status()[0]);
+	// The casters' map: each of HiFi XI's three (the middle, the see-through one, the fogged one) seen from above in its
+	// own x band, the game's own (left) not; the nearest texel the top of the box (the head), within a texel or two
+	{
+		float *cz = nullptr;
+		caster_back->Map(0, nullptr, reinterpret_cast<void **>(&cz));
+		uint32_t band[4] = {};
+		float nearest = 1.0f;
+		const float dxs[4] = { 0.0f, -kShift, kShift, 2 * kShift }; // (middle, left, see-through, fogged)
+		for (UINT y = 0; y < kCasterSize; ++y)
+			for (UINT x = 0; x < kCasterSize; ++x)
+			{
+				const float d = cz[size_t(y) * kCasterSize + x];
+				if (!(d < 1.0f))
+					continue;
+				nearest = std::min(nearest, d);
+				const float wx = c_x + ((float(x) + 0.5f) / kCasterSize * 2.0f - 1.0f) * c_reach;
+				for (int k = 0; k < 4; ++k)
+					if (wx >= lo[0] + dxs[k] - 0.05f && wx <= hi[0] + dxs[k] + 0.05f)
+						band[k]++;
+			}
+		const float head = (lo[1] - c_top) / c_span, texel_depth = 2.0f * c_reach / kCasterSize / c_span;
+		std::snprintf(line, sizeof(line), "the casters' map from above: %u, %u, %u texels under HiFi XI's three, %u under the game's own; nearest %.4f (the box's top %.4f)",
+			band[0], band[2], band[3], band[1], nearest, head);
+		check(casters_drawn && band[0] > 2000 && band[2] > 2000 && band[3] > 2000 && band[1] == 0 && std::fabs(nearest - head) < 3.0f * texel_depth + 0.002f, line);
+		const inj::counts nc = inj::get_counts();
+		check(nc.caster_frames == 1 && nc.caster_models == 3, "counted: 1 casters' frame, 3 models (" + std::to_string(nc.caster_models) + ")");
+		caster_back->Unmap(0, nullptr);
+	}
 	if (argc > 2)
 	{
 		FILE *fo = nullptr;

@@ -339,7 +339,12 @@ namespace hifi::chars::inject
 			g.renderer && g.renderer->ready() ? "up" : "not made", static_cast<unsigned long long>(g.n.frames), static_cast<unsigned long long>(g.n.models),
 			static_cast<unsigned long long>(g.n.see_through), static_cast<unsigned long long>(g.n.failed), g.why.empty() ? "" : " (the last: ",
 			g.why.empty() ? "" : (g.why + ")").c_str(), g.last.models, g.last.draws, g.last.triangles, g.last.not_ready, g.last.hidden, g.last.untextured);
-		return { line };
+		std::vector<std::string> lines = { line };
+		std::snprintf(line, sizeof(line), "native character renderer: sun shadows from their meshes: %llu frames, %llu models%s",
+			static_cast<unsigned long long>(g.n.caster_frames), static_cast<unsigned long long>(g.n.caster_models),
+			g.n.caster_frames == 0 ? " (none yet: needs World FX's sun shadow map and Characters cast sun shadows)" : "");
+		lines.push_back(line);
+		return lines;
 	}
 
 	counts get_counts()
@@ -427,6 +432,36 @@ namespace hifi::chars::inject
 		put_back(list, bound);
 		g.n.frames++;
 		g.n.models += g.last.models;
+	}
+
+	bool record_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (!g.renderer || !g.renderer->ready() || g.seq == 0)
+			return false;
+		const frame *f = published(g.seq & 15u);
+		if (f == nullptr || f->seq.load(std::memory_order_acquire) != g.seq)
+			return false;
+		// (the game's heaps go back after: World FX sets its own state, but binds no heaps. Not drawn at all when they
+		// aren't known: the game's next tables would point into ours.)
+		const auto known = g.lists.find(list);
+		if (known == g.lists.end() || known->second.count == 0)
+			return false;
+		const char_stats st = g.renderer->record_casters(list, *f, world_to_clip, dsv, size);
+		if (st.models != 0)
+			list->SetDescriptorHeaps(known->second.count, known->second.h);
+		if (st.draws == 0)
+			return false;
+		g.n.caster_frames++;
+		g.n.caster_models += st.models;
+		return true;
+	}
+
+	grass::renderer::caster_fn caster_hook()
+	{
+		return [](void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
+			return record_casters(list, world_to_clip, dsv, size);
+		};
 	}
 
 	void on_see_through(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)

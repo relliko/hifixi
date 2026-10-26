@@ -78,7 +78,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.34;
+	constexpr double kVersion = 0.35;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -235,6 +235,7 @@ class hifixi final : public IPlugin
 	uint32_t m_zone = 0;         // (the zone the zone files were last asked for)
 	bool m_zoneslot_refused = false; // (the zone slot couldn't be marked: not tried again until its option goes off and on)
 	bool m_native_refused = false;   // (likewise the native zone draw)
+	bool m_casters_set = false;      // (the characters' sun shadows handed to World FX: worldfx::set_casters)
 	bool m_charslot_refused = false; // (native characters: likewise the character slots)
 	bool m_chardata_refused = false; // (native characters: likewise the model draw's stub)
 	bool m_nativechars_refused = false; // (native characters: likewise their renderer)
@@ -515,6 +516,12 @@ class hifixi final : public IPlugin
 		if (!native_chars_wanted())
 			m_nativechars_refused = false;
 		hifi::chars::inject::set_options(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault));
+		// (their sun shadows from their meshes: World FX calls for them in its shading pass, once its renderer is up)
+		if (!m_casters_set && hifi::chars::inject::ready())
+		{
+			worldfx::set_casters(hifi::chars::inject::caster_hook(), nullptr);
+			m_casters_set = true;
+		}
 		const uint64_t sent = hifi::game::charslot::get_counts().sent[3], seen = hifi::chars::marks::get_counts().end;
 		const bool flowing = sent != 0 && seen + 8 >= sent;
 		hifi::game::charmodel::set_native(want && flowing && hifi::chars::inject::ready());
