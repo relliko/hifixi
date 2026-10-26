@@ -78,7 +78,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.36;
+	constexpr double kVersion = 0.37;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -235,6 +235,28 @@ class hifixi final : public IPlugin
 	uint32_t m_zone = 0;         // (the zone the zone files were last asked for)
 	bool m_zoneslot_refused = false; // (the zone slot couldn't be marked: not tried again until its option goes off and on)
 	bool m_native_refused = false;   // (likewise the native zone draw)
+	// Whether the end markers sent are coming through to Direct3D 12 (the native draws are left to HiFi XI only then): over
+	// the last kWindow presents, at least one ever seen and no more than 8 fewer seen than sent. (The totals since the start
+	// were compared before: 97 markers lost once, at a zone change or a stall, left native drawing off for the rest of
+	// the session, in game 2026-10-26.)
+	struct marker_flow
+	{
+		static constexpr uint32_t kWindow = 32;
+		uint64_t sent[kWindow] = {}, seen[kWindow] = {};
+		uint32_t at = 0, filled = 0;
+		bool update(uint64_t s, uint64_t e)
+		{
+			const uint32_t oldest = filled < kWindow ? 0 : at;
+			const uint64_t s0 = filled != 0 ? sent[oldest] : s, e0 = filled != 0 ? seen[oldest] : e;
+			sent[at] = s;
+			seen[at] = e;
+			at = (at + 1) % kWindow;
+			filled = std::min(filled + 1, kWindow);
+			const uint64_t ds = s - std::min(s, s0), de = e - std::min(e, e0);
+			return s != 0 && e != 0 && de + 8 >= ds;
+		}
+	};
+	marker_flow m_zone_flow, m_char_flow;
 	bool m_casters_set = false;      // (the characters' sun shadows handed to World FX: worldfx::set_casters)
 	bool m_zone_casters_set = false; // (the zone's sun shadow cascades handed to World FX: worldfx::set_zone_casters)
 	bool m_charslot_refused = false; // (native characters: likewise the character slots)
@@ -523,8 +545,7 @@ class hifixi final : public IPlugin
 			worldfx::set_casters(hifi::chars::inject::caster_hook(), nullptr);
 			m_casters_set = true;
 		}
-		const uint64_t sent = hifi::game::charslot::get_counts().sent[3], seen = hifi::chars::marks::get_counts().end;
-		const bool flowing = sent != 0 && seen + 8 >= sent;
+		const bool flowing = m_char_flow.update(hifi::game::charslot::get_counts().sent[3], hifi::chars::marks::get_counts().end);
 		hifi::game::charmodel::set_native(want && flowing && hifi::chars::inject::ready());
 	}
 
@@ -563,8 +584,7 @@ class hifixi final : public IPlugin
 	void native_gate()
 	{
 		const bool want = hifi::game::zonedraw::in() && hifi::game::option_on("zone", "native", hifi::zone::options::kNativeByDefault);
-		const uint64_t sent = hifi::game::zoneslot::get_counts().sent[1], seen = hifi::backend::zone_ends_seen();
-		const bool flowing = sent != 0 && sent - std::min(sent, seen) <= 8;
+		const bool flowing = m_zone_flow.update(hifi::game::zoneslot::get_counts().sent[1], hifi::backend::zone_ends_seen());
 		hifi::game::zonedraw::set_state(want, hifi::zone::native::ready_zone(0), hifi::zone::native::ready_zone(1), flowing && hifi::zone::inject::ready());
 	}
 
