@@ -442,6 +442,12 @@ int main()
 		zd::on_slot(0, 24, R);
 		check(run(MK, O, R, T, 0) == 1, "the Direct3D 12 side not ready: the game draws it");
 		zd::on_slot(1, 24, R);
+		// A zone change: no data on the GPU, a pass 16 after seq 21 (same slot): its end mustn't find 21's frame
+		check(hifi::zone::published(21 & 15) != nullptr, "seq 21's frame still there before");
+		zd::set_state(true, nullptr, nullptr, true);
+		zd::on_slot(0, 37, R);
+		zd::on_slot(1, 37, R);
+		check(hifi::zone::published(37 & 15) == nullptr, "  a pass with no zone data: its slot unpublished (not seq 21's frame and its data let go)");
 		zd::set_state(false, nullptr, nullptr, false);
 
 		// Back

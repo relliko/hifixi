@@ -410,6 +410,9 @@ namespace hifi::game::zonedraw
 			g.renderer = renderer;
 			g.native = false;
 			g.f = nullptr;
+			// (this seq's slot unpublished first, drawn or not: else its end marker finds the frame 16 passes back, whose
+			// zone data may be let go by now, as at a zone change)
+			zone::frame &slot = zone::frame_slot(seq);
 			const char *why = nullptr;
 			zone::gpu_zone *const z = g.zones[0];
 			if (!g.in)
@@ -425,7 +428,7 @@ namespace hifi::game::zonedraw
 			g.n.gate = why != nullptr ? why : "";
 			if (why != nullptr)
 				return;
-			g.f = &zone::frame_slot(seq);
+			g.f = &slot;
 			g.f->native = true;
 			g.f->no_bump = false;
 			g.f->zone = z;

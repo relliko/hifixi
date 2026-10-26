@@ -78,7 +78,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.32;
+	constexpr double kVersion = 0.33;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
