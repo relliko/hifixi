@@ -23,7 +23,8 @@ namespace vistest
 		glow_fade = 1, // 04E6FF: an effect element's fade (a lamp's light: its brightness in the game's light table)
 		flare = 2,     // 054AE2: the sun's lens flare
 		door = 3,      // 0AC894: a door's 'hidden' bit (targeting reads it)
-		kinds = 4,
+		actor = 4,     // 0CC688: a character's or monster's (0 hides it: not drawn, no name, not targetable)
+		kinds = 5,
 	};
 
 	// A test as the game asks it: its screen box (viewport pixels, any corner order), the depth tested at (NDC z), and

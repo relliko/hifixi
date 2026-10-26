@@ -1030,6 +1030,23 @@ namespace
 		const uintptr_t mw = exp::where().walls, mp = exp::where().proxy;
 		check(exp::toggle("occlusion").on && exp::toggle("walls").on && exp::toggle("sse").on && exp::toggle("batch").on && exp::toggle("dedupe").on,
 			"everything on");
+		// The characters' test answered elsewhere (World FX's VisTest takes the call: set_actors_elsewhere): walls lets go
+		// at once (its call the game's test again) and update() keeps it off; occlusion's frame check made 'every frame'
+		// (xor eax, eax; xor edi, edi). Given back: walls on again, occlusion at its rate again.
+		{
+			const uintptr_t occl_at = exp::where().occlusion;
+			const std::string every = std::string("\x31\xC0\x31\xFF", 4) + std::string(8, '\x90');
+			exp::set_actors_elsewhere(true);
+			const bool let_go = !exp::toggle("walls").on && !exp::walls_holding() && bytes_at(d.walls_call + 1, 4) == d.walls_rel;
+			exp::update();
+			const bool kept_off = !exp::toggle("walls").on && !exp::walls_holding();
+			const bool every_frame = occl_at != 0 && bytes_at(occl_at, 12) == every && contains(exp::toggle("occlusion").stat, "every frame");
+			check(let_go && kept_off, "the characters' test elsewhere: walls lets go of its call at once (the game's test again) and stays off");
+			check(every_frame, "  occlusion: every character tested every frame");
+			exp::set_actors_elsewhere(false);
+			exp::update();
+			check(exp::toggle("walls").on && exp::walls_holding() && bytes_at(occl_at, 12) != every, "given back: walls on again, occlusion at its rate");
+		}
 		exp::stop();
 		check(memory_free(mw) && memory_free(mp), "stop(): our memory freed");
 		put_bytes(d.renderer_global, renderer_was);

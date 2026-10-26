@@ -168,7 +168,7 @@ namespace hifi::game::hifps::exp
 			bool on[kCount] = {};
 			std::string err[kCount];          // why it could not be turned on
 			std::vector<uintptr_t> ashita;    // patched jumps
-			bool occl = false;                // the occlusion test's bytes (and the m written, 0: none yet)
+			bool occl = false;                // the occlusion test's bytes (and the m written, 0: none yet; kEveryFrame)
 			uintptr_t occl_addr = 0;
 			uint32_t occl_m = 0;
 			walls_state walls;
@@ -191,6 +191,7 @@ namespace hifi::game::hifps::exp
 			bool enabled = false, restore_pending = false;
 			bool wanted[kCount] = {};
 			bool wanted_force = false;
+			bool actors_elsewhere = false;    // the characters' test is World FX's VisTest's (set_actors_elsewhere)
 			std::vector<std::string> said;    // what the addon would have printed, the last few
 		};
 		state g;
@@ -748,8 +749,17 @@ namespace hifi::game::hifps::exp
 
 		// ---------------------------------------------------------------- occlusion
 
+		// (m kEveryFrame: 'xor eax, eax; xor edi, edi': the frame and the phase compared equal, a test every frame)
+		constexpr uint32_t kEveryFrame = 0xFFFFFFFFu;
+
 		void occl_bytes(uint32_t m, uint8_t out[12])
 		{
+			if (m == kEveryFrame)
+			{
+				const uint8_t b[12] = { 0x31, 0xC0, 0x31, 0xFF, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+				std::memcpy(out, b, 12);
+				return;
+			}
 			const uint8_t sh = uint8_t(std::floor(std::log(double(m)) / std::log(2.0) + 0.5));
 			const uint8_t b[12] = { 0x83, 0xE0, uint8_t(4 * m - 1), 0xC1, 0xE7, sh, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
 			std::memcpy(out, b, 12);
@@ -758,6 +768,8 @@ namespace hifi::game::hifps::exp
 		// 3% slack: a frame limit of 120 measures as 119.9fps and should still count as 120.
 		uint32_t occl_m()
 		{
+			if (g.actors_elsewhere)
+				return kEveryFrame;
 			uint32_t m = 1;
 			while (m < 16 && m * 2 <= hifps::fps() * 1.03 / 60)
 				m *= 2;
@@ -1269,7 +1281,8 @@ namespace hifi::game::hifps::exp
 				return "nothing uses the draw events (" + g.checked + ")";
 			}
 			else if (n == kOcclusion && g.occl)
-				return fmt("every %u frames at %.0f fps", 4 * (g.occl_m != 0 ? g.occl_m : 1), hifps::fps());
+				return g.occl_m == kEveryFrame ? std::string("every frame (World FX's VisTest answers the characters' test)")
+												: fmt("every %u frames at %.0f fps", 4 * (g.occl_m != 0 ? g.occl_m : 1), hifps::fps());
 			else if (n == kWalls && g.walls.base != 0 && g.walls.site != 0)
 			{
 				// r: tests, segments, hidden, shown without a clear segment, over budget, the client's test, ticks (a second)
@@ -1311,6 +1324,26 @@ namespace hifi::game::hifps::exp
 		}
 	}
 
+	void set_actors_elsewhere(bool on)
+	{
+		if (g.actors_elsewhere == on)
+			return;
+		g.actors_elsewhere = on;
+		if (on && g.on[kWalls])
+		{
+			// (at once: VisTest waits for the call)
+			g.wanted[kWalls] = false;
+			exp_toggle(kWalls, false, false);
+		}
+		if (g.occl)
+			occl_set(occl_m());
+	}
+
+	bool walls_holding()
+	{
+		return g.walls.site != 0;
+	}
+
 	void set_ashita(void *ashita_core)
 	{
 		g_core = static_cast<IAshitaCore *>(ashita_core);
@@ -1343,6 +1376,8 @@ namespace hifi::game::hifps::exp
 		bool wanted[kCount];
 		for (int n = 0; n < kCount; ++n)
 			wanted[n] = option_on(kSection, kOptions[n], true); // (each on unless turned off: the frame rate's options are on by default)
+		// (walls off while World FX's VisTest answers the characters' test: the call is VisTest's then)
+		wanted[kWalls] = wanted[kWalls] && !g.actors_elsewhere;
 		const bool force = option_on(kSection, "ashita_force", false);
 		if (g.restore_pending)
 		{

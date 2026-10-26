@@ -3419,6 +3419,7 @@ extern "C" __declspec(dllexport) uintptr_t __cdecl worldfx_vis_entry(uint32_t ki
 	case vistest::glow_fade: return reinterpret_cast<uintptr_t>(&vis_entry<vistest::glow_fade>);
 	case vistest::flare: return reinterpret_cast<uintptr_t>(&vis_entry<vistest::flare>);
 	case vistest::door: return reinterpret_cast<uintptr_t>(&vis_entry<vistest::door>);
+	case vistest::actor: return reinterpret_cast<uintptr_t>(&vis_entry<vistest::actor>);
 	default: return 0;
 	}
 }
@@ -3436,6 +3437,15 @@ extern "C" __declspec(dllexport) void __cdecl worldfx_vis_setup(uintptr_t origin
 	}
 	if (!vis_wanted.load())
 		vistest::reset();
+}
+
+// The characters' and monsters' tests (vistest::actor: kept apart from worldfx_vis_stats, whose 12 words the
+// worldfx Ashita addon reads too): out[0] asked for, out[1] answers kept for them
+extern "C" __declspec(dllexport) void __cdecl worldfx_vis_actors(uint32_t out[2])
+{
+	const vistest::stats s = vistest::get_stats();
+	out[0] = uint32_t(s.by_kind[vistest::actor]);
+	out[1] = s.objects;
 }
 
 // For /worldfx vistest: out[0] tests answered from the depth copy, [1] run by the game, [2] boxes sent to the GPU,
@@ -3459,7 +3469,7 @@ extern "C" __declspec(dllexport) void __cdecl worldfx_vis_stats(uint32_t out[12]
 	}
 	out[5] = uint32_t(s.dropped + skipped);
 	out[6] = s.last_answer_ms != 0 ? uint32_t(std::min<uint64_t>(now - s.last_answer_ms, UINT32_MAX - 1)) : UINT32_MAX;
-	for (uint32_t k = 0; k < vistest::kinds; ++k)
+	for (uint32_t k = 0; k < 4; ++k) // (glow, fade, flare, door: the characters' are worldfx_vis_actors')
 		out[7 + k] = uint32_t(s.by_kind[k]);
 	out[11] = on ? 1u : 0u;
 }

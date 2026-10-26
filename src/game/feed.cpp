@@ -174,24 +174,29 @@ namespace hifi::game::feed
 		// The game's visibility tests (FFXiMain 06C280; client-notes "The visibility test, and a replacement that
 		// doesn't wait"): a screen box drawn against the scene's depth and read back from the GPU, which waits for the
 		// GPU to finish the frame so far. Glows, every effect element's fade, the sun's lens flare and doors test every
-		// frame. With World FX's VisTest setting on, these four calls go to its entries (worldfx_vis_entry), which
-		// answer from its copy of the world's depth a few frames late, without waiting; the game's own test still runs
-		// for a test object with no answer yet and while none come in. (Characters' calls are left to hifps's walls.)
-		// Put back when the setting goes off, and on unload.
+		// frame. With World FX's VisTest setting on, these calls go to its entries (worldfx_vis_entry), which answer
+		// from its copy of the world's depth a few frames late, without waiting; the game's own test still runs while
+		// none come in. Characters' and monsters' too (0CC688, the actor draw; their test every frame then, as hifps's
+		// occlusion has it: set_actor_handoff), in place of hifps's walls, which guessed from the zone's collision and
+		// hid characters behind walls that weren't drawn there (in game, 2026-10-26): optional, the other four work
+		// without it. Put back when the setting goes off, and on unload.
 		struct vis_site_info
 		{
 			const char *name, *pattern;
 			uint32_t at, kind;
+			bool optional;
 		};
 		const vis_site_info kVisSites[] = {
 			// push ecx; push edx; mov ecx, esi; call test; test eax, eax; je; mov al, 1 (a glow: drawn or not)
-			{ "glow", "51528BCEE8????????85C07407B0015E83C410C3", 4, 0 },
+			{ "glow", "51528BCEE8????????85C07407B0015E83C410C3", 4, 0, false },
 			// push ecx; push edx; mov ecx, esi; call test; mov [esp+18h], eax; fild [esp+18h]; pop esi (an element's fade)
-			{ "glow fade", "51528BCEE8????????89442418DB4424185E", 4, 1 },
+			{ "glow fade", "51528BCEE8????????89442418DB4424185E", 4, 1, false },
 			// push eax; push ecx; lea ecx, [esi+17Fh]; call test; mov edi, eax (the sun's lens flare)
-			{ "lens flare", "50518D8E7F010000E8????????8BF88B8604010000", 8, 2 },
+			{ "lens flare", "50518D8E7F010000E8????????8BF88B8604010000", 8, 2, false },
 			// push ecx; push edx; lea ecx, [esi+88Ch]; call test; test eax, eax; je (a door; its 'hidden' bit)
-			{ "door", "51528D8E8C080000E8????????85C00F84", 8, 3 },
+			{ "door", "51528D8E8C080000E8????????85C00F84", 8, 3, false },
+			// lea ecx, [esi+8F0h]; call test; cmp eax, ebp; mov [esi+9F4h], eax (a character's or monster's: 0 hides it)
+			{ "characters", "8D8EF0080000E8????????3BC58986F4", 6, 4, true },
 		};
 		// The test's first bytes: mov eax, [renderer]; push ebx; push esi; mov esi, ecx; mov bl, [eax+828h] (0: any byte)
 		const uint8_t kVisTest[] = { 0xA1, 0, 0, 0, 0, 0x53, 0x56, 0x8B, 0xF1, 0x8A, 0x98, 0x28, 0x08, 0x00, 0x00 };
@@ -208,8 +213,12 @@ namespace hifi::game::feed
 			std::vector<vis_site> sites; // (empty: the game's own)
 			bool tried = false;
 			std::string why;
+			bool actors = false;       // the characters' call among them
+			std::string actors_why;    // why not, when it isn't
 		};
 		vis_state g_vis;
+		void (*g_actors_elsewhere)(bool) = nullptr;
+		bool (*g_walls_holding)() = nullptr;
 
 		// The Mog House: the party data keeps the town's zone there, so World FX drew the town's grass, water and
 		// shadows in the room (in game, 2026-10-21). The zone-in packet (0x00A, read only) says where you are: its login
@@ -831,6 +840,9 @@ namespace hifi::game::feed
 			if (!g_vis.sites.empty())
 				worldfx_vis_setup(0, 0);
 			g_vis.sites.clear();
+			g_vis.actors = false;
+			if (g_actors_elsewhere != nullptr)
+				g_actors_elsewhere(false); // (walls may have it again)
 		}
 
 		bool vis_on(std::string &why)
@@ -839,12 +851,18 @@ namespace hifi::game::feed
 				return true;
 			std::vector<vis_site> found;
 			uint32_t test = 0;
+			g_vis.actors_why.clear();
 			for (const vis_site_info &s : kVisSites)
 			{
 				const uintptr_t m = find(s.pattern);
 				if (m == 0)
 				{
 					why = std::string("the ") + s.name + "'s call wasn't found";
+					if (s.optional)
+					{
+						g_vis.actors_why = why;
+						continue;
+					}
 					return false;
 				}
 				const uintptr_t site = m + s.at;
@@ -852,6 +870,11 @@ namespace hifi::game::feed
 				if (test != 0 && t != test)
 				{
 					why = std::string("the ") + s.name + "'s call goes somewhere else (another addon hooks it)";
+					if (s.optional)
+					{
+						g_vis.actors_why = why;
+						continue;
+					}
 					return false;
 				}
 				test = t;
@@ -885,6 +908,7 @@ namespace hifi::game::feed
 					return false;
 				}
 				f.entry = entry;
+				g_vis.actors = g_vis.actors || f.kind == 4;
 			}
 			return true;
 		}
@@ -896,9 +920,16 @@ namespace hifi::game::feed
 			const bool want = setting_on("VisTest", true) && worldfx_drawing() != 0;
 			if (want && g_vis.sites.empty() && !g_vis.tried)
 			{
+				// (the characters' call: walls told to let go, the calls taken once it has, a half second on at most)
+				if (g_actors_elsewhere != nullptr)
+					g_actors_elsewhere(true);
+				if (g_walls_holding != nullptr && g_walls_holding())
+					return;
 				g_vis.tried = true;
 				std::string why;
 				g_vis.why = vis_on(why) ? std::string() : why;
+				if (g_actors_elsewhere != nullptr && !g_vis.actors)
+					g_actors_elsewhere(false); // (not VisTest's after all: walls may have it again)
 			}
 			else if (!want)
 			{
@@ -922,8 +953,9 @@ namespace hifi::game::feed
 				std::snprintf(since, sizeof(since), "none yet");
 			else
 				std::snprintf(since, sizeof(since), "%u ms ago", b[6]);
-			std::snprintf(line, sizeof(line), "answered from World FX's depth copy %u times, by the game's own test %u; %u boxes tested on the GPU, %u answers back (last %s), %u objects known, %u dropped; asked by glows %u, fades %u, the flare %u, doors %u",
-				b[0], b[1], b[2], b[3], since, b[4], b[5], b[7], b[8], b[9], b[10]);
+			std::snprintf(line, sizeof(line), "answered from World FX's depth copy %u times, by the game's own test %u; %u boxes tested on the GPU, %u answers back (last %s), %u objects known, %u dropped; asked by glows %u, fades %u, the flare %u, doors %u; characters: %s",
+				b[0], b[1], b[2], b[3], since, b[4], b[5], b[7], b[8], b[9], b[10],
+				g_vis.actors ? "answered here too (every frame)" : ("left to hifps (" + (g_vis.actors_why.empty() ? std::string("not taken") : g_vis.actors_why) + ")").c_str());
 			return line;
 		}
 
@@ -1031,6 +1063,12 @@ namespace hifi::game::feed
 		g_zone.mog_house = data[0x80] == 1 ? uint32_t(data[0xAA] | (data[0xAB] << 8)) + 1 : 0;
 	}
 
+	void set_actor_handoff(void (*elsewhere)(bool on), bool (*walls_holding)())
+	{
+		g_actors_elsewhere = elsewhere;
+		g_walls_holding = walls_holding;
+	}
+
 	void stop()
 	{
 		publish_zone(0);
@@ -1104,7 +1142,7 @@ namespace hifi::game::feed
 			: g_shadows.off ? "left out (HiFi XI casts characters' shadows)" : "drawn (HiFi XI isn't casting characters' shadows here now)"));
 		out.push_back("the game's water: " + gamewater::status());
 		out.push_back("the game's weather: " + gamerain::status());
-		out.push_back("visibility tests (glows, lamps, the flare, doors): " + vis_status());
+		out.push_back("visibility tests (glows, lamps, the flare, doors, characters): " + vis_status());
 		return out;
 	}
 }

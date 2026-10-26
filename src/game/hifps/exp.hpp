@@ -30,6 +30,11 @@ namespace hifi::game::hifps::exp
 	// Every present (now: seconds): walls' kept actors each frame; once a second the occlusion rate (from
 	// hifps::fps()), the counters, the 'ashita' watch (exp_tick)
 	void present(double now);
+	// The characters' visibility test answered elsewhere (World FX's VisTest, from its depth copy: src/game/feed.cpp): walls
+	// is kept off while so (its call is VisTest's then), and occlusion has every character tested every frame (an answer
+	// costs nothing there) instead of every 4m-th. walls_holding: whether walls still has the call (VisTest waits for it).
+	void set_actors_elsewhere(bool on);
+	bool walls_holding();
 	// Everything put back (only over our own bytes), the memory freed when nothing points into it, all forgotten
 	void stop();
 	// The stream log's tap on the game's draws (src/backend/streamlog): the client device's DrawPrimitive,

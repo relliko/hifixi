@@ -29,6 +29,10 @@ namespace hifi::game::feed
 	void packet_in(uint16_t id, const uint8_t *data, uint32_t size, const entities &e);
 	// Everything put back (the plugin unloaded) and forgotten
 	void stop();
+	// The characters' visibility test (0CC688) is shared with hifps's walls, which points the same call at its own code:
+	// VisTest tells it to let go (elsewhere(true)) and takes the call once walls_holding() says it has; elsewhere(false)
+	// gives it back. main.cpp passes hifps::exp's; none given (the tests): the call is taken as it is.
+	void set_actor_handoff(void (*elsewhere)(bool on), bool (*walls_holding)());
 	// What it's doing, for /hifi status and the menu
 	std::vector<std::string> status();
 	// The zone told to World FX (1000 + the room's model in a Mog House), 0 before the first

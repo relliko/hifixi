@@ -523,15 +523,17 @@ namespace
 			}
 		}
 
-		// 7. The visibility tests: pointed at World FX's entries with VisTest on, put back with it off
+		// 7. The visibility tests: pointed at World FX's entries with VisTest on, put back with it off. The characters' call
+		// too, once walls (a stand-in for hifps's: told to let go, holding it for one more half second) has let go of
+		// it; given back to walls after.
 		{
 			const char *const patterns[] = { "51528BCEE8????????85C07407B0015E83C410C3", "51528BCEE8????????89442418DB4424185E",
-				"50518D8E7F010000E8????????8BF88B8604010000", "51528D8E8C080000E8????????85C00F84" };
-			const uint32_t offsets[] = { 4, 4, 8, 8 };
-			uintptr_t sites[4] = {};
+				"50518D8E7F010000E8????????8BF88B8604010000", "51528D8E8C080000E8????????85C00F84", "8D8EF0080000E8????????3BC58986F4" };
+			const uint32_t offsets[] = { 4, 4, 8, 8, 6 };
+			uintptr_t sites[5] = {};
 			uint32_t test = 0;
 			bool found = true;
-			for (int i = 0; i < 4; ++i)
+			for (int i = 0; i < 5; ++i)
 			{
 				const uintptr_t m = hifi::game::find(patterns[i]);
 				found = found && m != 0;
@@ -539,21 +541,33 @@ namespace
 				if (m != 0)
 					test = hifi::game::rel_target(sites[i]);
 			}
-			check(found, "the four visibility test calls found");
+			check(found && hifi::game::rel_target(sites[4]) == test, "the five visibility test calls found (the characters' too, to the same test)");
+			static std::vector<int> told; // (the stand-in walls: what it was told; holding while g_holding)
+			static bool g_holding = true;
+			told.clear();
+			hifi::game::feed::set_actor_handoff([](bool on) { told.push_back(on ? 1 : 0); }, []() { return g_holding; });
 			g_settings["VisTest"] = "1";
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
+			const bool waited = found && hifi::game::rel_target(sites[0]) == test && hifi::game::rel_target(sites[4]) == test && !told.empty() && told.back() == 1;
+			g_holding = false;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
 			bool pointed = found;
-			for (int i = 0; i < 4 && found; ++i)
+			for (int i = 0; i < 5 && found; ++i)
 				pointed = pointed && hifi::game::rel_target(sites[i]) == 0x31000000u + uint32_t(i) * 0x10;
-			check(pointed && g_sent.vis_original == test && g_sent.vis_on == 1, "VisTest on: each call pointed at World FX's entry for its kind, World FX told the game's test");
+			check(waited, "VisTest on while walls holds the characters' call: walls told to let go, nothing pointed yet");
+			check(pointed && g_sent.vis_original == test && g_sent.vis_on == 1 && told.back() == 1,
+				"once it has: each call pointed at World FX's entry for its kind (the characters' as actors), World FX told the game's test");
 			g_settings["VisTest"] = "0";
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			bool back = found;
-			for (int i = 0; i < 4 && found; ++i)
+			for (int i = 0; i < 5 && found; ++i)
 				back = back && hifi::game::rel_target(sites[i]) == test;
-			check(back && g_sent.vis_on == 0, "VisTest off: the calls back to the game's test");
+			check(back && g_sent.vis_on == 0 && told.back() == 0, "VisTest off: the calls back to the game's test, the characters' given back to walls");
+			hifi::game::feed::set_actor_handoff(nullptr, nullptr);
+			g_holding = true;
 		}
 
 		// 8. The game's water and rain: routed as their settings say (their own tests check the routines and lists)

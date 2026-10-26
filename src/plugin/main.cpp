@@ -78,7 +78,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.37;
+	constexpr double kVersion = 0.38;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -660,6 +660,8 @@ public:
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&now_seconds), &self);
 		hifi::backend::set_log_sink(ashita_log);
 		hifi::game::hifps::exp::set_ashita(core);
+		// (the characters' visibility test: World FX's VisTest takes it from walls, and gives it back)
+		hifi::game::feed::set_actor_handoff(hifi::game::hifps::exp::set_actors_elsewhere, hifi::game::hifps::exp::walls_holding);
 		// (the stream log's view of the game's draws: a tap on the client device, the hifps proxy's slots when it's in)
 		hifi::backend::streamlog::set_d3d8_tap(hifi::game::hifps::exp::draw_tap, hifi::game::hifps::exp::draw_untap);
 		// (the zone pass's begin and end to the native zone draw)
