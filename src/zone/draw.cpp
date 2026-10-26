@@ -79,7 +79,10 @@ float3 dir_light(object o, float3 d)
 }
 float4 unpack(uint c) { return float4((c >> 16) & 255, (c >> 8) & 255, c & 255, c >> 24) / 255.0; }
 
-// The object's lamps (point lights: attenuation 1 / (a2 d^2) within their range)
+// The object's lamps (point lights: attenuation 1 / (a2 d^2) within their range). The game's light stops dead at its
+// range, still at an eighth of its colour (a2 0.5, range 3-6): a hard circle round each lamp that the eye takes for a
+// dark ring past it (in game, 2026-10-26; the game's own drawing has it too, softened by its vertices). Here it fades
+// to none over the outer 40% of the range instead.
 float3 lamp_light(object o, float3 world, float3 n)
 {
 	float3 sum = 0;
@@ -94,9 +97,11 @@ float3 lamp_light(object o, float3 world, float3 n)
 			continue;
 		const float3 d = l.pos - world;
 		const float d2 = dot(d, d);
-		if (d2 > l.range * l.range)
+		const float r2 = l.range * l.range;
+		if (d2 > r2)
 			continue;
-		sum += l.colour * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(l.att2 * d2, 1e-3);
+		const float edge = 1.0 - smoothstep(0.36, 1.0, d2 / max(r2, 1e-6));
+		sum += edge * l.colour * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(l.att2 * d2, 1e-3);
 	}
 	return sum;
 }

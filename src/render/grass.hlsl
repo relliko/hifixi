@@ -2283,6 +2283,13 @@ bool on_screen(float3 w, out int2 q, out float depth, out float2 ndc)
 	return c.w > 0.2 && all(abs(ndc) < 1.0);
 }
 
+// The pixel at ndc, or at the screen's edge where ndc is past it (for a point ahead of the camera)
+int2 edge_texel(float2 ndc)
+{
+	float2 e = clamp(ndc, -1.0, 1.0);
+	return clamp(int2((e.x * 0.5 + 0.5) * ground.y, (0.5 - e.y * 0.5) * ground.z), int2(0, 0), int2(ground.yz) - 1);
+}
+
 // The sky the add-on guesses toward r when the screen doesn't show it: from the time of day; with the
 // zone's fog colour (the world's clear, when the add-on sends it) along the horizon
 float3 sky_guess(float3 r)
@@ -2296,17 +2303,26 @@ float3 sky_guess(float3 r)
 // Blended in toward the screen's edges and from 80 to 160 yalms, so nothing switches outright as the
 // camera turns. (It used to fall back on the sky along the top of the screen, one average for all the
 // water: each time a treetop crossed one of its points, all of the water's sky changed at once.)
+// Toward and just past the screen's sides, what's drawn at the side stands in: a guess faded in toward the sides
+// made a band of the sky's colour down them, over water mirroring a cliff, that moved with the camera (in game,
+// 2026-10-26).
 float3 sky_toward(float3 r)
 {
 	float3 guess = sky_guess(r);
 	int2 q;
 	float d;
 	float2 ndc;
-	if (!on_screen(eye.xyz + r * 4000.0, q, d, ndc))
+	on_screen(eye.xyz + r * 4000.0, q, d, ndc);
+	if (d <= 0.2 || abs(ndc.y) >= 1.0)
 		return guess;
+	q = edge_texel(ndc);
 	float z = drawn_depth(q);
+	// (only what's far off: nearer, the march would have found it. Faded toward the top and bottom, where what's
+	// past the edge is unknown (looking down at water, its sky far above the screen's top); not toward the sides:
+	// just past one, the edge's own pixel, fading to the guess by half a screen past)
 	float far = z > 1e8 ? 1.0 : smoothstep(80.0, 160.0, z);
-	return lerp(guess, texel(q), far * saturate((1.0 - max(abs(ndc.x), abs(ndc.y))) / 0.15));
+	float sides = 1.0 - smoothstep(1.0, 1.5, abs(ndc.x));
+	return lerp(guess, texel(q), far * sides * saturate((1.0 - abs(ndc.y)) / 0.15));
 }
 
 // The rings spreading from characters and monsters moving through the water. From the add-on, two float4s
@@ -2455,7 +2471,8 @@ float4 water_ps(water_v2p i) : SV_Target
 	// Reflected: the ray off the surface marched along the depth copy, sixteen steps each 1.42 times the last
 	// from 0.4 yalms (to some 80); the first step just behind what's drawn there is a hit, narrowed down with
 	// five halvings between it and the step before. How much it's trusted fades where the ray, narrowed down,
-	// still passes well behind what's drawn (behind a trunk, not into it), toward the screen's edges and far
+	// still passes well behind what's drawn (behind a trunk, not into it), toward the screen's top and bottom (at its
+// sides only over the last 1%: a wider fade there was a band down each side that followed the camera) and far
 	// out, so a reflection fades in and out as the camera moves instead of switching. (No start turned per
 	// pixel any more: a pattern fixed to the screen that the water slid under, a shimmer as the camera moved.)
 	// Fixed runs, each read on its own (no loop that waits on a read to go on).
@@ -2501,7 +2518,7 @@ float4 water_ps(water_v2p i) : SV_Target
 		q = clamp(q, int2(0, 0), int2(ground.yz) - 1);
 		float thick = 0.5 + 0.02 * d;
 		float trust = (1.0 - smoothstep(0.5 * thick, thick, d - drawn_depth(q))) *
-			saturate((1.0 - max(abs(ndc.x), abs(ndc.y))) / 0.1) * (1.0 - smoothstep(40.0, 80.0, hi)) * near_water;
+			saturate((1.0 - abs(ndc.y)) / 0.1) * saturate((1.0 - abs(ndc.x)) / 0.02) * (1.0 - smoothstep(40.0, 80.0, hi)) * near_water;
 		mirrored = lerp(mirrored, texel(q), trust);
 	}
 	// (how much water reflects at this angle: 2% looking straight down, all of it along the surface)
