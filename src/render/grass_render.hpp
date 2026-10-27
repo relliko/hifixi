@@ -353,6 +353,13 @@ namespace grass
 		bool snow_trails = false;
 		float snowfall = 0.0f;
 		float snow_sway = 0.35f;
+		// Light in the air (vol_ps, laid over everything by the air pass; needs the sun's shadow map): sun shafts (vol_light:
+		// how strong, 0 none) in the light's colour (vol_light_color: the sun's, the moon's by night), and the air itself
+		// (vol_density: how much there is a yalm at the ground, 0 none), thinning with height, in its own colour (vol_air:
+		// the game's fog's, or the sky's); the march's steps a pixel
+		float vol_light = 0.0f, vol_density = 0.0f;
+		float vol_light_color[3] = { 1.0f, 0.95f, 0.85f }, vol_air[3] = { 0.6f, 0.65f, 0.7f };
+		uint32_t vol_steps = 24;
 		float snow_light[3] = { 0.85f, 0.87f, 0.9f };
 		// A sky of its own, in the shading pass, on the pixels where the zone drew nothing (the game's sky dome doesn't
 		// write depth: what's left there is the cleared depth): the weather record's gradient again, evaluated for each
@@ -538,6 +545,7 @@ namespace grass
 		bool weather = false;       // the weather of its own's parameters went to the passes (look::wx)
 		bool shimmer = false;       // heat shimmer in the shading pass
 		bool air = false;           // the air pass at the end (dust, streaks, fog banks) or the lightning's flash after it
+		bool volumetric = false;    // the light in the air worked out (and laid over everything by the air pass)
 		bool clouds = false;        // the clouds' own pass ran (cloud_ps, at a quarter of the world's size)
 		bool clouds_carried = false; // ... carrying the last frame's picture over (false: every pixel of it marched)
 		bool cloud_shadows = false; // ... and their shadows' map made, for the shading pass
@@ -715,6 +723,7 @@ namespace grass
 		void finish_timing(ID3D12GraphicsCommandList *list, bool shaded);
 		ID3D12PipelineState *shade_pipeline_for(const target &t, std::string &error);
 		ID3D12PipelineState *sun_pipeline(std::string &error);
+		ID3D12PipelineState *vol_pipeline(std::string &error);
 		bool sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, UINT64 clouds, std::string &error);
 		ID3D12PipelineState *cloud_pipeline(std::string &error);
 		ID3D12PipelineState *trail_pipeline(std::string &error);
@@ -768,6 +777,9 @@ namespace grass
 		ID3D12Resource *_look_buf = nullptr;
 		UINT64 _look_buf_size = 0;
 		double _look_clock = 0.0;
+		// (what the bloom's first level was kept for last frame: its size and the buffer it's in)
+		uint32_t _look_history_w = 0, _look_history_h = 0;
+		ID3D12Resource *_look_history_buf = nullptr;
 		uint64_t _shader_key = 0;
 		bool _shaders_from_cache = false;
 		double _shader_seconds = 0.0;
@@ -777,6 +789,8 @@ namespace grass
 		ID3D12Resource *_rain_window = nullptr;
 		int32_t _rain_window_i = 0, _rain_window_j = 0;
 		ID3D12PipelineState *_sun_pso = nullptr; // the sun's shadows at half size (no render target: it writes _sun_mask)
+		ID3D12PipelineState *_vol_pso = nullptr; // the light in the air at half size (likewise)
+		std::vector<uint8_t> _vol_ps;
 		ID3D12Resource *_sun_mask = nullptr;     // what it works out, a uint for each of the world's pixels in four (UAV)
 		UINT64 _sun_mask_size = 0;
 		// Trails through settled snow (trail_ps, no render target): their map at the end of _sun_mask (kTrailBytes), the

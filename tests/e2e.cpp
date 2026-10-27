@@ -186,10 +186,10 @@ int main()
 		char hour[16] = "10";
 		if (GetEnvironmentVariableA("WFX_E2E_HOUR", hour, sizeof(hour)) == 0)
 			strcpy_s(hour, "10");
-		// (the look over the world off: the colour checks below look for the world's colours exactly as drawn; the look's
-		// own checks turn it on, as a menu does)
+		// (the look over the world off, and the light in the air: the colour checks below look for the world's colours
+		// exactly as drawn; the look's own checks turn it on, as a menu does)
 		std::fprintf(f, "[FFXI_WORLDFX]\nD3D12DebugLayer=1\nSunShadows=0.6\nSunCharacters=1\nTestVanadielHour=%s\nTestMoon=0.5476\nTestShadeMaxMs=500\nWetGround=1\nSky=1\n"
-			"Tonemap=0\nBloom=0\nColourGrade=0\n", hour);
+			"Tonemap=0\nBloom=0\nColourGrade=0\nVolLight=0\nVolFog=0\n", hour);
 		fclose(f);
 	}
 	// HiFi XI keeps its own settings: none yet, so it makes them from ReShade.ini above (once), and leaves that as it is

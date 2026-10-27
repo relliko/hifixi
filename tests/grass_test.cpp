@@ -586,6 +586,26 @@ int main(int argc, char **argv)
 			for (size_t i = 0; i < out2.size(); ++i)
 				most = std::max(most, std::abs(int(out2[i]) - int(dull[i])));
 			check(most <= 1, "L: nothing bright, no bloom (within the dither)");
+			// A small bright dot (3 x 3) moved a pixel at a time across 8: the glow beside it changes in even steps, not in
+			// one jump as the dot crosses from one of the first level's 4 x 4 blocks into the next (bright snow and stone
+			// crawled at their edges as the camera moved, 2026-10-27)
+			double glow[9] = {};
+			for (int s = 0; s <= 8; ++s)
+			{
+				const UINT x0 = LW / 2 - 4 + UINT(s);
+				const picture dot = make([&](UINT x, UINT y, uint8_t *q) {
+					const bool in = x >= x0 && x < x0 + 3 && y >= LH / 2 && y < LH / 2 + 3;
+					q[0] = q[1] = q[2] = in ? 255 : 40;
+				});
+				const picture o = frame(dot, l);
+				glow[s] = mean(o, LW / 2 + 8, LH / 2 - 4, LW / 2 + 14, LH / 2 + 7, 3) - 40.0;
+			}
+			double biggest = 0.0;
+			for (int s = 1; s <= 8; ++s)
+				biggest = std::max(biggest, std::fabs(glow[s] - glow[s - 1]));
+			const double range = std::fabs(glow[8] - glow[0]);
+			std::printf("  bloom from a dot moved a pixel at a time: glow beside it %.2f .. %.2f, biggest step %.2f\n", glow[0], glow[8], biggest);
+			check(range > 0.3 && biggest < 0.45 * range, "L: a small bright dot's glow moves smoothly as the dot does (no jumps between blocks)");
 		}
 		// The grade's direction (no tone mapping, no bloom)
 		{
@@ -1527,7 +1547,7 @@ int main(int argc, char **argv)
 				for (const char *vs : { "vs_main", "shade_vs", "shadow_vs", "water_vs", "water_debug_vs", "firefly_vs", "rain_vs", "splash_vs", "snow_vs", "leaf_vs", "snow_layer_vs" })
 					s += std::string("float4 ") + vs + "(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }\n";
 				for (const char *ps : { "ps_main", "shade_ps", "sun_ps", "shadow_ps", "water_ps", "water_debug_ps", "firefly_ps", "rain_ps", "splash_ps", "snow_ps", "vis_ps", "leaf_ps", "air_ps", "flash_ps", "cloud_ps", "cloud_shadow_ps", "look_first_ps",
-					"look_down_ps", "look_exposure_ps", "look_up_ps", "look_ps", "trail_ps", "snow_layer_ps" })
+					"look_down_ps", "look_exposure_ps", "look_up_ps", "look_ps", "trail_ps", "snow_layer_ps", "vol_ps" })
 					s += std::string("float4 ") + ps + "() : SV_Target { return float4(1, 0, 0, 1); }\n";
 				return s + "// " + std::to_string(n) + "\n";
 			};
@@ -1553,7 +1573,7 @@ int main(int argc, char **argv)
 			std::string cache_why;
 			const bool compiled = grass::compile_shaders(tiny(0), folder, first, from_first, cache_why);
 			const bool read_back = grass::compile_shaders(tiny(0), folder, again, from_again, cache_why);
-			check(compiled && !from_first && exists(file_of(tiny(0))) && first.blobs.size() == 34, "a source compiled is written to the cache");
+			check(compiled && !from_first && exists(file_of(tiny(0))) && first.blobs.size() == 35, "a source compiled is written to the cache");
 			check(read_back && from_again && again.blobs == first.blobs && again.key == first.key, "and read back from it the same");
 			grass::compile_shaders(tiny(0), std::wstring(), fresh, from_fresh, cache_why);
 			check(!from_fresh && fresh.blobs == first.blobs, "(the same as compiled without the cache)");
@@ -2192,6 +2212,9 @@ int main(int argc, char **argv)
 		bool with_box = false;
 		bool characters = false; // (the characters' sun shadows asked for: rule bit 4)
 		float bumps = 0.0f; // (the ground's depth made rough: bumps this high)
+		float air = 0.0f; // (the light in the air: its density a yalm, 0 none)
+		float air_light = 1.0f; // (its shafts' strength)
+		bool air_dark = false; // (its own colour black: only the sun's light added)
 		vec3 to_sun = {};
 		draw_stats last = {};
 		auto frame = [&](bool map, const camera &c) {
@@ -2219,6 +2242,11 @@ int main(int argc, char **argv)
 			l2.sun_shadow = 0.6f;
 			l2.sun_map = map;
 			l2.sun_characters = characters;
+			l2.vol_density = air;
+			l2.vol_light = air > 0.0f ? air_light : 0.0f;
+			if (air_dark)
+				l2.vol_air[0] = l2.vol_air[1] = l2.vol_air[2] = 0.0f;
+			l2.vol_steps = 24;
 			last = r.draw(g.list, t, c, l2, error);
 			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			return g.read(world, 4);
@@ -2274,6 +2302,46 @@ int main(int argc, char **argv)
 		std::printf("  shadow map: the sun behind a slab off screen: looked-at ground %.1f without the map, %.1f with it; 55 yalms out %.1f, %.1f; beside the shadow %.1f, %.1f far out; drew cascades %u (%u triangles)\n",
 			here_off, here_on, far_off, far_on, side_on, far_side_on, first.sun_map_cascades, first.sun_map_triangles);
 		check(first.sun_map && first.sun_map_cascades == 3 && first.sun_map_triangles == 12, "the map drawn (both cascades, the far-off square left out) and read");
+		// The light in the air (look::vol_*), the sun behind the slab: the air lit where the sun reaches it, not in the slab's
+		// shadow. The fog alone (its air black, no light) dims what's behind it; the sun's light added on top of that is the
+		// shafts: more over ground beside the shadow, seen through lit air, than far out along it, seen through shadowed air.
+		// (Four frames: the far cascade's every-other-frame turn below stays as it was.)
+		{
+			to_sun = sun_from(dh, 59.0f);
+			with_box = false;
+			characters = false;
+			bumps = 0.0f;
+			const std::vector<uint8_t> clear_air = frame(true, cam);
+			air = 0.02f;
+			air_dark = true;
+			air_light = 0.0f;
+			const std::vector<uint8_t> dimmed = frame(true, cam);
+			air_light = 1.0f;
+			const std::vector<uint8_t> shafts = frame(true, cam);
+			air_dark = false;
+			const std::vector<uint8_t> hazy = frame(true, cam);
+			const draw_stats vol_stats = last;
+			air = 0.0f;
+			const double here_shaft = at_point(shafts, far_point, 3, 1) - at_point(dimmed, far_point, 3, 1);
+			const double side_shaft = at_point(shafts, far_side, 3, 1) - at_point(dimmed, far_side, 3, 1);
+			uint32_t changed = 0;
+			for (size_t i = 0; i < size_t(W) * H; ++i)
+			{
+				const int d = (hazy[i * 4] + hazy[i * 4 + 1] + hazy[i * 4 + 2]) - (clear_air[i * 4] + clear_air[i * 4 + 1] + clear_air[i * 4 + 2]);
+				changed += d != 0 ? 1 : 0;
+			}
+			if (FILE *f = nullptr; fopen_s(&f, "build\\volumetric_test.ppm", "wb") == 0 && f != nullptr)
+			{
+				std::fprintf(f, "P6 %u %u 255\n", W, H);
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+					std::fwrite(&hazy[i * 4], 1, 3, f);
+				std::fclose(f);
+			}
+			std::printf("  light in the air: %u pixels changed; the sun's light it adds: %.1f far out along the slab's shadow, %.1f beside it\n",
+				changed, here_shaft, side_shaft);
+			check(vol_stats.volumetric && vol_stats.air && changed > W * H / 4, "the light in the air worked out and laid over the frame");
+			check(side_shaft > here_shaft + 2.0, "  the air lit beside the slab's shadow more than in it (shafts)");
+		}
 		check(here_off > 0.0 && std::fabs(here_off - plain_luma) < 1.5, "without the map, nothing off screen casts (the march can't see it)");
 		check(here_on > 0.0 && here_on < here_off * 0.6, "an off-screen tall caster shadows the ground (near cascade)");
 		check(far_on > 0.0 && far_on < far_off * 0.75, "... and ground 55 yalms out along its shadow (far cascade)");
@@ -2580,6 +2648,7 @@ int main(int argc, char **argv)
 		frame(true, cam);
 		check(!last.sun_map && !r.shadow_loaded(), "without the zone's meshes, no map");
 		check(g.report_messages() == 0, "no debug-layer errors (shadow map)");
+
 	}
 
 	// 1o2. Leaf shadows hold still while the map is drawn again: a card 8 yalms across, 6 over the looked-at point, its

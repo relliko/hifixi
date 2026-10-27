@@ -97,6 +97,16 @@ namespace hifi::settings
 			{ "Bloom", tab::lighting, "Tone and colour", "Bloom",
 				"A soft glow around the brightest things: the sun, lamps, glowing effects, a bright sky and the lit edges of "
 				"clouds (0: none, 1: subtle).", "%.2f", nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
+			{ "VolLight", tab::lighting, "Light in the air", "Sun shafts",
+				"Sunlight through the air: shafts where it comes past trees, buildings and cliffs, a glow looking toward the sun, "
+				"the moon's fainter by night; none under a full overcast (0: none).", "%.2f", nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
+			{ "VolFog", tab::lighting, "Light in the air", "Fog lying low",
+				"Air you can see near you: it lies low and thins with height, patchy and drifting, thicker at dawn and dusk and in "
+				"mist, rain and snow, lit by the sun where it reaches (0: clear air only).", "%.2f", nullptr, false,
+				{ 0.0f, 1.0f, 1.0f, 1.0f } },
+			{ "VolQuality", tab::lighting, "Light in the air", "Their detail",
+				"How finely the air is worked out (0 low .. 2 high): more steps, a little more GPU time.", nullptr, nullptr, false,
+				{ _, 0.0f, 1.0f, 2.0f } },
 			{ "ColourGrade", tab::lighting, "Tone and colour", "Colour grade",
 				"The world's colours shift with the hour and the weather: warm at dawn and dusk, cool at night, grey in rain "
 				"and gloom, a warm haze in heat and dust (0: off, 1: subtle). Not under a roof or underground.", "%.2f",

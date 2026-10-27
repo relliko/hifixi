@@ -3648,6 +3648,108 @@ float4 leaf_ps(leaf_v2p i) : SV_Target
 //   in front of what's drawn and low over the ground, noise stretched along the wind and blowing along it.
 // (The lightning's flash is a pass of its own after it: flash_ps.) Names facelift drew into the world are left clear, as
 // the shading pass leaves them; the sky gets only the streaks (its own dust and gloom are weather_sky's).
+// Light in the air (vol_ps, then air_ps; crowd.x rule bit 16384): sun shafts and a fog that lies low, worked out at half
+// the world's size like the sun's shadows (into u1 after the clouds: kVol + 3's x, two uints a pixel in four) and laid
+// over everything at the end by the air pass. Each view ray is marched from the camera to what's drawn there (the sky:
+// out to the march's reach), [kVol + 3].y steps, each its own share of the way along, started a little further per
+// pixel (shaded noise: no banding); at each, how much air there is (the density at the ground [kVol + 1].w thinning
+// with height over the ground under the camera, 1/e every [kVol + 2].x yalms, and patchy, drifting with the time) and
+// whether the sun reaches it (the shadow map's one texel there, the clouds' shadows too: sun_map_point). Kept: the sun's
+// light scattered toward the camera (in units of the light), the ambient light scattered (the same, unshadowed) and how
+// much of what's behind still shows; with the view depth for the air pass's taps (it joins pixels of one surface).
+// [kVol] the light's colour (the sun's, the moon's by night) and the shafts' strength; [kVol + 1] the air's own colour
+// (the game's fog's, or the sky's) and the density at the ground (a yalm); [kVol + 2] x the thinning height, y the
+// ground under the camera (y, down positive), z seconds, w how far the march reaches (yalms); [kVol + 3] x where its
+// results start in u1 (bytes), y steps (uint bits), z the scattering's lean forward (Henyey-Greenstein's g), w 1;
+// [kVol + 4] and [kVol + 5] the view's first and third rows (a view-space point's world x and z). Without the shadow
+// map (no open sky, rule bit 8 off) none of it is drawn.
+static const uint kVol = kSnow + 4 + 2 * kMaxPrints;
+bool volumetric() { return ((crowd.x >> 16) & 16384) != 0; }
+
+// Whether the sun reaches P (view space) by the shadow map's one texel there (near cascade where P is well inside it,
+// else the far one; 1 off both): what the march needs, many times a pixel, not the surfaces' filtered 4 x 4
+float sun_map_point(float3 P)
+{
+	float4 info = actors[kSunMap + 6], info2 = actors[kSunMap + 7];
+	float size = info.x;
+	float4 q = float4(P, 1.0);
+	float2 t = float2(dot(q, actors[kSunMap]), dot(q, actors[kSunMap + 1]));
+	bool near = min(min(t.x, t.y), size - max(t.x, t.y)) > 1.0;
+	uint c = near ? kSunMap : kSunMap + 3;
+	if (!near)
+		t = float2(dot(q, actors[c]), dot(q, actors[c + 1]));
+	if (min(min(t.x, t.y), size - max(t.x, t.y)) < 0.0)
+		return 1.0;
+	int2 at = clamp(int2(t), int2(0, 0), int2(size, size) - 1);
+	float d = asfloat(sun_map.Load((asuint(near ? info2.w : info2.z) + uint(at.y) * uint(info.w) + uint(at.x)) * 4));
+	return d < dot(q, actors[c + 2]) && d < 1.0 ? 0.0 : 1.0;
+}
+
+void vol_ps(float4 pos : SV_Position)
+{
+	int2 h = int2(pos.xy);
+	int2 size = sun_mask_size();
+	if (any(h >= size))
+		return;
+	int2 p = h * 2;
+	float z = drawn_depth(p);
+	bool sky = z > kSkyDepth;
+	float2 ndc = float2((p.x + 0.5) / ground.y * 2.0 - 1.0, 1.0 - (p.y + 0.5) / ground.z * 2.0);
+	float3 v = sky ? float3(ndc.x / lin.z, ndc.y / lin.w, up_row.w) : view_at(p);
+	float3 dir = normalize(v);
+	float4 c1 = actors[kVol + 1], c2 = actors[kVol + 2], c3 = actors[kVol + 3];
+	float3 r0 = actors[kVol + 4].xyz, r2 = actors[kVol + 5].xyz;
+	uint steps = max(asuint(c3.y), 1u);
+	float far = min(sky ? 1e9 : length(v), c2.w);
+	float ds = far / float(steps);
+	float jitter = frac(52.9829189 * frac(dot(float2(h), float2(0.06711056, 0.00583715))));
+	bool clouds = cloud_shadows();
+	float clear = 1.0, sun_in = 0.0, air_in = 0.0;
+	[loop] for (uint k = 0; k < steps; ++k)
+	{
+		float3 P = dir * ((float(k) + jitter) * ds);
+		float3 W = float3(eye.x + dot(r0, P), eye.y + dot(up_row.xyz, P), eye.z + dot(r2, P));
+		float over = c2.y - W.y; // (over the ground under the camera: y is down)
+		float patchy = noise2(W.xz * 0.045 + float2(c2.z * 0.021, c2.z * 0.013) + W.y * 0.06);
+		float a = c1.w * exp(-max(over, 0.0) / c2.x) * (0.5 + patchy) * ds;
+		float lit = sun_map_point(P);
+		[branch] if (clouds && lit > 0.0)
+			lit *= cloud_shadow_at(P);
+		sun_in += clear * a * lit;
+		air_in += clear * a;
+		clear *= exp(-a);
+	}
+	uint at = asuint(c3.x) + (uint(h.y) * uint(size.x) + uint(h.x)) * 8;
+	sun_mask.Store2(at, uint2(f32tof16(sun_in) | (f32tof16(air_in) << 16), f32tof16(clear) | (f32tof16(min(z, 60000.0)) << 16)));
+}
+
+// The air pass's read of it (t0 there: the sun's mask whole, as a shader resource): the four half-size pixels round p,
+// blended as bilinear taps, each by how near its depth is to z (a shaft doesn't bleed off a near surface onto the far one
+// behind its edge); x the sun's light scattered, y the ambient's, z how much still shows
+ByteAddressBuffer light_air : register(t0);
+float3 vol_at(int2 p, float z)
+{
+	int2 size = sun_mask_size();
+	float2 hp = (float2(p) + 0.5) * 0.5 - 0.5;
+	int2 b = int2(floor(hp));
+	float2 f = hp - floor(hp);
+	uint base = asuint(actors[kVol + 3].x);
+	float3 sum = 0.0;
+	float weight = 0.0;
+	[unroll] for (int k = 0; k < 4; ++k)
+	{
+		int2 o = int2(k & 1, k >> 1);
+		int2 q = clamp(b + o, int2(0, 0), size - 1);
+		uint2 v = light_air.Load2(base + (uint(q.y) * uint(size.x) + uint(q.x)) * 8);
+		float d = f16tof32(v.y >> 16);
+		float w = (o.x != 0 ? f.x : 1.0 - f.x) * (o.y != 0 ? f.y : 1.0 - f.y) + 1e-3;
+		w *= 1.0 / (1e-3 + abs(d - min(z, 60000.0)) / (0.04 * min(z, 60000.0) + 0.2));
+		sum += w * float3(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y));
+		weight += w;
+	}
+	return sum / weight;
+}
+
 struct air_out
 {
 	float4 add : SV_Target0;
@@ -3684,7 +3786,8 @@ air_out air_ps(float4 pos : SV_Position)
 	float len = sky ? 1e9 : length(v);
 	float3 wd = normalize(float3(dot(r0.xyz, v), dot(up_row.xyz, v), dot(r2.xyz, v)));
 	float3 add = 0.0, keep = 1.0;
-	[branch] if (!sky && (dust.w > 0.0 || gloom.w > 0.0))
+	const bool wx = weather_fx(); // (the light in the air may come without them: their parameters not written then)
+	[branch] if (wx && !sky && (dust.w > 0.0 || gloom.w > 0.0))
 	{
 		float he = r0.w - eye.y, hp = he - wd.y * len; // (over the ground under the camera, at the camera and at what's drawn)
 		float2 far_xz = (eye.xz + wd.xz * min(len, 160.0)) / 48.0, near_xz = (eye.xz + wd.xz * min(len, 25.0)) / 48.0;
@@ -3695,7 +3798,7 @@ air_out air_ps(float4 pos : SV_Position)
 		add = (gloom.rgb * tau_g + dust.rgb * tau_d) / max(tau_g + tau_d, 1e-6) * (1.0 - clear);
 		keep = clear;
 	}
-	[branch] if (streak.x > 0.0)
+	[branch] if (wx && streak.x > 0.0)
 	{
 		// On sheets fixed in the world: upright, along the wind, kStreakGap yalms apart, read where the view ray crosses
 		// them between 2 and 26 yalms out (faded in and out at the ends). They were read on spheres round the camera
@@ -3729,6 +3832,19 @@ air_out air_ps(float4 pos : SV_Position)
 		}
 		add = add * clear + dust.rgb * (1.0 - clear);
 		keep *= clear;
+	}
+	// The light in the air (vol_ps), nearer than the dust and fog banks as a rule: the sun's light by how it scatters
+	// toward the camera at this angle to it (Henyey-Greenstein, lean [kVol + 3].z, 1 on average: a glow round the sun,
+	// shafts brightest looking toward it), the air's own colour by what it scattered
+	[branch] if (volumetric())
+	{
+		float3 l = vol_at(p, z);
+		float g = actors[kVol + 3].z;
+		float c = dot(normalize(v), sun_in_view());
+		float hg = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
+		float4 light = actors[kVol], air = actors[kVol + 1];
+		add = add * l.z + light.rgb * light.w * hg * l.x + air.rgb * l.y;
+		keep *= l.z;
 	}
 	o.add = float4(add, 0.0);
 	o.keep = float4(keep, 1.0);
@@ -3851,36 +3967,51 @@ float3 look_tone(float3 v)
 }
 
 // The first level: each texel a 4 x 4 block of the world's pixels: the light over the bloom's threshold (a soft knee),
-// averaged with less weight for the brightest (a lone bright pixel doesn't flicker), and the block's mean log2 luminance
+// averaged with less weight for the brightest (a lone bright pixel doesn't flicker), and the block's mean log2 luminance.
+// The light is taken from the 8 x 8 pixels round the block, a tent (1 2 3 4 4 3 2 1 each way), so what crosses a block's
+// edge fades from one texel into the next instead of jumping between them (bright snow and stone crawled at their edges
+// as the camera moved: 2026-10-27); then a share of the last frame's level (view_proj[2].y where it's kept, blade.w how
+// much of it: 0 when there's none to go on), so it can't flicker from one frame to the next.
 void look_first_ps(float4 pos : SV_Position)
 {
 	int2 q = int2(pos.xy);
 	int2 base = q * 4;
 	float thr = view_proj[3].z, knee = max(view_proj[3].w, 1e-3);
+	static const float tent[8] = { 1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0 };
 	float3 sum = 0.0;
 	float weights = 0.0, logs = 0.0, n = 0.0;
-	[unroll] for (int j = 0; j < 4; ++j)
-		[unroll] for (int i = 0; i < 4; ++i)
+	[unroll] for (int j = 0; j < 8; ++j)
+		[unroll] for (int i = 0; i < 8; ++i)
 		{
-			int2 p = min(base + int2(i, j), int2(ground.yz) - 1);
+			int2 p = clamp(base + int2(i - 2, j - 2), int2(0, 0), int2(ground.yz) - 1);
 			uint v = world.Load((uint(p.y) * ground.x + uint(p.x)) * 4);
 			if ((v >> 24) != 1u) // (not a name)
 			{
 				float3 c = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0;
 				float3 l = srgb_to_linear(ground.w == 2 ? c.bgr : c);
 				float y = look_luma(l);
-				logs += log2(y + 1e-3);
-				n += 1.0;
+				bool inner = i >= 2 && i < 6 && j >= 2 && j < 6; // (the block itself: its mean luminance, for the exposure)
+				logs += inner ? log2(y + 1e-3) : 0.0;
+				n += inner ? 1.0 : 0.0;
 				float b = max(l.r, max(l.g, l.b));
 				float rq = clamp(b - thr + knee, 0.0, 2.0 * knee);
 				rq = rq * rq / (4.0 * knee);
 				float share = max(rq, b - thr) / max(b, 1e-4);
-				float k = 1.0 / (1.0 + y);
+				float k = tent[i] * tent[j] / (1.0 + y);
 				sum += l * share * k;
 				weights += k;
 			}
 		}
-	look_write(asuint(eye.y), q, asuint(color.x), float4(weights > 0.0 ? sum / weights : 0.0, n > 0.0 ? logs / n : log2(0.07)));
+	float3 light = weights > 0.0 ? sum / weights : 0.0;
+	float kept = blade.w;
+	[branch] if (kept > 0.0)
+	{
+		uint history = asuint(view_proj[2].y);
+		float3 was = look_read(history, q, uint2(asuint(color.x), asuint(color.y))).rgb;
+		light = lerp(light, was, kept);
+		look_write(history, q, asuint(color.x), float4(light, 0.0));
+	}
+	look_write(asuint(eye.y), q, asuint(color.x), float4(light, n > 0.0 ? logs / n : log2(0.07)));
 }
 
 // A level from the one before (twice its size): a 4 x 4 tent (1 3 3 1 each way) around the texels it covers

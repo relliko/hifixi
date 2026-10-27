@@ -85,7 +85,14 @@ namespace grass
 		constexpr float kSnowDepth = 0.22f;
 		constexpr UINT kLayerCells = 256;
 		constexpr UINT kSnowOffset = kCasterOffset + kCasterParams;
-		constexpr UINT kActorBytes = (kSnowOffset + kSnowParams) * 4;
+		// ... and after the snow's the light in the air's (grass.hlsl kVol; rule bit 16384): the light's colour and the
+		// shafts' strength, the air's colour and density, its thinning height, the ground, the time and the march's reach,
+		// where its results start in the sun's mask, the steps, the scattering's lean, the view's first and third rows
+		constexpr UINT kVolParams = 24;
+		constexpr UINT kVolOffset = kSnowOffset + kSnowParams;
+		constexpr UINT kActorBytes = (kVolOffset + kVolParams) * 4;
+		// (how far its march reaches, yalms; past that the game's own fog is the air; how high the air thins to 1/e)
+		constexpr float kVolReach = 80.0f, kVolThinning = 9.0f;
 		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
 		constexpr float kCasterReach = 32.0f;
 		// The clouds' steps along a view ray and toward the light at each quality (look::weather_fx::cloud_quality)
@@ -146,7 +153,7 @@ namespace grass
 			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" }, { "leaf_vs", "vs_5_0" }, { "leaf_ps", "ps_5_0" },
 			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" }, { "cloud_ps", "ps_5_0" }, { "cloud_shadow_ps", "ps_5_0" },
 			{ "look_first_ps", "ps_5_0" }, { "look_down_ps", "ps_5_0" }, { "look_exposure_ps", "ps_5_0" }, { "look_up_ps", "ps_5_0" }, { "look_ps", "ps_5_0" },
-			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" } };
+			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" }, { "vol_ps", "ps_5_0" } };
 		constexpr size_t kShaderEntryCount = sizeof(kShaderEntries) / sizeof(kShaderEntries[0]);
 		constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
@@ -1897,6 +1904,7 @@ namespace grass
 			release(e.pso);
 		_layer_psos.clear();
 		release(_trail_pso);
+		release(_vol_pso);
 		for (pso_entry &e : _leaf_psos)
 			release(e.pso);
 		_leaf_psos.clear();
@@ -2191,7 +2199,7 @@ namespace grass
 		std::vector<uint8_t> *const into[kShaderEntryCount] = { &_vs, &_ps, &_shade_vs, &_shade_ps, &_sun_ps, &_shadow_vs, &_shadow_ps,
 			&_water_vs, &_water_ps, &_water_debug_vs, &_water_debug_ps, &_firefly_vs, &_firefly_ps, &_rain_vs, &_rain_ps,
 			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps, &_cloud_ps, &_cloud_shadow_ps,
-			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps };
+			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps, &_vol_ps };
 		if (code.blobs.size() != kShaderEntryCount)
 			return;
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
@@ -2215,6 +2223,9 @@ namespace grass
 		if (_trail_pso != nullptr)
 			_old.push_back({ _trail_pso, 0 });
 		_trail_pso = nullptr;
+		if (_vol_pso != nullptr)
+			_old.push_back({ _vol_pso, 0 });
+		_vol_pso = nullptr;
 		for (pso_entry &e : _layer_psos)
 			_old.push_back({ e.pso, 0 });
 		_layer_psos.clear();
@@ -2333,13 +2344,14 @@ namespace grass
 	}
 
 	// The mask the sun's shadows go into: a uint for each pixel of the world at half its width and height
-	// (rounded up), and after it `clouds` bytes for the clouds' two pictures, then the snow's trail map (kTrailBytes, at
-	// the buffer's end: trail_offset), made again when that grows. Buffers start
+	// (rounded up), and after it `clouds` bytes for the clouds' two pictures, then the light in the air's (two uints for
+	// each of the mask's: vol_offset) and the snow's trail map (kTrailBytes, at the buffer's end), made again when that
+	// grows. Buffers start
 	// in COMMON and go back to it after each list: the passes use it as a UAV straight away (a buffer is promoted to
 	// that by itself).
 	bool renderer::sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, UINT64 clouds, std::string &error)
 	{
-		const UINT64 size = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 4 + clouds + kTrailBytes;
+		const UINT64 size = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 12 + clouds + kTrailBytes;
 		if (_sun_mask != nullptr && _sun_mask_size >= size)
 			return true;
 		if (_sun_mask != nullptr)
@@ -2513,6 +2525,36 @@ namespace grass
 		}
 		_trail_pso->SetName(L"worldfx: trail pipeline");
 		return _trail_pso;
+	}
+
+	// The light in the air (vol_ps): a full-screen triangle over the half-size viewport with no render target (its pixels
+	// write their results into the sun's mask), as the sun's shadows. Made once.
+	ID3D12PipelineState *renderer::vol_pipeline(std::string &error)
+	{
+		if (_vol_pso != nullptr)
+			return _vol_pso;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _shade_vs.data(), _shade_vs.size() };
+		desc.PS = { _vol_ps.data(), _vol_ps.size() };
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 0;
+		desc.SampleDesc.Count = 1;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&_vol_pso));
+		if (FAILED(hr))
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "light-in-the-air pipeline failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			_vol_pso = nullptr;
+			return nullptr;
+		}
+		_vol_pso->SetName(L"worldfx: light in the air pipeline");
+		return _vol_pso;
 	}
 
 	// The snow layer (snow_layer_vs, snow_layer_ps): opaque, into the world and the blades' depth (tested and written:
@@ -2960,6 +3002,8 @@ namespace grass
 		constexpr UINT64 kLookExposureBytes = 256;
 		constexpr uint32_t kLookLevels = 10, kLookSmallest = 16, kLookBloomLevels = 6;
 		constexpr float kLookBloom = 0.6f;
+		// (how much of the bloom's first level is its last frame's: grass.hlsl look_first_ps)
+		constexpr float kLookBloomKept = 0.45f;
 	}
 
 	// The look's pipelines at the small sizes: full-screen triangles with no render target (their pixels write the look's
@@ -3068,6 +3112,9 @@ namespace grass
 				break;
 		}
 		const uint32_t bloom_levels = std::min(levels, kLookBloomLevels);
+		// (and after the levels the first one's last frame, which this frame's takes a share of: grass.hlsl look_first_ps)
+		const UINT64 history_at = bytes;
+		bytes += UINT64(sizes[0][0]) * sizes[0][1] * 8;
 		if (_look_buf == nullptr || _look_buf_size < bytes)
 		{
 			if (_look_buf != nullptr)
@@ -3125,6 +3172,16 @@ namespace grass
 		c[10] = p.snap || dt < 0.0 || dt > 1.0 ? -1.0f : float(dt);
 		_look_clock = std::isfinite(l.clock) ? l.clock : 0.0;
 		c[11] = finite(p.key, 0.005f, 1.0f, 0.07f);
+		// (the bloom's first level a share of its last frame, when there's one at this size to go on: none after a snap, a
+		// jump in time, a new buffer or another size)
+		const bool history_ok = !(p.snap || dt < 0.0 || dt > 1.0) && _look_history_w == sizes[0][0] && _look_history_h == sizes[0][1] &&
+			_look_history_buf == _look_buf;
+		const uint32_t history_offset = uint32_t(history_at);
+		std::memcpy(&c[9], &history_offset, 4);
+		c[27] = history_ok && bloom > 0.0f ? kLookBloomKept : 0.0f;
+		_look_history_w = sizes[0][0];
+		_look_history_h = sizes[0][1];
+		_look_history_buf = _look_buf;
 		c[12] = finite(p.exposure_min, 0.25f, 1.0f, 0.78f);
 		c[13] = finite(p.exposure_max, 1.0f, 4.0f, 1.06f);
 		c[14] = finite(p.threshold, 0.0f, 4.0f, 0.55f);
@@ -4509,6 +4566,10 @@ namespace grass
 			part(wx.aurora, 2.0f) > 0.0f || part(wx.sky_dark, 1.0f) > 0.0f || wx_stars != 1.0f || wx_dust > 0.0f || wx_gloom > 0.0f);
 		const bool shimmer = !only_blades && wx_heat > 0.0f;
 		const bool air_wanted = !only_blades && (wx_flash > 0.0f || wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f); // (the flash's pass with it)
+		// The light in the air (with the shading pass, which brings the sun's shadow map it needs)
+		const bool vol_wanted = !only_blades && std::isfinite(l.vol_light) && std::isfinite(l.vol_density) &&
+			(l.vol_light > 0.0f || l.vol_density > 0.0f) && l.vol_density > 0.0f;
+		bool vol_drawn = false;
 		const bool leaves = !only_blades && wx_leaves > 0.0f && !_rain.q.empty();
 		const bool shading_wanted = !only_blades && (l.ao_strength > 0.0f || l.relief > 0.0f || sun_shadow > 0.0f || lamp_count != 0 || dome || shimmer);
 		// The game's fog, when it makes sense (ending past where it starts)
@@ -5062,9 +5123,9 @@ namespace grass
 		// lit twice. Their pixels read the depth copy (t3), the parameters (t2) and the world's copy for names facelift drew
 		// (t1: names are left as they are, as the shading pass leaves them).
 		auto air_pass = [&]() {
-			if (!air_wanted || !wx_written || depth_kind == 0)
+			if (((!air_wanted || !wx_written) && !vol_drawn) || depth_kind == 0)
 				return;
-			const bool air = wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f;
+			const bool air = (wx_written && (wx_dust > 0.0f || wx_streaks > 0.0f || wx_gloom > 0.0f)) || vol_drawn;
 			ID3D12PipelineState *const air_pso = air ? air_pipeline_for(t, false, error) : nullptr;
 			ID3D12PipelineState *const flash_pso = wx_flash > 0.0f ? air_pipeline_for(t, true, error) : nullptr;
 			if (air_pso == nullptr && flash_pso == nullptr)
@@ -5077,8 +5138,15 @@ namespace grass
 			list->RSSetViewports(1, &viewport);
 			list->RSSetScissorRects(1, &scissor);
 			list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
-			// (t0 isn't read: the depth copy's address; t1 without a copy of the world isn't read either, ground.w being 0)
-			list->SetGraphicsRootShaderResourceView(1, _depth.buffer->GetGPUVirtualAddress());
+			// (t0: the sun's mask as a shader resource, for the light in the air (its writes before the reads); else not read:
+			// the depth copy's address. t1 without a copy of the world isn't read either, ground.w being 0)
+			if (vol_drawn)
+			{
+				transition(list, _sun_mask, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				list->SetGraphicsRootShaderResourceView(1, _sun_mask->GetGPUVirtualAddress());
+			}
+			else
+				list->SetGraphicsRootShaderResourceView(1, _depth.buffer->GetGPUVirtualAddress());
 			list->SetGraphicsRootShaderResourceView(2, (ground_kind != 0 ? _ground.buffer : _depth.buffer)->GetGPUVirtualAddress());
 			list->SetGraphicsRootShaderResourceView(4, actor_buffer->GetGPUVirtualAddress());
 			list->SetGraphicsRootShaderResourceView(5, _depth.buffer->GetGPUVirtualAddress());
@@ -5088,6 +5156,8 @@ namespace grass
 					list->SetPipelineState(pso);
 					list->DrawInstanced(3, 1, 0, 0);
 				}
+			if (vol_drawn) // (back for anything after that writes it this frame)
+				transition(list, _sun_mask, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 			stats.air = true;
 		};
 
@@ -5207,6 +5277,61 @@ namespace grass
 				list->ResourceBarrier(1, &written);
 				stats.sun = true;
 			}
+			// The light in the air (vol_ps): marched through the sun's shadow map at half size into the mask after the clouds'
+			// (vol_offset), its parameters after the snow's ([kVol]); laid over everything by the air pass at the end
+			if (vol_wanted && stats.sun_map && actor_data != nullptr)
+				if (ID3D12PipelineState *const vol_pso = vol_pipeline(error))
+				{
+					section(list, L"worldfx: light in the air");
+					auto finite = [](float v, float lo, float hi) { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; };
+					const UINT half_w = UINT((rt_desc.Width + 1) / 2), half_h = (rt_desc.Height + 1) / 2;
+					const uint32_t offset = uint32_t(_sun_mask_size - kTrailBytes - UINT64(half_w) * half_h * 8);
+					const uint32_t steps = std::clamp<uint32_t>(l.vol_steps, 4u, 64u);
+					float *const q = actor_data + kVolOffset;
+					for (int i = 0; i < 3; ++i)
+					{
+						q[i] = finite(l.vol_light_color[i], 0.0f, 2.0f);
+						q[4 + i] = finite(l.vol_air[i], 0.0f, 2.0f);
+					}
+					q[3] = finite(l.vol_light, 0.0f, 4.0f);
+					q[7] = finite(l.vol_density, 0.0f, 0.2f);
+					q[8] = kVolThinning;
+					q[9] = finite(l.wx.ground_y, -1e6f, 1e6f);
+					if (!std::isfinite(l.wx.ground_y) || l.wx.ground_y == 0.0f)
+						q[9] = eye[1] + 2.0f; // (y is down: the ground under the camera, below it)
+					q[10] = float(std::fmod(std::isfinite(l.time) ? double(l.time) : 0.0, 100000.0));
+					q[11] = kVolReach;
+					std::memcpy(&q[12], &offset, 4);
+					std::memcpy(&q[13], &steps, 4);
+					q[14] = 0.6f;
+					q[15] = 1.0f;
+					for (int i = 0; i < 3; ++i)
+					{
+						q[16 + i] = cam.view[i];
+						q[20 + i] = cam.view[8 + i];
+					}
+					q[19] = q[23] = 0.0f;
+					const D3D12_VIEWPORT half_viewport = { 0.0f, 0.0f, float(half_w), float(half_h), 0.0f, 1.0f };
+					const D3D12_RECT half_scissor = { 0, 0, LONG(half_w), LONG(half_h) };
+					list->SetGraphicsRootShaderResourceView(1, _sun_map_copy->GetGPUVirtualAddress());
+					list->SetPipelineState(vol_pso);
+					list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+					list->RSSetViewports(1, &half_viewport);
+					list->RSSetScissorRects(1, &half_scissor);
+					list->DrawInstanced(3, 1, 0, 0);
+					D3D12_RESOURCE_BARRIER written = {};
+					written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+					written.UAV.pResource = _sun_mask;
+					list->ResourceBarrier(1, &written);
+					// (the air pass reads it: rule bit 16384 on from here; the constants go again with each pass's)
+					uint32_t crowd_now = 0;
+					std::memcpy(&crowd_now, &constants[32], 4);
+					crowd_now |= 16384u << 16;
+					std::memcpy(&constants[32], &crowd_now, 4);
+					list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
+					vol_drawn = true;
+					stats.volumetric = true;
+				}
 			// The snow's trails (trail_ps) kept before the shading pass reads them: the map at the end of the sun's mask, its
 			// parameters after the snow's ([kSnow + 3]); the rain map's window in t0
 			if (snow_written && trails)

@@ -412,6 +412,10 @@ namespace
 		// WeatherOwn on, the game's weather stays left out.
 		bool weather_own = true, clouds_on = true, lightning_on = true;
 		int cloud_quality = 1; // (how finely the clouds are marched: 0 low .. 2 high, look::weather_fx::cloud_quality)
+		// Light in the air: the sun's shafts (0 none), the fog's thickness over clear air's (0 clear air only) and how
+		// finely it's marched (0 low .. 2 high: 16, 24 or 32 steps a pixel)
+		float vol_light = 1.0f, vol_fog = 1.0f;
+		int vol_quality = 1;
 		int cloud_style = 0;   // (0 game-like, 1 volumetric: look::weather_fx::cloud_style)
 		float weather_dust = 1.0f, weather_wind = 1.0f, heat_shimmer = 1.0f, aurora_amount = 1.0f, gloom_fog = 1.0f;
 		// What moves: how far the clouds have drifted (the broad shapes', the detail's: the noise's units, each wrapped to its
@@ -1549,6 +1553,26 @@ namespace
 		}
 		for (int i = 0; i < 3; ++i)
 			g.look.snow_light[i] = std::clamp((g.look.haze ? g.look.haze_color[i] : g.look.sky[i]) * 1.45f + 0.12f, 0.0f, 1.6f);
+		// Light in the air (look::vol_*), under open sky: clear air carries the shafts, more of it in mist, rain, snow and
+		// cloud, and lying thicker at dawn and dusk; the shafts as strong as the sun gets through (none under a whole
+		// overcast), in its colour (the moon's by night, fainter); the air in the fog's colour, or the sky's
+		{
+			const grass::weather_kind_fx x = fresh ? grass::weather_fx_of(w) : grass::weather_kind_fx();
+			const float snow_now = fresh ? grass::weather_snowfall(w) : 0.0f;
+			const float low = 1.0f - std::clamp(std::fabs(g.hour_up) / 0.3f, 0.0f, 1.0f);
+			const float thicker = 1.0f + low * low * (3.0f - 2.0f * low); // (twice at sunrise and sunset)
+			const bool any = g.zone_sunlit && (g.vol_light > 0.0f || g.vol_fog > 0.0f);
+			const float extra = 0.012f * x.veil + 0.005f * rain + 0.007f * snow_now + 0.003f * x.cover;
+			g.look.vol_density = any ? (0.0016f + g.vol_fog * extra) * thicker : 0.0f;
+			const float through = (1.0f - 0.85f * std::clamp(x.cover, 0.0f, 1.0f)) * (fresh && w.record ? std::clamp(g.weather_share, 0.0f, 1.0f) : 1.0f);
+			g.look.vol_light = any ? g.vol_light * 0.35f * through * (g.hour_up < 0.0f ? 0.5f : 1.0f) : 0.0f;
+			for (int i = 0; i < 3; ++i)
+			{
+				g.look.vol_light_color[i] = g.look.sun_color[i];
+				g.look.vol_air[i] = g.look.haze ? g.look.haze_color[i] : g.look.sky[i];
+			}
+			g.look.vol_steps = uint32_t(16 + 8 * std::clamp(g.vol_quality, 0, 2));
+		}
 		for (int i = 0; i < 3; ++i)
 		{
 			g.look.wet_light[i] = w.record ? std::min(w.sun_color[i] * w.intensity * 0.5f, 1.5f) : g.look.sun_color[i];
@@ -3767,6 +3791,12 @@ void worldfx::draw_panel(const ui &u)
 			set_config("Clouds", g.clouds_on);
 		if (u.slider_int("Clouds' detail (0 low .. 2 high: steps through them)", &g.cloud_quality, 0, 2))
 			set_config("CloudQuality", g.cloud_quality);
+		if (u.slider_float("Sun shafts in the air (0 = none)", &g.vol_light, 0.0f, 2.0f, "%.2f"))
+			set_config("VolLight", g.vol_light);
+		if (u.slider_float("Fog lying low, thicker in mist, rain and snow (0 = clear air only)", &g.vol_fog, 0.0f, 2.0f, "%.2f"))
+			set_config("VolFog", g.vol_fog);
+		if (u.slider_int("Their detail (0 low .. 2 high: steps through the air)", &g.vol_quality, 0, 2))
+			set_config("VolQuality", g.vol_quality);
 		if (u.slider_int("Clouds' style (0 game-like: soft, in the sky's colours; 1 volumetric heaps)", &g.cloud_style, 0, 1))
 			set_config("CloudStyle", g.cloud_style);
 		if (u.checkbox("Lightning in thunder and thunderstorms: flashes and bolts", &g.lightning_on))
@@ -3944,6 +3974,9 @@ namespace
 			flag("WeatherOwn", g.weather_own);
 			flag("Clouds", g.clouds_on);
 			whole("CloudQuality", g.cloud_quality, 0, 2);
+			number("VolLight", g.vol_light, 0.0f, 2.0f);
+			number("VolFog", g.vol_fog, 0.0f, 2.0f);
+			whole("VolQuality", g.vol_quality, 0, 2);
 			whole("CloudStyle", g.cloud_style, 0, 1);
 			flag("Lightning", g.lightning_on);
 			number("WeatherDust", g.weather_dust, 0.0f, 2.0f);
