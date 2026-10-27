@@ -1,10 +1,10 @@
 /*
  * HiFi XI's zone files made on the player's PC (src/bake/runner: the bakers on a thread of their own), into a folder of
  * the test's own, the FFXiMain dump mapped (tests/game_dump.hpp) for the game's key tables:
- *   - a zone entered (West Ronfaure, 100): its grass, water, shadow map and lamps made; its wet ground, rain and sea
- *     (its pond lies inside the zone: no sheet goes on past it), which it has none of, marked .none (not tried again);
- *     the shadow map only because the zone is in worldfx-sunlit.txt;
- *   - a zone with only meshes under open sky (1): its shadow map, every other kind .none;
+ *   - a zone entered (West Ronfaure, 100): its grass, water, wet ground, rain and lamps made; its sea (its pond lies
+ *     inside the zone: no sheet goes on past it), which it has none of, marked .none (not tried again); no shadow meshes
+ *     (none since 0.42: the native zone casts the sun's shadows);
+ *   - a zone with only meshes under open sky (1): every kind .none;
  *   - entered again: nothing made twice; but a lamps file from before the hour (LMP1) made again, as LMP2;
  *   - each file the same bytes as the baker's own, made straight (the bakers' tests check those against the Python);
  *   - status while it works and after, and stop() with the thread ending.
@@ -131,10 +131,10 @@ int main()
 	auto none = [&](const wchar_t *kind, uint32_t zone) { return folder + kind + L"\\" + std::to_wstring(zone) + L".none"; };
 	char line[200];
 	// (wet ground and rain for every zone the sun lights, whatever its own weather: West Ronfaure has no rain of its own)
-	std::snprintf(line, sizeof(line), "zone 100: its grass, water, wet ground, rain, shadow map and lamps made (%.1f s); its sea marked none",
+	std::snprintf(line, sizeof(line), "zone 100: its grass, water, wet ground, rain and lamps made (%.1f s); its sea marked none; no shadow meshes",
 		seconds);
-	check(exists(bin(L"worldfx-grass", 100)) && exists(bin(L"worldfx-water", 100)) && exists(bin(L"worldfx-shadow", 100)) &&
-		exists(bin(L"worldfx-lamps", 100)) && exists(bin(L"worldfx-wet", 100)) && exists(bin(L"worldfx-rain", 100)) &&
+	check(exists(bin(L"worldfx-grass", 100)) && exists(bin(L"worldfx-water", 100)) && !exists(bin(L"worldfx-shadow", 100)) &&
+		!exists(none(L"worldfx-shadow", 100)) && exists(bin(L"worldfx-lamps", 100)) && exists(bin(L"worldfx-wet", 100)) && exists(bin(L"worldfx-rain", 100)) &&
 		exists(none(L"worldfx-sea", 100)) && !exists(bin(L"worldfx-sea", 100)), line);
 	check(g_reloads == 1, "World FX told to read zone 100's files again (it's the zone you're in)");
 
@@ -146,7 +146,7 @@ int main()
 		bool same = true;
 		struct one { const wchar_t *kind; bool (*bake)(uint32_t, const std::wstring &, hifi::bake::result &); };
 		for (const one &o : { one{ L"worldfx-grass", hifi::bake::grass }, one{ L"worldfx-water", hifi::bake::water },
-				 one{ L"worldfx-shadow", hifi::bake::shadow }, one{ L"worldfx-lamps", hifi::bake::lamps } })
+				 one{ L"worldfx-lamps", hifi::bake::lamps } })
 		{
 			const std::wstring mine = straight + o.kind + L".bin";
 			std::vector<uint8_t> a, b;
@@ -161,13 +161,13 @@ int main()
 		check(same, "each the same bytes as its baker's own (the sea: none from the baker too)");
 	}
 
-	// A zone with no collision and no lamps (Phanauet Channel, 1: the barge's), only meshes under open sky
+	// A zone with no collision and no lamps (Phanauet Channel, 1: the barge's), only meshes under open sky: nothing made
 	hifi::bake::runner::zone_entered(1);
 	check(wait_idle(60.0), "zone 1 entered: done");
 	bool all_none = true;
 	for (const wchar_t *kind : { L"worldfx-grass", L"worldfx-water", L"worldfx-wet", L"worldfx-rain", L"worldfx-sea", L"worldfx-lamps" })
 		all_none = all_none && exists(none(kind, 1)) && !exists(bin(kind, 1));
-	check(all_none && exists(bin(L"worldfx-shadow", 1)), "zone 1: its shadow map made, every other kind marked none, nothing written for them");
+	check(all_none && !exists(bin(L"worldfx-shadow", 1)), "zone 1: every kind marked none, nothing written");
 
 	// Entered again: nothing made twice
 	const FILETIME grass_at = written(bin(L"worldfx-grass", 100));

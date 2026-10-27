@@ -1,6 +1,6 @@
 #pragma once
 
-// What shadow.cpp, lamps.cpp and zonemesh.cpp share (private to them): a zone DAT's bytes read as the Python reads them, a read past
+// What lamps.cpp and zonemesh.cpp share (private to them): a zone DAT's bytes read as the Python reads them, a read past
 // the end being a failure as struct.error is there, and the MZB unscrambled as zone_collision.py's decrypt_mzb does.
 // (In a namespace of its own: the other bakers have their own MZB code.)
 

@@ -228,26 +228,15 @@ namespace hifi::settings
 				"characters cast sun or moon shadows here: two at different angles looked like copies of one. Where HiFi XI casts "
 				"none (no open sky, the sun down and no moon), the game's are drawn as before.", nullptr, "SunCharacters", false,
 				{ 1.0f, 1.0f, 1.0f, 1.0f } },
-			{ "zone.native", tab::game, "Drawn by HiFi XI (experimental)", "The zone's scenery",
-				"HiFi XI draws the zone's buildings, ground and plants itself from your game's files, where the game drew them, "
-				"lit as the game lights them. What it doesn't have yet the game still draws. (/hifi nativezone)", nullptr, nullptr,
-				false, { 0.0f, zone::options::kNativeByDefault ? 1.0f : _, zone::options::kNativeByDefault ? 1.0f : _, zone::options::kNativeByDefault ? 1.0f : _ },
-				flag, 0.0f, 1.0f, zone::options::kNativeByDefault ? 1.0f : 0.0f },
-			{ "zone.perpixel", tab::game, "Drawn by HiFi XI (experimental)", "Light the scenery per pixel",
+			{ "zone.perpixel", tab::game, "Drawn by HiFi XI", "Light the scenery per pixel",
 				"The sun and lamps worked out at each pixel instead of at each corner, and the normal maps used, "
-				"for smoother light and sharper detail where a surface has one. (/hifi nativezone perpixel)", nullptr, "zone.native", false,
+				"for smoother light and sharper detail where a surface has one. (/hifi nativezone perpixel)", nullptr, nullptr, false,
 				{ _, zone::options::kPerPixelByDefault ? 1.0f : _, zone::options::kPerPixelByDefault ? 1.0f : _, zone::options::kPerPixelByDefault ? 1.0f : _ },
 				flag, 0.0f, 1.0f, zone::options::kPerPixelByDefault ? 1.0f : 0.0f },
 			// (native characters: their default in src/chars/charoptions.hpp)
-			{ "chars.native", tab::game, "Drawn by HiFi XI (experimental)", "Characters and monsters",
-				"HiFi XI draws the characters, monsters and NPCs itself from what your game has loaded, where the game drew them, "
-				"posed and lit as the game poses and lights them. A model whose data isn't on the GPU yet the game still draws. "
-				"(/hifi nativechars)", nullptr, nullptr, false,
-				{ 0.0f, chars::options::kNativeByDefault ? 1.0f : _, chars::options::kNativeByDefault ? 1.0f : _, chars::options::kNativeByDefault ? 1.0f : _ },
-				flag, 0.0f, 1.0f, chars::options::kNativeByDefault ? 1.0f : 0.0f },
-			{ "chars.perpixel", tab::game, "Drawn by HiFi XI (experimental)", "Light the characters per pixel",
+			{ "chars.perpixel", tab::game, "Drawn by HiFi XI", "Light the characters per pixel",
 				"The sun, moon and lamps on characters worked out at each pixel instead of at each corner: smoother light on "
-				"faces and folds. (/hifi nativechars perpixel)", nullptr, "chars.native", false,
+				"faces and folds. (/hifi nativechars perpixel)", nullptr, nullptr, false,
 				{ _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _ },
 				flag, 0.0f, 1.0f, chars::options::kPerPixelByDefault ? 1.0f : 0.0f },
 

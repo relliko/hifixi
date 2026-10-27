@@ -42,7 +42,7 @@ rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hif
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
 set "FEED=src\game\game.cpp src\game\feed.cpp src\game\glows.cpp src\game\gamewater.cpp src\game\gamerain.cpp"
 set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp src\game\zoneslot.cpp"
-set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
+set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 rem The native zone renderer (src\zone): each zone's data on the GPU (the plugin alone)
 set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\game\zonedraw.cpp"
@@ -180,13 +180,13 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   tests\runner_test.cpp %BAKE% src\game\game.cpp /Fo"build\test\\" /Fe"build\runner_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\runner_test.exe
 rem The zone bakers against the Python bakers (tests\bake1_oracle.py, bake2_oracle.py): build\bake1_test.exe (grass,
-rem water, wet ground, rain), build\bake2_test.exe (shadow maps, lamps)
+rem water, wet ground, rain), build\bake2_test.exe (lamps)
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\bake1_test.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp ^
   src\bake\sea.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\bake1_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\bake1_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\bake2_test.cpp src\bake\shadow.cpp src\bake\lamps.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
+  tests\bake2_test.cpp src\bake\lamps.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\bake2_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\bake2_test.exe
 rem The sea sheets against tools\bake_sea.py (tests\sea_oracle.py): build\sea_test.exe

@@ -658,7 +658,7 @@ namespace hifi::game::zonedraw
 		char game[96];
 		std::snprintf(game, sizeof(game), "; the game's count for its last zone pass: %u objects drawn", g_game_drawn);
 		if (!g.in)
-			return std::string("native zone drawing: off (/hifi nativezone on)") + (g_game_passes != 0 ? game : "");
+			return std::string("native zone drawing: not started") + (g_game_passes != 0 ? game : "");
 		char line[480];
 		if (!g.n.gate.empty())
 			std::snprintf(line, sizeof(line), "native zone drawing: the game draws the zone (%s); %llu of %llu passes HiFi XI's", g.n.gate.c_str(),

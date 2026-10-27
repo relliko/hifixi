@@ -4633,7 +4633,8 @@ namespace grass
 		uint32_t actor_count = 0;
 		ID3D12Resource *actor_buffer = nullptr;
 		float *actor_data = nullptr;
-		const bool sun_map = l.sun_map && sun_shadow > 0.0f && _shadow_geo != nullptr && shading;
+		// (the zone's casters from the uploaded meshes, or the host's own zone: set_zone_casters)
+		const bool sun_map = l.sun_map && sun_shadow > 0.0f && (_shadow_geo != nullptr || (_zone_bounds != nullptr && _zone_draw != nullptr)) && shading;
 		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies)
 		{
 			const uint32_t slot = _actor_slot++ % kActorSlots;

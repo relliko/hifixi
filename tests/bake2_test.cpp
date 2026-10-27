@@ -1,21 +1,19 @@
 /*
- * HiFi XI's shadow and lamp bakers (src/bake: shadow.cpp, lamps.cpp: reshade-worldfx's tools/bake_shadow_geo.py and
- * tools/bake_lamps.py in C++) against the Python bakers themselves, byte for byte:
+ * HiFi XI's lamp baker (src/bake/lamps.cpp: reshade-worldfx's tools/bake_lamps.py in C++) against the Python baker
+ * itself, byte for byte (the shadow meshes' baker went in 0.42: the native zone casts the sun's shadows):
  *   - the FFXiMain dump mapped first (tests/game_dump.hpp), so key_tables finds the game's two key tables in it (each
  *     where the Python reads it: 0x376AC0 and 0x376DE8);
  *   - the Python run once on every zone (tests/bake2_oracle.py, plain python), each bake timed, into a folder;
- *   - each zone baked here, timed, and its file compared with the Python's (an SHD2 file that differs is unpacked to
- *     say where); a zone the Python writes nothing for must be `none` here, nothing written;
+ *   - each zone baked here, timed, and its file compared with the Python's; a zone the Python writes nothing for must
+ *     be `none` here, nothing written;
  *   - then a few of them baked again on threads of their own, all at once (as "Build all zones" runs them): the same
  *     bytes again;
  *   - and the other dump (FFXiMain_041C0000.bin) mapped: key_tables finds the same two tables in it.
- * Shadow zones: West Ronfaure 100, Northern San d'Oria 231, Zi'Tah 121, Jugner 104 (cut-out leaves), and the towns
- * whose MMBs use the second key table's swaps (Whitegate 50, Al Zahbi 48, Norg 252); zone 0 places nothing that casts.
  * Lamp zones: towns (Southern and Northern San d'Oria, Port Jeuno, Whitegate, Al Zahbi's 71 with 229 ids without a
  * generator), fields (100, 102, 121) and two without lamps (Jugner 104, 1).
  *
  *   build\bake2_test.exe              (from this folder)
- *   build\bake2_test.exe --all        (every zone: the sunlit list for the shadow maps, 0-299 for the lamps)
+ *   build\bake2_test.exe --all        (every zone, 0-299)
  *   build\bake2_test.exe --no-python  (the Python's last files, from %TEMP%\hifixi_bake2_test\py)
  *
  * Exit code: the number of failures.
@@ -110,15 +108,7 @@ namespace
 		return out;
 	}
 
-	uint32_t le32(const std::vector<uint8_t> &b, size_t at)
-	{
-		uint32_t v = 0;
-		if (at + 4 <= b.size())
-			std::memcpy(&v, b.data() + at, 4);
-		return v;
-	}
-
-	// Where two files first differ ("" when they don't); an SHD2 file is unpacked to say which part
+	// Where two files first differ ("" when they don't)
 	std::string difference(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b)
 	{
 		if (a == b)
@@ -128,46 +118,7 @@ namespace
 		while (at < a.size() && at < b.size() && a[at] == b[at])
 			at++;
 		std::snprintf(text, sizeof(text), "%zu and %zu bytes, first differing at %zu", a.size(), b.size(), at);
-		std::string out = text;
-		if (a.size() < 64 || b.size() < 64 || std::memcmp(a.data(), "SHD2", 4) != 0 || std::memcmp(b.data(), "SHD2", 4) != 0)
-			return out;
-		auto body = [](const std::vector<uint8_t> &f, std::vector<uint8_t> &raw) {
-			const uint32_t packing = le32(f, 32), packed = le32(f, 36), size = le32(f, 40);
-			if (64 + size_t(packed) > f.size())
-				return false;
-			if (packing == 0)
-			{
-				raw.assign(f.begin() + 64, f.begin() + 64 + packed);
-				return true;
-			}
-			return hifi::bake::unxpress(f.data() + 64, packed, size, raw);
-		};
-		std::vector<uint8_t> ra, rb;
-		for (size_t i = 4; i < 64; i += 4)
-			if (le32(a, i) != le32(b, i))
-			{
-				std::snprintf(text, sizeof(text), "; header word %zu: %u here, %u in the Python's", i / 4, le32(a, i), le32(b, i));
-				out += text;
-				break;
-			}
-		if (!body(a, ra) || !body(b, rb))
-			return out + "; a body doesn't unpack";
-		size_t d = 0;
-		while (d < ra.size() && d < rb.size() && ra[d] == rb[d])
-			d++;
-		if (d == ra.size() && d == rb.size())
-			return out + "; the bodies are the same (only the packing differs)";
-		const size_t models = le32(b, 12), tris = le32(b, 16), placements = le32(b, 20);
-		const size_t t0 = models * 8, p0 = t0 + tris * 48, m0 = p0 + placements * 56;
-		if (d < t0)
-			std::snprintf(text, sizeof(text), "; unpacked: model range %zu", d / 8);
-		else if (d < p0)
-			std::snprintf(text, sizeof(text), "; unpacked: triangle %zu, corner %zu, word %zu", (d - t0) / 48, (d - t0) % 48 / 16, (d - t0) % 16 / 4);
-		else if (d < m0)
-			std::snprintf(text, sizeof(text), "; unpacked: placement %zu, word %zu", (d - p0) / 56, (d - p0) % 56 / 4);
-		else
-			std::snprintf(text, sizeof(text), "; unpacked: the masks, byte %zu", d - m0);
-		return out + text;
+		return text;
 	}
 
 	typedef bool (*baker)(uint32_t, const std::wstring &, hifi::bake::result &);
@@ -217,22 +168,6 @@ namespace
 		else
 			check(!wrote && !r.none && !exists(ours), std::string(name) + ": fails as the Python's does (here: " + r.why + "; the Python: " + o->second.what + ")");
 	}
-
-	std::vector<uint32_t> sunlit_zones(const std::string &list)
-	{
-		std::vector<uint32_t> out;
-		std::ifstream f(list);
-		std::string line;
-		while (std::getline(f, line))
-		{
-			line = line.substr(0, line.find('#'));
-			std::istringstream s(line);
-			uint32_t z = 0;
-			if (s >> z)
-				out.push_back(z);
-		}
-		return out;
-	}
 }
 
 int main(int argc, char **argv)
@@ -256,11 +191,9 @@ int main(int argc, char **argv)
 	const std::string folder = std::string(temp) + "hifixi_bake2_test\\", py = folder + "py\\", cpp = folder + "cpp\\";
 	CreateDirectoryA(folder.c_str(), nullptr);
 
-	std::vector<uint32_t> shadow_zones = { 100, 231, 121, 104, 50, 48, 252, 0 };
 	std::vector<uint32_t> lamp_zones = { 230, 231, 246, 50, 71, 100, 102, 121, 104, 1 };
 	if (all)
 	{
-		shadow_zones = sunlit_zones(root + "..\\reshade-worldfx\\build\\worldfx-sunlit.txt");
 		lamp_zones.clear();
 		for (uint32_t z = 0; z < 300; ++z)
 			lamp_zones.push_back(z);
@@ -283,14 +216,11 @@ int main(int argc, char **argv)
 	// 2. The Python, every zone, timed
 	if (python)
 	{
-		std::string command = "python \"" + root + "tests\\bake2_oracle.py\" \"" + folder + "py\" --shadow";
-		for (const uint32_t z : shadow_zones)
-			command += " " + std::to_string(z);
-		command += " --lamps";
+		std::string command = "python \"" + root + "tests\\bake2_oracle.py\" \"" + folder + "py\" --lamps";
 		for (const uint32_t z : lamp_zones)
 			command += " " + std::to_string(z);
 		command += " > \"" + folder + "oracle.log\" 2>&1";
-		std::printf("running the Python (%zu shadow maps, %zu lamp files)...\n", shadow_zones.size(), lamp_zones.size());
+		std::printf("running the Python (%zu lamp files)...\n", lamp_zones.size());
 		const int code = std::system(command.c_str());
 		check(code == 0, "the Python ran (" + folder + "oracle.log)");
 	}
@@ -299,20 +229,14 @@ int main(int argc, char **argv)
 
 	// 3. Each zone here against the Python's
 	CreateDirectoryA(cpp.c_str(), nullptr);
-	CreateDirectoryA((cpp + "shadow").c_str(), nullptr);
 	CreateDirectoryA((cpp + "lamps").c_str(), nullptr);
 	std::vector<job> jobs;
-	for (const uint32_t z : shadow_zones)
-		jobs.push_back({ "shadow", hifi::bake::shadow, z });
 	for (const uint32_t z : lamp_zones)
 		jobs.push_back({ "lamps", hifi::bake::lamps, z });
-	double cpp_shadow = 0.0, py_shadow = 0.0, cpp_lamps = 0.0, py_lamps = 0.0;
+	double cpp_lamps = 0.0, py_lamps = 0.0;
 	for (const job &j : jobs)
-	{
-		const bool is_shadow = std::strcmp(j.kind, "shadow") == 0;
-		compare(j, py, cpp, oracles, is_shadow ? cpp_shadow : cpp_lamps, is_shadow ? py_shadow : py_lamps);
-	}
-	std::printf("      all shadow maps: C++ %.2f s, Python %.2f s; all lamp files: C++ %.2f s, Python %.2f s\n", cpp_shadow, py_shadow, cpp_lamps, py_lamps);
+		compare(j, py, cpp, oracles, cpp_lamps, py_lamps);
+	std::printf("      all lamp files: C++ %.2f s, Python %.2f s\n", cpp_lamps, py_lamps);
 	{
 		// (this 32-bit process's peak so far: the dump mapped, 12 MB, plus the biggest bake)
 		PROCESS_MEMORY_COUNTERS pm = {};
@@ -323,11 +247,10 @@ int main(int argc, char **argv)
 
 	// 4. Several at once on threads of their own: the same bytes
 	{
-		const job parallel[] = { { "shadow", hifi::bake::shadow, 121 }, { "shadow", hifi::bake::shadow, 50 }, { "shadow", hifi::bake::shadow, 100 },
+		const job parallel[] = { { "lamps", hifi::bake::lamps, 230 }, { "lamps", hifi::bake::lamps, 71 }, { "lamps", hifi::bake::lamps, 100 },
 			{ "lamps", hifi::bake::lamps, 246 }, { "lamps", hifi::bake::lamps, 50 }, { "lamps", hifi::bake::lamps, 104 } };
 		const std::string out = folder + "threads\\";
 		CreateDirectoryA(out.c_str(), nullptr);
-		CreateDirectoryA((out + "shadow").c_str(), nullptr);
 		CreateDirectoryA((out + "lamps").c_str(), nullptr);
 		bool wrote[6] = {};
 		hifi::bake::result results[6];
@@ -354,7 +277,7 @@ int main(int argc, char **argv)
 				same = same && !wrote[i] && results[i].none;
 		}
 		char what[160];
-		std::snprintf(what, sizeof(what), "six bakes at once on their own threads (shadow 121, 50, 100; lamps 246, 50, 104): the Python's bytes, %.3f s in all", seconds);
+		std::snprintf(what, sizeof(what), "six bakes at once on their own threads (lamps 230, 71, 100, 246, 50, 104): the Python's bytes, %.3f s in all", seconds);
 		check(same, what);
 	}
 

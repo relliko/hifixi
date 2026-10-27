@@ -866,7 +866,11 @@ namespace
 				std::snprintf(sea_status, sizeof(sea_status), "zone %u: %s", zone, why == "no file for this zone" ? "no sea" : why.c_str());
 			g.sea_status = sea_status;
 		}
-		// The zone's meshes for the sun's shadow map (tools/bake_shadow_geo.py)
+		// The zone's meshes for the sun's shadow map (tools/bake_shadow_geo.py), unless the host draws the zone's casters
+		// itself (set_zone_casters: HiFi XI's native zone)
+		if (g.zone_bounds != nullptr && g.zone_draw != nullptr)
+			g.shadow_status = "zone " + std::to_string(zone) + ": the host's own zone casts the shadows";
+		else
 		{
 			const std::wstring shadow_path = addon_folder() + L"worldfx-shadow\\" + std::wstring(name, name + std::strlen(name));
 			grass::shadow_file meshes;

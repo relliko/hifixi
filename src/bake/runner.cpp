@@ -25,9 +25,10 @@ namespace hifi::bake
 
 		// The kinds, in the order they're made (rain and the sea after water: they read the zone's water). A kind added
 		// later (the sea, 2026-10-22) is simply missing for every zone of an install made before it: made as zones are
-		// entered, or by "every zone".
-		enum class kind { grass, water, wet, rain, sea, shadow, lamps };
-		const kind kKinds[] = { kind::grass, kind::water, kind::wet, kind::rain, kind::sea, kind::shadow, kind::lamps };
+		// entered, or by "every zone". (No shadow meshes since 0.42: the native zone casts the sun's shadows; files made
+		// before stay where they are, unread.)
+		enum class kind { grass, water, wet, rain, sea, lamps };
+		const kind kKinds[] = { kind::grass, kind::water, kind::wet, kind::rain, kind::sea, kind::lamps };
 		const wchar_t *folder_of(kind k)
 		{
 			switch (k)
@@ -37,7 +38,6 @@ namespace hifi::bake
 			case kind::wet: return L"worldfx-wet";
 			case kind::rain: return L"worldfx-rain";
 			case kind::sea: return L"worldfx-sea";
-			case kind::shadow: return L"worldfx-shadow";
 			default: return L"worldfx-lamps";
 			}
 		}
@@ -50,7 +50,6 @@ namespace hifi::bake
 			case kind::wet: return "wet ground";
 			case kind::rain: return "rain";
 			case kind::sea: return "sea";
-			case kind::shadow: return "shadow map";
 			default: return "lamps";
 			}
 		}
@@ -150,8 +149,6 @@ namespace hifi::bake
 					if (k != kind::water && k != kind::lamps)
 						DeleteFileW(out.c_str());
 				}
-				if (k == kind::shadow && !sunlit(folder, zone))
-					continue;
 				// (the sea reads the zone's water: none when the zone has none; when its water wasn't made (it failed),
 				// not tried, so not marked none either: tried again with the water next time)
 				if (k == kind::sea && !exists(file_of(folder, kind::water, zone, L".bin")))
@@ -177,7 +174,6 @@ namespace hifi::bake
 					case kind::wet: ok = wet(zone, out, r, any_weather); break;
 					case kind::rain: ok = rain(zone, out, file_of(folder, kind::water, zone, L".bin"), r, any_weather); break;
 					case kind::sea: ok = sea(zone, out, file_of(folder, kind::water, zone, L".bin"), r); break;
-					case kind::shadow: ok = shadow(zone, out, r); break;
 					case kind::lamps: ok = lamps(zone, out, r); break;
 					}
 				}

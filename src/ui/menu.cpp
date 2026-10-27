@@ -435,7 +435,7 @@ namespace hifi::ui
 			draw_tab_settings(g, settings::tab::world);
 			draw_weather_debug(g);
 			heading(g, "Zone files");
-			g.text_wrapped("Grass, water, rain, wet ground, the sun's shadow map and the lamps come from each zone's own files in "
+			g.text_wrapped("Grass, water, rain, wet ground and the lamps come from each zone's own files in "
 				"your game, made the first time you enter a zone (a few seconds, in the background). Or make them all now:");
 			const bake::runner_status r = bake::runner::status();
 			if (r.busy)

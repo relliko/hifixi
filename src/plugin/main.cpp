@@ -23,22 +23,20 @@
  *   /hifi zoneslot [on|off]   the zone pass's slot markers (src/game/zoneslot: on by default, [zone] slot in the
  *                  settings): where the game draws its zone, marked in its own Direct3D 8 stream for the Direct3D 12
  *                  side (World FX finds the world by them, the game's zone drawing on or off), or what they're doing
- *   /hifi zonedata [on|off]   the native zone renderer's data (src/zone/native: off by default, [zone] data): each
- *                  zone's meshes, textures and normal maps read from the game's DATs and put on the GPU as it's
- *                  entered (nothing draws with them yet), or what's loaded
- *   /hifi nativezone [on|off] | perpixel [on|off]   HiFi XI draws the zone itself in the game's place (src/game/
- *                  zonedraw, src/zone: off by default, [zone] native; [zone] perpixel its per-pixel lighting), or what
- *                  it's doing; the game draws whatever HiFi XI can't
- *   /hifi charslot [on|off]   the character passes' slot markers (src/game/charslot: off by default, [chars] slot):
- *                  the opaque actors' walk and each see-through actor, marked for the native character renderer to
- *                  come, or what they're doing
- *   /hifi chardata [on|off]   the native character renderer's data (src/game/charmodel, src/chars: off by default,
- *                  [chars] data): each model the game draws recorded at its draw (its palettes, lights, meshes), the
- *                  meshes and textures put on the GPU as they're first seen (nothing draws with them yet), or what's
- *                  there; /hifi gamedraw chars goes through its stub while it's in
- *   /hifi nativechars [on|off] | perpixel [on|off]   HiFi XI draws the characters itself in the game's place
- *                  (src/chars: off by default, [chars] native, needs the character data on; [chars] perpixel its
- *                  per-pixel lighting), or what it's doing; the game draws any model whose data isn't up yet
+ *   HiFi XI always draws the zone and the characters itself (since 0.42: no switching back to the game's drawing;
+ *   the game still draws whatever HiFi XI can't yet). What each part is doing:
+ *   /hifi zonedata   the native zone renderer's data (src/zone/native): each zone's meshes, textures and normal maps
+ *                  read from the game's DATs and put on the GPU as it's entered
+ *   /hifi zoneslot   the zone pass's slot markers (src/game/zoneslot)
+ *   /hifi nativezone [perpixel on|off]   HiFi XI drawing the zone in the game's place (src/game/zonedraw, src/zone;
+ *                  [zone] perpixel its per-pixel lighting)
+ *   /hifi charslot   the character passes' slot markers (src/game/charslot): the opaque actors' walk and each
+ *                  see-through actor
+ *   /hifi chardata   the native character renderer's data (src/game/charmodel, src/chars): each model the game draws
+ *                  recorded at its draw (its palettes, lights, meshes), the meshes and textures put on the GPU as
+ *                  they're first seen; /hifi gamedraw chars goes through its stub
+ *   /hifi nativechars [perpixel [on|off]]   HiFi XI drawing the characters in the game's place (src/chars; [chars]
+ *                  perpixel its per-pixel lighting); the game draws any model whose data isn't up yet
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
  *                  mist, dryw, heat, rain, squl, dust, sand, wind, stom, snow, bliz, thdr, bolt, aura, ligt, fogd, dark),
  *                  cross-faded; off: back to the real one; flash: lightning now. Debug, not saved (off at every start);
@@ -78,7 +76,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.41;
+	constexpr double kVersion = 0.42;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -411,73 +409,50 @@ class hifixi final : public IPlugin
 			say(hifi::game::gamedraw::status());
 	}
 
-	// The zone pass's slot markers in or out as the option has them ([zone] slot, on by default; once FFXiMain is
-	// there), and sent only while the Direct3D 12 side is attached to see them
+	// The zone pass's slot markers in (once FFXiMain is there: the native zone draw needs them), and sent only while the
+	// Direct3D 12 side is attached to see them
 	void follow_zoneslot()
 	{
 		std::string why;
-		const bool want = hifi::game::option_on("zone", "slot", true);
-		if (want && !hifi::game::zoneslot::in() && !m_zoneslot_refused && hifi::game::image_known())
+		if (!hifi::game::zoneslot::in() && !m_zoneslot_refused && hifi::game::image_known())
 		{
 			if (hifi::game::zoneslot::start(why))
 				hifi::backend::log(0, "HiFi XI: the zone pass's slot marked (178CCE through our stub)");
 			else
 			{
-				m_zoneslot_refused = true; // (not tried again until the option goes off and on)
+				m_zoneslot_refused = true; // (not tried again: the game draws its zone itself)
 				hifi::backend::log(1, ("HiFi XI: the zone pass's slot not marked: " + why).c_str());
 			}
-		}
-		else if (!want)
-		{
-			m_zoneslot_refused = false;
-			if (hifi::game::zoneslot::in() && !hifi::game::zoneslot::stop(why))
-				hifi::backend::log(1, ("HiFi XI: the zone pass's slot markers not taken out: " + why).c_str());
 		}
 		hifi::game::zoneslot::set_wanted(hifi::game::zoneslot::in() && hifi::backend::started() && hifi::host::installed() && worldfx::attached() != nullptr);
 	}
 
-	// (native characters) Whether HiFi XI draws the characters: [chars] native (its default: src/chars/charoptions.hpp)
-	static bool native_chars_wanted()
-	{
-		return hifi::game::option_on("chars", "native", hifi::chars::options::kNativeByDefault);
-	}
-
-	// (native characters) The character passes' slot markers in or out as [chars] slot has it (off by default), sent
-	// only while the Direct3D 12 side is attached to see them
+	// (native characters) The character passes' slot markers in (the character data needs their frames), sent only while
+	// the Direct3D 12 side is attached to see them
 	void follow_charslot()
 	{
 		std::string why;
-		// (the character data needs the markers' frames too)
-		const bool want = hifi::game::option_on("chars", "slot", false) || hifi::game::option_on("chars", "data", false) || native_chars_wanted();
-		if (want && !hifi::game::charslot::in() && !m_charslot_refused && hifi::game::image_known())
+		if (!hifi::game::charslot::in() && !m_charslot_refused && hifi::game::image_known())
 		{
 			if (hifi::game::charslot::start(why))
 				hifi::backend::log(0, "HiFi XI: the character passes' slots marked (0817E0 and 0C7E7C through our stubs)");
 			else
 			{
-				m_charslot_refused = true; // (not tried again until the option goes off and on)
+				m_charslot_refused = true; // (not tried again: the game draws its characters itself)
 				hifi::backend::log(1, ("HiFi XI: the character passes' slots not marked: " + why).c_str());
 			}
-		}
-		else if (!want)
-		{
-			m_charslot_refused = false;
-			if (hifi::game::charslot::in() && !hifi::game::charslot::stop(why))
-				hifi::backend::log(1, ("HiFi XI: the character slot markers not taken out: " + why).c_str());
 		}
 		hifi::game::charslot::set_wanted(hifi::game::charslot::in() && hifi::backend::started() && hifi::host::installed() && worldfx::attached() != nullptr);
 	}
 
-	// (native characters) The model draw's stub in or out as [chars] data has it (off by default; after the character
-	// slots), taking over /hifi gamedraw chars's state; the cache's device (while the Direct3D 12 side is attached) and
-	// its forgetting
+	// (native characters) The model draw's stub in (after the character slots), taking over /hifi gamedraw chars's
+	// state; the cache's device (while the Direct3D 12 side is attached) and its forgetting
 	void follow_chardata(double now)
 	{
 		namespace cm = hifi::game::charmodel;
 		using hifi::game::gamedraw::part;
 		std::string why;
-		const bool want = hifi::game::option_on("chars", "data", false) || native_chars_wanted();
-		if (want && !cm::in() && !m_chardata_refused && hifi::game::charslot::in())
+		if (!cm::in() && !m_chardata_refused && hifi::game::charslot::in())
 		{
 			const bool game_off = hifi::game::gamedraw::is_off(part::chars);
 			if (game_off && !hifi::game::gamedraw::set(part::chars, false, why))
@@ -499,45 +474,26 @@ class hifixi final : public IPlugin
 			if (m_chardata_refused)
 				hifi::backend::log(1, ("HiFi XI: the character models not recorded: " + why).c_str());
 		}
-		else if (!want)
-		{
-			m_chardata_refused = false;
-			if (cm::in())
-			{
-				const bool game_off = !cm::game_draws();
-				if (!cm::stop(why))
-					hifi::backend::log(1, ("HiFi XI: the model draw's stub not taken out: " + why).c_str());
-				else
-				{
-					hifi::chars::clear_frames();
-					hifi::chars::cache::stop();
-					if (game_off)
-						hifi::game::gamedraw::set(part::chars, true, why); // (the game's character drawing stays off, as it was)
-				}
-			}
-		}
 		if (cm::in())
 			hifi::chars::cache::frame_tick(hifi::backend::started() && hifi::host::installed() ? worldfx::attached() : nullptr, now);
 	}
 
-	// (native characters) HiFi XI's own character draw as [chars] native has it (its renderer made for the game's
-	// device first), its per-pixel option; and whether models are left to it now: wanted, the renderer ready, and the
-	// characters' end markers coming through (no more than 8 behind those sent)
+	// (native characters) HiFi XI's own character draw (its renderer made for the game's device first), its per-pixel
+	// option; and whether models are left to it now: their data recorded, the renderer ready, and the characters' end
+	// markers coming through (no more than 8 behind those sent)
 	void follow_nativechars()
 	{
 		std::string why;
-		const bool want = native_chars_wanted() && hifi::game::charmodel::in();
+		const bool want = hifi::game::charmodel::in();
 		ID3D12Device *const device = worldfx::attached();
 		if (want && !m_nativechars_refused && device != nullptr && !hifi::chars::inject::ready())
 		{
 			if (!hifi::chars::inject::prepare(device, why))
 			{
-				m_nativechars_refused = true; // (not tried again until the option goes off and on)
+				m_nativechars_refused = true; // (not tried again: the game draws its characters itself)
 				hifi::backend::log(1, ("HiFi XI: the native character renderer not made: " + why).c_str());
 			}
 		}
-		if (!native_chars_wanted())
-			m_nativechars_refused = false;
 		hifi::chars::inject::set_options(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault));
 		// (their sun shadows from their meshes: World FX calls for them in its shading pass, once its renderer is up)
 		if (!m_casters_set && hifi::chars::inject::ready())
@@ -549,9 +505,9 @@ class hifixi final : public IPlugin
 		hifi::game::charmodel::set_native(want && flowing && hifi::chars::inject::ready());
 	}
 
-	// The native zone draw in or out as [zone] native has it (its renderer made for the game's device first), its
-	// per-pixel option; and each pass's gate inputs: the zone's data, the Direct3D 12 side's readiness (its renderer,
-	// and the zone's end markers coming through: no more than 8 behind the ones sent)
+	// The native zone draw in (its renderer made for the game's device first), its per-pixel option; and each pass's
+	// gate inputs: the zone's data, the Direct3D 12 side's readiness (its renderer, and the zone's end markers coming
+	// through: no more than 8 behind the ones sent)
 	void follow_native()
 	{
 		std::string why;
@@ -561,29 +517,22 @@ class hifixi final : public IPlugin
 			worldfx::set_zone_casters(hifi::zone::inject::zone_bounds_hook(), hifi::zone::inject::zone_draw_hook(), nullptr);
 			m_zone_casters_set = true;
 		}
-		const bool want = hifi::game::option_on("zone", "native", hifi::zone::options::kNativeByDefault);
 		ID3D12Device *const device = worldfx::attached();
-		if (want && !hifi::game::zonedraw::in() && !m_native_refused && device != nullptr && hifi::game::zoneslot::in())
+		if (!hifi::game::zonedraw::in() && !m_native_refused && device != nullptr && hifi::game::zoneslot::in())
 		{
 			if (!hifi::zone::inject::prepare(device, why) || !hifi::game::zonedraw::start(why))
 			{
-				m_native_refused = true; // (not tried again until the option goes off and on)
+				m_native_refused = true; // (not tried again: the game draws its zone itself)
 				hifi::backend::log(1, ("HiFi XI: the native zone draw not started: " + why).c_str());
 			}
 			else
 				hifi::backend::log(0, "HiFi XI: the native zone draw in (17CBA8 through our stub; the renderer made)");
 		}
-		else if (!want)
-		{
-			m_native_refused = false;
-			if (hifi::game::zonedraw::in() && !hifi::game::zonedraw::stop(why))
-				hifi::backend::log(1, ("HiFi XI: the native zone draw not taken out: " + why).c_str());
-		}
 		hifi::zone::inject::set_options(hifi::game::option_on("zone", "perpixel", hifi::zone::options::kPerPixelByDefault));
 	}
 	void native_gate()
 	{
-		const bool want = hifi::game::zonedraw::in() && hifi::game::option_on("zone", "native", hifi::zone::options::kNativeByDefault);
+		const bool want = hifi::game::zonedraw::in();
 		const bool flowing = m_zone_flow.update(hifi::game::zoneslot::get_counts().sent[1], hifi::backend::zone_ends_seen());
 		hifi::game::zonedraw::set_state(want, hifi::zone::native::ready_zone(0), hifi::zone::native::ready_zone(1), flowing && hifi::zone::inject::ready());
 	}
@@ -683,9 +632,7 @@ public:
 		if (!hifi::game::zonedraw::stop(why))
 			ashita_log(1, ("the native zone draw not taken out: " + why).c_str());
 		hifi::game::zoneslot::set_listener(nullptr);
-		// (the zone's data let go unless the renderer may still be drawing with it on dgVoodoo's lists)
-		if (!hifi::game::option_on("zone", "native", hifi::zone::options::kNativeByDefault))
-			hifi::zone::native::stop();
+		// (the zone's data stays: the renderer may still be drawing with it on dgVoodoo's lists)
 		hifi::game::zoneslot::set_wanted(false);
 		if (!hifi::game::zoneslot::stop(why))
 			ashita_log(1, ("the zone pass's slot markers not taken out: " + why).c_str());
@@ -750,79 +697,46 @@ public:
 		else if (arg == "nativezone" || arg.rfind("nativezone ", 0) == 0)
 		{
 			const std::string how = arg.size() > 11 ? arg.substr(11) : std::string();
-			if (how == "on" || how == "off")
-				hifi::game::set_option_on("zone", "native", how == "on");
-			else if (how == "perpixel on" || how == "perpixel off")
+			if (how == "perpixel on" || how == "perpixel off")
 				hifi::game::set_option_on("zone", "perpixel", how == "perpixel on");
 			else if (!how.empty())
-				say("/hifi nativezone [on|off] | perpixel [on|off]: HiFi XI draws the zone itself (the game draws what it can't), with its per-pixel lighting or the game's");
+				say("/hifi nativezone [perpixel on|off]: what HiFi XI's own zone drawing is doing (the game draws what it can't), with its per-pixel lighting or the game's");
 			follow_native();
 			say(hifi::game::zonedraw::status());
 			for (const std::string &line : hifi::zone::inject::status())
 				say(line);
 		}
-		else if (arg == "zonedata" || arg == "zonedata on" || arg == "zonedata off")
+		else if (arg == "zonedata")
 		{
-			if (arg != "zonedata")
-				hifi::game::set_option_on("zone", "data", arg == "zonedata on");
-			say(std::string("Native zone data ") + (hifi::game::option_on("zone", "data", false) ? "on: each zone's meshes, textures and normal maps go on the GPU as it's entered (/hifi status)."
-				: "off."));
+			say("Native zone data: each zone's meshes, textures and normal maps go on the GPU as it's entered.");
 			for (const std::string &line : hifi::zone::native::status())
 				say(line);
 		}
-		else if (arg == "zoneslot" || arg == "zoneslot on" || arg == "zoneslot off")
+		else if (arg == "zoneslot")
 		{
-			if (arg != "zoneslot")
-			{
-				hifi::game::set_option_on("zone", "slot", arg == "zoneslot on");
-				follow_zoneslot();
-			}
 			say(hifi::game::zoneslot::status());
 		}
-		else if (arg == "charslot" || arg == "charslot on" || arg == "charslot off") // (native characters)
+		else if (arg == "charslot") // (native characters)
 		{
-			if (arg != "charslot")
-			{
-				hifi::game::set_option_on("chars", "slot", arg == "charslot on");
-				follow_charslot();
-			}
 			say(hifi::game::charslot::status());
 			say(hifi::chars::marks::status());
 		}
-		else if (arg == "chardata" || arg == "chardata on" || arg == "chardata off") // (native characters)
+		else if (arg == "chardata") // (native characters)
 		{
-			if (arg != "chardata")
-			{
-				hifi::game::set_option_on("chars", "data", arg == "chardata on");
-				follow_charslot();
-				follow_chardata(now_seconds());
-			}
-			say(std::string("Native character data ") + (hifi::game::option_on("chars", "data", false) ?
-				"on: each model the game draws is recorded, its meshes and textures put on the GPU as they're first seen." : "off."));
+			say("Native character data: each model the game draws is recorded, its meshes and textures put on the GPU as they're first seen.");
 			say(hifi::game::charmodel::status());
 			for (const std::string &line : hifi::chars::cache::status())
 				say(line);
 		}
-		else if (arg == "nativechars" || arg == "nativechars on" || arg == "nativechars off" || arg == "nativechars perpixel" || arg == "nativechars perpixel on" ||
-			arg == "nativechars perpixel off") // (native characters)
+		else if (arg == "nativechars" || arg == "nativechars perpixel" || arg == "nativechars perpixel on" || arg == "nativechars perpixel off") // (native characters)
 		{
-			if (arg == "nativechars on" || arg == "nativechars off")
-			{
-				const bool on = arg == "nativechars on";
-				hifi::game::set_option_on("chars", "native", on);
-				if (on)
-					hifi::game::set_option_on("chars", "data", true); // (it draws from the character data)
-				follow_charslot();
-				follow_chardata(now_seconds());
-				follow_nativechars();
-			}
-			else if (arg != "nativechars")
+			if (arg != "nativechars")
 			{
 				const bool on = arg == "nativechars perpixel" ? !hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault) : arg == "nativechars perpixel on";
 				hifi::game::set_option_on("chars", "perpixel", on);
 				follow_nativechars();
 			}
-			say(std::string("Native characters ") + (native_chars_wanted() ? "on: HiFi XI draws each model whose data is on the GPU, the game the rest" : "off") +
+			say(std::string("Native characters: HiFi XI draws each model whose data is on the GPU, the game the rest") +
 				(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault) ? "; lit per pixel." : "; lit as the game lights them."));
 			say(hifi::game::charmodel::status());
 			for (const std::string &line : hifi::chars::inject::status())
@@ -848,7 +762,7 @@ public:
 				say("Direct3D 12 hooks not in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot [on|off]: the zone pass's markers; /hifi charslot [on|off]: the character passes' markers; /hifi chardata [on|off]: the characters' data on the GPU; /hifi nativechars [on|off] | perpixel [on|off]: HiFi XI draws the characters; /hifi zonedata [on|off]: each zone's data on the GPU; /hifi nativezone [on|off] | perpixel [on|off]: HiFi XI draws the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel [on|off]]: HiFi XI drawing the characters; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
 		return true;
 	}
 
@@ -897,10 +811,8 @@ public:
 		{
 			const hifi::game::feed::party p = party_now();
 			hifi::game::feed::frame(g_entities, p, now);
-			// (the native zone renderer's data for the zone and its second map, while [zone] data is on; native drawing
-			// needs the data too)
-			hifi::zone::native::frame(worldfx::attached(), p.in_game ? hifi::game::feed::zone() : 0, p.in_game ? hifi::game::zonedraw::second_map() : 0,
-				hifi::game::option_on("zone", "data", false) || hifi::game::option_on("zone", "native", hifi::zone::options::kNativeByDefault));
+			// (the native zone renderer's data for the zone and its second map)
+			hifi::zone::native::frame(worldfx::attached(), p.in_game ? hifi::game::feed::zone() : 0, p.in_game ? hifi::game::zonedraw::second_map() : 0, true);
 			native_gate();
 			// (only while World FX draws into the game's world: on another output its files would go unused)
 			if (const uint32_t zone = hifi::game::feed::zone(); zone != m_zone && worldfx_drawing() != 0)

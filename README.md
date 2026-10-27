@@ -16,7 +16,7 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
 - **The zone and the characters drawn by HiFi XI itself**, from your own game files, in the game's own look:
   - **Per-pixel light** with every texture's normal map, on the zone and on characters and monsters;
   - **Tone mapping, bloom and a colour grade** over the world;
-  - Either can be handed back to the game at any time (`/hifi nativezone off`, `/hifi nativechars off`).
+  - Always on: the game draws only what HiFi XI can't yet.
 - **A richer world**, drawn into the game's own frame:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
   - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone's own meshes, with characters and monsters casting their real shapes;
@@ -49,7 +49,7 @@ Your settings from hifps and drawcull are taken over the first time HiFi XI star
 
 ## Zone data
 
-Grass, water, the sea past the zone's edge, rain, wet ground, the sun's shadow map and the lamps come from each zone's own files in your game. HiFi XI makes them on your PC, in the background, the first time you enter a zone; nothing from the game's data ships with HiFi XI. To make every zone's at once: **Grass, water, weather -> Make every zone's files now**.
+Grass, water, the sea past the zone's edge, rain, wet ground and the lamps come from each zone's own files in your game. HiFi XI makes them on your PC, in the background, the first time you enter a zone; nothing from the game's data ships with HiFi XI. To make every zone's at once: **Grass, water, weather -> Make every zone's files now**.
 
 They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
@@ -59,7 +59,7 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 - `/hifi status`: what HiFi XI is doing, part by part.
 - `/hifi glows`: the glows lighting the scene now, and the glowing effects met lately.
 - `/hifi gpu`: the GPU time each part of the richer world takes, the costliest first (also in the menu's **Performance** tab).
-- `/hifi nativezone on|off`, `/hifi nativechars on|off`: HiFi XI drawing the zone, or the characters, itself (on by default); `perpixel on|off` after either for its per-pixel light.
+- `/hifi nativezone`, `/hifi nativechars`: what HiFi XI's own drawing of the zone, or the characters, is doing; `perpixel on|off` after either for its per-pixel light.
 - `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
 - `/hifi reset`: its counts started again.
