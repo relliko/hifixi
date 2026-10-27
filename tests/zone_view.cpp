@@ -9,6 +9,8 @@
  *     point, looking a little down), or "x y z yaw pitch" (an eye in the game's coordinates, y down; yaw in degrees
  *     from +z toward +x, pitch down)
  *     --perpixel: the renderer's per-pixel option; --night: a dark ambient and the sun low
+ *     --alpha1: the pixels whose alpha came out 1 (of 255) painted magenta and counted: World FX takes those for names
+ *     facelift drew (grass.hlsl name_at) and leaves them unshaded
  *
  * Needs the game closed (the GPU; or --warp) and the FFXiMain dump (the key tables). Exit code: 0 when written.
  */
@@ -128,12 +130,12 @@ int main(int argc, char **argv)
 {
 	if (argc < 3)
 	{
-		std::printf("zone_view <map> <out.bmp> [top | street [yaw] | x y z yaw pitch] [--perpixel] [--night] [--warp]\n");
+		std::printf("zone_view <map> <out.bmp> [top | street [yaw] | x y z yaw pitch] [--perpixel] [--night] [--alpha1] [--warp]\n");
 		return 1;
 	}
 	const uint32_t map = uint32_t(std::strtoul(argv[1], nullptr, 10));
 	const char *out = argv[2];
-	bool warp = false, per_pixel = false, night = false, top = true, street = false;
+	bool warp = false, per_pixel = false, night = false, top = true, street = false, alpha1 = false;
 	float eye[3] = {}, yaw = 0, tilt = 0;
 	std::vector<std::string> rest;
 	for (int i = 3; i < argc; ++i)
@@ -145,6 +147,8 @@ int main(int argc, char **argv)
 			per_pixel = true;
 		else if (a == "--night")
 			night = true;
+		else if (a == "--alpha1")
+			alpha1 = true;
 		else if (a == "street")
 			street = true;
 		else if (a != "top")
@@ -395,6 +399,22 @@ int main(int argc, char **argv)
 	}
 	uint8_t *pixels = nullptr;
 	readback->Map(0, nullptr, reinterpret_cast<void **>(&pixels));
+	uint32_t ones = 0;
+	if (alpha1)
+		for (UINT y = 0; y < H; ++y)
+			for (UINT x = 0; x < W; ++x)
+			{
+				uint8_t *q = pixels + size_t(y) * pitch + x * 4;
+				if (q[3] == 1)
+				{
+					q[0] = 255;
+					q[1] = 0;
+					q[2] = 255;
+					ones++;
+				}
+			}
+	if (alpha1)
+		std::printf("%u pixels with alpha 1\n", ones);
 	const bool written = write_bmp(out, pixels, W, H, pitch);
 	std::printf("map %u from %.1f %.1f %.1f: renderer made in %.0f ms; %u objects, %u draws, %u triangles (%u skipped), recorded in %.1f ms, drawn in %.0f ms -> %s\n",
 		map, eye[0], eye[1], eye[2], init_ms, st.objects, st.draws, st.triangles, st.skipped, record_ms, gpu_ms, written ? out : "NOT WRITTEN");

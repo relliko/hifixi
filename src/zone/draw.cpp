@@ -44,7 +44,7 @@ cbuffer draw_constants : register(b1)
 {
 	uint object_index;
 	uint first_index;
-	uint piece;          // kBump, kTested, kDoorEnv, kMapped (a normal map: used per pixel)
+	uint piece;          // kBump, kTested, kDoorEnv, kMapped (a normal map: used per pixel), kBlended
 	uint unused;
 };
 struct vertex { float3 pos; float3 normal; uint colour; float2 uv; float3 sway; };
@@ -58,7 +58,7 @@ Texture2D colour_map : register(t4);
 Texture2D normal_map : register(t5);
 SamplerState wrap : register(s0);
 
-static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
+static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
 
 // The piece's environment: its object's, or for a door's bit-28 piece the door's (never past the 8 there are)
 env_t env_of(object o)
@@ -199,11 +199,15 @@ float4 ps(v2p i) : SV_Target
 	}
 	else
 		lit = i.lit.rgb;
-	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb, i.fog), a);
+	// (the world's alpha 1 of 255 marks a name facelift drew, left unshaded by World FX (grass.hlsl name_at): a solid
+	// piece writes at least 2 instead, so the band where a ground layer's vertex alpha fades out doesn't come out 1 (Valkurm's
+	// sand outlined in lines, 2026-10-27); a blended one keeps its own (it's also its colour's share), and blended over 2 or
+	// more its result stays over 1.99)
+	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
 }
 )";
 
-		constexpr uint32_t kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8;
+		constexpr uint32_t kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16;
 		constexpr UINT64 kConstantsBytes = 1024;
 		// Blended pieces' depth bias: the game sends ZBIAS 8 for them (notes-zone, "Blended pieces"), which dgVoodoo 2.87
 		// makes DepthBias trunc(-2.5 ZBIAS) and SlopeScaledDepthBias -0.5 ZBIAS, no clamp (measured: dgvprobe ZBIAS_TEST)
@@ -514,7 +518,8 @@ float4 ps(v2p i) : SV_Target
 					list->SetPipelineState(bound = pso);
 				// (doors take the fixed-function path, never the bump shader; their bit-28 pieces the door's environment)
 				const uint32_t flags = (pc.normal_map != zm::kNone && mo.bump && !door && !f.no_bump ? kBump : 0) | ((fo.flags & zm::kAlphaTested) != 0 ? kTested : 0) |
-					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !f.no_bump ? kMapped : 0);
+					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !f.no_bump ? kMapped : 0) |
+					(blended ? kBlended : 0);
 				const uint32_t dc[4] = { i, pc.first_index, flags, 0 };
 				list->SetGraphicsRoot32BitConstants(1, 4, dc, 0);
 				list->SetGraphicsRootDescriptorTable(6, z->texture_srv(pc.texture));
