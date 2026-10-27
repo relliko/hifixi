@@ -154,6 +154,13 @@ namespace hifi::settings
 				"While it snows, snow builds up over a few minutes on whatever faces up under open sky, and frosts and flattens "
 				"the grass; it melts slowly after, and a new zone starts with its own weather's (0: off; off too with the "
 				"snow of its own off).", "%.2f", "Snow", false, { 0.0f, 1.0f, 1.0f, 1.0f } },
+			{ "SnowDepth", tab::world, "Weather", "Its depth",
+				"How deep the settled snow lies near you: up to about a fifth of a yalm in a blizzard, over the ground, roofs "
+				"and ledges, hiding feet and the bottoms of the grass (0: flat, painted on).", "%.2f", "SnowCover", false,
+				{ 0.0f, 1.0f, 1.0f, 1.0f } },
+			{ "SnowTrails", tab::world, "Weather", "Trails through it",
+				"Whoever walks through settled snow treads a trail into it; snow falling fills it back in over a few minutes.",
+				nullptr, "SnowCover", false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			{ "WeatherOwn", tab::world, "Weather", "All of the weather its own",
 				"HiFi XI draws all of the weather itself, with its sky: clouds, lightning, dust and sand, wind, heat shimmer, "
 				"auroras and gloom, as well as its rain and snow. The game's own weather effects are left out under open sky "

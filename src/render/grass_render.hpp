@@ -347,6 +347,11 @@ namespace grass
 		// it covers now (0 none .. 1 a whole layer, the core building it up while it snows and melting it after), on what
 		// faces up under open sky; the blades shorter and frosted from the tip down by as much
 		float snow_cover = 0.0f;
+		// ... with depth (the snow layer, after the shading pass: 0 none, 1 a whole layer kSnowDepth yalms deep), and
+		// trails trodden through it by whoever walks there, filling back in while it snows (snowfall: how hard, 0..1)
+		float snow_depth = 0.0f;
+		bool snow_trails = false;
+		float snowfall = 0.0f;
 		float snow_sway = 0.35f;
 		float snow_light[3] = { 0.85f, 0.87f, 0.9f };
 		// A sky of its own, in the shading pass, on the pixels where the zone drew nothing (the game's sky dome doesn't
@@ -522,6 +527,8 @@ namespace grass
 		uint32_t lamps = 0;         // lamps whose glow the shading pass added
 		bool wet = false;           // the wet look on path and stone in the shading pass
 		bool snow_cover = false;    // settled snow in the shading pass
+		bool snow_layer = false;    // ... with depth, its layer drawn
+		bool snow_trails = false;   // ... and the trails kept
 		uint32_t rain_drops = 0;    // raindrops drawn (instances: most of them dead or out of view at any moment)
 		uint32_t splashes = 0;      // splash places drawn (instances: a splash shows at each for a moment)
 		bool rain_map_moved = false; // the rain map's window around the camera was written again this frame
@@ -709,6 +716,8 @@ namespace grass
 		ID3D12PipelineState *sun_pipeline(std::string &error);
 		bool sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, UINT64 clouds, std::string &error);
 		ID3D12PipelineState *cloud_pipeline(std::string &error);
+		ID3D12PipelineState *trail_pipeline(std::string &error);
+		ID3D12PipelineState *layer_pipeline_for(const target &t, std::string &error);
 		bool cloud_noise_for(std::string &error);
 		// The water's pipelines: the water alone (a zone without a sea), the debug view, and with a sea the baked water's
 		// whole pixels (marking them in the stencil), the sea where they aren't, the baked water's fading pixels over that
@@ -769,6 +778,14 @@ namespace grass
 		ID3D12PipelineState *_sun_pso = nullptr; // the sun's shadows at half size (no render target: it writes _sun_mask)
 		ID3D12Resource *_sun_mask = nullptr;     // what it works out, a uint for each of the world's pixels in four (UAV)
 		UINT64 _sun_mask_size = 0;
+		// Trails through settled snow (trail_ps, no render target): their map at the end of _sun_mask (kTrailBytes), the
+		// zone's number in their tags (a new zone's start untrodden), the clock at the last frame they were kept; the snow
+		// layer's pipelines (by the world's format)
+		std::vector<uint8_t> _trail_ps, _layer_vs, _layer_ps;
+		ID3D12PipelineState *_trail_pso = nullptr;
+		std::vector<pso_entry> _layer_psos;
+		uint32_t _trail_epoch = 0;
+		double _trail_time = -1.0;
 		// The clouds (cloud_ps, at a quarter of the world's width and height, no render target): their two pictures after
 		// the sun's mask in _sun_mask (this frame's and the last's, in turn), their noise (default heap, from its upload
 		// copy at the first draw with clouds), and what carrying the last picture over needs: whether there is one that

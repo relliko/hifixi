@@ -378,6 +378,9 @@ namespace
 		// ground's wetness and snow go straight to its weather for kZoneWeatherMs after: none carried over from the last)
 		float snow_cover_amount = 1.0f;
 		float snow_cover = 0.0f;
+		// ... with depth (0 flat, 1 a whole layer grass_render's kSnowDepth deep) and trails trodden through it
+		float snow_depth = 1.0f;
+		bool snow_trails = true;
 		ULONGLONG snow_at = 0;
 		bool snow_weather_known = false;
 		ULONGLONG zone_entered_at = 0;
@@ -1536,6 +1539,9 @@ namespace
 				g.snow_cover = std::max(target, g.snow_cover - sdt / kSnowMeltSeconds);
 			g.snow_weather_known = fresh;
 			g.look.snow_cover = g.renderer != nullptr && g.renderer->rain_loaded() ? g.snow_cover_amount * g.snow_cover : 0.0f;
+			g.look.snow_depth = g.snow_depth;
+			g.look.snow_trails = g.snow_trails;
+			g.look.snowfall = target; // (trails fill back in as hard as it snows)
 		}
 		for (int i = 0; i < 3; ++i)
 			g.look.snow_light[i] = std::clamp((g.look.haze ? g.look.haze_color[i] : g.look.sky[i]) * 1.45f + 0.12f, 0.0f, 1.6f);
@@ -2305,7 +2311,8 @@ static std::string crash_context()
 		(g.weather_at != 0 ? weather_text() : "never sent") + "\n";
 	std::snprintf(line, sizeof(line), "  wet ground: setting %.2f, wet now %.2f (%s)\n", g.wet_ground, g.wetness, g.wet_status.c_str());
 	out += line;
-	std::snprintf(line, sizeof(line), "  settled snow: setting %.2f, lying now %.2f%s\n", g.snow_cover_amount, g.snow_cover, g.last.snow_cover ? " (drawn)" : "");
+	std::snprintf(line, sizeof(line), "  settled snow: setting %.2f, lying now %.2f%s; depth %.2f%s, trails %s%s\n", g.snow_cover_amount, g.snow_cover,
+		g.last.snow_cover ? " (drawn)" : "", g.snow_depth, g.last.snow_layer ? " (drawn)" : "", g.snow_trails ? "on" : "off", g.last.snow_trails ? " (kept)" : "");
 	out += line;
 	std::snprintf(line, sizeof(line), "  rain %s (amount %.2f), raining now %.2f; snow %s (amount %.2f), snowing now %.2f; rain map: %s\n", g.rain_on ? "on" : "off",
 		g.rain_amount, g.raining, g.snow_on ? "on" : "off", g.snow_amount, g.snowing, g.rain_status.c_str());
@@ -3727,6 +3734,10 @@ void worldfx::draw_panel(const ui &u)
 			set_config("WetGround", g.wet_ground);
 		if (u.slider_float("Snow settling on the ground while it snows (0 = off; needs snow of its own)", &g.snow_cover_amount, 0.0f, 1.0f, "%.2f"))
 			set_config("SnowCover", g.snow_cover_amount);
+		if (u.slider_float("Its depth (0 = flat)", &g.snow_depth, 0.0f, 2.0f, "%.2f"))
+			set_config("SnowDepth", g.snow_depth);
+		if (u.checkbox("Trails trodden through it", &g.snow_trails))
+			set_config("SnowTrails", g.snow_trails);
 		if (u.checkbox("Rain of its own, in place of the game's", &g.rain_on))
 			set_config("Rain", g.rain_on);
 		if (u.slider_float("How hard it rains (times the weather's)", &g.rain_amount, 0.0f, 2.0f, "%.2f"))
@@ -3915,6 +3926,8 @@ namespace
 			flag("WeatherShadows", g.weather_shadows);
 			number("WetGround", g.wet_ground, 0.0f, 1.0f);
 			number("SnowCover", g.snow_cover_amount, 0.0f, 1.0f);
+			number("SnowDepth", g.snow_depth, 0.0f, 2.0f);
+			flag("SnowTrails", g.snow_trails);
 			flag("Rain", g.rain_on);
 			number("RainAmount", g.rain_amount, 0.0f, 2.0f);
 			number("RainSplashes", g.rain_splashes, 0.0f, 2.0f);

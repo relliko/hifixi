@@ -74,6 +74,14 @@ namespace grass
 		// ... and after the casters' the settled snow's (grass.hlsl kSnow; rule bit 8192): the view's first row and the cover,
 		// its third row, the rain map's window (where it starts, x and z, its squares' size)
 		constexpr UINT kSnowParams = 16;
+		// The snow's trail map (grass.hlsl trail_at, kTrailSize texels a side of kTrailTexel yalms, a uint each), how long
+		// snow takes to fill a trail back in at a blizzard's (seconds; more the lighter it snows), the snow layer at a whole
+		// layer (yalms deep) and its grid (snow_layer_vs: kLayerCells a side)
+		constexpr UINT kTrailSize = 512;
+		constexpr UINT64 kTrailBytes = UINT64(kTrailSize) * kTrailSize * 4;
+		constexpr float kTrailRefillSeconds = 150.0f;
+		constexpr float kSnowDepth = 0.22f;
+		constexpr UINT kLayerCells = 256;
 		constexpr UINT kSnowOffset = kCasterOffset + kCasterParams;
 		constexpr UINT kActorBytes = (kSnowOffset + kSnowParams) * 4;
 		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
@@ -135,7 +143,8 @@ namespace grass
 			{ "rain_vs", "vs_5_0" }, { "rain_ps", "ps_5_0" }, { "splash_vs", "vs_5_0" }, { "splash_ps", "ps_5_0" },
 			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" }, { "leaf_vs", "vs_5_0" }, { "leaf_ps", "ps_5_0" },
 			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" }, { "cloud_ps", "ps_5_0" }, { "cloud_shadow_ps", "ps_5_0" },
-			{ "look_first_ps", "ps_5_0" }, { "look_down_ps", "ps_5_0" }, { "look_exposure_ps", "ps_5_0" }, { "look_up_ps", "ps_5_0" }, { "look_ps", "ps_5_0" } };
+			{ "look_first_ps", "ps_5_0" }, { "look_down_ps", "ps_5_0" }, { "look_exposure_ps", "ps_5_0" }, { "look_up_ps", "ps_5_0" }, { "look_ps", "ps_5_0" },
+			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" } };
 		constexpr size_t kShaderEntryCount = sizeof(kShaderEntries) / sizeof(kShaderEntries[0]);
 		constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
@@ -1882,6 +1891,10 @@ namespace grass
 		for (pso_entry &e : _snow_psos)
 			release(e.pso);
 		_snow_psos.clear();
+		for (pso_entry &e : _layer_psos)
+			release(e.pso);
+		_layer_psos.clear();
+		release(_trail_pso);
 		for (pso_entry &e : _leaf_psos)
 			release(e.pso);
 		_leaf_psos.clear();
@@ -1992,7 +2005,7 @@ namespace grass
 		params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
 		params[6].Descriptor.ShaderRegister = 1;
-		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL; // (the sun's shadows, in the shading passes)
+		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL; // (the sun's shadows, in the shading passes; the snow's trails, read by the snow layer's corners too)
 		desc.NumParameters = 7;
 		desc.pParameters = params;
 		desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
@@ -2176,7 +2189,7 @@ namespace grass
 		std::vector<uint8_t> *const into[kShaderEntryCount] = { &_vs, &_ps, &_shade_vs, &_shade_ps, &_sun_ps, &_shadow_vs, &_shadow_ps,
 			&_water_vs, &_water_ps, &_water_debug_vs, &_water_debug_ps, &_firefly_vs, &_firefly_ps, &_rain_vs, &_rain_ps,
 			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps, &_cloud_ps, &_cloud_shadow_ps,
-			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps };
+			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps };
 		if (code.blobs.size() != kShaderEntryCount)
 			return;
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
@@ -2197,6 +2210,12 @@ namespace grass
 		if (_shadow_pso != nullptr)
 			_old.push_back({ _shadow_pso, 0 });
 		_shadow_pso = nullptr;
+		if (_trail_pso != nullptr)
+			_old.push_back({ _trail_pso, 0 });
+		_trail_pso = nullptr;
+		for (pso_entry &e : _layer_psos)
+			_old.push_back({ e.pso, 0 });
+		_layer_psos.clear();
 		for (ID3D12PipelineState **pso : { &_look_first_pso, &_look_down_pso, &_look_exposure_pso, &_look_up_pso })
 		{
 			if (*pso != nullptr)
@@ -2312,12 +2331,13 @@ namespace grass
 	}
 
 	// The mask the sun's shadows go into: a uint for each pixel of the world at half its width and height
-	// (rounded up), and after it `clouds` bytes for the clouds' two pictures, made again when that grows. Buffers start
+	// (rounded up), and after it `clouds` bytes for the clouds' two pictures, then the snow's trail map (kTrailBytes, at
+	// the buffer's end: trail_offset), made again when that grows. Buffers start
 	// in COMMON and go back to it after each list: the passes use it as a UAV straight away (a buffer is promoted to
 	// that by itself).
 	bool renderer::sun_mask_for(const D3D12_RESOURCE_DESC &rt_desc, UINT64 clouds, std::string &error)
 	{
-		const UINT64 size = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 4 + clouds;
+		const UINT64 size = ((rt_desc.Width + 1) / 2) * ((UINT64(rt_desc.Height) + 1) / 2) * 4 + clouds + kTrailBytes;
 		if (_sun_mask != nullptr && _sun_mask_size >= size)
 			return true;
 		if (_sun_mask != nullptr)
@@ -2394,6 +2414,76 @@ namespace grass
 		}
 		_cloud_pso->SetName(L"worldfx: cloud pipeline");
 		return _cloud_pso;
+	}
+
+	// The trail map kept (trail_ps): a full-screen triangle over a kTrailSize viewport with no render target (its pixels
+	// write the map at the end of the sun's mask). Made once.
+	ID3D12PipelineState *renderer::trail_pipeline(std::string &error)
+	{
+		if (_trail_pso != nullptr)
+			return _trail_pso;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _shade_vs.data(), _shade_vs.size() };
+		desc.PS = { _trail_ps.data(), _trail_ps.size() };
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 0;
+		desc.SampleDesc.Count = 1;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&_trail_pso));
+		if (FAILED(hr))
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "trail pipeline failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			_trail_pso = nullptr;
+			return nullptr;
+		}
+		_trail_pso->SetName(L"worldfx: trail pipeline");
+		return _trail_pso;
+	}
+
+	// The snow layer (snow_layer_vs, snow_layer_ps): opaque, into the world and the blades' depth (tested and written:
+	// the blades and flakes after it are hidden by it), by the world's format
+	ID3D12PipelineState *renderer::layer_pipeline_for(const target &t, std::string &error)
+	{
+		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
+		for (const pso_entry &e : _layer_psos)
+			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
+				return e.pso;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _layer_vs.data(), _layer_vs.size() };
+		desc.PS = { _layer_ps.data(), _layer_ps.size() };
+		desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.RasterizerState.MultisampleEnable = rt_desc.SampleDesc.Count > 1;
+		desc.DepthStencilState.DepthEnable = TRUE;
+		desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		desc.DSVFormat = kBladeDepthFormat; // (the blades' depth buffer)
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 1;
+		desc.RTVFormats[0] = t.rtv_format;
+		desc.SampleDesc = rt_desc.SampleDesc;
+		ID3D12PipelineState *pso = nullptr;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		if (FAILED(hr))
+		{
+			char text[96];
+			std::snprintf(text, sizeof(text), "snow layer pipeline failed (0x%08lX, format %u)", static_cast<unsigned long>(hr), static_cast<unsigned>(t.rtv_format));
+			error = text;
+			return nullptr;
+		}
+		pso->SetName(L"worldfx: snow layer pipeline");
+		_layer_psos.push_back({ t.rtv_format, kBladeDepthFormat, rt_desc.SampleDesc, pso });
+		return pso;
 	}
 
 	// The clouds' noise (cloud_noise): into an upload buffer, copied into a default-heap one at the next draw (the pass
@@ -3049,6 +3139,7 @@ namespace grass
 			_old.push_back({ _rain_window, 0 }); // (as the water)
 		_rain_window = nullptr;
 		_rain = rain_file();
+		_trail_epoch++; // (the next zone's trails start untrodden: grass.hlsl trail_tag)
 	}
 
 	bool renderer::rain_surface(float x, float z, float &y, uint8_t &kind) const
@@ -4360,6 +4451,9 @@ namespace grass
 		// in t0 of the shading pass in the wet mask's place, so wet ground waits while snow lies; they never fall together)
 		const float snow_cover = std::isfinite(l.snow_cover) ? std::clamp(l.snow_cover, 0.0f, 1.0f) : 0.0f;
 		const bool snow_lies = snow_cover > 0.0f && !_rain.q.empty();
+		// ... with depth (the snow layer: yalms deep at a whole layer) and trails trodden through it
+		const float layer_depth = std::isfinite(l.snow_depth) ? std::clamp(l.snow_depth, 0.0f, 2.0f) * kSnowDepth : 0.0f;
+		const bool trails = snow_lies && !only_blades && l.snow_trails;
 		// The wet look on path and stone, with the zone's mask loaded (it's read in the shading pass)
 		const bool wet = !only_blades && std::isfinite(l.wet) && l.wet > 0.0f && _wet != nullptr && !snow_lies;
 		const bool shading = shading_wanted || wet || (snow_lies && !only_blades);
@@ -4681,7 +4775,7 @@ namespace grass
 		{
 			const float params[kSnowParams] = {
 				cam.view[0], cam.view[1], cam.view[2], snow_cover,
-				cam.view[8], cam.view[9], cam.view[10], 0.0f,
+				cam.view[8], cam.view[9], cam.view[10], layer_depth,
 				_rain.x0 + float(_rain_window_i) * _rain.square, _rain.z0 + float(_rain_window_j) * _rain.square, _rain.square, 0.0f,
 				0.0f, 0.0f, 0.0f, 0.0f };
 			std::memcpy(actor_data + kSnowOffset, params, sizeof(params));
@@ -5042,6 +5136,35 @@ namespace grass
 				list->ResourceBarrier(1, &written);
 				stats.sun = true;
 			}
+			// The snow's trails (trail_ps) kept before the shading pass reads them: the map at the end of the sun's mask, its
+			// parameters after the snow's ([kSnow + 3]); the rain map's window in t0
+			if (snow_written && trails)
+				if (ID3D12PipelineState *const trail_pso = trail_pipeline(error))
+				{
+					section(list, L"worldfx: snow trails");
+					const float dt = _trail_time >= 0.0 && std::isfinite(l.time) ? float(std::clamp(double(l.time) - _trail_time, 0.0, 0.25)) : 0.0f;
+					_trail_time = std::isfinite(l.time) ? double(l.time) : -1.0;
+					const float snowfall = std::isfinite(l.snowfall) ? std::clamp(l.snowfall, 0.0f, 1.0f) : 0.0f;
+					const uint32_t offset = uint32_t(_sun_mask_size - kTrailBytes);
+					float *const q = actor_data + kSnowOffset + 12;
+					std::memcpy(&q[0], &offset, 4);
+					q[1] = dt * snowfall / kTrailRefillSeconds;
+					std::memcpy(&q[2], &_trail_epoch, 4);
+					q[3] = 1.0f;
+					const D3D12_VIEWPORT trail_viewport = { 0.0f, 0.0f, float(kTrailSize), float(kTrailSize), 0.0f, 1.0f };
+					const D3D12_RECT trail_scissor = { 0, 0, LONG(kTrailSize), LONG(kTrailSize) };
+					list->SetGraphicsRootShaderResourceView(1, _rain_window->GetGPUVirtualAddress());
+					list->SetPipelineState(trail_pso);
+					list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+					list->RSSetViewports(1, &trail_viewport);
+					list->RSSetScissorRects(1, &trail_scissor);
+					list->DrawInstanced(3, 1, 0, 0);
+					D3D12_RESOURCE_BARRIER written = {};
+					written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+					written.UAV.pResource = _sun_mask;
+					list->ResourceBarrier(1, &written);
+					stats.snow_trails = true;
+				}
 			section(list, L"worldfx: shading pass");
 			// (t0 in the shading pass: the rain map's window under settled snow, the wet mask when it's read; else as the sun
 			// pass left it, or still unread)
@@ -5062,6 +5185,20 @@ namespace grass
 			stats.snow_cover = snow_written;
 			stats.sky = sky_written;
 			stats.shimmer = shimmer && wx_written;
+			// The snow layer (snow_layer_vs, snow_layer_ps), with the shading pass's constants and views (its copy of the world
+			// still the one before shading: the snow's light is read from it): into the blades' depth, cleared here and
+			// kept for the blades and flakes after it
+			if (snow_written && layer_depth > 0.0f && blade_depth_for(rt_desc, error))
+				if (ID3D12PipelineState *const layer_pso = layer_pipeline_for(t, error))
+				{
+					section(list, L"worldfx: snow layer");
+					const D3D12_CPU_DESCRIPTOR_HANDLE layer_dsv = _dsv_heap->GetCPUDescriptorHandleForHeapStart();
+					list->ClearDepthStencilView(layer_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+					list->SetPipelineState(layer_pso);
+					list->OMSetRenderTargets(1, &world_rtv, FALSE, &layer_dsv);
+					list->DrawInstanced(6, kLayerCells * kLayerCells, 0, 0);
+					stats.snow_layer = true;
+				}
 			if ((run_count != 0 || (water_shade && (water_run_count != 0 || sea_here))) && copy_out(list, _ground, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)
 				transition(list, t.rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		}
@@ -5204,7 +5341,8 @@ namespace grass
 			return stats;
 		}
 		const D3D12_CPU_DESCRIPTOR_HANDLE blade_dsv = _dsv_heap->GetCPUDescriptorHandleForHeapStart();
-		list->ClearDepthStencilView(blade_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+		if (!stats.snow_layer) // (the snow layer's depth stays: what's drawn after is hidden by it)
+			list->ClearDepthStencilView(blade_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 		// (at the zone's end: the blades into the world's own depth, tested against it and written, so the characters
 		// and effects drawn after them are hidden behind blades or drawn over them by depth)
 		D3D12_CPU_DESCRIPTOR_HANDLE grass_dsv = blade_dsv;

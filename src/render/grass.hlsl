@@ -264,7 +264,8 @@ static const uint kWx = kWear + 2 + 2 * kMaxCuts + 8;
 // Settled snow (rule bit 8192; grass_render.cpp kSnowParams, after the clouds' (kCloud, 10) and the casters' map's
 // (kCaster, 4)): [kSnow] the view's first row (a view-space point's world x is eye.x + dot(it, the point)) and the cover
 // (0..1: a whole layer at 1); [kSnow + 1] its third row (world z); [kSnow + 2] the rain map's window around the camera:
-// its corner (x, z) and its squares' size. The window (kSnowWindow squares a side, a uint a square as the rain's: the
+// its corner (x, z) and its squares' size; [kSnow + 1].w the snow layer's depth at a whole layer (yalms: snow_layer_vs;
+// 0 none); [kSnow + 3] the trails' (trail_at). The window (kSnowWindow squares a side, a uint a square as the rain's: the
 // topmost surface's y as float bits, what it is in the low 2 bits: 0 nothing, 1 leaves or steep, 2 ground facing up,
 // 3 water) is t0 in the shading pass, in the wet mask's place (they never fall together).
 static const uint kSnow = kWx + 16 + 10 + 4;
@@ -735,6 +736,78 @@ float snow_open(float3 W)
 	float2 f = s - floor(s);
 	return lerp(lerp(snow_open_square(i, W.y), snow_open_square(i + int2(1, 0), W.y), f.x),
 		lerp(snow_open_square(i + int2(0, 1), W.y), snow_open_square(i + int2(1, 1), W.y), f.x), f.y);
+}
+
+// A square of the rain map's window (t0 in the shading pass and the snow layer's passes) by its place in it: its uint
+// (the topmost surface's y as float bits, what it is in the low 2 bits), 0 off the window
+uint snow_square(int2 i)
+{
+	bool in_window = all(i >= 0) && all(i < int(kSnowWindow));
+	int2 c = clamp(i, int2(0, 0), int2(kSnowWindow - 1, kSnowWindow - 1)); // (a root view has no bounds: never read past it)
+	uint v = wet_mask.Load((uint(c.y) * kSnowWindow + uint(c.x)) * 4);
+	return in_window ? v : 0u;
+}
+
+// Where settled snow lies at xz (0..1): patches across the world that join up as it deepens (cover 0..1: a whole
+// layer at 1; half a layer, about half the ground)
+float snow_patches(float2 xz, float cover)
+{
+	float patches = noise2(xz * 0.45) * 0.65 + noise2(xz * 2.3) * 0.35;
+	return saturate((patches - 1.15 + 1.3 * cover) / 0.18);
+}
+
+// Trails trodden through settled snow (shading pass and snow layer; [kSnow + 3]: x where the trail map starts in u1
+// (bytes, uint bits), y how much it fills back in this frame, z the zone's number (uint bits), w 1 with trails on).
+// The map is kTrailSize texels a side, kTrailTexel yalms each, fixed to the world and wrapped round (a world texel
+// ix, iz is at ix & (kTrailSize - 1), iz & ...) over the kTrailSize texels around the camera that trail_ps keeps: a
+// uint each, how trodden (0..65535) in the low 16 bits and in the high 16 whose it is (trail_tag: its tile of the world
+// and the zone), so a texel the camera moved away from, or one of the last zone's, reads as untrodden.
+static const int kTrailSize = 512;
+static const float kTrailTexel = 0.125;
+bool trails_on() { return actors[kSnow + 3].w > 0.0; }
+
+uint trail_tag(int2 texel)
+{
+	int2 tile = texel >> 9; // (kTrailSize)
+	return ((uint(tile.x) & 63u) | ((uint(tile.y) & 63u) << 6) | ((asuint(actors[kSnow + 3].z) & 15u) << 12));
+}
+
+float trail_texel(int2 texel)
+{
+	uint2 slot = uint2(texel) & uint(kTrailSize - 1);
+	uint v = sun_mask.Load(asuint(actors[kSnow + 3].x) + (slot.y * uint(kTrailSize) + slot.x) * 4);
+	return (v >> 16) == trail_tag(texel) ? (v & 0xFFFFu) / 65535.0 : 0.0;
+}
+
+// How trodden the snow at xz is (0..1), its four texels around blended
+float trail_at(float2 xz)
+{
+	float2 t = xz / kTrailTexel - 0.5;
+	int2 i = int2(floor(t));
+	float2 f = t - floor(t);
+	return lerp(lerp(trail_texel(i), trail_texel(i + int2(1, 0)), f.x), lerp(trail_texel(i + int2(0, 1)), trail_texel(i + int2(1, 1)), f.x), f.y);
+}
+
+// Settled snow's colour at p (what's drawn there at view depth z): lit as the scene around it is, its brightness on
+// that surface read as a mid-grey ground's light (sun, shade, night and the game's own lamps carry over), from a
+// small ring a tenth of a yalm and at most 6 pixels out on the same surface (four taps half a yalm out, up to 40
+// pixels, put four copies of every shadow and dark spot on the snow around it, and the whole snowy ground looked
+// blurred); a little uneven across the world (xz)
+float3 snow_white(int2 p, float z, float px_per_yalm, float2 xz)
+{
+	float around = luma(texel(p)), taps = 1.0;
+	float r = clamp(0.1 * px_per_yalm, 1.0, 6.0);
+	static const float2 ring[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+		float2(0.7071, 0.7071), float2(-0.7071, 0.7071), float2(0.7071, -0.7071), float2(-0.7071, -0.7071) };
+	[unroll] for (int k = 0; k < 8; ++k)
+	{
+		int2 q = p + int2(round(ring[k] * r));
+		bool same = abs(drawn_depth(q) - z) < 0.03 * z + 0.1;
+		around += same ? luma(texel(q)) : 0.0;
+		taps += same ? 1.0 : 0.0;
+	}
+	float light = clamp(around / taps / 0.3, 0.1, 1.8);
+	return min(float3(0.9, 0.93, 0.98) * light * (0.94 + 0.06 * noise2(xz * 9.0)), 1.0);
 }
 
 // A sky of its own (crowd.x rule bit 128; t2 after the wet look's: grass_render.cpp kSkyParams), on the pixels the zone
@@ -1613,6 +1686,53 @@ float3 shimmered(int2 p, float3 P, float z, float3 col)
 	return col;
 }
 
+// Sun shadows: worked out for one pixel in four (sun_ps, below), each starting its march at its own one of
+// sixteen points within the first step; here the 4 x 4 of those around this pixel are averaged, so every
+// pixel sees all sixteen starts and the shadow comes out soft and whole rather than in a pattern (one
+// march a pixel, all or nothing, showed as hatching). Only those on this pixel's surface count (a similar
+// depth), so a shadow doesn't bleed across an edge. Each holds two amounts: the shadow (the march's and the
+// map's), which takes the sun's share of this surface's light (sun_share: none on a surface turned away, which the
+// game's own lighting already leaves to the ambient light); and the map's shadow from something well above (over
+// 2 yalms toward the sun: a canopy, a crown, a cliff) on a surface seen too nearly edge on for its facing to be
+// told from the depth, already at the share a surface facing up would lose (a ledge's steep face seen edge on
+// under trees stayed bright, and came and went with the camera's angle), and a character's (sun_ps), both taken
+// as they are.
+// The clouds' shadows too, with cloud_shade. (The shading pass's, and the snow layer's: snow_layer_ps.)
+float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade)
+{
+	float sunlit = 1.0;
+	if (shade.w > 0.0)
+	{
+		float share = sun_share(dot(n, sun_in_view()));
+		int2 size = sun_mask_size();
+		int2 first = (p - 3) >> 1;
+		float2 sum = 0.0, nearest_shadow = 0.0;
+		float weight = 0.0, nearest = 1e9;
+		[unroll] for (int j = 0; j < 16; ++j)
+		{
+			int2 h = clamp(first + int2(j & 3, j >> 2), int2(0, 0), size - 1);
+			uint m = sun_mask.Load((h.y * size.x + h.x) * 4);
+			float2 s = float2(m & 0xFF, (m >> 8) & 0xFF) / 255.0;
+			float apart = abs(f16tof32(m >> 16) - z);
+			float same = apart < 0.03 * z + 0.1 ? 1.0 : 0.0;
+			sum += same * s;
+			weight += same;
+			nearest_shadow = apart < nearest ? s : nearest_shadow;
+			nearest = min(nearest, apart);
+		}
+		// (none at this depth: ground seen at a grazing angle far off, where each row of pixels is a yalm or more
+		// further than the last and the pass's rows skip every other one: the nearest in depth, rather than none,
+		// which left every other row there unshaded)
+		float2 s = weight > 0.0 ? sum / weight : nearest_shadow;
+		sunlit = 1.0 - shade.w * max(s.x * share, s.y);
+	}
+	// The clouds' shadows (cloud_shadow_at): what they keep off the sun's share of this surface's light, as strong as
+	// [kCloud + 9].y says
+	[branch] if (cloud_shade)
+		sunlit *= 1.0 - actors[kCloud + 9].y * sun_share(dot(n, sun_in_view())) * (1.0 - cloud_shadow_at(P));
+	return sunlit;
+}
+
 float4 shade_ps(float4 pos : SV_Position) : SV_Target
 {
 	int2 p = int2(pos.xy);
@@ -1684,47 +1804,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 			relief = 1.0 + shade.z * clamp(0.6 * detail + 0.2 * lit, -0.45, 0.45) * saturate((rr - 1.5) / 3.0);
 		}
 	}
-	// Sun shadows: worked out for one pixel in four (sun_ps, below), each starting its march at its own one of
-	// sixteen points within the first step; here the 4 x 4 of those around this pixel are averaged, so every
-	// pixel sees all sixteen starts and the shadow comes out soft and whole rather than in a pattern (one
-	// march a pixel, all or nothing, showed as hatching). Only those on this pixel's surface count (a similar
-	// depth), so a shadow doesn't bleed across an edge. Each holds two amounts: the shadow (the march's and the
-	// map's), which takes the sun's share of this surface's light (sun_share: none on a surface turned away, which the
-	// game's own lighting already leaves to the ambient light); and the map's shadow from something well above (over
-	// 2 yalms toward the sun: a canopy, a crown, a cliff) on a surface seen too nearly edge on for its facing to be
-	// told from the depth, already at the share a surface facing up would lose (a ledge's steep face seen edge on
-	// under trees stayed bright, and came and went with the camera's angle), and a character's (sun_ps), both taken
-	// as they are.
-	float sunlit = 1.0;
-	if (shade.w > 0.0)
-	{
-		float share = sun_share(dot(n, sun_in_view()));
-		int2 size = sun_mask_size();
-		int2 first = (p - 3) >> 1;
-		float2 sum = 0.0, nearest_shadow = 0.0;
-		float weight = 0.0, nearest = 1e9;
-		[unroll] for (int j = 0; j < 16; ++j)
-		{
-			int2 h = clamp(first + int2(j & 3, j >> 2), int2(0, 0), size - 1);
-			uint m = sun_mask.Load((h.y * size.x + h.x) * 4);
-			float2 s = float2(m & 0xFF, (m >> 8) & 0xFF) / 255.0;
-			float apart = abs(f16tof32(m >> 16) - z);
-			float same = apart < 0.03 * z + 0.1 ? 1.0 : 0.0;
-			sum += same * s;
-			weight += same;
-			nearest_shadow = apart < nearest ? s : nearest_shadow;
-			nearest = min(nearest, apart);
-		}
-		// (none at this depth: ground seen at a grazing angle far off, where each row of pixels is a yalm or more
-		// further than the last and the pass's rows skip every other one: the nearest in depth, rather than none,
-		// which left every other row there unshaded)
-		float2 s = weight > 0.0 ? sum / weight : nearest_shadow;
-		sunlit = 1.0 - shade.w * max(s.x * share, s.y);
-	}
-	// The clouds' shadows (cloud_shadow_at): what they keep off the sun's share of this surface's light, as strong as
-	// [kCloud + 9].y says
-	[branch] if (cloud_shade)
-		sunlit *= 1.0 - actors[kCloud + 9].y * sun_share(dot(n, sun_in_view())) * (1.0 - cloud_shadow_at(P));
+	float sunlit = sun_lit_at(p, z, n, P, cloud_shade);
 	// Settled snow (snow_open, the cover [kSnow].w): on what faces up under open sky, in patches across the world that join
 	// up as it deepens (a whole layer at 1), lit as the scene around it is (its brightness on this surface read as a
 	// mid-grey ground's light: sun, shade, night and the game's own lamps carry over), in the game's fog as the rest; the
@@ -1738,27 +1818,17 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		[branch] if (facing > 0.0)
 		{
 			float3 W = float3(eye.x + dot(actors[kSnow].xyz, P), eye.y + dot(up_row.xyz, P), eye.z + dot(actors[kSnow + 1].xyz, P));
-			float patches = noise2(W.xz * 0.45) * 0.65 + noise2(W.xz * 2.3) * 0.35;
-			float amount = facing * saturate((patches - 1.15 + 1.3 * cover) / 0.18); // (half a layer: about half the ground)
+			float amount = facing * snow_patches(W.xz, cover); // (half a layer: about half the ground)
 			[branch] if (amount > 0.0)
 				amount *= snow_open(W);
+			// (trodden down where people walked (trail_at): thinner, packed and greyer)
+			float trodden = 0.0;
+			[branch] if (amount > 0.0 && trails_on())
+				trodden = trail_at(W.xz);
+			amount *= 1.0 - 0.75 * trodden;
 			[branch] if (amount > 0.0)
 			{
-				// (a small ring, a tenth of a yalm and at most 6 pixels out: four taps half a yalm out, up to 40 pixels, put
-				// four copies of every shadow and dark spot on the snow around it, and the whole snowy ground looked blurred)
-				float around = luma(col), taps = 1.0;
-				float r = clamp(0.1 * px_per_yalm, 1.0, 6.0);
-				static const float2 ring[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
-					float2(0.7071, 0.7071), float2(-0.7071, 0.7071), float2(0.7071, -0.7071), float2(-0.7071, -0.7071) };
-				[unroll] for (int k = 0; k < 8; ++k)
-				{
-					int2 q = p + int2(round(ring[k] * r));
-					bool same = abs(drawn_depth(q) - z) < 0.03 * z + 0.1;
-					around += same ? luma(texel(q)) : 0.0;
-					taps += same ? 1.0 : 0.0;
-				}
-				float light = clamp(around / taps / 0.3, 0.1, 1.8);
-				float3 snow = min(float3(0.9, 0.93, 0.98) * light * (0.94 + 0.06 * noise2(W.xz * 9.0)), 1.0);
+				float3 snow = snow_white(p, z, px_per_yalm, W.xz) * (1.0 - 0.15 * trodden);
 				[branch] if (hazy())
 					snow = lerp(haze_colour(), snow, clear_at(z));
 				col = lerp(col, snow, 0.95 * amount);
@@ -3302,6 +3372,165 @@ float4 snow_ps(snow_v2p i) : SV_Target
 		discard;
 	float edge = 1.0 - r2;
 	return float4(color.rgb, i.alpha * edge * sqrt(edge));
+}
+
+// Trails through settled snow (trail_ps): the trail map (trail_at) kept, a pixel a texel over a kTrailSize viewport
+// with no render target, before the shading pass (its constants; the rain map's window in t0). Each slot stands for the
+// world texel in it within kTrailSize / 2 of the camera's; one that was another's (another tag) starts untrodden. It
+// fills back in by [kSnow + 3].y this frame (the snow falling on it), and whoever stands near with their feet on its
+// surface (within kTrailTread of the map's top there, on ground facing up: not someone flying over it) treads it down:
+// wholly within 0.28 times their size (a quarter of a yalm to 1.2), softening out to 1.8 times that.
+static const float kTrailTread = 0.75;
+
+void trail_ps(float4 pos : SV_Position)
+{
+	int2 slot = int2(pos.xy);
+	int2 first = int2(floor(eye.xz / kTrailTexel)) - kTrailSize / 2;
+	int2 texel = first + int2(uint2(slot - first) & uint(kTrailSize - 1));
+	uint at = asuint(actors[kSnow + 3].x) + (uint(slot.y) * uint(kTrailSize) + uint(slot.x)) * 4;
+	uint v = sun_mask.Load(at);
+	uint tag = trail_tag(texel);
+	float trodden = (v >> 16) == tag ? (v & 0xFFFFu) / 65535.0 : 0.0;
+	trodden = max(trodden - actors[kSnow + 3].y, 0.0);
+	float2 xz = (float2(texel) + 0.5) * kTrailTexel;
+	float4 win = actors[kSnow + 2];
+	uint c = snow_square(int2(floor((xz - win.xy) / win.z)));
+	float top = asfloat(c & ~3u);
+	uint count = crowd.x & 0xFFFF;
+	[loop] for (uint k = 0; k < min(count, 32u); ++k)
+	{
+		float4 a = actors[k];
+		float r = clamp(0.28 * a.w, 0.25, 1.2);
+		bool on = (c & 3u) == 2u && abs(a.y - top) < kTrailTread;
+		trodden = on ? max(trodden, 1.0 - smoothstep(r, 1.8 * r, distance(xz, a.xz))) : trodden;
+	}
+	sun_mask.Store(at, (tag << 16) | uint(saturate(trodden) * 65535.0 + 0.5));
+}
+
+// The snow layer (snow_layer_vs, snow_layer_ps): settled snow with depth, after the shading pass (its constants, with the
+// rain map's window in t0) and into the blades' depth (what comes after, blades and flakes, is hidden by it). A grid of
+// kTrailTexel cells, kLayerCells a side round the camera, fixed to the world; each corner on the ground the rain map has
+// there (layer_ground: on what holds snow, ground facing up under open sky, roofs too), raised by the snow lying there:
+// [kSnow + 1].w yalms at a whole layer (cover [kSnow].w) times the patches the flat snow lies in, thinning to nothing at
+// the edges of what holds it, pressed down in trails (trail_at) with a little ridge beside them, faded out over the last
+// 4 yalms before kLayerReach from the camera. Where it would climb a step (steeper than 60 degrees: a kerb, a wall) or
+// stand over nothing, its triangles are left out; where it's thinner than kLayerThin, the flat snow under it shows.
+static const int kLayerCells = 256;
+static const float kLayerReach = 15.0, kLayerThin = 0.012;
+
+struct layer_v2p
+{
+	float4 pos : SV_Position;
+	float3 P : VIEWPOS;    // the point, view space
+	float3 n : NORMAL;     // its facing, view space
+	float2 xz : WORLDXZ;   // and where it is in the world
+	float thick : THICK;   // how deep the snow is (yalms)
+	float trodden : TRODDEN; // how trodden (trail_at)
+	float steep : STEEP;   // 1 at a corner on a step or over nothing (its triangles left out)
+};
+
+// The ground under xz from the rain map's window: the tops of the four squares around, blended over those that hold
+// snow (ground facing up) within 0.3 yalms of the nearest one's (a kerb's two sides aren't blended into a ramp); holds,
+// how much of the four do (soft edges; 0 where the nearest doesn't)
+float layer_ground(float2 xz, out float holds)
+{
+	float4 win = actors[kSnow + 2];
+	float2 s = (xz - win.xy) / win.z - 0.5;
+	int2 i = int2(floor(s));
+	float2 f = s - floor(s);
+	uint near = snow_square(i + int2(f.x >= 0.5 ? 1 : 0, f.y >= 0.5 ? 1 : 0));
+	float near_top = asfloat(near & ~3u);
+	float sum = 0.0, h = 0.0;
+	[unroll] for (int k = 0; k < 4; ++k)
+	{
+		int2 o = int2(k & 1, k >> 1);
+		uint v = snow_square(i + o);
+		float t = asfloat(v & ~3u);
+		float w = (o.x != 0 ? f.x : 1.0 - f.x) * (o.y != 0 ? f.y : 1.0 - f.y);
+		float ok = (v & 3u) == 2u && abs(t - near_top) < 0.3 ? w : 0.0;
+		sum += ok;
+		h += ok * t;
+	}
+	holds = (near & 3u) == 2u ? smoothstep(0.35, 0.9, sum) : 0.0;
+	return sum > 0.0 ? h / sum : near_top;
+}
+
+// The layer's top at xz (y, down positive), how deep it is there, how much of the ground there holds it and how trodden
+float layer_top(float2 xz, float cover, float depth, out float thick, out float holds, out float t)
+{
+	float y = layer_ground(xz, holds);
+	thick = depth * cover * holds * snow_patches(xz, cover);
+	t = 0.0;
+	[branch] if (trails_on() && thick > 0.0)
+	{
+		t = trail_at(xz);
+		float beside = max(max(trail_at(xz + float2(0.4, 0.0)), trail_at(xz - float2(0.4, 0.0))),
+			max(trail_at(xz + float2(0.0, 0.4)), trail_at(xz - float2(0.0, 0.4))));
+		thick *= 1.0 - 0.92 * t + 0.35 * saturate(beside - t);
+	}
+	return y - thick;
+}
+
+layer_v2p snow_layer_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+{
+	static const int2 corner[6] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(0, 1), int2(1, 0), int2(1, 1) };
+	int2 cell = int2(floor(eye.xz / kTrailTexel)) - kLayerCells / 2 + int2(iid % uint(kLayerCells), iid / uint(kLayerCells)) + corner[vid % 6];
+	float2 xz = float2(cell) * kTrailTexel;
+	float cover = actors[kSnow].w;
+	float depth = actors[kSnow + 1].w * saturate((kLayerReach - distance(xz, eye.xz)) / 4.0);
+	float thick, holds, trodden, tx, hx, sx, tz, hz, sz;
+	float y = layer_top(xz, cover, depth, thick, holds, trodden);
+	float yx = layer_top(xz + float2(kTrailTexel, 0.0), cover, depth, tx, hx, sx);
+	float yz = layer_top(xz + float2(0.0, kTrailTexel), cover, depth, tz, hz, sz);
+	float3 nw = normalize(float3(yx - y, -kTrailTexel, yz - y)); // (the world's, y down: facing up has a negative y)
+	float3 r0 = actors[kSnow].xyz, r2 = actors[kSnow + 1].xyz;
+	float3 d = float3(xz.x, y, xz.y) - eye.xyz;
+	layer_v2p o;
+	o.pos = mul(float4(xz.x, y, xz.y, 1.0), view_proj);
+	o.P = r0 * d.x + up_row.xyz * d.y + r2 * d.z;
+	o.n = r0 * nw.x + up_row.xyz * nw.y + r2 * nw.z;
+	o.xz = xz;
+	o.thick = thick;
+	o.trodden = trodden;
+	o.steep = holds <= 0.0 || -nw.y < 0.5 ? 1.0 : 0.0;
+	return o;
+}
+
+float4 snow_layer_ps(layer_v2p i) : SV_Target
+{
+	if (i.steep > 0.001 || i.thick < kLayerThin || behind_drawn(i.pos))
+		discard;
+	// (never seen from under it: under a roof, the roof hides the snow on it; where the game draws nothing there, its
+	// underside isn't left floating)
+	float3 n = normalize(i.n);
+	if (dot(n, -i.P) < 0.0)
+		discard;
+	int2 p = int2(i.pos.xy);
+	float z = drawn_depth(p); // (what's drawn behind it: the ground under it, as a rule)
+	float depth = abs(i.P.z);
+	// White as the flat snow under it is (lit as the scene around), then as it faces against flat ground (the game
+	// lights with an ambient part and the light's by the cosine): a drift's side toward the light brighter, a trail's
+	// far wall darker
+	// (packed and greyer where trodden, and as the flat snow, a little of what's under it showing: the same where the two
+	// meet)
+	float3 snow = snow_white(p, z, lin.z * 0.5 * ground.y / depth, i.xz) * (1.0 - 0.15 * i.trodden);
+	const float3 L = sun_in_view(), world_up = -up_row.xyz;
+	float facing = (0.49 + 1.25 * saturate(dot(n, L))) / (0.49 + 1.25 * saturate(dot(world_up, L)));
+	snow = lerp(texel(p), min(snow * clamp(facing, 0.6, 1.35), 1.0), 0.95 * (1.0 - 0.75 * saturate(i.trodden)));
+	// World FX's shadows and lamps on it, in the game's fog, as the shading pass's on the rest
+	float sunlit = sun_lit_at(p, z, n, i.P, cloud_shadows());
+	float3 glow = 0.0;
+	[branch] if (((crowd.x >> 16) & 16) != 0)
+		glow = lamp_light(i.P, n, 1.0, snow);
+	float3 haze = 0.0;
+	float clear = 1.0;
+	[branch] if (hazy())
+	{
+		clear = clear_at(depth);
+		snow = lerp(haze_colour(), snow, clear);
+		haze = haze_colour() * (1.0 - clear);
+	}
+	return float4(haze + (snow - haze) * sunlit + glow * clear, 1.0);
 }
 
 // Leaves in wind and gales (leaf_vs, leaf_ps): in the rain's columns (its constants as the snow's), falling slowly
