@@ -780,6 +780,7 @@ namespace grass
 		// (what the bloom's first level was kept for last frame: its size and the buffer it's in)
 		uint32_t _look_history_w = 0, _look_history_h = 0;
 		ID3D12Resource *_look_history_buf = nullptr;
+		bool _look_history_bloom = false; // (the last frame drew the bloom, keeping each level's light)
 		uint64_t _shader_key = 0;
 		bool _shaders_from_cache = false;
 		double _shader_seconds = 0.0;

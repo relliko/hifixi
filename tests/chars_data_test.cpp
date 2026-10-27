@@ -366,6 +366,31 @@ int main(int argc, char **argv)
 			os2::hidden_by(0x32) == 64u && os2::hidden_by(0x11) == 0u && os2::hidden_by(1) == 0u,
 		"hide groups: 2 -> 1; 5 -> 1-4, 8; 0x12 -> 5; 0x22 -> 7; 0x32 -> 6; 0x11, 1 -> none");
 
+	// A type-1 mesh (header byte 2 low bits 1: 12-byte vertices, a draw of its own) refused, its model left to the game:
+	// the San d'Orian banner's cloth (NPC model 814, ROM/7/95.DAT 'hf_f'; read as an ordinary mesh it came out in shards),
+	// its pole ('hf_b', an ordinary mesh) decoded
+	{
+		bool cloth_refused = false, pole_ok = false;
+		std::string cloth_why;
+		for (const chunk &c : chunks_of("ROM/7/95.DAT"))
+		{
+			if (c.kind != 0x2A)
+				continue;
+			os2::sections s;
+			os2::mesh m;
+			std::string why;
+			const bool ok = os2::sections_of_chunk(c.data.data(), c.data.size(), s) && os2::decode(c.data.data(), c.data.size(), s, m, why);
+			if (std::memcmp(c.name, "hf_f", 4) == 0)
+			{
+				cloth_refused = !ok && why.find("type-1") != std::string::npos;
+				cloth_why = why;
+			}
+			else if (std::memcmp(c.name, "hf_b", 4) == 0)
+				pole_ok = ok && m.vertices.size() == 432;
+		}
+		check(cloth_refused && pole_ok, "a type-1 mesh refused (the banner's cloth: " + cloth_why + "), the pole beside it decoded");
+	}
+
 	if (failures == 0)
 		std::printf("\nall passed (%d)\n", passes);
 	else

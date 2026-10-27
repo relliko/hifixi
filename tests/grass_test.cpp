@@ -606,6 +606,126 @@ int main(int argc, char **argv)
 			const double range = std::fabs(glow[8] - glow[0]);
 			std::printf("  bloom from a dot moved a pixel at a time: glow beside it %.2f .. %.2f, biggest step %.2f\n", glow[0], glow[8], biggest);
 			check(range > 0.3 && biggest < 0.45 * range, "L: a small bright dot's glow moves smoothly as the dot does (no jumps between blocks)");
+			// Round, not square: a dot's glow the same all the way round it, 20 and 36 pixels out (the coarse levels' texels
+			// 16 and 32 pixels: drawn up between them one tap each, the glow came out in squares; Valkurm's sand at night,
+			// 2026-10-27). The ring's spread (most - least) over its mean.
+			{
+				// (8 x 8, on black: the glow well over the dither 36 pixels out, read where the screen's curve is steep)
+				const picture dot = make([&](UINT x, UINT y, uint8_t *q) {
+					const bool in = x + 4 >= LW / 2 && x < LW / 2 + 4 && y + 4 >= LH / 2 && y < LH / 2 + 4;
+					q[0] = q[1] = q[2] = in ? 255 : 0;
+				});
+				look lr2 = l;
+				lr2.post.bloom = 8.0f;
+				const picture o = frame(dot, lr2);
+				save(o, "build\\look_bloom_dot.ppm");
+				// (along the 4 diagonals against along the 4 axes, the same distances out, 3 x 3 means: a square glow reaches
+				// further along its diagonals)
+				const double cx = LW / 2 - 0.5, cy = LH / 2 - 0.5;
+				auto at = [&](double x, double y) { return mean(o, UINT(std::lround(x)) - 1, UINT(std::lround(y)) - 1, UINT(std::lround(x)) + 2, UINT(std::lround(y)) + 2, 3); };
+				for (const auto &band : { std::pair<double, double> { 12.0, 26.0 }, std::pair<double, double> { 26.0, 44.0 } })
+				{
+					double axes = 0.0, diagonals = 0.0;
+					for (double r = band.first; r < band.second; r += 1.0)
+					{
+						const double d = r / std::sqrt(2.0);
+						axes += at(cx + r, cy) + at(cx - r, cy) + at(cx, cy + r) + at(cx, cy - r);
+						diagonals += at(cx + d, cy + d) + at(cx - d, cy + d) + at(cx + d, cy - d) + at(cx - d, cy - d);
+					}
+					const double n = 4.0 * (band.second - band.first);
+					std::printf("  bloom round a dot %.0f..%.0f pixels out: along the axes %.2f, the diagonals %.2f (%.2f times)\n", band.first, band.second,
+						axes / n, diagonals / n, diagonals / std::max(axes, 1e-6));
+					// (one tap between the texels: 1.06 and 1.14 times; a tent of them: 1.04 and 1.04)
+					check(axes / n > 1.0 && diagonals <= 1.08 * axes, band.first < 20.0 ? "L: a dot's glow round 12..26 pixels out (no squares)" : "L: a dot's glow round 26..44 pixels out (no squares)");
+				}
+			}
+			// Steady: a bright ground near the threshold whose pixels change from frame to frame (sand and snow shimmering as
+			// the camera moves), frames a 144th of a second apart: the glow it casts on the dark ground beside it hardly
+			// changes from one frame to the next (each level of the bloom a share of its last frame's)
+			{
+				uint32_t seed = 12345;
+				auto rnd = [&seed] {
+					seed = seed * 1664525u + 1013904223u;
+					return (seed >> 8) & 0xFFFF;
+				};
+				look lf = l;
+				lf.post.bloom = 1.0f;
+				lf.clock = 200.0;
+				picture prev;
+				double change = 0.0, glow_sum = 0.0;
+				int counted = 0;
+				for (int f = 0; f < 40; ++f)
+				{
+					const picture sand = make([&](UINT x, UINT y, uint8_t *q) {
+						// (patches 6 pixels across, each its own brightness this frame: 150..255, around the knee)
+						(void)x;
+						q[0] = q[1] = q[2] = y < LH / 2 ? 40 : 0;
+					});
+					picture in = sand;
+					for (UINT by = LH / 2; by < LH; by += 6)
+						for (UINT bx = 0; bx < LW; bx += 6)
+						{
+							const uint8_t v = uint8_t(150 + rnd() % 106);
+							for (UINT y = by; y < std::min(by + 6, LH); ++y)
+								for (UINT x = bx; x < std::min(bx + 6, LW); ++x)
+								{
+									uint8_t *q = &in[(size_t(y) * LW + x) * 4];
+									q[0] = q[1] = q[2] = v;
+								}
+						}
+					const picture o = frame(in, lf);
+					lf.clock += 1.0 / 144.0;
+					if (f >= 20)
+					{
+						double d = 0.0, g2 = 0.0;
+						for (UINT y = LH / 2 - 30; y < LH / 2 - 4; ++y)
+							for (UINT x = 20; x < LW - 20; ++x)
+							{
+								d += std::abs(px(o, x, y, 1) - px(prev, x, y, 1));
+								g2 += px(o, x, y, 1) - 40;
+							}
+						const double n = double(LW - 40) * 26.0;
+						change += d / n;
+						glow_sum += g2 / n;
+						counted++;
+					}
+					prev = o;
+				}
+				change /= counted;
+				glow_sum /= counted;
+				std::printf("  bloom beside a shimmering bright ground, a 144th of a second apart: glow %.2f, changing %.3f a frame\n", glow_sum, change);
+				// (the first level alone a fixed 0.45 of its last frame: 7.6 % of the glow a frame; each level by its time: 1.2 %)
+				check(glow_sum > 1.0 && change < 0.03 * glow_sum, "L: the glow beside a shimmering bright ground stays steady from frame to frame");
+				// ... and lets go soon: the ground dark, a quarter of a second later little of the glow is left
+				const picture dark = make([](UINT, UINT y, uint8_t *q) { q[0] = q[1] = q[2] = y < LH / 2 ? 40 : 0; });
+				picture o;
+				for (int f = 0; f < 36; ++f)
+				{
+					o = frame(dark, lf);
+					lf.clock += 1.0 / 144.0;
+				}
+				const double left = mean(o, 20, LH / 2 - 30, LW - 20, LH / 2 - 4, 1) - 40.0;
+				std::printf("  a quarter of a second after the bright ground went dark: glow %.2f (of %.2f)\n", left, glow_sum);
+				check(left < 0.15 * glow_sum, "L: the steadied glow lets go within a quarter of a second");
+				// ... and a frame without bloom leaves nothing to go on: all bright with the bloom on (its levels kept bright), a
+				// frame with the look on but the bloom off, then dark with the bloom on again: no glow from the bright frames
+				const picture bright = make([](UINT, UINT, uint8_t *q) { q[0] = q[1] = q[2] = 250; });
+				for (int f = 0; f < 3; ++f)
+				{
+					frame(bright, lf);
+					lf.clock += 1.0 / 144.0;
+				}
+				look off = lf;
+				off.post.bloom = 0.0f;
+				off.post.tonemap = true;
+				frame(bright, off);
+				lf.clock += 1.0 / 144.0;
+				const picture after = frame(dark, lf);
+				int most = 0;
+				for (size_t i = 0; i < after.size(); i += 4)
+					most = std::max(most, std::abs(int(after[i + 1]) - int(dark[i + 1])));
+				check(most <= 1, "L: no glow carried over from frames drawn without the bloom (within the dither)");
+			}
 		}
 		// The grade's direction (no tone mapping, no bloom)
 		{

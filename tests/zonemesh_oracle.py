@@ -14,7 +14,8 @@ What's kept, in this order:
     each kept piece's vertices all appended (48 bytes: position, normal, colour, UV, sway vector), its indices made
     absolute;
   - textures: those the kept pieces name, in first-use order, the first chunk of that name: 0xA1 DXT3 (blocks as
-    stored) or 0xB1 palettized (expanded to BGRA through its 256-entry palette); none for a name with neither;
+    stored) or 0xB1 palettized (expanded to BGRA through its 256-entry palette); for a name with neither, the first
+    such chunk whose name's last 8 characters are the same (not blank); none if there's none;
   - normal maps (03ADC0): the bump DAT's first height map (chunk 0x5D) whose name's last 8 characters are the
     texture's last 8, made into B8G8R8A8 texels as 01E0A0 makes them, in first-use order;
   - placements: the MZB's object records naming a kept model, finite: flags 1 alpha-tested ('_'), 2 mirrored
@@ -210,6 +211,8 @@ def figures(m):
     for name, kind, ps in models:
         kinds[kind] = kinds.get(kind, 0) + 1
         for tex, bits, vs, tri in ps:
+            if tex not in imgs and tex[8:].strip(b' '):
+                tex = next((k for k in imgs if k[8:] == tex[8:]), tex)
             base = len(verts)
             verts.extend(vs)
             for t in tri:

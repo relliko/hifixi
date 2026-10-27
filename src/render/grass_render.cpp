@@ -3002,8 +3002,10 @@ namespace grass
 		constexpr UINT64 kLookExposureBytes = 256;
 		constexpr uint32_t kLookLevels = 10, kLookSmallest = 16, kLookBloomLevels = 6;
 		constexpr float kLookBloom = 0.6f;
-		// (how much of the bloom's first level is its last frame's: grass.hlsl look_first_ps)
-		constexpr float kLookBloomKept = 0.45f;
+		// (each bloom level steadied toward its own light over this many seconds, the coarser more slowly: grass.hlsl
+		// look_up_ps. The first level alone, a fixed 0.45 of its last frame, still flickered in squares on bright sand at
+		// night at well over 100 frames a second: 2026-10-27. 0.02 s is that 0.45 at 60.)
+		constexpr float kLookBloomSeconds[kLookBloomLevels] = { 0.02f, 0.03f, 0.045f, 0.065f, 0.09f, 0.12f };
 	}
 
 	// The look's pipelines at the small sizes: full-screen triangles with no render target (their pixels write the look's
@@ -3112,9 +3114,13 @@ namespace grass
 				break;
 		}
 		const uint32_t bloom_levels = std::min(levels, kLookBloomLevels);
-		// (and after the levels the first one's last frame, which this frame's takes a share of: grass.hlsl look_first_ps)
-		const UINT64 history_at = bytes;
-		bytes += UINT64(sizes[0][0]) * sizes[0][1] * 8;
+		// (and after the levels each bloom level's steadied light, which this frame's takes a share of: grass.hlsl look_up_ps)
+		UINT64 history_at[kLookBloomLevels] = {};
+		for (uint32_t i = 0; i < bloom_levels; ++i)
+		{
+			history_at[i] = bytes;
+			bytes += UINT64(sizes[i][0]) * sizes[i][1] * 8;
+		}
 		if (_look_buf == nullptr || _look_buf_size < bytes)
 		{
 			if (_look_buf != nullptr)
@@ -3172,16 +3178,15 @@ namespace grass
 		c[10] = p.snap || dt < 0.0 || dt > 1.0 ? -1.0f : float(dt);
 		_look_clock = std::isfinite(l.clock) ? l.clock : 0.0;
 		c[11] = finite(p.key, 0.005f, 1.0f, 0.07f);
-		// (the bloom's first level a share of its last frame, when there's one at this size to go on: none after a snap, a
-		// jump in time, a new buffer or another size)
+		// (each bloom level a share of its last frame, when the last frame drew the bloom at this size: none after a snap, a
+		// jump in time, a new buffer, another size or a frame without bloom; the levels' shares and where they're kept are set
+		// pass by pass below)
 		const bool history_ok = !(p.snap || dt < 0.0 || dt > 1.0) && _look_history_w == sizes[0][0] && _look_history_h == sizes[0][1] &&
-			_look_history_buf == _look_buf;
-		const uint32_t history_offset = uint32_t(history_at);
-		std::memcpy(&c[9], &history_offset, 4);
-		c[27] = history_ok && bloom > 0.0f ? kLookBloomKept : 0.0f;
+			_look_history_buf == _look_buf && _look_history_bloom;
 		_look_history_w = sizes[0][0];
 		_look_history_h = sizes[0][1];
 		_look_history_buf = _look_buf;
+		_look_history_bloom = bloom > 0.0f;
 		c[12] = finite(p.exposure_min, 0.25f, 1.0f, 0.78f);
 		c[13] = finite(p.exposure_max, 1.0f, 4.0f, 1.06f);
 		c[14] = finite(p.threshold, 0.0f, 4.0f, 0.55f);
@@ -3229,9 +3234,19 @@ namespace grass
 			pass(_look_down_pso, at[i - 1], sizes[i - 1], at[i], sizes[i]);
 		if (p.tonemap)
 			pass(_look_exposure_pso, at[levels - 1], sizes[levels - 1], 0, one);
+		// (from the smallest up, each level steadied toward its last frame's and kept for the next, then the one under it
+		// added: the smallest has none, its size 0)
+		const uint32_t none[2] = { 0, 0 };
 		if (bloom > 0.0f)
-			for (uint32_t i = bloom_levels - 1; i-- > 0;)
-				pass(_look_up_pso, at[i + 1], sizes[i + 1], at[i], sizes[i]);
+			for (uint32_t i = bloom_levels; i-- > 0;)
+			{
+				const uint32_t history = uint32_t(history_at[i]);
+				const float kept = history_ok ? float(std::exp(-dt / kLookBloomSeconds[i])) : 0.0f;
+				list->SetGraphicsRoot32BitConstants(0, 1, &history, 9);
+				list->SetGraphicsRoot32BitConstants(0, 1, &kept, 27);
+				const bool smallest = i + 1 == bloom_levels;
+				pass(_look_up_pso, smallest ? 0 : at[i + 1], smallest ? none : sizes[i + 1], at[i], sizes[i]);
+			}
 
 		// The world drawn again from its copy
 		section(list, L"worldfx: look");

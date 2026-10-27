@@ -3911,13 +3911,15 @@ void vis_ps(float4 pos : SV_Position)
 // facelift drew (alpha 1) aren't part of it: left out of the light measured and the bloom, and left as drawn.
 //   view_proj[0]: the grade's gain (rgb, linear: white balance), its saturation
 //   view_proj[1]: its lift (rgb: the shadows tinted toward it), its contrast (around 0.3 as the screen shows it)
-//   view_proj[2]: the bloom's strength (over its levels' count), unused, seconds since the last frame (< 0: the exposure
-//                 set at once), the light the scene is exposed for (its mean luminance's key)
+//   view_proj[2]: the bloom's strength (over its levels' count), where the level's steadied light is kept (look_up_ps:
+//                 bytes, uint bits), seconds since the last frame (< 0: the exposure set at once), the light the scene is
+//                 exposed for (its mean luminance's key)
 //   view_proj[3]: the exposure's least and most (times), the bloom's threshold and knee (linear)
 //   eye (uint bits): where the pass reads (bytes into the buffer), where it writes, the size it reads (w, h)
 //   color (uint bits): the size it writes (w, h), where the exposure is, which parts are on (1 tone mapping, 2 bloom,
 //                 4 the grade)
-//   blade (uint bits): where the bloom's first level is, its size (w, h)
+//   blade (uint bits): where the bloom's first level is, its size (w, h); w (a float) how much of the level's last frame
+//                 look_up_ps keeps (0: none to go on)
 RWByteAddressBuffer look_buf : register(u1);
 
 float3 srgb_to_linear(float3 c)
@@ -3970,8 +3972,7 @@ float3 look_tone(float3 v)
 // averaged with less weight for the brightest (a lone bright pixel doesn't flicker), and the block's mean log2 luminance.
 // The light is taken from the 8 x 8 pixels round the block, a tent (1 2 3 4 4 3 2 1 each way), so what crosses a block's
 // edge fades from one texel into the next instead of jumping between them (bright snow and stone crawled at their edges
-// as the camera moved: 2026-10-27); then a share of the last frame's level (view_proj[2].y where it's kept, blade.w how
-// much of it: 0 when there's none to go on), so it can't flicker from one frame to the next.
+// as the camera moved: 2026-10-27). (Steadied from frame to frame with the others, in look_up_ps.)
 void look_first_ps(float4 pos : SV_Position)
 {
 	int2 q = int2(pos.xy);
@@ -4003,14 +4004,6 @@ void look_first_ps(float4 pos : SV_Position)
 			}
 		}
 	float3 light = weights > 0.0 ? sum / weights : 0.0;
-	float kept = blade.w;
-	[branch] if (kept > 0.0)
-	{
-		uint history = asuint(view_proj[2].y);
-		float3 was = look_read(history, q, uint2(asuint(color.x), asuint(color.y))).rgb;
-		light = lerp(light, was, kept);
-		look_write(history, q, asuint(color.x), float4(light, 0.0));
-	}
 	look_write(asuint(eye.y), q, asuint(color.x), float4(light, n > 0.0 ? logs / n : log2(0.07)));
 }
 
@@ -4055,14 +4048,32 @@ void look_exposure_ps(float4 pos : SV_Position)
 	look_buf.Store2(at, uint2(asuint(now), asuint(mean)));
 }
 
-// A level with the next smaller one added (between its texels): from the smallest up, each level ends up holding the
-// bright light blurred over all the sizes under it
+// A level with the next smaller one added: from the smallest up, each level ends up holding the bright light blurred
+// over all the sizes under it. Its own light first steadied: a share of its last frame's (blade.w, kept at
+// view_proj[2].y; the coarser, the more, set by the time between frames), kept for the next, so a coarse texel's worth
+// of bright ground crossing the threshold back and forth fades rather than flickers. The smaller level read through a
+// 3 x 3 tent of taps between its texels a texel apart (1 2 1 each way): read with one, its texels showed through as
+// squares (bright sand at night, 2026-10-27). The smallest has none under it (its size 0).
 void look_up_ps(float4 pos : SV_Position)
 {
 	int2 q = int2(pos.xy);
 	uint2 here = uint2(asuint(color.x), asuint(color.y));
 	float4 me = look_read(asuint(eye.y), q, here);
-	float3 up = look_between(asuint(eye.x), (float2(q) + 0.5) * 0.5 - 0.5, uint2(asuint(eye.z), asuint(eye.w))).rgb;
+	uint history = asuint(view_proj[2].y);
+	[branch] if (blade.w > 0.0)
+		me.rgb = lerp(me.rgb, look_read(history, q, here).rgb, blade.w);
+	look_write(history, q, here.x, float4(me.rgb, 0.0));
+	float3 up = 0.0;
+	uint2 size = uint2(asuint(eye.z), asuint(eye.w));
+	[branch] if (size.x > 0)
+	{
+		float2 c = (float2(q) + 0.5) * 0.5 - 0.5;
+		const float w3[3] = { 1.0, 2.0, 1.0 };
+		[unroll] for (int j = 0; j < 3; ++j)
+			[unroll] for (int i = 0; i < 3; ++i)
+				up += look_between(asuint(eye.x), c + float2(i - 1, j - 1), size).rgb * (w3[i] * w3[j]);
+		up /= 16.0;
+	}
 	look_write(asuint(eye.y), q, here.x, float4(me.rgb + up, me.a));
 }
 

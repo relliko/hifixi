@@ -257,6 +257,7 @@ namespace hifi::bake::zonemesh
 
 		// The images by name, the first of each that's whole
 		std::unordered_map<std::string, image> images;
+		std::vector<std::string> images_in_order; // (their names, in the DAT's order)
 		for (const chunk &c : all)
 		{
 			const uint8_t *b = c.body;
@@ -274,6 +275,7 @@ namespace hifi::bake::zonemesh
 			{
 				if (std::memcmp(b + 57, "3TXD", 4) != 0 || w % 4 != 0 || h % 4 != 0 || 69 + size_t(w / 4) * size_t(h / 4) * 16 > c.size)
 					continue;
+				images_in_order.push_back(name);
 				images.emplace(std::move(name), image{ b, c.size, uint32_t(w), uint32_t(h), kBC2 });
 			}
 			else
@@ -281,6 +283,7 @@ namespace hifi::bake::zonemesh
 				// (a u32 at +57, the 256-entry B8G8R8A8 palette at +61, then a byte an index)
 				if (61 + 1024 + size_t(w) * size_t(h) > c.size)
 					continue;
+				images_in_order.push_back(name);
 				images.emplace(std::move(name), image{ b, c.size, uint32_t(w), uint32_t(h), kBGRA8 });
 			}
 		}
@@ -360,8 +363,19 @@ namespace hifi::bake::zonemesh
 				z.indices.insert(z.indices.end(), scratch.begin(), scratch.end());
 				for (uint32_t i = 0; i < p.count; ++i)
 					z.vertices.push_back(vertex_of(p.verts + size_t(i) * stride, swaying));
-				const std::string tex(reinterpret_cast<const char *>(p.tex), 16);
-				const auto img = images.find(tex);
+				std::string tex(reinterpret_cast<const char *>(p.tex), 16);
+				auto img = images.find(tex);
+				// (none of that name: the first whose last 8 characters are the same, if they aren't blank. Chateau
+				// d'Oraguille's fireplace names 'fireefc e_ekken', which no DAT has; its 'model   e_ekken' is the hall's
+				// stone: drawn white without it, 2026-10-27)
+				if (img == images.end() && tex.find_first_not_of(' ', 8) != std::string::npos)
+					for (auto i = images_in_order.begin(); i != images_in_order.end(); ++i)
+						if (i->compare(8, 8, tex, 8, 8) == 0)
+						{
+							tex = *i;
+							img = images.find(tex);
+							break;
+						}
 				if (img == images.end())
 					z.missing_textures++;
 				else
@@ -371,7 +385,7 @@ namespace hifi::bake::zonemesh
 					{
 						const image &im = img->second;
 						texture t;
-						std::memcpy(t.name, p.tex, 16);
+						std::memcpy(t.name, tex.data(), 16);
 						t.w = im.w;
 						t.h = im.h;
 						t.format = im.format;

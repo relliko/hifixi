@@ -157,6 +157,14 @@ namespace hifi::chars::os2
 		out.hides = data[3];
 		out.mirrored = (data[4] & 1) != 0;
 		const bool uses_table = (out.flags & 0x80) != 0;
+		// (byte 2's low 7 bits 1: a type-1 mesh, 52 in the game, the outposts' nation banners among them: 12-byte vertices
+		// and a draw of its own (02D7F0 -> 022470, drawn by 0224D0), not this. Read as one of these it came out in shards
+		// (West Ronfaure's San d'Orian banner, 2026-10-27); refused, its model stays the game's)
+		if ((out.flags & 0x7F) != 0)
+		{
+			why = "a type-1 mesh (its own vertices and draw): the game draws it";
+			return false;
+		}
 
 		// The bone table, the counts, the references
 		if (!r.has(s.at[1], s.size[1]) || !r.has(s.at[2], 4))
