@@ -71,7 +71,11 @@ namespace grass
 		// view-space point, then its depth a yalm, where it starts in the copy (uints, as bits), a texel's size (yalms)
 		constexpr UINT kCasterParams = 16;
 		constexpr UINT kCasterOffset = kWxOffset + kWxParams + kCloudParams;
-		constexpr UINT kActorBytes = (kCasterOffset + kCasterParams) * 4;
+		// ... and after the casters' the settled snow's (grass.hlsl kSnow; rule bit 8192): the view's first row and the cover,
+		// its third row, the rain map's window (where it starts, x and z, its squares' size)
+		constexpr UINT kSnowParams = 16;
+		constexpr UINT kSnowOffset = kCasterOffset + kCasterParams;
+		constexpr UINT kActorBytes = (kSnowOffset + kSnowParams) * 4;
 		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
 		constexpr float kCasterReach = 32.0f;
 		// The clouds' steps along a view ray and toward the light at each quality (look::weather_fx::cloud_quality)
@@ -4352,9 +4356,13 @@ namespace grass
 		const float haze_params[kHazeParams] = { haze ? std::clamp(l.haze_color[0], 0.0f, 1.0f) : 0.0f, haze ? std::clamp(l.haze_color[1], 0.0f, 1.0f) : 0.0f,
 			haze ? std::clamp(l.haze_color[2], 0.0f, 1.0f) : 0.0f, haze ? 1.0f : 0.0f,
 			l.haze_start, l.haze_end, haze ? 1.0f / (l.haze_end - l.haze_start) : 0.0f, 0.0f };
+		// Settled snow, with the zone's rain map loaded (its window around the camera says what's under open sky: it's read
+		// in t0 of the shading pass in the wet mask's place, so wet ground waits while snow lies; they never fall together)
+		const float snow_cover = std::isfinite(l.snow_cover) ? std::clamp(l.snow_cover, 0.0f, 1.0f) : 0.0f;
+		const bool snow_lies = snow_cover > 0.0f && !_rain.q.empty();
 		// The wet look on path and stone, with the zone's mask loaded (it's read in the shading pass)
-		const bool wet = !only_blades && std::isfinite(l.wet) && l.wet > 0.0f && _wet != nullptr;
-		const bool shading = shading_wanted || wet;
+		const bool wet = !only_blades && std::isfinite(l.wet) && l.wet > 0.0f && _wet != nullptr && !snow_lies;
+		const bool shading = shading_wanted || wet || (snow_lies && !only_blades);
 		// The sea (the zone's sea sheets, with the water): the water then reaches as far as it does (its distance), so the
 		// baked water doesn't fade out where the sea goes on
 		const bool sea = !only_blades && l.water && l.sea && _sea != nullptr;
@@ -4522,7 +4530,7 @@ namespace grass
 		constants[21] = l.color[1];
 		constants[22] = l.color[2];
 		constants[23] = l.time;
-		constants[24] = l.height;
+		constants[24] = l.height * (1.0f - 0.45f * (snow_lies ? snow_cover : 0.0f)); // (pressed down under settled snow)
 		constants[25] = l.width;
 		constants[26] = static_cast<float>(tuft);
 		const uint32_t ground_info[4] = { ground_pitch, static_cast<uint32_t>(rt_desc.Width), rt_desc.Height, ground_kind };
@@ -4532,7 +4540,7 @@ namespace grass
 		ID3D12Resource *actor_buffer = nullptr;
 		float *actor_data = nullptr;
 		const bool sun_map = l.sun_map && sun_shadow > 0.0f && _shadow_geo != nullptr && shading;
-		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any)
+		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies)
 		{
 			const uint32_t slot = _actor_slot++ % kActorSlots;
 			if (_actors[slot] == nullptr)
@@ -4666,6 +4674,18 @@ namespace grass
 		// The grass's wear after the sky's (rule bit 256), its times on the memory's clock: seconds since the memory was
 		// zeroed (a new one at this draw), from 1 (0 is "never")
 		const bool wear_written = wearing && actor_data != nullptr;
+		// The settled snow's (rule bit 8192), for the blades and the shading pass, with the rain map's window up to date
+		bool snow_moved = false;
+		const bool snow_written = snow_lies && actor_data != nullptr && rain_window_for(eye, snow_moved, error);
+		if (snow_written)
+		{
+			const float params[kSnowParams] = {
+				cam.view[0], cam.view[1], cam.view[2], snow_cover,
+				cam.view[8], cam.view[9], cam.view[10], 0.0f,
+				_rain.x0 + float(_rain_window_i) * _rain.square, _rain.z0 + float(_rain_window_j) * _rain.square, _rain.square, 0.0f,
+				0.0f, 0.0f, 0.0f, 0.0f };
+			std::memcpy(actor_data + kSnowOffset, params, sizeof(params));
+		}
 		if (wear_written)
 		{
 			if (_memory_fresh || _memory_epoch == 0.0)
@@ -4833,7 +4853,7 @@ namespace grass
 		}
 		const uint32_t rules = (l.rule_in_front ? 1u : 0u) | (l.rule_outliers ? 2u : 0u) | (l.sun_characters ? 4u : 0u) | (lamps_written != 0 ? 16u : 0u) |
 			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u) |
-			(clouds ? 1024u : 0u) | (cloud_shade ? 2048u : 0u);
+			(clouds ? 1024u : 0u) | (cloud_shade ? 2048u : 0u) | (snow_written ? 8192u : 0u);
 		const uint32_t crowd = actor_count | (rules << 16);
 		std::memcpy(&constants[32], &crowd, 4);
 		// Toward the sun in view space (row vectors: v * the view's rotation)
@@ -5023,8 +5043,11 @@ namespace grass
 				stats.sun = true;
 			}
 			section(list, L"worldfx: shading pass");
-			// (t0 in the shading pass: the wet mask when it's read; else as the sun pass left it, or still unread)
-			if (wet_written)
+			// (t0 in the shading pass: the rain map's window under settled snow, the wet mask when it's read; else as the sun
+			// pass left it, or still unread)
+			if (snow_written)
+				list->SetGraphicsRootShaderResourceView(1, _rain_window->GetGPUVirtualAddress());
+			else if (wet_written)
 				list->SetGraphicsRootShaderResourceView(1, _wet->GetGPUVirtualAddress());
 			else if (sun_pso == nullptr)
 				list->SetGraphicsRootShaderResourceView(1, _depth.buffer->GetGPUVirtualAddress());
@@ -5036,6 +5059,7 @@ namespace grass
 			stats.shaded = true;
 			stats.lamps = lamps_written;
 			stats.wet = wet_written;
+			stats.snow_cover = snow_written;
 			stats.sky = sky_written;
 			stats.shimmer = shimmer && wx_written;
 			if ((run_count != 0 || (water_shade && (water_run_count != 0 || sea_here))) && copy_out(list, _ground, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)

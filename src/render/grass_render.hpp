@@ -343,6 +343,10 @@ namespace grass
 		// times the amount setting), how far a flake sways (yalms), the light the flakes catch (rgb). Slanted by
 		// rain_slant; no splashes.
 		float snow = 0.0f;
+		// Settled snow (shading pass, rule bit 8192; needs the rain map, read in t0 in its place): how much of the ground
+		// it covers now (0 none .. 1 a whole layer, the core building it up while it snows and melting it after), on what
+		// faces up under open sky; the blades shorter and frosted from the tip down by as much
+		float snow_cover = 0.0f;
 		float snow_sway = 0.35f;
 		float snow_light[3] = { 0.85f, 0.87f, 0.9f };
 		// A sky of its own, in the shading pass, on the pixels where the zone drew nothing (the game's sky dome doesn't
@@ -517,6 +521,7 @@ namespace grass
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
 		uint32_t lamps = 0;         // lamps whose glow the shading pass added
 		bool wet = false;           // the wet look on path and stone in the shading pass
+		bool snow_cover = false;    // settled snow in the shading pass
 		uint32_t rain_drops = 0;    // raindrops drawn (instances: most of them dead or out of view at any moment)
 		uint32_t splashes = 0;      // splash places drawn (instances: a splash shows at each for a moment)
 		bool rain_map_moved = false; // the rain map's window around the camera was written again this frame

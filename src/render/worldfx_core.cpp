@@ -373,6 +373,12 @@ namespace
 		ULONGLONG wet_at = 0;
 		bool wet_weather_known = false; // (the weather was known at the last update: rain starting then wets the ground slowly)
 		std::string wet_status = "-";
+		// Settled snow: the setting (how much at most, 0 off), how much lies now (building up while it snows, melting
+		// after), when that was last worked out, and whether the weather was known then
+		float snow_cover_amount = 1.0f;
+		float snow_cover = 0.0f;
+		ULONGLONG snow_at = 0;
+		bool snow_weather_known = false;
 		// Rain of the add-on's own, in rain, squalls and thunder: on or off, how hard at most (times the weather's own:
 		// rain 0.55, squalls 0.8, thunder 1), how many splashes and how strong the rings on the water; the zone's rain
 		// map (worldfx-rain\<zone>.bin, tools/bake_rain.py: where drops stop); how hard it rains now (for the panel)
@@ -1117,6 +1123,9 @@ namespace
 	// Wet ground dries over this long after the rain stops (seconds), and gets wet over this long once it starts
 	constexpr float kDryingSeconds = 90.0f;
 	constexpr float kWettingSeconds = 60.0f;
+	// Settled snow: a whole layer after this long of snow (a blizzard's, deeper than snow's), gone this long after it stops
+	constexpr float kSnowSettleSeconds = 240.0f;
+	constexpr float kSnowMeltSeconds = 600.0f;
 
 	bool weather_fresh()
 	{
@@ -1500,6 +1509,22 @@ namespace
 		g.snowing = snowfall;
 		g.look.snow = g.renderer != nullptr && g.renderer->rain_loaded() ? snowfall * g.snow_amount : 0.0f;
 		g.look.snow_sway = fresh ? grass::weather_sway(w) : 0.0f;
+		// The snow that settles: towards the weather's (snow 0.84 of a whole layer, a blizzard all of it) over
+		// kSnowSettleSeconds, melting over kSnowMeltSeconds after; already snowing when the weather becomes known (logging
+		// in, zoning), it lies there at once. (Whether World FX draws its own flakes or not: the game's weather decides.)
+		{
+			const float target = fresh ? std::min(grass::weather_snowfall(w) * 1.4f, 1.0f) : 0.0f;
+			const float sdt = g.snow_at != 0 ? std::min(float(now - g.snow_at) / 1000.0f, 1.0f) : 0.0f;
+			g.snow_at = now;
+			if (!fresh)
+				g.snow_cover = 0.0f;
+			else if (target >= g.snow_cover)
+				g.snow_cover = g.snow_weather_known ? std::min(target, g.snow_cover + sdt / kSnowSettleSeconds) : target;
+			else
+				g.snow_cover = std::max(target, g.snow_cover - sdt / kSnowMeltSeconds);
+			g.snow_weather_known = fresh;
+			g.look.snow_cover = g.renderer != nullptr && g.renderer->rain_loaded() ? g.snow_cover_amount * g.snow_cover : 0.0f;
+		}
 		for (int i = 0; i < 3; ++i)
 			g.look.snow_light[i] = std::clamp((g.look.haze ? g.look.haze_color[i] : g.look.sky[i]) * 1.45f + 0.12f, 0.0f, 1.6f);
 		for (int i = 0; i < 3; ++i)
@@ -1594,7 +1619,8 @@ namespace
 	bool shading_on()
 	{
 		return g.look.ao_strength > 0.0f || g.look.relief > 0.0f || g.sun_shadows > 0.0f || lamps_on() || g.sky_on ||
-			(g.wet_ground > 0.0f && (g.wetness > 0.0f || (weather_fresh() && grass::weather_rain(g.weather) > 0.0f)));
+			(g.wet_ground > 0.0f && (g.wetness > 0.0f || (weather_fresh() && grass::weather_rain(g.weather) > 0.0f))) ||
+			(g.snow_cover_amount > 0.0f && (g.snow_cover > 0.0f || (weather_fresh() && grass::weather_snowfall(g.weather) > 0.0f)));
 	}
 
 	// Lamps: lights reaching further than this (yalms) are a whole area's fill light (dungeons have many, reaching
@@ -2266,6 +2292,8 @@ static std::string crash_context()
 	out += "  weather: fog " + std::string(g.weather_fog ? "on" : "off") + ", shadows by it " + (g.weather_shadows ? "on" : "off") + "; " +
 		(g.weather_at != 0 ? weather_text() : "never sent") + "\n";
 	std::snprintf(line, sizeof(line), "  wet ground: setting %.2f, wet now %.2f (%s)\n", g.wet_ground, g.wetness, g.wet_status.c_str());
+	out += line;
+	std::snprintf(line, sizeof(line), "  settled snow: setting %.2f, lying now %.2f%s\n", g.snow_cover_amount, g.snow_cover, g.last.snow_cover ? " (drawn)" : "");
 	out += line;
 	std::snprintf(line, sizeof(line), "  rain %s (amount %.2f), raining now %.2f; snow %s (amount %.2f), snowing now %.2f; rain map: %s\n", g.rain_on ? "on" : "off",
 		g.rain_amount, g.raining, g.snow_on ? "on" : "off", g.snow_amount, g.snowing, g.rain_status.c_str());
@@ -3546,6 +3574,7 @@ static void status_lines(const worldfx::ui &u)
 		u.text_disabled("Weather: not known (the worldfx Ashita addon sends it)");
 	text(u, "Clear sky: %s", g.clear_sky_status.c_str());
 	text(u, "Wet ground: %s; wet now %.0f%%%s", g.wet_status.c_str(), g.wetness * 100.0f, g.last.wet ? " (drawn)" : "");
+	text(u, "Settled snow: %.0f%% lying%s", g.snow_cover * 100.0f, g.last.snow_cover ? " (drawn)" : "");
 	text(u, "Rain map: %s; raining now %.0f%%%s", g.rain_status.c_str(), g.raining * 100.0f,
 		g.last.rain_drops != 0 ? " (drawn)" : "");
 	text(u, "Snowing now %.0f%%%s", g.snowing * 100.0f, g.last.snow_flakes != 0 ? " (drawn)" : "");
@@ -3684,6 +3713,8 @@ void worldfx::draw_panel(const ui &u)
 			set_config("WeatherShadows", g.weather_shadows);
 		if (u.slider_float("Wet path and stone in rain (0 = off)", &g.wet_ground, 0.0f, 1.0f, "%.2f"))
 			set_config("WetGround", g.wet_ground);
+		if (u.slider_float("Snow settling on the ground while it snows (0 = off)", &g.snow_cover_amount, 0.0f, 1.0f, "%.2f"))
+			set_config("SnowCover", g.snow_cover_amount);
 		if (u.checkbox("Rain of its own, in place of the game's", &g.rain_on))
 			set_config("Rain", g.rain_on);
 		if (u.slider_float("How hard it rains (times the weather's)", &g.rain_amount, 0.0f, 2.0f, "%.2f"))
@@ -3871,6 +3902,7 @@ namespace
 			flag("WeatherFog", g.weather_fog);
 			flag("WeatherShadows", g.weather_shadows);
 			number("WetGround", g.wet_ground, 0.0f, 1.0f);
+			number("SnowCover", g.snow_cover_amount, 0.0f, 1.0f);
 			flag("Rain", g.rain_on);
 			number("RainAmount", g.rain_amount, 0.0f, 2.0f);
 			number("RainSplashes", g.rain_splashes, 0.0f, 2.0f);

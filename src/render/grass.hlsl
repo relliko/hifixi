@@ -260,6 +260,16 @@ bool wearing() { return ((crowd.x >> 16) & 256) != 0; }
 // [kWx + 14] xy: how far the fog banks have drifted (the noise's units, 48 yalms each).
 // Read only behind a [branch] on weather_fx(), as the fog.
 static const uint kWx = kWear + 2 + 2 * kMaxCuts + 8;
+
+// Settled snow (rule bit 8192; grass_render.cpp kSnowParams, after the clouds' (kCloud, 10) and the casters' map's
+// (kCaster, 4)): [kSnow] the view's first row (a view-space point's world x is eye.x + dot(it, the point)) and the cover
+// (0..1: a whole layer at 1); [kSnow + 1] its third row (world z); [kSnow + 2] the rain map's window around the camera:
+// its corner (x, z) and its squares' size. The window (kSnowWindow squares a side, a uint a square as the rain's: the
+// topmost surface's y as float bits, what it is in the low 2 bits: 0 nothing, 1 leaves or steep, 2 ground facing up,
+// 3 water) is t0 in the shading pass, in the wet mask's place (they never fall together).
+static const uint kSnow = kWx + 16 + 10 + 4;
+static const uint kSnowWindow = 256;
+bool snowy() { return ((crowd.x >> 16) & 8192) != 0; }
 bool weather_fx() { return ((crowd.x >> 16) & 512) != 0; }
 
 // Each point's wear, after its colour in the memory (+12, +16: when its trampling will have worn off, and when it'll
@@ -375,6 +385,13 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 	}
 	static const float kStub = 0.15;
 	float flat = 0.8 * worn;
+	// Under settled snow: bowed over (shorter already: blade.x) and frosted from the tip down (below)
+	float snowed = 0.0;
+	[branch] if (snowy())
+	{
+		snowed = actors[kSnow].w;
+		flat = max(flat, 0.4 * snowed);
+	}
 
 	float h = blade.x * (0.55 + 0.7 * hash(seed * 13.17)) * (1.0 - 0.4 * spread / 0.3) * fade
 		* lerp(kStub, 1.0, smoothstep(0.0, 1.0, 1.0 - cut)) * (1.0 - 0.4 * worn);
@@ -434,6 +451,13 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 	// (worn grass takes the ground's colour; a fresh cut's end paler, yellower)
 	o.col = lerp(o.col, g * 0.85, 0.55 * worn);
 	o.col = lerp(o.col, o.col * float3(1.15, 1.1, 0.75) + 0.015, 0.6 * cut * t);
+	// (frosted: the snow's white in the light the ground has (its brightness over a mid-grey ground's), the tips first)
+	[branch] if (snowed > 0.0)
+	{
+		float light = clamp(dot(g, float3(0.3, 0.59, 0.11)) / 0.3, 0.1, 1.8);
+		float frost = snowed * smoothstep(0.3, 1.0, t) * (0.6 + 0.4 * hash(seed * 8.7));
+		o.col = lerp(o.col, min(float3(0.88, 0.91, 0.96) * light, 1.0), 0.85 * frost);
+	}
 	// Into the game's fog as the ground around it is (o.pos.w: the view depth)
 	[branch] if (hazy())
 		o.col = lerp(haze_colour(), o.col, clear_at(o.pos.w));
@@ -688,6 +712,29 @@ float wet_here(float3 P)
 	int2 i = int2(floor(c));
 	float2 f = c - floor(c);
 	return lerp(lerp(wet_bit(i), wet_bit(i + int2(1, 0)), f.x), lerp(wet_bit(i + int2(0, 1)), wet_bit(i + int2(1, 1)), f.x), f.y);
+}
+
+// How open to the sky the surface at W (world, y down) is, from the rain map's window (t0, kSnow): 1 where it's the
+// topmost surface over its square (no more than 0.4 yalms under the map's height there), 0 under something (a roof, a
+// ledge, a canopy) or on water; 1 off the window and where the map has nothing. The 4 squares around, blended.
+float snow_open_square(int2 i, float y)
+{
+	bool in_window = all(i >= 0) && all(i < int(kSnowWindow));
+	int2 c = clamp(i, int2(0, 0), int2(kSnowWindow - 1, kSnowWindow - 1)); // (a root view has no bounds: never read past it)
+	uint v = wet_mask.Load((uint(c.y) * kSnowWindow + uint(c.x)) * 4);
+	uint kind = v & 3u;
+	float top = asfloat(v & ~3u);
+	return !in_window || kind == 0u ? 1.0 : kind == 3u ? 0.0 : (y < top + 0.4 ? 1.0 : 0.0);
+}
+
+float snow_open(float3 W)
+{
+	float4 win = actors[kSnow + 2];
+	float2 s = (W.xz - win.xy) / win.z - 0.5;
+	int2 i = int2(floor(s));
+	float2 f = s - floor(s);
+	return lerp(lerp(snow_open_square(i, W.y), snow_open_square(i + int2(1, 0), W.y), f.x),
+		lerp(snow_open_square(i + int2(0, 1), W.y), snow_open_square(i + int2(1, 1), W.y), f.x), f.y);
 }
 
 // A sky of its own (crowd.x rule bit 128; t2 after the wet look's: grass_render.cpp kSkyParams), on the pixels the zone
@@ -1586,7 +1633,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	bool lamps = ((crowd.x >> 16) & 16) != 0;
 	bool wetting = wet();
 	bool cloud_shade = cloud_shadows();
-	if (shade.x > 0.0 || shade.w > 0.0 || lamps || wetting || cloud_shade)
+	bool snowing = snowy();
+	if (shade.x > 0.0 || shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)
 		n = surface_normal(p, P, steep);
 	float noise = frac(52.9829189 * frac(dot(pos.xy, float2(0.06711056, 0.00583715))));
 
@@ -1677,6 +1725,44 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	// [kCloud + 9].y says
 	[branch] if (cloud_shade)
 		sunlit *= 1.0 - actors[kCloud + 9].y * sun_share(dot(n, sun_in_view())) * (1.0 - cloud_shadow_at(P));
+	// Settled snow (snow_open, the cover [kSnow].w): on what faces up under open sky, in patches across the world that join
+	// up as it deepens (a whole layer at 1), lit as the scene around it is (its brightness on this surface read as a
+	// mid-grey ground's light: sun, shade, night and the game's own lamps carry over), in the game's fog as the rest; the
+	// surface's relief mostly buried under it. A surface seen too nearly edge on for its facing to be told is taken as
+	// facing up. World FX's own shadows, occlusion and lamps then fall on it as on the rest.
+	[branch] if (snowing)
+	{
+		const float3 world_up = -up_row.xyz; // (the world's up in view space: its y is down)
+		float cover = actors[kSnow].w;
+		float facing = steep < 4.0 ? saturate((dot(n, world_up) - 0.5) / 0.3) : 1.0;
+		[branch] if (facing > 0.0)
+		{
+			float3 W = float3(eye.x + dot(actors[kSnow].xyz, P), eye.y + dot(up_row.xyz, P), eye.z + dot(actors[kSnow + 1].xyz, P));
+			float patches = noise2(W.xz * 0.45) * 0.65 + noise2(W.xz * 2.3) * 0.35;
+			float amount = facing * saturate((patches - 1.15 + 1.3 * cover) / 0.18); // (half a layer: about half the ground)
+			[branch] if (amount > 0.0)
+				amount *= snow_open(W);
+			[branch] if (amount > 0.0)
+			{
+				float around = luma(col), taps = 1.0;
+				float r = min(0.5 * px_per_yalm, 40.0);
+				static const int2 four[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+				[unroll] for (int k = 0; k < 4; ++k)
+				{
+					int2 q = p + int2(float2(four[k]) * r);
+					bool same = abs(drawn_depth(q) - z) < 0.03 * z + 0.1;
+					around += same ? luma(texel(q)) : 0.0;
+					taps += same ? 1.0 : 0.0;
+				}
+				float light = clamp(around / taps / 0.3, 0.1, 1.8);
+				float3 snow = min(float3(0.9, 0.93, 0.98) * light * (0.94 + 0.06 * noise2(W.xz * 9.0)), 1.0);
+				[branch] if (hazy())
+					snow = lerp(haze_colour(), snow, clear_at(z));
+				col = lerp(col, snow, 0.95 * amount);
+				relief = lerp(relief, 1.0, 0.8 * amount);
+			}
+		}
+	}
 	// Lamps lit near (lamp_light): their glow on top, darkened by the ambient occlusion like the rest
 	float3 glow = 0.0;
 	[branch] if (lamps)
