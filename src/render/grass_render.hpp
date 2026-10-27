@@ -529,6 +529,7 @@ namespace grass
 		bool snow_cover = false;    // settled snow in the shading pass
 		bool snow_layer = false;    // ... with depth, its layer drawn
 		bool snow_trails = false;   // ... and the trails kept
+		uint32_t footprints = 0;    // ... new footprints this frame
 		uint32_t rain_drops = 0;    // raindrops drawn (instances: most of them dead or out of view at any moment)
 		uint32_t splashes = 0;      // splash places drawn (instances: a splash shows at each for a moment)
 		bool rain_map_moved = false; // the rain map's window around the camera was written again this frame
@@ -786,6 +787,14 @@ namespace grass
 		std::vector<pso_entry> _layer_psos;
 		uint32_t _trail_epoch = 0;
 		double _trail_time = -1.0;
+		// Who walks through it (footprints): where each was last frame, where their last footprint went, which way they
+		// were going and which foot is next (+1 left, -1 right), matched to the actors frame by frame by nearness
+		struct walker
+		{
+			float x = 0.0f, z = 0.0f, px = 0.0f, pz = 0.0f, dx = 0.0f, dz = 1.0f, side = 1.0f;
+		};
+		std::vector<walker> _walkers;
+		uint32_t footprints(const look &l, float *out);
 		// The clouds (cloud_ps, at a quarter of the world's width and height, no render target): their two pictures after
 		// the sun's mask in _sun_mask (this frame's and the last's, in turn), their noise (default heap, from its upload
 		// copy at the first draw with clouds), and what carrying the last picture over needs: whether there is one that

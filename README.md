@@ -21,6 +21,7 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
   - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone's own meshes, with characters and monsters casting their real shapes;
   - **Water** with reflections and ripples, carried on over the game's own sea past the zone's edge, out to the horizon;
+  - **Snow that settles** while it snows, deep enough near you to hide feet and the bottoms of the grass, with footprints left by whoever walks through it, filling back in as it keeps snowing;
   - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
   - **Sky:** a smooth sky with a sun, stars and a moon in the game's own phase;
   - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn.

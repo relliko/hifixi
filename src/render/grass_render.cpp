@@ -73,7 +73,9 @@ namespace grass
 		constexpr UINT kCasterOffset = kWxOffset + kWxParams + kCloudParams;
 		// ... and after the casters' the settled snow's (grass.hlsl kSnow; rule bit 8192): the view's first row and the cover,
 		// its third row, the rain map's window (where it starts, x and z, its squares' size)
-		constexpr UINT kSnowParams = 16;
+		// (then the frame's new footprints, two float4 each: grass.hlsl trail_ps)
+		constexpr UINT kMaxPrints = 32;
+		constexpr UINT kSnowParams = 16 + 8 * kMaxPrints;
 		// The snow's trail map (grass.hlsl trail_at, kTrailSize texels a side of kTrailTexel yalms, a uint each), how long
 		// snow takes to fill a trail back in at a blizzard's (seconds; more the lighter it snows), the snow layer at a whole
 		// layer (yalms deep) and its grid (snow_layer_vs: kLayerCells a side)
@@ -2416,6 +2418,73 @@ namespace grass
 		return _cloud_pso;
 	}
 
+	// This frame's new footprints (grass.hlsl trail_ps) into `out` (kMaxPrints at most, 8 floats each): each actor matched
+	// to the walker nearest where it was last frame (within 2 yalms; one not seen before starts where it stands, no print
+	// yet), a print each stride it has gone since its last, along its way and its foot's half step to the side, left and
+	// right in turn. Its stride and print grow with its size (a person's about 0.8 and 0.3 yalms); one standing or turning
+	// on the spot leaves none. Walkers not seen this frame are forgotten.
+	uint32_t renderer::footprints(const look &l, float *out)
+	{
+		uint32_t count = 0;
+		std::vector<walker> next;
+		const uint32_t actors = l.actors != nullptr ? std::min<uint32_t>(l.actor_count, kMaxActors) : 0;
+		for (uint32_t i = 0; i < actors; ++i)
+		{
+			const float *a = l.actors + size_t(i) * 4;
+			if (!(std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2]) && std::isfinite(a[3])))
+				continue;
+			size_t best = _walkers.size();
+			float best_d = 4.0f; // (2 yalms, squared)
+			for (size_t k = 0; k < _walkers.size(); ++k)
+			{
+				const float ex = a[0] - _walkers[k].x, ez = a[2] - _walkers[k].z, d = ex * ex + ez * ez;
+				if (d < best_d)
+					best = k, best_d = d;
+			}
+			walker w;
+			if (best == _walkers.size())
+			{
+				w.x = w.px = a[0];
+				w.z = w.pz = a[2];
+				next.push_back(w);
+				continue;
+			}
+			w = _walkers[best];
+			_walkers.erase(_walkers.begin() + std::ptrdiff_t(best));
+			const float size = std::clamp(a[3], 0.3f, 4.0f);
+			const float stride = std::clamp(0.8f * size, 0.45f, 3.0f), length = std::clamp(0.3f * size, 0.18f, 1.0f);
+			for (int n = 0; n < 4; ++n)
+			{
+				const float gx = a[0] - w.px, gz = a[2] - w.pz, gone = std::sqrt(gx * gx + gz * gz);
+				if (gone < stride)
+					break;
+				w.dx = gx / gone;
+				w.dz = gz / gone;
+				w.px += w.dx * stride;
+				w.pz += w.dz * stride;
+				if (count < kMaxPrints)
+				{
+					const float half = 0.11f * size * w.side; // (left: the way's left, x across from z)
+					float *p = out + size_t(count) * 8;
+					p[0] = w.px - w.dz * half;
+					p[1] = a[1];
+					p[2] = w.pz + w.dx * half;
+					p[3] = length;
+					p[4] = w.dx;
+					p[5] = w.dz;
+					p[6] = p[7] = 0.0f;
+					count++;
+				}
+				w.side = -w.side;
+			}
+			w.x = a[0];
+			w.z = a[2];
+			next.push_back(w);
+		}
+		_walkers.swap(next);
+		return count;
+	}
+
 	// The trail map kept (trail_ps): a full-screen triangle over a kTrailSize viewport with no render target (its pixels
 	// write the map at the end of the sun's mask). Made once.
 	ID3D12PipelineState *renderer::trail_pipeline(std::string &error)
@@ -3140,6 +3209,7 @@ namespace grass
 		_rain_window = nullptr;
 		_rain = rain_file();
 		_trail_epoch++; // (the next zone's trails start untrodden: grass.hlsl trail_tag)
+		_walkers.clear();
 	}
 
 	bool renderer::rain_surface(float x, float z, float &y, uint8_t &kind) const
@@ -5152,6 +5222,9 @@ namespace grass
 					q[1] = dt * snowfall / kTrailRefillSeconds;
 					std::memcpy(&q[2], &_trail_epoch, 4);
 					q[3] = 1.0f;
+					const uint32_t prints = footprints(l, actor_data + kSnowOffset + 16);
+					std::memcpy(actor_data + kSnowOffset + 11, &prints, 4);
+					stats.footprints = prints;
 					const D3D12_VIEWPORT trail_viewport = { 0.0f, 0.0f, float(kTrailSize), float(kTrailSize), 0.0f, 1.0f };
 					const D3D12_RECT trail_scissor = { 0, 0, LONG(kTrailSize), LONG(kTrailSize) };
 					list->SetGraphicsRootShaderResourceView(1, _rain_window->GetGPUVirtualAddress());
