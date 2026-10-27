@@ -20,6 +20,9 @@ namespace hifi::chars::inject
 	bool prepare(ID3D12Device *device, std::string &why);
 	void release();
 	void set_options(bool per_pixel);
+	// The en-spell effects' time (chardraw.hpp record_enspells) held at `seconds` (the tests, the offline viewer); below 0,
+	// the real clock again
+	void set_clock(double seconds);
 	// Whether models can be handed over: the renderer is up and nothing failed in the last two seconds
 	bool ready();
 	std::vector<std::string> status();
@@ -48,6 +51,7 @@ namespace hifi::chars::inject
 	{
 		uint64_t frames = 0, models = 0, see_through = 0, failed = 0;
 		uint64_t caster_frames = 0, caster_models = 0; // (drawn into the sun's casters' map)
+		uint64_t enspell_models = 0; // (models drawn with an en-spell effect)
 	};
 	counts get_counts();
 }

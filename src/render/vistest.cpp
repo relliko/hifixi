@@ -26,6 +26,7 @@ namespace vistest
 		std::vector<uint32_t> asked_order; // the objects in asked, in the order first asked
 		std::unordered_map<uint32_t, known> answers;
 		uint64_t last_forget_ms = 0;
+		uint64_t waiting_since_ms = 0; // (the first test asked since the last answer came in; 0 none)
 		stats counts;
 	}
 
@@ -33,6 +34,8 @@ namespace vistest
 	{
 		std::lock_guard<std::mutex> lock(mutex);
 		counts.asked++;
+		if (waiting_since_ms == 0)
+			waiting_since_ms = now_ms;
 		if (b.kind < kinds)
 			counts.by_kind[b.kind]++;
 		auto p = asked.find(object);
@@ -58,7 +61,15 @@ namespace vistest
 	bool live(uint64_t now_ms)
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		return counts.last_answer_ms != 0 && now_ms - counts.last_answer_ms <= kLiveMs;
+		return (counts.last_answer_ms != 0 && now_ms - counts.last_answer_ms <= kLiveMs) ||
+			(waiting_since_ms != 0 && now_ms - waiting_since_ms <= kLiveMs);
+	}
+
+	uint64_t overdue_ms(uint64_t now_ms)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		const uint64_t since = std::max(counts.last_answer_ms, waiting_since_ms);
+		return since != 0 && now_ms > since ? now_ms - since : 0;
 	}
 
 	uint32_t take(uint32_t objects[kMaxBoxes], box boxes[kMaxBoxes])
@@ -94,7 +105,10 @@ namespace vistest
 			counts.answered++;
 		}
 		if (n != 0)
+		{
 			counts.last_answer_ms = now_ms;
+			waiting_since_ms = 0;
+		}
 		if (now_ms - last_forget_ms > 1000)
 		{
 			last_forget_ms = now_ms;
@@ -124,6 +138,7 @@ namespace vistest
 		asked_order.clear();
 		answers.clear();
 		counts.last_answer_ms = 0;
+		waiting_since_ms = 0;
 	}
 
 	stats get_stats()

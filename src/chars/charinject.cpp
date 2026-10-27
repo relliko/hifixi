@@ -39,6 +39,7 @@ namespace hifi::chars::inject
 			ID3D12Device *device = nullptr;
 			std::unique_ptr<char_renderer> renderer; // (made and let go outside the mutex: see prepare)
 			std::atomic<bool> per_pixel { false };
+			std::atomic<double> clock { -1.0 }; // (the en-spells' time: below 0, the real one)
 			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES plane[2] = { kUnknown, kUnknown };
@@ -64,6 +65,18 @@ namespace hifi::chars::inject
 			bool snapshot_taken = false;
 		};
 		state g;
+
+		// The en-spells' time in seconds: set_clock's, else the performance counter's
+		double effect_time()
+		{
+			const double held = g.clock.load(std::memory_order_relaxed);
+			if (held >= 0.0)
+				return held;
+			LARGE_INTEGER f, t;
+			QueryPerformanceFrequency(&f);
+			QueryPerformanceCounter(&t);
+			return double(t.QuadPart) / double(f.QuadPart);
+		}
 
 		template <typename T>
 		void drop(T *&p)
@@ -323,6 +336,11 @@ namespace hifi::chars::inject
 		g.per_pixel.store(per_pixel, std::memory_order_relaxed);
 	}
 
+	void set_clock(double seconds)
+	{
+		g.clock.store(seconds, std::memory_order_relaxed);
+	}
+
 	bool ready()
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
@@ -424,6 +442,10 @@ namespace hifi::chars::inject
 		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		g.last = g.renderer->record_opaque(list, target_of(w, rtv, dsv), *f, o);
+		{
+			const char_stats en = g.renderer->record_enspells(list, target_of(w, rtv, dsv), *f, effect_time());
+			g.n.enspell_models += en.models;
+		}
 		if (f->see_through.load(std::memory_order_acquire) == 0)
 			take_snapshot(list, w);
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);

@@ -20,6 +20,15 @@
 //
 // Option: per-pixel lighting (the same lights at each pixel, the normal interpolated).
 //
+// En-spells (record_enspells, after the opaque models): HiFi XI's own effect on a model's blades (cache::mesh_view's
+// os2::blade) while it has one (model_entry::enspell, one of the eight elements); not the game's. The blade's mesh
+// drawn again a little swollen with the element's surface on it (fire climbing, frost, wind streaks, glowing cracks,
+// crackling lines, flowing caustics, a warm glow, a smouldering dark), and the element's sprites round it (flames and
+// embers; sparkles, motes and ice shards; wisps on helices; circling rocks and dust; arcs and sparks; falling drops, a
+// stream and bubbles; stars, motes and rays; smoke and wisps). Stateless: every sprite's place and age follow from the
+// time and its number, so nothing is kept between frames. Premultiplied onto the world's target (ONE, INVSRCALPHA,
+// colour only: glows add, smoke and stone cover), depth tested against it, nothing written to depth.
+//
 // Vertices, corners and palette rows are read in the vertex shader (descriptor table, root SRV), so nothing of the
 // input assembler's is touched. record_*() set the targets, viewport, heaps, root signature and pipelines and leave
 // them so (putting the list's own back is the caller's).
@@ -76,6 +85,9 @@ namespace hifi::chars
 		char_stats record_casters(ID3D12GraphicsCommandList *list, const frame &f, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size);
 		// T (an SRV of it in `srv`, a descriptor of the cache's heap) laid over the world's target as the game does
 		void record_composite(ID3D12GraphicsCommandList *list, const char_target &world, D3D12_GPU_DESCRIPTOR_HANDLE srv, uint32_t colour);
+		// The frame's opaque models' en-spell effects (models with enspell set and a blade among their meshes) into the
+		// target, at `seconds` (any clock: only its steps are seen)
+		char_stats record_enspells(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, double seconds);
 
 	private:
 		bool begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o);
@@ -86,6 +98,8 @@ namespace hifi::chars
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
 		void *_vs = nullptr, *_ps = nullptr, *_cvs = nullptr, *_cps = nullptr, *_cps_ms = nullptr, *_sps = nullptr; // (ID3DBlob)
+		ID3D12RootSignature *_en_root = nullptr; // (the en-spells': 32 constants, the palette, the mesh)
+		void *_en_svs = nullptr, *_en_sps = nullptr, *_en_pvs = nullptr, *_en_pps = nullptr; // (ID3DBlob: shell, sprites)
 		ID3D12PipelineState *_shadow_pso = nullptr; // (depth only, D32: made in init, not under the injection's mutex)
 		ID3D12Resource *_ring = nullptr; // upload: kFrames slots, each two halves of the frame's constants and its models' (its draw; its shadow)
 		uint8_t *_mapped = nullptr;

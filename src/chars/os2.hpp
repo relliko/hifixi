@@ -100,4 +100,27 @@ namespace hifi::chars::os2
 
 	// The hide groups a mesh's header byte 3 switches on (02DFAA-02E07A), as bits 1 << kind
 	uint32_t hidden_by(uint8_t byte3);
+
+	// Where the en-spell effects go on a weapon (blade_of): a rigid mesh (every vertex one-bone, all on one bone, no
+	// mirrored half) in a melee slot, held by its grip at the bone's origin. In the bone's space: the line from where
+	// the effect starts (base) to its end (tip), a half width for its sprites, and what kind of piece it is:
+	//   kLine   a blade (swords, daggers, katanas, thin clubs and staves): from just past the guard to the tip
+	//   kHead   a head much wider than its shaft (axes, scythes, picks, polearms, headed clubs and staves): the head,
+	//           its end found by its width (a polearm's spearhead, not its butt); the sprites start on its vertices
+	//   kWhole  a compact piece (hand-to-hand, both hands' pieces): all of it
+	// Not valid: anything else (ranged weapons and ammo by their slot, two-bone or mirrored meshes).
+	struct blade
+	{
+		static constexpr uint8_t kLine = 0, kHead = 1, kWhole = 2;
+		bool valid = false;
+		uint8_t kind = kLine;
+		uint16_t bone = 0;
+		float base[3] = {}, tip[3] = {};
+		float half_width = 0.0f;
+		uint8_t edge_axis = 0; // the bone's axis across the blade's flat (its wider side): 0 x, 1 y, 2 z
+	};
+	// A weapon mesh's slot from its chunk name: "wep0" the main hand 0, "wep1" the sub 1, anything else -1 (ranged
+	// "wep2", ammo "wep3", not a weapon)
+	int weapon_slot(const char name[4]);
+	blade blade_of(const mesh &m, int slot);
 }

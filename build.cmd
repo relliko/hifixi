@@ -145,6 +145,12 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   tests\charinject_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
   /Fo"build\test\\" /Fe"build\charinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\charinject_test.exe
+rem The en-spell effects offline, on the GPU (tests\enspell_view.cpp; poses from tests\enspell_poses.py, a GIF from
+rem tools\enspell_gif.py): build\enspell_view.exe <poses.bin> <out folder> <frames> <dat> [dat...]
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
+  tests\enspell_view.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
+  /Fo"build\test\\" /Fe"build\enspell_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\enspell_view.exe
 rem The native zone renderer's zone data against tests\zonemesh_oracle.py: build\zonemesh_test.exe; and its offline
 rem picture of a zone through the GPU upload (needs the game closed, or --warp): build\zone_view.exe; the plugin's
 rem per-zone loading on WARP: build\zonenative_test.exe

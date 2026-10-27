@@ -65,6 +65,8 @@ namespace hifi::chars::cache
 			uint8_t hides = 0;
 			state s = state::queued;
 			os2::mesh decoded;  // (vertices and corners dropped once uploaded; groups kept)
+			int weapon_slot = -1; // (the weapon slot its name gives: os2::weapon_slot)
+			os2::blade blade;   // (found from the vertices while they're here)
 			uint32_t vertices = 0, corners = 0;
 			ID3D12Resource *vb = nullptr, *cb = nullptr;
 			uint32_t slot = kNoSlot;
@@ -274,6 +276,8 @@ namespace hifi::chars::cache
 			}
 			e.vertices = uint32_t(e.decoded.vertices.size());
 			e.corners = uint32_t(e.decoded.corners.size());
+			if (ok)
+				e.blade = os2::blade_of(e.decoded, e.weapon_slot);
 			std::vector<uint8_t>().swap(e.raw);
 			ms += (seconds() - t0) * 1000.0;
 		}
@@ -692,10 +696,11 @@ namespace hifi::chars::cache
 		return it->second;
 	}
 
-	uint32_t add_mesh(const key &k, std::vector<uint8_t> &&data, uint32_t live_base, std::vector<uint32_t> &&textures)
+	uint32_t add_mesh(const key &k, std::vector<uint8_t> &&data, uint32_t live_base, std::vector<uint32_t> &&textures, const char *name)
 	{
 		auto e = std::make_unique<mesh_entry>();
 		e->k = k;
+		e->weapon_slot = os2::weapon_slot(name);
 		e->hides = data.size() > 3 ? data[3] : 0;
 		e->raw = std::move(data);
 		e->base = live_base;
@@ -805,6 +810,7 @@ namespace hifi::chars::cache
 		out.corners = e.corners;
 		out.groups = e.decoded.groups;
 		out.textures = e.textures;
+		out.blade = e.blade;
 		out.views = g.heap->GetGPUDescriptorHandleForHeapStart();
 		out.views.ptr += uint64_t(2 * e.slot) * g.step;
 		return true;

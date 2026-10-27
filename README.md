@@ -20,11 +20,13 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
 - **A richer world**, drawn into the game's own frame:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
   - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone's own meshes, with characters and monsters casting their real shapes;
+  - **Light in the air:** sun shafts where sunlight comes past trees, buildings and cliffs, and fog lying low, patchy and drifting, thicker at dawn, dusk and in mist, rain and snow;
   - **Water** with reflections and ripples, carried on over the game's own sea past the zone's edge, out to the horizon;
   - **Snow that settles** while it snows, deep enough near you to hide feet and the bottoms of the grass, with footprints left by whoever walks through it, filling back in as it keeps snowing;
   - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
   - **Sky:** a smooth sky with a sun, stars and a moon in the game's own phase;
   - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn.
+- **En-spell effects:** while Enfire, Enblizzard, Enaero, Enstone, Enthunder, Enwater, Enlight or Endark is on you (the IIs too), your weapons carry its element: flames, frost and ice shards, wind, circling stones, arcs of lightning, flowing water, rays of light or dark smoke. On every melee weapon of every race: along a blade, on an axe's, scythe's, staff's or spear's head, all over hand-to-hand weapons.
 
 Everything is in one menu (`/hifi`), with presets (Off, Balanced, High, Ultra) and a tooltip on every setting.
 
@@ -61,6 +63,7 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 - `/hifi glows`: the glows lighting the scene now, and the glowing effects met lately.
 - `/hifi gpu`: the GPU time each part of the richer world takes, the costliest first (also in the menu's **Performance** tab).
 - `/hifi nativezone`, `/hifi nativechars`: what HiFi XI's own drawing of the zone, or the characters, is doing; `perpixel on|off` after either for its per-pixel light.
+- `/hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]`: the en-spell effect on your weapons. `auto` (the default) follows the en-spell on you; an element shows that one now, to see it. The same buttons are in the menu's Game tab.
 - `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
 - `/hifi reset`: its counts started again.

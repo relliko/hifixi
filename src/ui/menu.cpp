@@ -488,6 +488,35 @@ namespace hifi::ui
 		void draw_game(const gui &g)
 		{
 			draw_tab_settings(g, settings::tab::game);
+			// The en-spell effect on your weapons ([chars] enspell, as /hifi enspell sets it; the plugin follows it every
+			// half second): the en-spell on you, off, or one held to look at it
+			heading(g, "En-spell effects");
+			g.text_wrapped("While an en-spell is on you, your weapons glow with its element. Pick one to see it now.");
+			std::string mode;
+			if (!backend::option("chars", "enspell", mode) || mode.empty())
+				mode = "auto";
+			static const char *const kModes[][3] = {
+				{ "auto", "While one is on you", "The en-spell on you, in its element (Enfire to Endark, the IIs too)." },
+				{ "off", "Off", "Never." },
+				{ "fire", "Enfire", "Always Enfire's, to see it." },
+				{ "ice", "Enblizzard", "Always Enblizzard's, to see it." },
+				{ "wind", "Enaero", "Always Enaero's, to see it." },
+				{ "earth", "Enstone", "Always Enstone's, to see it." },
+				{ "thunder", "Enthunder", "Always Enthunder's, to see it." },
+				{ "water", "Enwater", "Always Enwater's, to see it." },
+				{ "light", "Enlight", "Always Enlight's, to see it." },
+				{ "dark", "Endark", "Always Endark's, to see it." },
+			};
+			for (size_t i = 0; i < std::size(kModes); ++i)
+			{
+				if (i != 0 && i != 2 && i != 6)
+					g.same_line();
+				g.push_id(kModes[i][0]);
+				if (g.toggle_button(kModes[i][1], mode == kModes[i][0]))
+					backend::set_option("chars", "enspell", kModes[i][0]);
+				g.tooltip(kModes[i][2]);
+				g.pop_id();
+			}
 			heading(g, "What HiFi XI does with the game");
 			for (const std::string &line : game::feed::status())
 				g.text_wrapped(line.c_str());

@@ -53,12 +53,17 @@ namespace hifi::chars
 	constexpr uint32_t kFromFlush = 1u << 0; // drawn from the priority-12 flush (see-through), at its own marker
 	constexpr uint32_t kNative = 1u << 2;    // HiFi XI draws it (the game left it out); else the game drew it
 
+	// An en-spell on the actor (model_entry::enspell): HiFi XI's own effect on its blades (chardraw.hpp), by element in
+	// the game's order
+	constexpr uint8_t kEnNone = 0, kEnFire = 1, kEnIce = 2, kEnWind = 3, kEnEarth = 4, kEnThunder = 5, kEnWater = 6, kEnLight = 7, kEnDark = 8;
+
 	struct model_entry
 	{
 		uintptr_t actor = 0, model = 0;
 		uint32_t colour = 0;      // 02B6E0's argument 7: 0xAARRGGBB, alpha 0x80 = opaque (carries every fade)
 		uint32_t flags = 0;
 		uint32_t hidden = 0;      // hide groups (1 << kind) switched on by the model's meshes' header byte 3
+		uint8_t enspell = kEnNone; // the en-spell effect on its blades (the game side sets it: src/game/charmodel)
 		uint32_t first_instance = 0, instances = 0;
 		light8 lights[4];
 		uint32_t ambient = 0;     // AMBIENT (D3DCOLOR) as 0CB4E0 set it for this actor

@@ -3478,6 +3478,17 @@ namespace
 					vis_answered++;
 					return known;
 				}
+				// (the game's waiting test from here: said in the log, at most every 10 s, with how long answers have been
+				// missing, so a stutter from it can be told)
+				static std::atomic<uint64_t> logged_at { 0 };
+				if (now - logged_at.load() > 10000)
+				{
+					logged_at = now;
+					char line[160];
+					std::snprintf(line, sizeof(line), "FFXI World FX: visibility tests: no answers back for %llu ms: the game's own (waiting) test runs",
+						static_cast<unsigned long long>(vistest::overdue_ms(now)));
+					log_message(1, line);
+				}
 			}
 		}
 		vis_by_game++;

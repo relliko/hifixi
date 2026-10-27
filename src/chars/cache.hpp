@@ -45,8 +45,9 @@ namespace hifi::chars::cache
 	uint32_t mesh(const key &k);
 	uint32_t texture(const key &k);
 	// A new one, with its bytes (the chunk's data) to decode: its id. A mesh's texture ids, one per texture command in
-	// command order (kNone where none was found); live_base: the data's address in the game (its section pointers).
-	uint32_t add_mesh(const key &k, std::vector<uint8_t> &&data, uint32_t live_base, std::vector<uint32_t> &&textures);
+	// command order (kNone where none was found); live_base: the data's address in the game (its section pointers);
+	// name: its chunk's 4-character name (a weapon's slot: os2::weapon_slot, for its blade), nullptr when not known.
+	uint32_t add_mesh(const key &k, std::vector<uint8_t> &&data, uint32_t live_base, std::vector<uint32_t> &&textures, const char *name = nullptr);
 	uint32_t add_texture(const key &k, std::vector<uint8_t> &&data);
 	// A mesh's header byte 3 (the hide groups it switches on), known when it's added (0 for an unknown id)
 	uint8_t mesh_hides(uint32_t id);
@@ -67,6 +68,7 @@ namespace hifi::chars::cache
 		uint32_t vertices = 0, corners = 0;
 		std::vector<os2::group> groups;
 		std::vector<uint32_t> textures; // the cache's texture per the mesh's texture index
+		os2::blade blade;               // its blade, when it's a weapon with one (the en-spell effects)
 		D3D12_GPU_DESCRIPTOR_HANDLE views {}; // vertices' view, then the corners'
 	};
 	bool mesh_view_of(uint32_t id, mesh_view &out);

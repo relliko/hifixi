@@ -7,7 +7,8 @@
  *   - an object not asked for a while (past 2 s, under a minute) keeps its last answer: asked again, it gets that one
  *     (counted stale) until a new one is in; past a minute unasked it's forgotten and is unknown again;
  *   - an answer for a forgotten object is dropped; reset() forgets everything and answers stop being live;
- *   - live(): not before any answer, then for 250 ms after the last;
+ *   - live(): not before any answer, then for kLiveMs (2 s) after the last; after a quiet while with nothing asked,
+ *     live again from the next test asked, until it's been kLiveMs with nothing back;
  *   - over 8192 objects kept, those not asked for 2 s go at the next sweep, the ones asked lately stay;
  *   - take(): the newest box per object, in the order first asked, at most 256 (the rest dropped, asked again later).
  *
@@ -64,6 +65,7 @@ int main()
 	answer_all(99, t + 90);
 	check(ask(1, box_of(0), t + 100) == 256, "points over 64 counted as 64");
 	check(get_stats().unknown == 1 && get_stats().stale == 0, "  nothing unknown or stale since");
+
 
 	// Unasked for 5 s: kept (the sweeps run at each answer, once a second)
 	answer_all(64, t + 100); // (object 1, asked just above, answered as before: 256)
@@ -141,6 +143,21 @@ int main()
 		answer(&seven, &points, 1, now + 4050);
 		check(get_stats().objects == 1 && ask(7, box_of(0), now + 4100) == 256,
 			"over 8192 kept: those unasked for 2 s swept, the one asked lately kept");
+	}
+
+	// A quiet while (nothing asked, so nothing answered): the next test asked is live, its last answer (or kUnknown),
+	// not the game's waiting test (the stutters in game, 2026-10-27); asked on with nothing back for kLiveMs, not live
+	{
+		reset();
+		const uint64_t q = t + 400000;
+		ask(9, box_of(0), q);
+		answer_all(64, q + 20);
+		const uint64_t later = q + 20 + kLiveMs + 5000; // (long after that answer, nothing asked between)
+		check(!live(later), "a quiet while with nothing asked: not live before anything is");
+		check(ask(9, box_of(0), later) == 256 && live(later) && live(later + kLiveMs), "  the next test asked: live (its last answer) for kLiveMs with nothing back");
+		check(!live(later + kLiveMs + 1), "  still nothing back after that: not live (the game's own test runs)");
+		answer_all(64, later + kLiveMs + 10);
+		check(live(later + kLiveMs + 10), "  answers back: live again");
 	}
 
 	if (failures == 0)

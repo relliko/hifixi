@@ -35,6 +35,9 @@
  *   /hifi chardata   the native character renderer's data (src/game/charmodel, src/chars): each model the game draws
  *                  recorded at its draw (its palettes, lights, meshes), the meshes and textures put on the GPU as
  *                  they're first seen; /hifi gamedraw chars goes through its stub
+ *   /hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]   the en-spell effect on your blades,
+ *                  HiFi XI's own (src/chars chardraw; [chars] enspell): auto = the element of the en-spell on you
+ *                  (Enfire .. Endark, the IIs too); off; or one element always (to look at it)
  *   /hifi nativechars [perpixel [on|off]]   HiFi XI drawing the characters in the game's place (src/chars; [chars]
  *                  perpixel its per-pixel lighting); the game draws any model whose data isn't up yet
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
@@ -76,7 +79,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.45;
+	constexpr double kVersion = 0.46;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -478,6 +481,46 @@ class hifixi final : public IPlugin
 			hifi::chars::cache::frame_tick(hifi::backend::started() && hifi::host::installed() ? worldfx::attached() : nullptr, now);
 	}
 
+	// (native characters) The en-spell elements' names for /hifi enspell, in charframe.hpp's kEn* order
+	static constexpr const char *kEnspellNames[] = { "off", "fire", "ice", "wind", "earth", "thunder", "water", "light", "dark" };
+
+	// The en-spell element of a status effect (Phoenix sql/spell_list.sql: Enfire .. Enwater 94-99, their IIs
+	// 277-282, Enlight 274, Endark 288), kEnNone for any other
+	static uint8_t enspell_of(int16_t effect)
+	{
+		if (effect >= 94 && effect <= 99)
+			return uint8_t(hifi::chars::kEnFire + (effect - 94));
+		if (effect >= 277 && effect <= 282)
+			return uint8_t(hifi::chars::kEnFire + (effect - 277));
+		return effect == 274 ? hifi::chars::kEnLight : effect == 288 ? hifi::chars::kEnDark : hifi::chars::kEnNone;
+	}
+
+	// (native characters) The en-spell effect on your own model's blades ([chars] enspell: auto = the element of the
+	// en-spell on you, off, or an element's name = always that one), handed to the model recording as your actor
+	void follow_enspell()
+	{
+		uint8_t element = hifi::chars::kEnNone;
+		uintptr_t actor = 0;
+		const std::string mode = hifi::game::option_text("chars", "enspell", "auto");
+		if (g_core != nullptr && mode != "off")
+		{
+			IParty *const party = g_core->GetMemoryManager()->GetParty();
+			IPlayer *const player = g_core->GetMemoryManager()->GetPlayer();
+			IEntity *const entity = g_core->GetMemoryManager()->GetEntity();
+			const uint32_t me = party->GetMemberTargetIndex(0);
+			actor = me != 0 ? entity->GetActorPointer(me) : 0;
+			for (uint8_t k = hifi::chars::kEnFire; k <= hifi::chars::kEnDark; ++k)
+				if (mode == kEnspellNames[k] || (k == hifi::chars::kEnFire && mode == "on"))
+					element = k;
+			if (const int16_t *buffs = player->GetBuffs(); buffs != nullptr && element == hifi::chars::kEnNone && mode == "auto")
+				for (int i = 0; i < 32 && element == hifi::chars::kEnNone; ++i)
+					element = enspell_of(buffs[i]);
+			if (actor == 0)
+				element = hifi::chars::kEnNone;
+		}
+		hifi::game::charmodel::set_enspell(actor, element);
+	}
+
 	// (native characters) HiFi XI's own character draw (its renderer made for the game's device first), its per-pixel
 	// option; and whether models are left to it now: their data recorded, the renderer ready, and the characters' end
 	// markers coming through (no more than 8 behind those sent)
@@ -742,6 +785,24 @@ public:
 			for (const std::string &line : hifi::chars::inject::status())
 				say(line);
 		}
+		else if (arg == "enspell" || arg.rfind("enspell ", 0) == 0) // (native characters)
+		{
+			const std::string want = arg.size() > 8 ? arg.substr(8) : std::string();
+			bool known = want.empty() || want == "auto";
+			for (const char *name : kEnspellNames)
+				known = known || want == name;
+			if (!known)
+				say("/hifi enspell auto|off|fire|ice|wind|earth|thunder|water|light|dark");
+			else
+			{
+				if (!want.empty())
+					hifixi_set_option("chars", "enspell", want.c_str());
+				follow_enspell();
+				const std::string chosen = hifi::game::option_text("chars", "enspell", "auto");
+				say(chosen == "auto" ? "En-spell effect: on your blades while an en-spell is on you, in its element." :
+					chosen == "off" ? "En-spell effect: off." : "En-spell effect: always " + chosen + " on your blades (/hifi enspell auto for the real one).");
+			}
+		}
 		else if (arg == "weather" || arg.rfind("weather ", 0) == 0)
 			weather(arg.substr(7));
 		else if (arg.empty() || arg == "menu")
@@ -762,7 +823,7 @@ public:
 				say("Direct3D 12 hooks not in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel [on|off]]: HiFi XI drawing the characters; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
 		return true;
 	}
 
@@ -803,6 +864,7 @@ public:
 			follow_charslot(); // (native characters)
 			follow_chardata(now);
 			follow_nativechars();
+			follow_enspell();
 			follow_native();
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first

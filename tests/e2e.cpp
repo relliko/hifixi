@@ -765,22 +765,22 @@ int main()
 				if (f == 0)
 					std::memcpy(first, last, sizeof(first));
 				render(false);
-				if (answered_at < 0 && last[0] != 777 && last[1] != 777 && last[2] != 777 && last[4] != 777)
+				if (answered_at < 0 && last[0] == 256 && last[2] == 256 && last[4] == 256)
 					answered_at = f;
 				if (answered_at >= 0 && f >= answered_at + 3)
 					break;
 			}
 			uint32_t vs[12] = {};
 			vis_stats(vs);
-			std::printf("  visibility tests: the game's own answered the first frame (%d %d %d), the depth copy's from frame %d: sky %d, terrain %d, in front %d, off the screen %d; %u from the copy, %u by the game, %u boxes, %u answers back\n",
+			std::printf("  visibility tests: the first frame (%d %d %d), the depth copy's from frame %d: sky %d, terrain %d, in front %d, off the screen %d; %u from the copy, %u by the game, %u boxes, %u answers back\n",
 				first[0], first[1], first[2], answered_at, last[0], last[1], last[2], last[3], vs[0], vs[1], vs[2], vs[3]);
-			check(first[0] == 777 && first[1] == 777 && first[2] == 777 && first[3] == 0, "no answers yet: the game's own test runs (off the screen: 0 at once)");
+			check(first[0] == 0 && first[1] == 0 && first[2] == 0 && first[3] == 0, "no answers yet: hidden for now (0), not the game's waiting test (off the screen: 0 at once)");
 			check(answered_at > 0 && answered_at < 20, "answers from the depth copy within a few frames");
 			check(last[0] == 256 && last[1] == 0 && last[2] == 256 && last[3] == 0, "sky visible, terrain hiding the sky's depth, nothing hiding the nearest, off the screen 0");
-			check(first[4] == 777 && last[4] == 256, "a character's test: the game's own first, then the depth copy's (in front of the terrain: 256)");
+			check(first[4] == 0 && last[4] == 256, "a character's test: hidden for now first, then the depth copy's (in front of the terrain: 256)");
 			check(vs[11] == 1 && vs[2] != 0 && vs[3] != 0 && vs[7] != 0 && vs[8] != 0 && vs[9] != 0, "the counts: on, boxes tested, answers back, asked by glows, fades and the flare");
 			const int by_game = game_tests - tests_before;
-			check(by_game >= 3 && by_game <= 3 * (answered_at + 1), "the game's test ran only until the answers came (its calls: as many as the frames before them)");
+			check(by_game == 0, "the game's waiting test never ran (2026-10-27: its readbacks were hard stutters with the GPU busy)");
 			// An object new in view once answers are coming in: hidden at once (vistest::kUnknown), never the game's
 			// waiting test; its own answer a few frames on
 			const int tests_now = game_tests;

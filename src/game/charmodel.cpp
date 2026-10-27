@@ -76,6 +76,8 @@ namespace hifi::game::charmodel
 			uint8_t saved[5] = {}, ours[5] = {};
 			bool in = false;
 			bool game_draws = true, recording = true, native = false;
+			uintptr_t enspell_actor = 0; // (set_enspell's)
+			uint8_t enspell = ch::kEnNone;
 			ch::frame *f = nullptr; // the frame the walk's begin started (nullptr: none yet)
 			bool in_walk = false;   // between the walk's begin and end
 			raw_model raw;          // (scratch for the model being recorded)
@@ -258,7 +260,11 @@ namespace hifi::game::charmodel
 					textures.push_back(tid);
 				}
 			g.n.new_meshes++;
-			return ch::cache::add_mesh(k, std::move(bytes), base, std::move(textures));
+			// (its chunk's name, from the resource's header copy at +0x20: a weapon's slot)
+			const uint32_t name_word = word(k.resource + 0x20);
+			char name[4];
+			std::memcpy(name, &name_word, 4);
+			return ch::cache::add_mesh(k, std::move(bytes), base, std::move(textures), name);
 		}
 
 		// The camera and the zone's fog as the zone pass left them in the renderer (renderer +0x38F5C VIEW x PROJECTION,
@@ -355,6 +361,7 @@ namespace hifi::game::charmodel
 			m.first_instance = f->instances;
 			m.instances = r.instances;
 			m.hidden = 0;
+			m.enspell = actor != 0 && actor == g.enspell_actor ? g.enspell : ch::kEnNone;
 			for (uint32_t i = 0; i < r.instances; ++i)
 			{
 				const raw_instance &ri = r.instance[i];
@@ -540,6 +547,12 @@ namespace hifi::game::charmodel
 	void set_native(bool on)
 	{
 		g.native = on;
+	}
+
+	void set_enspell(uintptr_t actor, uint8_t element)
+	{
+		g.enspell_actor = element != ch::kEnNone ? actor : 0;
+		g.enspell = element;
 	}
 
 	void on_slot(uint32_t kind, uint32_t seq, uintptr_t)

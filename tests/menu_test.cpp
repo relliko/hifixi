@@ -375,6 +375,21 @@ int main()
 		check(draw() && fake::click.empty(), "Flash lightning now clicked");
 	}
 
+	// 9. En-spell effects: the Game tab's buttons set [chars] enspell, the one picked shown so
+	{
+		hifi::ui::show_tab(hifi::settings::tab::game);
+		const bool balanced = draw();
+		check(balanced && fake::has("En-spell effects") && fake::has("[While one is on you]*") && fake::has("[Enfire]") && fake::has("[Endark]"),
+			"the Game tab: En-spell effects, following the en-spell on you, a button for each");
+		fake::click = "Enthunder";
+		draw();
+		draw();
+		check(hifi::game::option_text("chars", "enspell", "") == "thunder" && fake::has("[Enthunder]*") && !fake::has("[While one is on you]*"), "Enthunder clicked: saved, shown picked");
+		fake::click = "While one is on you";
+		draw();
+		check(hifi::game::option_text("chars", "enspell", "") == "auto", "back to following the en-spell on you");
+	}
+
 	check(read_all(reshade_ini) == old_ini, "ReShade.ini as it was, at the end");
 	std::printf(failures == 0 ? "\nall passed\n" : "\n%d failed\n", failures);
 	return failures == 0 ? 0 : 1;

@@ -192,6 +192,730 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 }
 )";
 
+		// En-spells (record_enspells). b0: 32 root constants; t3 the instance's palette; t0-t1 the blade's mesh.
+		const char *kEnShader = R"(
+cbuffer en_constants : register(b0)
+{
+	row_major float4x4 view_proj;
+	float time;
+	uint element;        // charframe.hpp kEn*: 1 fire, 2 ice, 3 wind, 4 earth, 5 thunder, 6 water, 7 light, 8 dark
+	uint bone_count;
+	uint vertex_count;
+	uint corner_count;
+	uint bone;           // the blade's bone
+	float half_width;
+	float strength;      // 0..1 (the model's fade)
+	float3 base;         // the blade, in its bone's space: where it leaves the guard
+	uint edge_axis;      // the bone's axis across the blade's flat (0 x, 1 y, 2 z)
+	float3 tip;
+	uint blade_kind;     // os2::blade's kind: 0 a blade (the line base..tip), 1 a head, 2 the whole piece
+};
+struct vertex_t { float3 p0; float w0; float3 p1; float w1; float3 n0; float3 n1; uint bones; uint mirror_bones; uint axes; };
+struct corner_t { uint vertex; float2 uv; };
+struct bone_t { float4 a; float4 b; float4 c; };
+StructuredBuffer<vertex_t> vertices : register(t0);
+StructuredBuffer<corner_t> corners : register(t1);
+StructuredBuffer<bone_t> palette : register(t3);
+
+static const float kPi = 3.14159265;
+static const float kSubtle = 0.6; // (every element's light, kept below the game's own spell effects)
+
+float3 bone_point(float3 p)
+{
+	const bone_t m = palette[min(bone, bone_count - 1)];
+	return p.x * float3(m.a.x, m.a.y, m.a.z) + p.y * float3(m.a.w, m.b.x, m.b.y) + p.z * float3(m.b.z, m.b.w, m.c.x) + float3(m.c.y, m.c.z, m.c.w);
+}
+float3 bone_dir(float3 n)
+{
+	const bone_t m = palette[min(bone, bone_count - 1)];
+	return n.x * float3(m.a.x, m.a.y, m.a.z) + n.y * float3(m.a.w, m.b.x, m.b.y) + n.z * float3(m.b.z, m.b.w, m.c.x);
+}
+
+float hash3(float3 p)
+{
+	p = frac(p * 0.3183099 + 0.1);
+	p *= 17.0;
+	return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float noise3(float3 x)
+{
+	const float3 i = floor(x);
+	float3 f = frac(x);
+	f = f * f * (3 - 2 * f);
+	return lerp(lerp(lerp(hash3(i), hash3(i + float3(1, 0, 0)), f.x), lerp(hash3(i + float3(0, 1, 0)), hash3(i + float3(1, 1, 0)), f.x), f.y),
+		lerp(lerp(hash3(i + float3(0, 0, 1)), hash3(i + float3(1, 0, 1)), f.x), lerp(hash3(i + float3(0, 1, 1)), hash3(i + float3(1, 1, 1)), f.x), f.y), f.z);
+}
+float fbm(float3 p)
+{
+	float a = 0.5, s = 0;
+	[unroll] for (int k = 0; k < 4; ++k)
+	{
+		s += a * noise3(p);
+		p = p * 2.03 + float3(1.7, 9.2, 3.1);
+		a *= 0.5;
+	}
+	return s;
+}
+float hash1(uint n)
+{
+	n = (n << 13) ^ n;
+	n = n * (n * n * 15731u + 789221u) + 1376312589u;
+	return float(n & 0x7FFFFFFFu) / 2147483647.0;
+}
+// Heat 0..1 to fire's colours: dark red, orange, yellow-white
+float3 fire_ramp(float v)
+{
+	float3 c = lerp(float3(0, 0, 0), float3(0.55, 0.06, 0.0), saturate(v * 3));
+	c = lerp(c, float3(1.0, 0.38, 0.04), saturate(v * 3 - 1));
+	return lerp(c, float3(1.0, 0.86, 0.5), saturate(v * 3 - 2));
+}
+// Toward the camera's forward (clip w is the view depth: view_proj's 4th column)
+float3 forward() { return normalize(float3(view_proj._14, view_proj._24, view_proj._34)); }
+
+// The blade in the world: its base B, its direction A (base to tip) and length, E across its flat, F through it
+struct blade_t
+{
+	float3 B, T, A, E, F;
+	float L;
+};
+blade_t blade_now()
+{
+	blade_t b;
+	b.B = bone_point(base);
+	b.T = bone_point(tip);
+	b.L = max(length(b.T - b.B), 1e-4);
+	b.A = (b.T - b.B) / b.L;
+	const float3 e = bone_dir(float3(edge_axis == 0 ? 1 : 0, edge_axis == 1 ? 1 : 0, edge_axis == 2 ? 1 : 0));
+	b.E = normalize(e - b.A * dot(e, b.A) + 1e-6);
+	b.F = cross(b.A, b.E);
+	return b;
+}
+
+// Where a sprite starts: on the line base..tip at t (a blade), else on one of the piece's own vertices (a head's: past
+// its base, found by a few tries)
+float3 at(blade_t b, uint n, float t)
+{
+	if (blade_kind == 0)
+		return lerp(b.B, b.T, t);
+	const float3 axis = tip - base;
+	for (uint k = 0; k < 6; ++k)
+	{
+		const float3 p = vertices[min(uint(hash1(n * 13u + k) * vertex_count), vertex_count - 1)].p0;
+		if (blade_kind == 2 || dot(p - base, axis) >= 0)
+			return bone_point(p);
+	}
+	return lerp(b.B, b.T, t);
+}
+
+// ------------------------------------------------------------------------------------------------ the blade's shell
+// The blade's own mesh, swollen along its normals, from the guard to the tip; each element's surface on it
+struct s2p
+{
+	float4 pos : SV_Position;
+	float3 world : TEXCOORD0;
+	float facing : TEXCOORD1;
+	float fade : TEXCOORD2;
+	float along : TEXCOORD3;
+};
+s2p svs(uint vid : SV_VertexID)
+{
+	const corner_t c = corners[min(vid, corner_count - 1)];
+	const vertex_t v = vertices[min(c.vertex & 0x7FFFFFFFu, vertex_count - 1)];
+	const float3 axis = tip - base;
+	const float along = dot(v.p0 - base, axis) / max(dot(axis, axis), 1e-6);
+	float3 n = bone_dir(v.n0);
+	n = dot(n, n) > 0 ? normalize(n) : float3(0, -1, 0);
+	const float swell = element == 1 ? half_width * (0.5 + 0.2 * sin(time * 9.0 + along * 21.0)) : half_width * 0.3;
+	s2p r;
+	r.world = bone_point(v.p0) + n * swell * saturate(along * 6 + 0.3);
+	r.pos = mul(float4(r.world, 1), view_proj);
+	r.facing = abs(dot(n, forward()));
+	r.fade = (blade_kind == 2 ? 1.0 : saturate(along * 10) * saturate((1.03 - along) * 12)) * strength;
+	r.along = along;
+	return r;
+}
+// (premultiplied: rgb added, alpha how much of what's behind is covered)
+float4 sps(s2p i) : SV_Target
+{
+	const float rim = pow(1 - saturate(i.facing), 1.5);
+	const float3 p = i.world;
+	float3 c = 0;
+	float a = 0;
+	switch (element)
+	{
+	case 1: // fire: noise climbing the blade, bright at the rim
+	{
+		float3 q = p * 7.0;
+		q.y += time * 3.4; // (y is down: the pattern climbs)
+		c = fire_ramp(saturate((fbm(q) - 0.32) * 2.0) * (0.3 + 0.9 * rim)) * 1.1;
+		break;
+	}
+	case 2: // ice: frost facets, a cold rim, the steel frosted over
+	{
+		const float n = noise3(p * 38.0);
+		const float facets = smoothstep(0.55, 0.62, n);
+		const float shimmer = 0.75 + 0.25 * sin(time * 3.0 + n * 12.0);
+		c = float3(0.3, 0.65, 1.0) * (0.2 + 0.8 * rim) + float3(0.75, 0.92, 1.0) * facets * 0.4 * shimmer;
+		a = 0.25;
+		break;
+	}
+	case 3: // wind: thin streaks racing along the blade
+	{
+		const float n = noise3(float3(i.along * 10.0 - time * 7.0, (p.x + p.z) * 30.0, p.y * 30.0));
+		c = float3(0.5, 1.0, 0.65) * (pow(saturate(n), 6) * 3.0 + 0.2 * rim);
+		break;
+	}
+	case 4: // earth: glowing cracks over a dulled blade, slowly pulsing
+	{
+		const float cracks = 1 - saturate(abs(noise3(p * 30.0) - 0.5) * 14.0);
+		const float pulse = 0.7 + 0.3 * sin(time * 2.5);
+		c = float3(1.0, 0.55, 0.15) * cracks * pulse * 0.9 + float3(0.6, 0.4, 0.15) * rim * 0.35;
+		a = 0.3;
+		break;
+	}
+	case 5: // thunder: crackling lines, a new pattern many times a second
+	{
+		const float step = floor(time * 18.0);
+		const float n = noise3(p * 30.0 + step * 7.3);
+		const float line_ = saturate(1 - abs(n - 0.5) * 25.0);
+		c = float3(0.8, 0.7, 1.0) * line_ * 1.6 + float3(0.5, 0.4, 1.0) * rim * (0.35 + 0.3 * hash3(float3(step, 1, 2)));
+		break;
+	}
+	case 6: // water: caustics flowing toward the tip over a wet blue sheen
+	{
+		const float n = fbm(float3(i.along * 8.0 - time * 2.5, (p.x + p.z) * 12.0, p.y * 12.0));
+		const float caustic = pow(saturate(1 - abs(sin(n * 14.0))), 5);
+		c = float3(0.15, 0.45, 1.0) * (0.25 + 0.6 * rim) * 0.6 + float3(0.7, 0.9, 1.0) * caustic * 0.6;
+		a = 0.15;
+		break;
+	}
+	case 7: // light: a warm white glow, pulsing, glittering
+	{
+		const float pulse = 0.8 + 0.2 * sin(time * 4.0);
+		const float glitter = pow(noise3(p * 60.0 + time * 2.0), 8) * 4.0;
+		c = float3(1.0, 0.9, 0.62) * ((0.3 + 0.9 * rim) * pulse + glitter);
+		break;
+	}
+	default: // dark: the blade swallowed, a violet rim smouldering
+	{
+		const float n = fbm(p * 6.0 + float3(0, time * 1.5, 0));
+		c = float3(0.35, 0.08, 0.6) * rim * (0.5 + n);
+		a = 0.6;
+		break;
+	}
+	}
+	return float4(c * kSubtle, a * 0.8) * i.fade;
+}
+
+)"
+									R"(
+// ------------------------------------------------------------------------------------------------ the sprites
+// kSprites quads per blade, each element's kinds of sprite. A sprite faces the camera (round ones), or lies along a
+// direction (streaks, shards, bolts, rays) turned to the camera round it. Stateless: a sprite's life comes from the
+// time and its number, a new place each life.
+static const uint kSprites = 186;
+static const float2 kQuad[6] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(-1, 1), float2(1, -1), float2(1, 1) };
+
+static const uint kFlame = 0, kGlow = 1, kStar = 2, kSoft = 3, kStreak = 4, kShard = 5, kRock = 6, kBolt = 7, kDrop = 8, kRing = 9, kSmoke = 10, kRay = 11;
+
+struct sprite
+{
+	float3 c;      // its middle
+	float3 dir;    // along: its length's direction
+	float len, wid; // half length (camera up, or dir), half width
+	bool along;
+	uint kind;
+	float4 col;    // premultiplied colour and cover
+	float age, seed;
+};
+
+// A sprite's life: its age 0..1 and a seed for this life
+void cycle(uint i, float shortest, float longest, out float age, out uint n)
+{
+	const float life = shortest + (longest - shortest) * hash1(i * 7 + 1);
+	const float c = time / life + hash1(i * 7 + 2);
+	age = frac(c);
+	n = i * 7919u + uint(floor(c)) * 104729u;
+}
+float3 ring_dir(blade_t b, float th) { return b.E * cos(th) + b.F * sin(th); }
+float bump(float age) { return sin(saturate(age) * kPi); }
+
+sprite fire_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	const bool ember = i >= 150;
+	float age;
+	uint n;
+	cycle(i, ember ? 1.3 : 0.42, ember ? 2.2 : 0.75, age, n);
+	const float t = lerp(0.03, 1.0, hash1(n + 3));
+	const float3 jitter = (float3(hash1(n + 4), hash1(n + 5), hash1(n + 6)) - 0.5) * half_width * 2.2;
+	const float rise = (ember ? 0.85 : 0.30) * (0.6 + 0.8 * hash1(n + 9));
+	const float3 sway = float3(sin(time * 3.1 + hash1(n + 7) * 6.28), 0, cos(time * 2.3 + hash1(n + 8) * 6.28)) * (ember ? 0.12 : 0.035) * age;
+	s.c = at(b, n, t) + jitter + float3(0, -rise * age, 0) + sway;
+	const float size = ember ? 0.010 : half_width * (0.9 + 0.8 * hash1(n + 10)) * (1 - age * 0.5) * smoothstep(0.0, 0.12, age);
+	s.wid = size;
+	s.len = ember ? size : size * 1.6;
+	s.kind = ember ? kGlow : kFlame;
+	s.col = ember ? float4(1.6, 0.88, 0.24, 0) * (1 - age) * (0.6 + 0.4 * sin(time * 23.0 + hash1(n + 11) * 40.0)) : float4(1, 1, 1, 0);
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+)"
+									R"(
+sprite ice_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 60) // sparkles on the blade
+	{
+		cycle(i, 0.5, 1.1, age, n);
+		s.c = at(b, n, lerp(0.05, 1.0, hash1(n + 3))) + ring_dir(b, hash1(n + 4) * 6.283) * half_width * 1.1;
+		s.wid = s.len = 0.035 * (0.6 + 0.8 * hash1(n + 5)) * bump(age);
+		s.kind = kStar;
+		s.col = float4(0.75, 0.95, 1.2, 0);
+	}
+	else if (i < 156) // frost motes drifting down
+	{
+		cycle(i, 1.4, 2.4, age, n);
+		const float th = hash1(n + 4) * 6.283;
+		s.c = at(b, n, lerp(0.0, 1.05, hash1(n + 3))) + ring_dir(b, th) * half_width * (1.5 + 3.0 * hash1(n + 5)) +
+			float3(sin(time * 1.3 + th) * 0.03, 0.18 * age, cos(time * 1.1 + th) * 0.03);
+		s.wid = s.len = 0.009 * (0.6 + 0.8 * hash1(n + 6));
+		s.kind = kGlow;
+		s.col = float4(0.7, 0.9, 1.1, 0) * bump(age) * 1.3;
+	}
+	else // ice shards growing off the edges toward the tip, then breaking off
+	{
+		cycle(i, 1.8, 2.8, age, n);
+		const float t = lerp(0.08, 0.95, hash1(n + 3));
+		const float side = hash1(n + 4) < 0.5 ? -1.0 : 1.0;
+		const float3 out_dir = normalize(b.E * side + b.A * (0.25 + 0.5 * hash1(n + 5)) + b.F * (hash1(n + 6) - 0.5) * 0.6);
+		const float grow = smoothstep(0.0, 0.25, age) * (1 - smoothstep(0.85, 1.0, age));
+		const float len = half_width * (0.4 + 0.7 * hash1(n + 7)) * (1.1 - 0.5 * t) * grow;
+		s.c = at(b, n, t) + b.E * side * half_width * 0.8 + out_dir * len;
+		s.dir = out_dir;
+		s.along = true;
+		s.len = len;
+		s.wid = len * 0.3;
+		s.kind = kShard;
+		s.col = float4(0.5, 0.8, 1.0, 0.5);
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+sprite wind_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 130) // wisps on three helices round the blade, racing toward the tip
+	{
+		cycle(i, 0.6, 1.1, age, n);
+		const float band = float(i % 3);
+		const float t = lerp(-0.08, 1.0, hash1(n + 3)) + age * 0.25;
+		const float th = band * 2.094 + t * 11.0 - time * 9.0;
+		const float r = half_width * (1.6 + 0.5 * sin(t * 5.0 + band));
+		const float3 out_ = ring_dir(b, th);
+		s.c = b.B + b.A * b.L * t + out_ * r;
+		s.dir = normalize(-b.E * sin(th) + b.F * cos(th) - b.A * 0.2);
+		s.along = true;
+		s.len = 0.07 + 0.06 * hash1(n + 4);
+		s.wid = 0.004;
+		s.kind = kStreak;
+		const float front = 0.45 + 0.55 * saturate(-dot(out_, forward()) * 0.5 + 0.5);
+		s.col = float4(0.55, 1.0, 0.7, 0) * bump(age) * front * 0.9;
+	}
+	else // motes caught in it
+	{
+		cycle(i, 0.8, 1.4, age, n);
+		const float t = hash1(n + 3);
+		const float th = hash1(n + 4) * 6.283 - time * 6.0 + t * 8.0;
+		s.c = at(b, n, t) + ring_dir(b, th) * half_width * (2.0 + 2.5 * hash1(n + 5)) + float3(0, -0.12 * age, 0);
+		s.wid = s.len = 0.008;
+		s.kind = kGlow;
+		s.col = float4(0.6, 1.1, 0.6, 0) * bump(age);
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+sprite earth_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 30) // rock chips circling slowly, bobbing
+	{
+		cycle(i, 3.0, 4.5, age, n);
+		const float th = hash1(n + 4) * 6.283 + time * 1.2 * (hash1(n + 5) < 0.5 ? -1.0 : 1.0);
+		s.c = at(b, n, lerp(0.05, 1.0, hash1(n + 3))) + ring_dir(b, th) * half_width * (2.5 + 2.0 * hash1(n + 6)) +
+			float3(0, sin(time * 2.0 + hash1(n + 7) * 6.28) * 0.02, 0);
+		s.wid = s.len = (0.016 + 0.02 * hash1(n + 8)) * smoothstep(0.0, 0.1, age) * (1 - smoothstep(0.9, 1.0, age));
+		s.kind = kRock;
+		s.col = float4(float3(0.42, 0.32, 0.22) * (0.8 + 0.4 * hash1(n + 9)), 1);
+	}
+	else if (i < 150) // dust: amber glints and dark grit drifting down and out
+	{
+		cycle(i, 1.2, 2.0, age, n);
+		const float3 out_ = ring_dir(b, hash1(n + 4) * 6.283);
+		s.c = at(b, n, hash1(n + 3)) + out_ * half_width * (1.0 + 2.5 * hash1(n + 5) + age) + float3(0, 0.1 * age, 0);
+		const bool grit = (i & 1) != 0;
+		s.wid = s.len = grit ? 0.007 : 0.012;
+		s.kind = kSoft;
+		s.col = (grit ? float4(0.12, 0.09, 0.05, 0.5) : float4(0.9, 0.6, 0.3, 0) * 0.45) * bump(age);
+	}
+	else // glints on the blade
+	{
+		cycle(i, 0.6, 1.2, age, n);
+		s.c = at(b, n, hash1(n + 3)) + ring_dir(b, hash1(n + 4) * 6.283) * half_width;
+		s.wid = s.len = 0.025 * bump(age);
+		s.kind = kStar;
+		s.col = float4(1.0, 0.7, 0.3, 0);
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+)"
+									R"(
+sprite thunder_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 38) // arcs jumping along the blade, and some into the air
+	{
+		cycle(i, 0.10, 0.22, age, n);
+		const float t0 = hash1(n + 3) * 0.85;
+		const float3 p0 = at(b, n, t0) + b.E * (hash1(n + 4) < 0.5 ? -1.0 : 1.0) * half_width;
+		float3 p1;
+		if (i < 30)
+			p1 = at(b, n + 977u, min(t0 + 0.1 + 0.25 * hash1(n + 5), 1.0)) + b.E * (hash1(n + 6) < 0.5 ? -1.0 : 1.0) * half_width;
+		else
+			p1 = p0 + normalize(ring_dir(b, hash1(n + 5) * 6.283) + float3(0, -0.6, 0)) * (0.2 + 0.25 * hash1(n + 6));
+		s.c = 0.5 * (p0 + p1);
+		s.dir = normalize(p1 - p0 + 1e-6);
+		s.along = true;
+		s.len = 0.5 * length(p1 - p0);
+		s.wid = s.len * 0.25 + half_width * 0.5;
+		s.kind = kBolt;
+		s.col = float4(0.6, 0.45, 1.0, 0) * (hash1(n + 20) < 0.5 ? 0.0 : 1.0); // (some blink out)
+	}
+	else // sparks flying off
+	{
+		cycle(i, 0.15, 0.35, age, n);
+		const float3 v = normalize(ring_dir(b, hash1(n + 4) * 6.283) + float3(0, -0.5, 0) + b.A * (hash1(n + 5) - 0.5));
+		s.c = at(b, n, hash1(n + 3)) + v * (half_width + 0.25 * age) + float3(0, 0.15 * age * age, 0);
+		s.dir = v;
+		s.along = true;
+		s.len = 0.02;
+		s.wid = 0.004;
+		s.kind = kStreak;
+		s.col = float4(0.8, 0.75, 1.2, 0) * (1 - age) * 1.5;
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+sprite water_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 50) // drops running off the edges and falling
+	{
+		cycle(i, 0.5, 0.9, age, n);
+		const float side = hash1(n + 4) < 0.5 ? -1.0 : 1.0;
+		s.c = at(b, n, lerp(0.05, 1.0, hash1(n + 3))) + b.E * side * half_width * (0.8 + age * 0.6) + float3(0, 0.9 * age * age, 0);
+		s.wid = (0.010 + 0.008 * hash1(n + 5)) * smoothstep(0.0, 0.15, age);
+		s.len = s.wid * 1.25;
+		s.kind = kDrop;
+		s.col = float4(0.35, 0.6, 1.0, 0.5);
+	}
+	else if (i < 150) // a stream wound twice round the blade, flowing to the tip
+	{
+		cycle(i, 0.7, 1.1, age, n);
+		const float band = float(i & 1);
+		const float t = lerp(-0.05, 1.0, hash1(n + 3)) + age * 0.2;
+		const float th = band * kPi + t * 8.0 - time * 5.0;
+		const float3 out_ = ring_dir(b, th);
+		s.c = b.B + b.A * b.L * t + out_ * half_width * 1.9;
+		s.dir = normalize(-b.E * sin(th) + b.F * cos(th) - b.A * 0.4);
+		s.along = true;
+		s.len = 0.07;
+		s.wid = 0.012;
+		s.kind = kStreak;
+		const float front = 0.4 + 0.6 * saturate(-dot(out_, forward()) * 0.5 + 0.5);
+		s.col = float4(0.25, 0.55, 1.0, 0.2) * bump(age) * front;
+	}
+	else // bubbles rising
+	{
+		cycle(i, 1.0, 1.8, age, n);
+		const float th = hash1(n + 4) * 6.283;
+		s.c = at(b, n, hash1(n + 3)) + ring_dir(b, th) * half_width * (1.5 + 2.0 * hash1(n + 5)) +
+			float3(sin(time * 4.0 + th) * 0.02, -0.15 * age, 0);
+		s.wid = s.len = 0.012 + 0.01 * hash1(n + 6);
+		s.kind = kRing;
+		s.col = float4(0.6, 0.85, 1.0, 0) * bump(age);
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+sprite light_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 50) // stars rising off it
+	{
+		cycle(i, 0.8, 1.4, age, n);
+		s.c = at(b, n, hash1(n + 3)) + ring_dir(b, hash1(n + 4) * 6.283) * half_width * (1.0 + 2.0 * hash1(n + 5)) + float3(0, -0.15 * age, 0);
+		s.wid = s.len = (0.03 + 0.03 * hash1(n + 6)) * bump(age);
+		s.kind = kStar;
+		s.col = float4(1.2, 1.1, 0.8, 0);
+	}
+	else if (i < 140) // motes drifting up
+	{
+		cycle(i, 1.0, 1.8, age, n);
+		s.c = at(b, n, hash1(n + 3)) + ring_dir(b, hash1(n + 4) * 6.283) * half_width * (1.0 + 3.0 * hash1(n + 5)) + float3(0, -0.35 * age, 0);
+		s.wid = s.len = 0.008;
+		s.kind = kGlow;
+		s.col = float4(1.0, 0.85, 0.45, 0) * bump(age) * 1.2;
+	}
+	else // rays fanning out, turning slowly
+	{
+		cycle(i, 1.5, 2.5, age, n);
+		const float3 p = at(b, n, lerp(0.1, 0.95, hash1(n + 3)));
+		const float3 d = normalize(ring_dir(b, hash1(n + 4) * 6.283 + time * 0.6) + b.A * (hash1(n + 5) - 0.5) * 0.5);
+		const float len = (0.08 + 0.14 * hash1(n + 6)) * bump(age);
+		s.c = p + d * len;
+		s.dir = d;
+		s.along = true;
+		s.len = len;
+		s.wid = 0.012;
+		s.kind = kRay;
+		s.col = float4(1.0, 0.92, 0.7, 0) * 0.7;
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+sprite dark_sprite(uint i, blade_t b)
+{
+	sprite s = (sprite)0;
+	float age;
+	uint n;
+	if (i < 100) // smoke welling up off it
+	{
+		cycle(i, 1.0, 1.8, age, n);
+		const float3 jitter = (float3(hash1(n + 4), hash1(n + 5), hash1(n + 6)) - 0.5) * half_width * 2.0;
+		s.c = at(b, n, hash1(n + 3)) + jitter + float3(sin(time * 1.7 + hash1(n + 7) * 6.28) * 0.03 * age, -0.25 * age, 0);
+		s.wid = s.len = half_width * (1.5 + 1.5 * hash1(n + 8)) * (0.6 + 0.8 * age);
+		s.kind = kSmoke;
+		s.col = float4(0.04, 0.0, 0.07, 0.7) * bump(age);
+	}
+	else if (i < 150) // violet wisps in it
+	{
+		cycle(i, 0.8, 1.4, age, n);
+		s.c = at(b, n, hash1(n + 3)) + (float3(hash1(n + 4), hash1(n + 5), hash1(n + 6)) - 0.5) * half_width * 2.0 + float3(0, -0.35 * age, 0);
+		s.wid = s.len = half_width * (0.6 + 0.6 * hash1(n + 8));
+		s.kind = kSmoke;
+		s.col = float4(0.35, 0.08, 0.6, 0) * 0.28 * bump(age);
+	}
+	else // motes
+	{
+		cycle(i, 1.0, 1.8, age, n);
+		s.c = at(b, n, hash1(n + 3)) + ring_dir(b, hash1(n + 4) * 6.283) * half_width * (1.0 + 2.5 * hash1(n + 5)) + float3(0, -0.25 * age, 0);
+		s.wid = s.len = 0.008;
+		s.kind = kGlow;
+		s.col = float4(0.8, 0.4, 1.3, 0) * bump(age);
+	}
+	s.age = age;
+	s.seed = hash1(n + 11);
+	return s;
+}
+
+)"
+									R"(
+struct p2p
+{
+	float4 pos : SV_Position;
+	float2 uv : TEXCOORD0;
+	float age : TEXCOORD1;
+	float seed : TEXCOORD2;
+	nointerpolation uint kind : TEXCOORD3;
+	float4 col : TEXCOORD4;
+};
+p2p pvs(uint vid : SV_VertexID)
+{
+	const uint i = vid / 6;
+	const float2 q = kQuad[vid % 6];
+	const blade_t b = blade_now();
+	sprite s;
+	switch (element)
+	{
+	case 1: s = fire_sprite(i, b); break;
+	case 2: s = ice_sprite(i, b); break;
+	case 3: s = wind_sprite(i, b); break;
+	case 4: s = earth_sprite(i, b); break;
+	case 5: s = thunder_sprite(i, b); break;
+	case 6: s = water_sprite(i, b); break;
+	case 7: s = light_sprite(i, b); break;
+	default: s = dark_sprite(i, b); break;
+	}
+	// (a third of them left out, the rest a little smaller: kept subtle)
+	if (i % 3 == 2)
+		s.wid = s.len = 0;
+	s.wid *= 0.85;
+	if (!s.along)
+		s.len *= 0.85;
+	float3 world;
+	if (s.along)
+	{
+		// (lying along dir, turned round it to face the camera)
+		float3 side = cross(s.dir, forward());
+		side = dot(side, side) > 1e-8 ? normalize(side) : normalize(float3(view_proj._11, view_proj._21, view_proj._31));
+		world = s.c + s.dir * s.len * q.y + side * s.wid * q.x;
+	}
+	else
+	{
+		const float3 right = normalize(float3(view_proj._11, view_proj._21, view_proj._31));
+		const float3 up = normalize(float3(view_proj._12, view_proj._22, view_proj._32));
+		world = s.c + right * s.wid * q.x + up * s.len * q.y;
+	}
+	p2p r;
+	r.pos = mul(float4(world, 1), view_proj);
+	r.uv = q;
+	r.age = s.age;
+	r.seed = s.seed;
+	r.kind = s.kind;
+	r.col = s.col;
+	return r;
+}
+float4 pps(p2p i) : SV_Target
+{
+	const float2 d = i.uv; // (-1..1; y along the sprite's length, or up)
+	const float r2 = dot(d, d);
+	float4 o = 0;
+	switch (i.kind)
+	{
+	case kFlame: // a tongue of fire, narrower toward its top
+	{
+		const float2 e = float2(d.x * (1.0 + 0.7 * (d.y * 0.5 + 0.5)), d.y);
+		const float n = fbm(float3(e * 1.9, i.seed * 13.0 + time * 2.2));
+		float shape = saturate(1 - length(e) - (n - 0.5) * 0.7);
+		shape *= shape;
+		o = float4(fire_ramp(saturate(shape * (1 - i.age) * 1.3 + 0.1 * (1 - i.age))) * shape * (1 - 0.7 * i.age) * 0.5, 0);
+		break;
+	}
+	case kGlow:
+	{
+		const float e = saturate(1 - r2);
+		o = i.col * e * e;
+		break;
+	}
+	case kStar: // four points and a core, twinkling
+	{
+		const float ax = abs(d.x), ay = abs(d.y);
+		const float star = saturate(1 - (ax * 7 + ay)) + saturate(1 - (ay * 7 + ax)) + saturate(1 - r2 * 5) * 0.6;
+		o = float4(i.col.rgb * star * (0.55 + 0.45 * sin(time * 9.0 + i.seed * 31.0)), 0);
+		break;
+	}
+	case kSoft:
+	{
+		const float e = saturate(1 - r2);
+		o = i.col * e * e;
+		break;
+	}
+	case kStreak: // soft across, fading at both ends
+	{
+		const float across = saturate(1 - abs(d.x));
+		o = i.col * across * across * saturate(1 - d.y * d.y);
+		break;
+	}
+	case kShard: // a sliver of ice: wide at its root, a point at its tip, edges bright
+	{
+		const float m = abs(d.x) / max((1 - d.y) * 0.5, 1e-3);
+		if (m > 1)
+			discard;
+		const float edge = smoothstep(0.55, 1.0, m);
+		o = float4(lerp(i.col.rgb, float3(0.9, 0.97, 1.0), edge) * (0.55 + 0.45 * edge), i.col.a);
+		break;
+	}
+	case kRock: // a lumpy stone, lit from above, an amber rim
+	{
+		const float ang = atan2(d.y, d.x);
+		const float edge = 0.7 + 0.3 * noise3(float3(cos(ang) * 2.0, sin(ang) * 2.0, i.seed * 10.0));
+		const float r = sqrt(r2);
+		if (r > edge)
+			discard;
+		const float3 nrm = normalize(float3(d, sqrt(saturate(edge * edge - r2)) + 0.2));
+		const float shade = 0.45 + 0.55 * saturate(dot(nrm, normalize(float3(-0.4, 0.7, 0.6))));
+		const float facet = 0.85 + 0.15 * noise3(float3(d * 5.0, i.seed * 7.0));
+		const float rim = smoothstep(edge - 0.15, edge, r);
+		o = float4(i.col.rgb * shade * facet + float3(1.0, 0.55, 0.15) * rim * 0.5, 1);
+		break;
+	}
+	case kBolt: // a jagged line across the sprite's length, a new shape many times a second
+	{
+		const float step = floor(time * 24.0);
+		const float x = d.y;
+		const float y = ((noise3(float3(x * 3.0 + i.seed * 20.0, step, 0)) - 0.5) * 1.2 + (noise3(float3(x * 9.0, i.seed * 7.0, step)) - 0.5) * 0.5) * (1 - x * x);
+		const float dist = abs(d.x - y);
+		const float core = saturate(1 - dist * 14.0), glow = saturate(1 - dist * 3.0);
+		o = float4(float3(1, 1, 1) * core * any(i.col.rgb) + i.col.rgb * glow * glow, 0) * saturate((1 - abs(x)) * 6.0);
+		break;
+	}
+	case kDrop: // a drop: rounder below, a highlight, clear in the middle
+	{
+		const float2 e = float2(d.x * (1.0 + max(d.y, 0.0) * 0.8), d.y);
+		const float r = length(e);
+		if (r > 1)
+			discard;
+		const float rim = smoothstep(0.55, 1.0, r);
+		const float highlight = saturate(1 - length(d - float2(-0.3, 0.35)) * 4.0);
+		const float cover = (0.3 + 0.5 * rim) * i.col.a;
+		o = float4(i.col.rgb * cover + highlight * 0.8, cover);
+		break;
+	}
+	case kRing: // a bubble
+	{
+		const float r = sqrt(r2);
+		const float ring = saturate(1 - abs(r - 0.8) * 8.0) + saturate(1 - length(d - float2(-0.35, 0.35)) * 6.0);
+		o = float4(i.col.rgb * ring, 0);
+		break;
+	}
+	case kSmoke: // a puff, ragged at its edge
+	{
+		const float n = fbm(float3(d * 1.5, i.seed * 9.0 + time * 0.4));
+		float m = saturate(1 - r2 - (n - 0.5) * 0.9);
+		o = i.col * m * m;
+		break;
+	}
+	default: // a ray: soft across, fading toward its far end
+	{
+		const float across = saturate(1 - abs(d.x));
+		const float t = d.y * 0.5 + 0.5;
+		o = i.col * across * across * across * (1 - t) * smoothstep(0.0, 0.1, t);
+		break;
+	}
+	}
+	return float4(o.rgb * kSubtle, o.a * (i.kind == kRock ? 1.0 : 0.8)) * strength;
+}
+)";
+		constexpr uint32_t kEnSpriteCount = 186; // (kSprites in the shader)
+
 		constexpr UINT64 kConstantsBytes = 256;
 		struct gpu_model
 		{
@@ -279,7 +1003,22 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		{
 			kModel = 0,
 			kComposite = 1,
+			kEnShell = 2,
+			kEnSprites = 3,
 		};
+
+		struct en_constants
+		{
+			float view_proj[16];
+			float time;
+			uint32_t element, bone_count, vertex_count, corner_count, bone;
+			float half_width, strength;
+			float base[3];
+			uint32_t edge_axis;
+			float tip[3];
+			uint32_t blade_kind;
+		};
+		static_assert(sizeof(en_constants) == 32 * 4, "the en-spell shader's b0");
 	}
 
 	char_renderer::~char_renderer()
@@ -299,7 +1038,8 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		_mapped = nullptr;
 		drop(_ring);
 		drop(_root);
-		for (void **b : { &_vs, &_ps, &_cvs, &_cps, &_cps_ms, &_sps })
+		drop(_en_root);
+		for (void **b : { &_vs, &_ps, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps })
 		{
 			if (*b != nullptr)
 				static_cast<ID3DBlob *>(*b)->Release();
@@ -325,11 +1065,14 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 			const char *name, *target;
 			void **out;
 		};
-		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps } };
+		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps },
+			{ "svs", "vs_5_0", &_en_svs }, { "sps", "ps_5_0", &_en_sps }, { "pvs", "vs_5_0", &_en_pvs }, { "pps", "ps_5_0", &_en_pps } };
 		for (const entry &e : entries)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
-			if (FAILED(compile(kShader, std::strlen(kShader), "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+			const bool en = e.out == &_en_svs || e.out == &_en_sps || e.out == &_en_pvs || e.out == &_en_pps;
+			const char *const src = en ? kEnShader : kShader;
+			if (FAILED(compile(src, std::strlen(src), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the character shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)
@@ -381,6 +1124,34 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		}
 		blob->Release();
 
+		// The en-spells' root signature: 0 32 constants b0, 1 SRV t3 (the palette), 2 table t0-t1 (the blade's mesh)
+		{
+			D3D12_ROOT_PARAMETER q[3] = {};
+			q[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+			q[0].Constants.ShaderRegister = 0;
+			q[0].Constants.Num32BitValues = 32;
+			q[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+			q[1].Descriptor.ShaderRegister = 3;
+			q[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+			q[2].DescriptorTable.NumDescriptorRanges = 1;
+			q[2].DescriptorTable.pDescriptorRanges = &ranges[0];
+			const D3D12_ROOT_SIGNATURE_DESC ed = { 3, q, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+			blob = nullptr;
+			errors = nullptr;
+			if (FAILED(serialize(&ed, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
+				FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&_en_root))))
+			{
+				why = "the en-spells' root signature couldn't be made";
+				if (blob != nullptr)
+					blob->Release();
+				if (errors != nullptr)
+					errors->Release();
+				release();
+				return false;
+			}
+			blob->Release();
+		}
+
 		// The shadow pipeline: depth only into a D32 map, LESS, no culling (as the character pass)
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = {};
 		sd.pRootSignature = _root;
@@ -431,9 +1202,10 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		if (known != _pipelines.end())
 			return known->second;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
-		d.pRootSignature = _root;
-		ID3DBlob *const vs = static_cast<ID3DBlob *>(k == kModel ? _vs : _cvs);
-		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : t.samples > 1 ? _cps_ms : _cps);
+		const bool en = k == kEnShell || k == kEnSprites;
+		d.pRootSignature = en ? _en_root : _root;
+		ID3DBlob *const vs = static_cast<ID3DBlob *>(k == kModel ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
+		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps : t.samples > 1 ? _cps_ms : _cps);
 		d.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
 		d.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
 		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -453,6 +1225,20 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 			d.DepthStencilState.DepthEnable = TRUE;
 			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
 			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		}
+		else if (en)
+		{
+			// (premultiplied: added on where alpha is 0 (glows), covering where it isn't (smoke, rock, ice); colour only;
+			// tested against the world's depth, none written)
+			d.DSVFormat = t.dsv_format;
+			d.DepthStencilState.DepthEnable = TRUE;
+			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			b.BlendEnable = TRUE;
+			b.SrcBlend = b.SrcBlendAlpha = D3D12_BLEND_ONE;
+			b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+			b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+			b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
 		}
 		else
 		{
@@ -658,5 +1444,73 @@ float4 cps_ms(c2p i, uint s : SV_SampleIndex) : SV_Target
 		list->SetGraphicsRoot32BitConstants(1, 8, dc, 0);
 		list->SetGraphicsRootDescriptorTable(5, srv);
 		list->DrawInstanced(3, 1, 0, 0);
+	}
+	char_stats char_renderer::record_enspells(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, double seconds)
+	{
+		char_stats st;
+		const uint32_t opaque = std::min(f.opaque.load(std::memory_order_acquire), kMaxModels);
+		bool any = false;
+		for (uint32_t i = 0; i < opaque && !any; ++i)
+			any = f.model[i].enspell != kEnNone && f.model[i].enspell <= kEnDark && (f.model[i].colour >> 24) != 0;
+		ID3D12DescriptorHeap *const heap = cache::heap();
+		const D3D12_GPU_VIRTUAL_ADDRESS palettes = cache::palettes(f.seq.load(std::memory_order_relaxed));
+		if (!any || _en_root == nullptr || heap == nullptr || palettes == 0 || !f.camera)
+			return st;
+		ID3D12PipelineState *const shell = pipeline(t, kEnShell), *const sprites = pipeline(t, kEnSprites);
+		if (shell == nullptr || sprites == nullptr)
+			return st;
+		list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
+		const D3D12_VIEWPORT vp = { t.offset, t.offset, t.width, t.height, 0.0f, 1.0f };
+		const D3D12_RECT sc = { 0, 0, LONG(t.width), LONG(t.height) };
+		list->RSSetViewports(1, &vp);
+		list->RSSetScissorRects(1, &sc);
+		list->SetDescriptorHeaps(1, &heap);
+		list->SetGraphicsRootSignature(_en_root);
+		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		// (the time wrapped, so the shader's floats keep fine steps)
+		const float time = float(std::fmod(seconds, 3600.0));
+		for (uint32_t mi = 0; mi < opaque; ++mi)
+		{
+			const model_entry &m = f.model[mi];
+			if (m.enspell == kEnNone || m.enspell > kEnDark || (m.colour >> 24) == 0)
+				continue;
+			st.models++;
+			for (uint32_t ii = 0; ii < m.instances && m.first_instance + ii < kMaxInstances; ++ii)
+			{
+				const instance_entry &ie = f.instance[m.first_instance + ii];
+				if (ie.bones == 0)
+					continue;
+				for (uint32_t k = 0; k < ie.meshes && ie.first_mesh + k < kMaxMeshes; ++k)
+				{
+					cache::mesh_view mv;
+					if (!cache::mesh_view_of(f.mesh[ie.first_mesh + k].mesh, mv) || mv.vertices == 0 || !mv.blade.valid || mv.blade.bone >= ie.bones)
+						continue;
+					en_constants c = {};
+					std::memcpy(c.view_proj, f.view_proj, sizeof(c.view_proj));
+					c.time = time;
+					c.element = m.enspell;
+					c.bone_count = ie.bones;
+					c.vertex_count = mv.vertices;
+					c.corner_count = mv.corners;
+					c.bone = mv.blade.bone;
+					c.half_width = mv.blade.half_width;
+					c.strength = std::min(1.0f, float(m.colour >> 24) / 128.0f);
+					std::memcpy(c.base, mv.blade.base, sizeof(c.base));
+					c.edge_axis = mv.blade.edge_axis;
+					c.blade_kind = mv.blade.kind;
+					std::memcpy(c.tip, mv.blade.tip, sizeof(c.tip));
+					list->SetGraphicsRoot32BitConstants(0, 32, &c, 0);
+					list->SetGraphicsRootShaderResourceView(1, palettes + UINT64(ie.first_bone) * sizeof(bone));
+					list->SetGraphicsRootDescriptorTable(2, mv.views);
+					list->SetPipelineState(shell);
+					list->DrawInstanced(mv.corners, 1, 0, 0);
+					list->SetPipelineState(sprites);
+					list->DrawInstanced(kEnSpriteCount * 6, 1, 0, 0);
+					st.draws += 2;
+					st.triangles += mv.corners / 3 + kEnSpriteCount * 2;
+				}
+			}
+		}
+		return st;
 	}
 }

@@ -35,6 +35,9 @@ namespace hifi::game::charmodel
 	// meshes and textures are all on the GPU is then marked kNative and left out of the game's draw; any other the game
 	// draws as before
 	void set_native(bool on);
+	// The actor (02B6E0's argument 1, Ashita's actor pointer) whose models carry an en-spell effect, and which one
+	// (charframe.hpp kEn*; kEnNone: none). One actor: the player's.
+	void set_enspell(uintptr_t actor, uint8_t element);
 
 	// charslot's listener: the walk's begin (2: a frame begun), end (3: its opaque models published)
 	void on_slot(uint32_t kind, uint32_t seq, uintptr_t actor);

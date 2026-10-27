@@ -46,8 +46,14 @@ namespace vistest
 	constexpr uint64_t kRememberMs = 60000;
 	constexpr uint32_t kMaxRemembered = 8192; // (over it, answers not asked for 2 s go first)
 	int32_t ask(uint32_t object, const box &b, uint64_t now_ms);
-	// Whether answers have come in lately (within kLiveMs): the game's own test runs when they haven't
-	constexpr uint64_t kLiveMs = 250;
+	// Whether answers are coming in: one came within kLiveMs, or none is overdue (the first test asked since the last
+	// answer was asked within kLiveMs). The game's own test runs only when they aren't: asked for that long with nothing
+	// back (zoning, the device gone, World FX not drawing). Until then a known object keeps its last answer and a new one
+	// is kUnknown. (It was "an answer within 250 ms": answers only come for what was asked, and a short gap in them made
+	// the next tests the game's waiting ones, each a 50-70 ms frame with the GPU busy: hard stutters in game, 2026-10-27.)
+	constexpr uint64_t kLiveMs = 2000;
+	// How long answers have been overdue at now_ms (0 when they aren't): for the log when the game's own test takes over
+	uint64_t overdue_ms(uint64_t now_ms);
 	bool live(uint64_t now_ms);
 
 	// The thread recording the world, at its end: the boxes asked for since the last take (the newest for each test

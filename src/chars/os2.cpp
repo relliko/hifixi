@@ -1,6 +1,8 @@
 // An Os2 skinned mesh decoded for the GPU (os2.hpp; the reference: research/ffxi-re/tools/chars.py Mesh)
 
 #include "os2.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace hifi::chars::os2
@@ -395,5 +397,156 @@ namespace hifi::chars::os2
 			}
 		}
 		return true;
+	}
+
+	int weapon_slot(const char name[4])
+	{
+		if (name == nullptr || std::memcmp(name, "wep", 3) != 0)
+			return -1;
+		return name[3] == '0' ? 0 : name[3] == '1' ? 1 : -1;
+	}
+
+	blade blade_of(const mesh &m, int slot)
+	{
+		blade b;
+		if (slot < 0 || m.mirrored || m.vertices.size() < 8)
+			return b;
+		const uint16_t bone = m.vertices[0].bone[0];
+		float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+		for (const vertex &v : m.vertices)
+		{
+			if (v.w1 != 0.0f || v.bone[0] != bone)
+				return b;
+			for (int k = 0; k < 3; ++k)
+			{
+				lo[k] = std::min(lo[k], v.p0[k]);
+				hi[k] = std::max(hi[k], v.p0[k]);
+			}
+		}
+		int a = 0;
+		for (int k = 1; k < 3; ++k)
+			if (hi[k] - lo[k] > hi[a] - lo[a])
+				a = k;
+		const int u = (a + 1) % 3, w = (a + 2) % 3;
+		const float length = hi[a] - lo[a], across = std::max(hi[u] - lo[u], hi[w] - lo[w]);
+		if (!(length > 0.12f))
+			return b;
+		b.bone = bone;
+		b.edge_axis = uint8_t(hi[u] - lo[u] >= hi[w] - lo[w] ? u : w);
+
+		// Half widths in slices along each side of the grip: half of each slice's own extent across (so a curved blade,
+		// bending away from the grip's line, is still as thin as it is)
+		constexpr int kSlices = 40;
+		auto profile = [&](float end, float *width) {
+			float slo[kSlices][2], shi[kSlices][2];
+			for (int s = 0; s < kSlices; ++s)
+			{
+				slo[s][0] = slo[s][1] = 1e30f;
+				shi[s][0] = shi[s][1] = -1e30f;
+			}
+			for (const vertex &v : m.vertices)
+			{
+				const float t = v.p0[a] / end;
+				if (t < 0.0f || t > 1.0f)
+					continue;
+				const int s = std::min(int(t * kSlices), kSlices - 1);
+				slo[s][0] = std::min(slo[s][0], v.p0[u]);
+				shi[s][0] = std::max(shi[s][0], v.p0[u]);
+				slo[s][1] = std::min(slo[s][1], v.p0[w]);
+				shi[s][1] = std::max(shi[s][1], v.p0[w]);
+			}
+			for (int s = 0; s < kSlices; ++s)
+				width[s] = shi[s][0] >= slo[s][0] ? 0.5f * std::max(shi[s][0] - slo[s][0], shi[s][1] - slo[s][1]) : 0.0f;
+			// (slices no vertex falls in are spanned by the triangles round them: their neighbours' width)
+			for (int s = 1; s < kSlices; ++s)
+				if (width[s] == 0.0f)
+					width[s] = width[s - 1];
+		};
+		auto total = [](const float *width, int from, int to) {
+			float x = 0.0f;
+			for (int s = from; s < to; ++s)
+				x += width[s];
+			return x;
+		};
+		auto widest = [](const float *width, int from, int to) {
+			float x = 0.0f;
+			for (int s = from; s < to; ++s)
+				x = std::max(x, width[s]);
+			return x;
+		};
+		float neg[kSlices], pos[kSlices];
+		const bool has_neg = lo[a] < -1e-4f, has_pos = hi[a] > 1e-4f;
+		if (has_neg)
+			profile(lo[a], neg);
+		if (has_pos)
+			profile(hi[a], pos);
+		// The tip's side: the far one when the grip is near an end; a grip toward the middle (a polearm, a staff) has
+		// its head on the side whose outer 40% carries more width (a spearhead is long, a butt cap short)
+		const float near_side = std::min(std::max(-lo[a], 0.0f), std::max(hi[a], 0.0f));
+		const bool middle_grip = has_neg && has_pos && near_side > 0.35f * length;
+		bool tip_pos = hi[a] > -lo[a];
+		if (middle_grip)
+		{
+			// (ends about as wide: the one with more of the mesh, a spearhead's flanges and collars, not a bare butt)
+			const float wp = total(pos, kSlices * 6 / 10, kSlices) * hi[a], wn = total(neg, kSlices * 6 / 10, kSlices) * -lo[a];
+			if (wp > 1.25f * wn || wn > 1.25f * wp)
+				tip_pos = wp > wn;
+			else
+			{
+				uint32_t np = 0, nn = 0;
+				for (const vertex &v : m.vertices)
+				{
+					np += v.p0[a] > 0.6f * hi[a];
+					nn += v.p0[a] < 0.6f * lo[a];
+				}
+				tip_pos = np >= nn;
+			}
+		}
+		const float tip = tip_pos ? hi[a] : lo[a];
+		const float *width = tip_pos ? pos : neg;
+
+		std::vector<float> shaft_widths(width + kSlices / 20, width + kSlices / 2);
+		std::nth_element(shaft_widths.begin(), shaft_widths.begin() + shaft_widths.size() / 2, shaft_widths.end());
+		const float shaft = shaft_widths[shaft_widths.size() / 2];
+		const float head = widest(width, kSlices / 2, kSlices);
+		b.valid = true;
+		b.base[u] = b.tip[u] = 0.0f;
+		b.base[w] = b.tip[w] = 0.0f;
+		b.tip[a] = tip;
+		if (head > 2.5f * shaft && head > 0.05f)
+		{
+			// A head: from the first slice past 30% that's a third as wide as it, out to the end
+			int first = kSlices * 3 / 10;
+			while (first < kSlices - 4 && width[first] < head * 0.35f)
+				first++;
+			b.kind = blade::kHead;
+			b.base[a] = tip * float(first) / kSlices;
+			b.half_width = std::clamp(0.3f * head, 0.02f, 0.08f);
+			return b;
+		}
+		// A compact piece (hand-to-hand, either hand): all of it, along its long axis through its box
+		if (across * 2.0f > length || length < 0.3f)
+		{
+			b.kind = blade::kWhole;
+			for (int k = 0; k < 3; ++k)
+				b.base[k] = b.tip[k] = 0.5f * (lo[k] + hi[k]);
+			b.base[a] = lo[a];
+			b.tip[a] = hi[a];
+			b.half_width = std::clamp(0.25f * across, 0.02f, 0.06f);
+			return b;
+		}
+		// A blade: the guard is the widest slice in the first 45%, the blade starts a slice past it
+		int guard = 0;
+		for (int s = 1; s < kSlices * 45 / 100; ++s)
+			if (width[s] > width[guard])
+				guard = s;
+		// (no guard on a polearm's shaft: its outer 40%)
+		const int first = middle_grip ? kSlices * 6 / 10 : std::min(guard + 1, kSlices - 2);
+		std::vector<float> along(width + first, width + std::max(first + 1, kSlices * 8 / 10));
+		std::nth_element(along.begin(), along.begin() + along.size() / 2, along.end());
+		b.kind = blade::kLine;
+		b.base[a] = tip * float(first) / kSlices;
+		b.half_width = std::clamp(along[along.size() / 2], 0.01f, 0.1f);
+		return b;
 	}
 }
