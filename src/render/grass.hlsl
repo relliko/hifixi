@@ -1744,12 +1744,15 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 				amount *= snow_open(W);
 			[branch] if (amount > 0.0)
 			{
+				// (a small ring, a tenth of a yalm and at most 6 pixels out: four taps half a yalm out, up to 40 pixels, put
+				// four copies of every shadow and dark spot on the snow around it, and the whole snowy ground looked blurred)
 				float around = luma(col), taps = 1.0;
-				float r = min(0.5 * px_per_yalm, 40.0);
-				static const int2 four[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
-				[unroll] for (int k = 0; k < 4; ++k)
+				float r = clamp(0.1 * px_per_yalm, 1.0, 6.0);
+				static const float2 ring[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+					float2(0.7071, 0.7071), float2(-0.7071, 0.7071), float2(0.7071, -0.7071), float2(-0.7071, -0.7071) };
+				[unroll] for (int k = 0; k < 8; ++k)
 				{
-					int2 q = p + int2(float2(four[k]) * r);
+					int2 q = p + int2(round(ring[k] * r));
 					bool same = abs(drawn_depth(q) - z) < 0.03 * z + 0.1;
 					around += same ? luma(texel(q)) : 0.0;
 					taps += same ? 1.0 : 0.0;

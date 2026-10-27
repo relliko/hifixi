@@ -152,7 +152,8 @@ namespace hifi::settings
 				{ _, _, _, _ } },
 			{ "SnowCover", tab::world, "Weather", "Snow settling on the ground",
 				"While it snows, snow builds up over a few minutes on whatever faces up under open sky, and frosts and flattens "
-				"the grass; it melts slowly after (0: off).", "%.2f", nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
+				"the grass; it melts slowly after, and a new zone starts with its own weather's (0: off; off too with the "
+				"snow of its own off).", "%.2f", "Snow", false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			{ "WeatherOwn", tab::world, "Weather", "All of the weather its own",
 				"HiFi XI draws all of the weather itself, with its sky: clouds, lightning, dust and sand, wind, heat shimmer, "
 				"auroras and gloom, as well as its rain and snow. The game's own weather effects are left out under open sky "
