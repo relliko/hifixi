@@ -3,7 +3,7 @@
 One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
 
 - **Above 60 fps** with game speed tied to real time, a frame cap, and speed-ups. Each speed-up removes a stall or repeated work from a frame:
-  - hidden characters found from the zone's walls instead of waiting on the GPU;
+  - hidden characters found from what's drawn (with the richer world on; from the zone's walls otherwise) instead of waiting on the GPU;
   - Ashita's per-draw dispatch skipped;
   - SSE skinning on any CPU;
   - batched text;
@@ -13,9 +13,13 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - the zone's visibility lists ignored, so far terrain doesn't pop in;
   - culling at the camera's own height of view;
   - square pixels.
+- **The zone and the characters drawn by HiFi XI itself**, from your own game files, in the game's own look:
+  - **Per-pixel light** with every texture's normal map, on the zone and on characters and monsters;
+  - **Tone mapping, bloom and a colour grade** over the world;
+  - Either can be handed back to the game at any time (`/hifi nativezone off`, `/hifi nativechars off`).
 - **A richer world**, drawn into the game's own frame:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
-  - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone, with characters casting long shadows;
+  - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone's own meshes, with characters and monsters casting their real shapes;
   - **Water** with reflections and ripples, carried on over the game's own sea past the zone's edge, out to the horizon;
   - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
   - **Sky:** a smooth sky with a sun, stars and a moon in the game's own phase;
@@ -55,6 +59,8 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 - `/hifi status`: what HiFi XI is doing, part by part.
 - `/hifi glows`: the glows lighting the scene now, and the glowing effects met lately.
 - `/hifi gpu`: the GPU time each part of the richer world takes, the costliest first (also in the menu's **Performance** tab).
+- `/hifi nativezone on|off`, `/hifi nativechars on|off`: HiFi XI drawing the zone, or the characters, itself (on by default); `perpixel on|off` after either for its per-pixel light.
+- `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
 - `/hifi reset`: its counts started again.
 
