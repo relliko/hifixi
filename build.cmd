@@ -88,6 +88,23 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   /link /NOLOGO || exit /b 1
 echo Built build\engine_check.exe
 
+rem The zone files the render tests read, made from this PC's game files with HiFi XI's own bakers when missing (not in
+rem the repo: they're made from the game's data): build\testdata (build\test_data.exe)
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\test_data.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\rain.cpp src\bake\sea.cpp src\bake\dat.cpp src\game\game.cpp ^
+  /Fo"build\test\\" /Fe"build\test_data.exe" /link /NOLOGO user32.lib || exit /b 1
+build\test_data.exe || exit /b 1
+
+rem The renderer's offline test (WARP, debug layer; from this folder): build\grass_test.exe [blade file]
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\grass_test.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\grass_test.exe" /link /NOLOGO || exit /b 1
+echo Built build\grass_test.exe
+
+rem The shading pass timed on the real GPU (see its header): build\shade_bench.exe <width> <height> [shader file] ...
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\shade_bench.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\shade_bench.exe" /link /NOLOGO || exit /b 1
+echo Built build\shade_bench.exe
+
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
@@ -203,17 +220,16 @@ for %%t in ("..\reshade-worldfx\tests\gamewater_cave.c" "tests\gamerain_cave.c")
   echo Built build\test\%%~nt.exe
 )
 
-rem "build.cmd e2e": World FX's end-to-end test (..\reshade-worldfx\tests\e2e.cpp, built with /DWORLDFX_NATIVE) on
-rem HiFi XI instead of ReShade, in build\e2e-native: the starter as its dxgi.dll, hifixi.dll beside it, the stand-in
-rem FFXiMain.dll and zone 100's blades. Run build\e2e-native\e2e.exe from there (WFX_E2E_HOUR=22 or 3 for night).
+rem "build.cmd e2e": World FX's end-to-end test on HiFi XI (tests\e2e.cpp) in build\e2e-native: the starter as its
+rem dxgi.dll, hifixi.dll beside it, the stand-in FFXiMain.dll and zone 100's blades. Run build\e2e-native\e2e.exe from
+rem there (WFX_E2E_HOUR=22 or 3 for night).
 if /i not "%~1"=="e2e" exit /b 0
-set "WFX=%~dp0..\reshade-worldfx"
 if not exist build\e2e-native\worldfx-grass mkdir build\e2e-native\worldfx-grass
-cl /nologo /O2 /MT /W4 /DWIN32_LEAN_AND_MEAN /LD "%WFX%\tests\fake_ffximain.cpp" /Fo"build\test\\" /Fe"build\e2e-native\FFXiMain.dll" /link /NOLOGO || exit /b 1
-cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /DWORLDFX_NATIVE /I src\render ^
-  "%WFX%\tests\e2e.cpp" build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\e2e-native\e2e.exe" /link /NOLOGO user32.lib || exit /b 1
+cl /nologo /O2 /MT /W4 /DWIN32_LEAN_AND_MEAN /LD tests\fake_ffximain.cpp /Fo"build\test\\" /Fe"build\e2e-native\FFXiMain.dll" /link /NOLOGO || exit /b 1
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\e2e.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\e2e-native\e2e.exe" /link /NOLOGO user32.lib || exit /b 1
 del /q build\e2e-native\FFXiMain.exp build\e2e-native\FFXiMain.lib 2>nul
 copy /y build\hifixi.dll build\e2e-native\ >nul || exit /b 1
 copy /y build\starter\dxgi.dll build\e2e-native\ >nul || exit /b 1
-copy /y "%WFX%\grass\100.bin" build\e2e-native\worldfx-grass\ >nul || exit /b 1
+copy /y build\testdata\grass\100.bin build\e2e-native\worldfx-grass\ >nul || exit /b 1
 echo Built build\e2e-native
