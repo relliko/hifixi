@@ -1,6 +1,7 @@
 @echo off
 rem Builds build\hifixi.dll (32-bit, like the game), the render engine (build_engine.cmd: build\engine\worldfx_engine.lib)
-rem and the offline tests with Visual Studio's compiler.
+rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests but hook_test; "build.cmd e2e":
+rem everything and the end-to-end test's folder).
 rem The Ashita v4 plugin SDK is in deps\ashita (a sparse clone of AshitaXI/Ashita-v4beta, plugins\sdk only); the Windows
 rem SDK headers and libraries are the NuGet copy reshade-worldfx uses (no Windows SDK installed on this PC).
 setlocal
@@ -70,6 +71,10 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEA
   tests\hook_test.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\test\\" /Fe"build\hook_test.exe" ^
   /link /NOLOGO || exit /b 1
 echo Built build\hook_test.exe
+
+rem "build.cmd quick": the plugin, the starter and hook_test only (a small fix). The other tests stay as the last full
+rem build left them: run the full build when what they test changed, and before a public release.
+if /i "%~1"=="quick" exit /b 0
 
 rem The stream log (/hifi streamlog) on the hooks, on WARP: build\streamlog_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
