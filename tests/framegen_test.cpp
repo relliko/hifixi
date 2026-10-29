@@ -245,76 +245,98 @@ int main()
 		b.Transition = { r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to };
 		list->ResourceBarrier(1, &b);
 	};
-	UINT presents_before = 0, presents_after = 0;
-	chain->GetLastPresentCount(&presents_before);
-	uint32_t prepared = 0, presented = 0;
 	std::string prepare_why;
-	for (UINT f = 0; f < 60; ++f)
-	{
-		const UINT index = chain->GetCurrentBackBufferIndex();
-		ID3D12Resource *buffer = nullptr;
-		if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer))))
-			continue;
-		device->CreateRenderTargetView(buffer, nullptr, rtv(3));
-		alloc->Reset();
-		list->Reset(alloc, nullptr);
-		// (the world: grey, a bright bar 64 wide moving 16 pixels right each frame; its motion, in A's pixels, back to where it was)
-		const float world[4] = { 0.2f, 0.2f, 0.2f, 1.0f }, bright[4] = { 0.8f, 0.8f, 0.8f, 1.0f }, far_depth[4] = { 0.5f }, still[4] = {};
-		const float moved[4] = { -16.0f / 1600.0f, 0.0f, 0.0f, 0.0f };
-		const LONG bar_x = LONG(400 + 16 * f);
-		const D3D12_RECT bar = { bar_x, 0, bar_x + 64, 900 }, bar_in_a = { bar_x / 2, 0, (bar_x + 64) / 2, 450 };
-		// (FSR 2's pass: its depth and motion written, its picture drawn, then onto the back buffer; the UI over that)
-		barrier(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		barrier(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		barrier(picture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		list->ClearRenderTargetView(rtv(0), far_depth, 0, nullptr);
-		list->ClearRenderTargetView(rtv(1), still, 0, nullptr);
-		list->ClearRenderTargetView(rtv(1), moved, 1, &bar_in_a);
-		list->ClearRenderTargetView(rtv(2), world, 0, nullptr);
-		list->ClearRenderTargetView(rtv(2), bright, 1, &bar);
-		barrier(depth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-		barrier(motion, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-		barrier(picture, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-		barrier(buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		list->ClearRenderTargetView(rtv(3), world, 0, nullptr);
-		list->ClearRenderTargetView(rtv(3), bright, 1, &bar);
-		const float ui[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-		const D3D12_RECT box = { 40, 40, 400, 120 };
-		list->ClearRenderTargetView(rtv(3), ui, 1, &box);
-		barrier(buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-		hifi::framegen::frame in;
-		in.depth = depth;
-		in.motion = motion;
-		in.picture = picture;
-		in.jitter[0] = (f % 2) ? 0.25f : -0.25f;
-		in.fov = 0.8f;
-		in.dt_ms = 16.7f;
-		in.reset = f == 0;
-		if (hifi::framegen::prepare(list, in, prepare_why))
-			prepared++;
-		list->Close();
-		ID3D12CommandList *l = list;
-		queue->ExecuteCommandLists(1, &l);
-		presented += SUCCEEDED(chain->Present(0, 0)) ? 1 : 0;
+	// count frames as the game draws them at the swap chain's size w x h: FSR 2's frame prepared (unless without_fsr2),
+	// generation turned on or off as the game thread's present does, then presented; the frames prepared and presented
+	auto run = [&](UINT count, UINT w, UINT h, bool without_fsr2, uint32_t &prepared, uint32_t &presented) {
+		prepared = presented = 0;
+		for (UINT f = 0; f < count; ++f)
+		{
+			const UINT index = chain->GetCurrentBackBufferIndex();
+			ID3D12Resource *buffer = nullptr;
+			if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer))))
+				continue;
+			device->CreateRenderTargetView(buffer, nullptr, rtv(3));
+			alloc->Reset();
+			list->Reset(alloc, nullptr);
+			// (the world: grey, a bright bar 64 wide moving 16 pixels right each frame; its motion, in A's pixels, back to where it was)
+			const float world[4] = { 0.2f, 0.2f, 0.2f, 1.0f }, bright[4] = { 0.8f, 0.8f, 0.8f, 1.0f }, far_depth[4] = { 0.5f }, still[4] = {};
+			const float moved[4] = { -16.0f / float(w), 0.0f, 0.0f, 0.0f };
+			const LONG bar_x = LONG(400 + 16 * f);
+			const D3D12_RECT bar = { bar_x, 0, bar_x + 64, LONG(h) }, bar_in_a = { LONG(bar_x * 800 / w), 0, LONG((bar_x + 64) * 800 / w), 450 };
+			// (FSR 2's pass: its depth and motion written, its picture drawn, then onto the back buffer; the UI over that)
+			barrier(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			barrier(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			barrier(picture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			list->ClearRenderTargetView(rtv(0), far_depth, 0, nullptr);
+			list->ClearRenderTargetView(rtv(1), still, 0, nullptr);
+			list->ClearRenderTargetView(rtv(1), moved, 1, &bar_in_a);
+			list->ClearRenderTargetView(rtv(2), world, 0, nullptr);
+			list->ClearRenderTargetView(rtv(2), bright, 1, &bar);
+			barrier(depth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			barrier(motion, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			barrier(picture, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			barrier(buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			list->ClearRenderTargetView(rtv(3), world, 0, nullptr);
+			list->ClearRenderTargetView(rtv(3), bright, 1, &bar);
+			const float ui[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+			const D3D12_RECT box = { 40, 40, 400, 120 };
+			list->ClearRenderTargetView(rtv(3), ui, 1, &box);
+			barrier(buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+			hifi::framegen::frame in;
+			in.depth = depth;
+			in.motion = motion;
+			in.picture = picture;
+			in.jitter[0] = (f % 2) ? 0.25f : -0.25f;
+			in.fov = 0.8f;
+			in.dt_ms = 16.7f;
+			in.reset = f == 0;
+			if (!without_fsr2 && hifi::framegen::prepare(list, in, prepare_why))
+				prepared++;
+			list->Close();
+			ID3D12CommandList *l = list;
+			queue->ExecuteCommandLists(1, &l);
+			hifi::framegen::present();
+			presented += SUCCEEDED(chain->Present(0, 0)) ? 1 : 0;
+			wait();
+			buffer->Release();
+		}
 		wait();
-		buffer->Release();
-	}
-	wait();
-	Sleep(200); // (AMD's presenting thread: its last frames out)
-	chain->GetLastPresentCount(&presents_after);
-	const std::vector<std::string> st = hifi::framegen::status();
-	for (const std::string &s : st)
-		std::printf("  %s\n", s.c_str());
-	const std::string gen_line = st.size() > 1 ? st[1] : std::string();
+		Sleep(200); // (AMD's presenting thread: its last frames out)
+	};
+	// the numbers in the status's generation line
+	struct counts
+	{
+		unsigned prepared = 0, made = 0, twice = 0, failed = 99, switches = 0;
+		std::string line;
+	};
+	auto counted = [&]() {
+		counts c;
+		const std::vector<std::string> st = hifi::framegen::status();
+		c.line = st.size() > 1 ? st[1] : std::string();
+		const size_t at = c.line.find("; ");
+		if (at != std::string::npos)
+			sscanf_s(c.line.c_str() + at, "; %u frames prepared, %u made between, %u shown twice, %u failed, turned on/off %u times", &c.prepared, &c.made, &c.twice,
+				&c.failed, &c.switches);
+		std::printf("  %s\n", c.line.c_str());
+		return c;
+	};
+	auto real_presents = [&]() {
+		UINT n = 0;
+		chain->GetLastPresentCount(&n);
+		return n;
+	};
+
+	uint32_t prepared = 0, presented = 0;
+	UINT presents_before = real_presents();
+	run(60, 1600, 900, false, prepared, presented);
+	const counts first = counted();
 	check(prepared == 60 && presented == 60, "60 frames prepared and presented with generation on (" + std::to_string(prepared) + ", " + std::to_string(presented) +
 		(prepare_why.empty() ? std::string(")") : "; " + prepare_why + ")"));
-	unsigned made_between = 0, failed_gen = 99;
-	const size_t at_made = gen_line.find(" frames prepared, ");
-	if (at_made != std::string::npos)
-		sscanf_s(gen_line.c_str() + at_made, " frames prepared, %u made between, %*u shown twice, %u failed", &made_between, &failed_gen);
-	check(made_between >= 58 && failed_gen == 0, "a frame made between each two (" + std::to_string(made_between) + " made, " + std::to_string(failed_gen) + " failed)");
-	const UINT real_presents = presents_after - presents_before;
-	check(real_presents >= 116, "the real swap chain shown twice as many frames as the game presented (" + std::to_string(real_presents) + " for 60)");
+	check(first.made >= 58 && first.failed == 0 && first.switches == 1, "a frame made between each two, generation turned on once (" + std::to_string(first.made) +
+		" made, " + std::to_string(first.failed) + " failed, " + std::to_string(first.switches) + " turned)");
+	const UINT doubled = real_presents() - presents_before;
+	check(doubled >= 116, "the real swap chain shown twice as many frames as the game presented (" + std::to_string(doubled) + " for 60)");
 	wait();
 
 	// The last frame made between (frames 58 and 59: the bar from x 1328, then 1344): the bar halfway, the UI box as drawn
@@ -368,6 +390,33 @@ int main()
 	}
 	else
 		check(false, "the last frame made between: none");
+
+	// Resized with generation on (1280x720, FSR 2's picture that size too): the contexts made again, the old ones
+	// retired and destroyed once the GPU is past them, frames made between at the new size
+	{
+		wait();
+		const HRESULT rs = chain->ResizeBuffers(2, 1280, 720, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+		picture->Release();
+		picture = texture(1280, 720, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		device->CreateRenderTargetView(picture, nullptr, rtv(2));
+		run(30, 1280, 720, false, prepared, presented);
+		const counts c = counted();
+		check(SUCCEEDED(rs) && prepared == 30 && c.failed == 0 && c.made - first.made >= 27 && c.line.find("the UI kept apart") != std::string::npos,
+			"resized to 1280x720 with generation on: 30 frames, " + std::to_string(c.made - first.made) + " made between, the UI still kept apart");
+	}
+	// FSR 2 stopped (a menu, a load): generation off a second later, each frame shown once
+	{
+		Sleep(1100);
+		const UINT before = real_presents();
+		run(20, 1280, 720, true, prepared, presented);
+		const counts c = counted();
+		const UINT shown = real_presents() - before;
+		check(c.line.find("off (no FSR 2 frames)") != std::string::npos && c.switches == 2 && shown >= 19 && shown <= 21,
+			"FSR 2 stopped: generation turned off, the real swap chain shown each frame once (" + std::to_string(shown) + " for 20)");
+		run(20, 1280, 720, false, prepared, presented);
+		const counts back = counted();
+		check(back.switches == 3 && back.made - c.made >= 18 && back.failed == 0, "FSR 2 back: generation on again (" + std::to_string(back.made - c.made) + " made between)");
+	}
 
 	const uint32_t errors = debug_messages(info, why);
 	check(errors == 0, "no debug-layer errors" + (errors != 0 ? " (" + std::to_string(errors) + ", the first: " + why + ")" : std::string()));

@@ -33,6 +33,10 @@ namespace hifi::framegen
 	// dgVoodoo's back). False with why when there's no frame generation (not wanted, no AMD swap chain, its contexts not
 	// made).
 	bool prepare(ID3D12GraphicsCommandList *list, const frame &f, std::string &why);
+	// Each present, on the game thread (Ashita's Direct3DPresent), no lock of HiFi XI's held: generation turned on in
+	// AMD's swap chain once FSR 2 hands frames over, off a second after the last (turning it either way waits for the
+	// presents in flight)
+	void present();
 	// (tests) The texture the last frame made between was written to, UNORDERED_ACCESS on the game's queue; nullptr before one
 	ID3D12Resource *last_made();
 

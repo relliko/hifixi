@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 namespace hifi::framegen
@@ -52,13 +53,16 @@ namespace hifi::framegen
 
 		// Generation: AMD's frame interpolation and optical flow, made for A's size and the screen's, their shared
 		// resources (dilated depth and motion, the last frame's depth, the flow and its scene-change data) in one
-		// backend context of their own, as AMD's FSR 3 makes them
-		struct generation
+		// backend context of their own, as AMD's FSR 3 makes them. One set (a kit) for each pair of sizes; a kit made for
+		// sizes gone is retired, not destroyed: destroyed once the game's queue is past a fence signalled at its retiring.
+		//
+		// Locks: prepare() runs inside HiFi XI's list hooks with upscale's lock held, and DXGI's own present work (on its
+		// threads, its swap chain's lock held) goes through those hooks too (its lists' Reset). So nothing here calls the
+		// swap chain or waits for the GPU or a present with gen.mutex or a hook's lock held: the swap chain's size comes from
+		// its making and each present (generate()), and generation is turned on and off from the game thread's present
+		// (present()), outside every lock.
+		struct kit
 		{
-			std::mutex mutex;
-			FfxSwapchain swapchain = nullptr;  // (the game window's, AMD's)
-			ID3D12CommandQueue *queue = nullptr;
-			bool made = false;
 			uint32_t rw = 0, rh = 0, dw = 0, dh = 0;
 			std::vector<uint8_t> scratch;
 			FfxInterface iface = {};
@@ -67,27 +71,67 @@ namespace hifi::framegen
 			FfxFrameInterpolationContext fi = {};
 			enum { kDilatedDepth, kDilatedMotion, kPrevDepth, kFlow, kSceneChange, kShared };
 			FfxResourceInternal shared[kShared] = {};
+			int made = 0; // (how far its making got: 1 backend, 2 + optical flow, 3 + frame interpolation, 4 + resources)
+			uint64_t retired_at = 0;
+		};
+
+		void destroy(kit &k)
+		{
+			if (k.made >= 4)
+				for (FfxResourceInternal &r : k.shared)
+					k.iface.fpDestroyResource(&k.iface, r, k.shared_id);
+			if (k.made >= 3)
+				ffxFrameInterpolationContextDestroy(&k.fi);
+			if (k.made >= 2)
+				ffxOpticalflowContextDestroy(&k.of);
+			if (k.made >= 1)
+				k.iface.fpDestroyBackendContext(&k.iface, k.shared_id);
+			k.made = 0;
+		}
+
+		struct generation
+		{
+			std::mutex mutex;
+			FfxSwapchain swapchain = nullptr;  // (the game window's, AMD's)
+			ID3D12CommandQueue *queue = nullptr;
+			uint32_t sw = 0, sh = 0;           // (its size: at its making, then each present's)
+			DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+			std::unique_ptr<kit> now;
+			std::vector<std::unique_ptr<kit>> retired;
+			ID3D12Fence *fence = nullptr;     // (on the game's queue: kits retired before its value are done with)
+			uint64_t fence_value = 0;
 			FfxFrameInterpolationPrepareDescription prepared = {};
 			FfxResource picture = {};
 			bool fresh = false, reset = false;
 			bool apart = true; // (FSR 2's picture the swap chain's size: the world without the UI)
-			uint64_t frame_id = 0;
-			uint32_t prepares = 0, generated = 0, repeated = 0, failed = 0;
+			uint64_t dispatch_id = 0;
+			uint64_t prepared_at = 0;  // (GetTickCount64 of the last prepare())
+			bool enabled = false;      // (as last told to AMD's swap chain, from present())
+			uint32_t prepares = 0, generated = 0, repeated = 0, failed = 0, switches = 0;
 			ID3D12Resource *last_output = nullptr;
 			std::string why;
 		};
 		generation gen;
 
-		void keep_swapchain(FfxSwapchain made, ID3D12CommandQueue *queue)
+		void keep_swapchain(FfxSwapchain made, ID3D12CommandQueue *queue, UINT width, UINT height, DXGI_FORMAT format)
 		{
 			std::lock_guard<std::mutex> lock(gen.mutex);
-			// (a swap chain made again: the contexts made for the last are left, not destroyed under it)
-			gen.made = false;
+			// (a swap chain made again: the kits made for the last are left, not destroyed under it)
+			gen.now.release();
+			gen.retired.clear();
+			if (gen.fence != nullptr)
+				gen.fence->Release();
+			gen.fence = nullptr;
+			gen.fresh = false;
+			gen.enabled = false;
 			gen.swapchain = made;
 			if (gen.queue != nullptr)
 				gen.queue->Release();
 			gen.queue = queue;
 			queue->AddRef();
+			gen.sw = width;
+			gen.sh = height;
+			gen.format = format;
 		}
 
 		bool patch(void **slot, void *to, void **was)
@@ -141,7 +185,7 @@ namespace hifi::framegen
 				t_inside--;
 				IDXGISwapChain4 *const chain = e == FFX_OK ? ffxGetDX12SwapchainPtr(made) : nullptr;
 				if (chain != nullptr)
-					keep_swapchain(made, queue);
+					keep_swapchain(made, queue, desc->Width, desc->Height, desc->Format);
 				queue->Release();
 				if (chain != nullptr)
 				{
@@ -171,7 +215,7 @@ namespace hifi::framegen
 				t_inside--;
 				IDXGISwapChain4 *const chain = e == FFX_OK ? ffxGetDX12SwapchainPtr(made) : nullptr;
 				if (chain != nullptr)
-					keep_swapchain(made, queue);
+					keep_swapchain(made, queue, desc->BufferDesc.Width, desc->BufferDesc.Height, desc->BufferDesc.Format);
 				queue->Release();
 				if (chain != nullptr)
 				{
@@ -190,104 +234,116 @@ namespace hifi::framegen
 			return g.create(self, device, desc, out);
 		}
 
-		// (gen.mutex held) Everything made for the last sizes destroyed, the GPU done with it first
-		void release_generation()
+		// (gen.mutex held) The retired kits the game's queue is past: destroyed. Never waits.
+		void sweep()
 		{
-			if (!gen.made)
+			if (gen.fence == nullptr)
 				return;
-			ffxWaitForPresents(gen.swapchain);
-			ID3D12Device *device = nullptr;
-			ID3D12Fence *fence = nullptr;
-			if (gen.queue != nullptr && SUCCEEDED(gen.queue->GetDevice(IID_PPV_ARGS(&device))) &&
-				SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
-			{
-				HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-				gen.queue->Signal(fence, 1);
-				fence->SetEventOnCompletion(1, done);
-				WaitForSingleObject(done, 5000);
-				CloseHandle(done);
-			}
-			if (fence != nullptr)
-				fence->Release();
-			if (device != nullptr)
-				device->Release();
-			ffxFrameInterpolationContextDestroy(&gen.fi);
-			ffxOpticalflowContextDestroy(&gen.of);
-			for (FfxResourceInternal &r : gen.shared)
-				gen.iface.fpDestroyResource(&gen.iface, r, gen.shared_id);
-			gen.iface.fpDestroyBackendContext(&gen.iface, gen.shared_id);
-			gen.made = false;
+			const uint64_t done = gen.fence->GetCompletedValue();
+			if (done == UINT64_MAX) // (the device removed: left as they are)
+				return;
+			for (auto it = gen.retired.begin(); it != gen.retired.end();)
+				if ((*it)->retired_at <= done)
+				{
+					destroy(**it);
+					it = gen.retired.erase(it);
+				}
+				else
+					++it;
 		}
 
-		// (gen.mutex held) The contexts and shared resources for A's size and the screen's
-		bool make_generation(ID3D12Device *device, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, DXGI_FORMAT format, std::string &why)
+		// (gen.mutex held) The kit for A's size and the screen's; the one before retired behind the fence
+		bool make_kit(ID3D12Device *device, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, std::string &why)
 		{
-			release_generation();
+			if (gen.fence == nullptr && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gen.fence))))
+			{
+				gen.fence = nullptr;
+				why = "no fence for frame generation's retired contexts";
+				return false;
+			}
+			if (gen.now != nullptr)
+			{
+				// (the game's queue has every list that used it already: the fence passes once they're done)
+				gen.now->retired_at = ++gen.fence_value;
+				gen.queue->Signal(gen.fence, gen.fence_value);
+				gen.retired.push_back(std::move(gen.now));
+			}
+			gen.fresh = false;
+			auto k = std::make_unique<kit>();
 			constexpr size_t kContexts = FFX_OPTICALFLOW_CONTEXT_COUNT + FFX_FRAMEINTERPOLATION_CONTEXT_COUNT + 1;
-			gen.scratch.assign(ffxGetScratchMemorySizeDX12(kContexts), 0);
-			FfxErrorCode e = ffxGetInterfaceDX12(&gen.iface, ffxGetDeviceDX12(device), gen.scratch.data(), gen.scratch.size(), kContexts);
-			if (e == FFX_OK)
-				e = gen.iface.fpCreateBackendContext(&gen.iface, FFX_EFFECT_SHAREDRESOURCES, nullptr, &gen.shared_id);
+			k->scratch.assign(ffxGetScratchMemorySizeDX12(kContexts), 0);
+			FfxErrorCode e = ffxGetInterfaceDX12(&k->iface, ffxGetDeviceDX12(device), k->scratch.data(), k->scratch.size(), kContexts);
+			if (e == FFX_OK && (e = k->iface.fpCreateBackendContext(&k->iface, FFX_EFFECT_SHAREDRESOURCES, nullptr, &k->shared_id)) == FFX_OK)
+				k->made = 1;
 			if (e != FFX_OK)
 			{
 				why = "AMD's DX12 backend refused (error " + std::to_string(int(e)) + ")";
 				return false;
 			}
 			FfxOpticalflowContextDescription od = {};
-			od.backendInterface = gen.iface;
+			od.backendInterface = k->iface;
 			od.resolution = { dw, dh };
-			if ((e = ffxOpticalflowContextCreate(&gen.of, &od)) != FFX_OK)
+			if ((e = ffxOpticalflowContextCreate(&k->of, &od)) != FFX_OK)
 			{
-				gen.iface.fpDestroyBackendContext(&gen.iface, gen.shared_id);
+				destroy(*k);
 				why = "optical flow's context refused (error " + std::to_string(int(e)) + ")";
 				return false;
 			}
+			k->made = 2;
 			FfxFrameInterpolationContextDescription fd = {};
-			fd.backendInterface = gen.iface;
+			fd.backendInterface = k->iface;
 			fd.flags = FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INFINITE;
 			fd.maxRenderSize = { rw, rh };
 			fd.displaySize = { dw, dh };
-			fd.backBufferFormat = ffxGetSurfaceFormatDX12(format);
+			fd.backBufferFormat = ffxGetSurfaceFormatDX12(gen.format);
 			fd.previousInterpolationSourceFormat = fd.backBufferFormat;
-			if ((e = ffxFrameInterpolationContextCreate(&gen.fi, &fd)) != FFX_OK)
+			if ((e = ffxFrameInterpolationContextCreate(&k->fi, &fd)) != FFX_OK)
 			{
-				ffxOpticalflowContextDestroy(&gen.of);
-				gen.iface.fpDestroyBackendContext(&gen.iface, gen.shared_id);
+				destroy(*k);
 				why = "frame interpolation's context refused (error " + std::to_string(int(e)) + ")";
 				return false;
 			}
+			k->made = 3;
 			FfxFrameInterpolationSharedResourceDescriptions fs = {};
 			FfxOpticalflowSharedResourceDescriptions os = {};
-			ffxFrameInterpolationGetSharedResourceDescriptions(&gen.fi, &fs);
-			ffxOpticalflowGetSharedResourceDescriptions(&gen.of, &os);
-			const FfxCreateResourceDescription *descs[generation::kShared] = { &fs.dilatedDepth, &fs.dilatedMotionVectors, &fs.reconstructedPrevNearestDepth,
+			ffxFrameInterpolationGetSharedResourceDescriptions(&k->fi, &fs);
+			ffxOpticalflowGetSharedResourceDescriptions(&k->of, &os);
+			const FfxCreateResourceDescription *descs[kit::kShared] = { &fs.dilatedDepth, &fs.dilatedMotionVectors, &fs.reconstructedPrevNearestDepth,
 				&os.opticalFlowVector, &os.opticalFlowSCD };
-			for (int i = 0; i < generation::kShared && e == FFX_OK; ++i)
-				e = gen.iface.fpCreateResource(&gen.iface, descs[i], gen.shared_id, &gen.shared[i]);
-			gen.made = true;
-			gen.rw = rw;
-			gen.rh = rh;
-			gen.dw = dw;
-			gen.dh = dh;
-			gen.fresh = false;
+			int i = 0;
+			for (; i < kit::kShared && e == FFX_OK; ++i)
+				e = k->iface.fpCreateResource(&k->iface, descs[i], k->shared_id, &k->shared[i]);
 			if (e != FFX_OK)
 			{
-				release_generation();
+				for (int j = 0; j < i - 1; ++j)
+					k->iface.fpDestroyResource(&k->iface, k->shared[j], k->shared_id);
+				destroy(*k);
 				why = "frame generation's resources couldn't be made (error " + std::to_string(int(e)) + ")";
 				return false;
 			}
+			k->made = 4;
+			k->rw = rw;
+			k->rh = rh;
+			k->dw = dw;
+			k->dh = dh;
+			gen.now = std::move(k);
 			return true;
 		}
 
 		// The frame between the last and this one, asked for by AMD's swap chain at dgVoodoo's Present (its list on the
 		// game's queue, after the frame's own): optical flow over FSR 2's pictures, then frame interpolation. Without a
-		// prepare() this frame, this frame again.
+		// prepare() this frame, or made for another size of the screen, this frame again.
 		FfxErrorCode generate(const FfxFrameGenerationDispatchDescription *d, void *)
 		{
 			std::lock_guard<std::mutex> lock(gen.mutex);
 			ID3D12GraphicsCommandList *const list = static_cast<ID3D12GraphicsCommandList *>(d->commandList);
-			if (!gen.made || !gen.fresh)
+			const uint32_t pw = d->presentColor.description.width, ph = d->presentColor.description.height;
+			gen.sw = pw;
+			gen.sh = ph;
+			kit *const k = gen.now.get();
+			if (k == nullptr || !gen.fresh || k->dw != pw || k->dh != ph)
 			{
+				gen.fresh = false;
 				ID3D12Resource *const from = static_cast<ID3D12Resource *>(d->presentColor.resource), *const to = static_cast<ID3D12Resource *>(d->outputs[0].resource);
 				D3D12_RESOURCE_BARRIER b[2] = {};
 				b[0].Transition = { from, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE };
@@ -302,8 +358,8 @@ namespace hifi::framegen
 			}
 			gen.fresh = false;
 			const bool reset = d->reset || gen.reset;
-			const FfxResource flow = gen.iface.fpGetResource(&gen.iface, gen.shared[generation::kFlow]);
-			const FfxResource scene_change = gen.iface.fpGetResource(&gen.iface, gen.shared[generation::kSceneChange]);
+			const FfxResource flow = k->iface.fpGetResource(&k->iface, k->shared[kit::kFlow]);
+			const FfxResource scene_change = k->iface.fpGetResource(&k->iface, k->shared[kit::kSceneChange]);
 
 			FfxOpticalflowDispatchDescription o = {};
 			o.commandList = d->commandList;
@@ -313,12 +369,12 @@ namespace hifi::framegen
 			o.minMaxLuminance = { d->minMaxLuminance[0], d->minMaxLuminance[1] };
 			o.opticalFlowVector = flow;
 			o.opticalFlowSCD = scene_change;
-			FfxErrorCode e = ffxOpticalflowContextDispatch(&gen.of, &o);
+			FfxErrorCode e = ffxOpticalflowContextDispatch(&k->of, &o);
 
 			const FfxFrameInterpolationPrepareDescription &p = gen.prepared;
 			FfxFrameInterpolationDispatchDescription f = {};
 			f.commandList = d->commandList;
-			f.displaySize = { d->presentColor.description.width, d->presentColor.description.height };
+			f.displaySize = { pw, ph };
 			f.currentBackBuffer = d->presentColor;
 			if (gen.apart)
 				f.currentBackBuffer_HUDLess = gen.picture;
@@ -327,22 +383,22 @@ namespace hifi::framegen
 			f.opticalFlowVector = flow;
 			f.opticalFlowSceneChangeDetection = scene_change;
 			f.opticalFlowBlockSize = 8;
-			f.opticalFlowScale = { 1.0f / float(f.displaySize.width), 1.0f / float(f.displaySize.height) };
+			f.opticalFlowScale = { 1.0f / float(pw), 1.0f / float(ph) };
 			f.frameTimeDelta = p.frameTimeDelta;
 			f.reset = reset;
 			f.cameraNear = p.cameraNear;
 			f.cameraFar = p.cameraFar;
 			f.viewSpaceToMetersFactor = p.viewSpaceToMetersFactor;
 			f.cameraFovAngleVertical = p.cameraFovAngleVertical;
-			f.interpolationRect = d->interpolationRect;
-			f.frameID = d->frameID;
+			f.interpolationRect = { 0, 0, int(pw), int(ph) }; // (the whole screen: the swap chain's own rect is from when generation was turned on)
+			f.frameID = ++gen.dispatch_id; // (one more each frame made: the swap chain's id is the game thread's)
 			f.dilatedDepth = p.dilatedDepth;
 			f.dilatedMotionVectors = p.dilatedMotionVectors;
 			f.reconstructedPrevDepth = p.reconstructedPrevDepth;
 			f.backBufferTransferFunction = d->backBufferTransferFunction;
 			f.minMaxLuminance[0] = d->minMaxLuminance[0];
 			f.minMaxLuminance[1] = d->minMaxLuminance[1];
-			e |= ffxFrameInterpolationDispatch(&gen.fi, &f);
+			e |= ffxFrameInterpolationDispatch(&k->fi, &f);
 			if (e != FFX_OK)
 			{
 				gen.failed++;
@@ -368,22 +424,22 @@ namespace hifi::framegen
 			why = "FSR 2's depth, motion or picture missing";
 			return false;
 		}
-		// (made for the swap chain's size; FSR 2's picture kept apart from the UI only when it's that size too, else the
-		// back buffer as it is, its UI moved with the world)
-		const D3D12_RESOURCE_DESC dd = in.depth->GetDesc(), pd = in.picture->GetDesc();
-		DXGI_SWAP_CHAIN_DESC1 sd = {};
-		IDXGISwapChain4 *const chain = ffxGetDX12SwapchainPtr(gen.swapchain);
-		if (chain == nullptr || FAILED(chain->GetDesc1(&sd)) || sd.Width == 0 || sd.Height == 0)
+		if (gen.sw == 0 || gen.sh == 0)
 		{
 			why = "AMD's swap chain's size isn't known";
 			return false;
 		}
-		const uint32_t rw = uint32_t(dd.Width), rh = dd.Height, dw = sd.Width, dh = sd.Height;
+		sweep();
+		// (made for the swap chain's size; FSR 2's picture kept apart from the UI only when it's that size too, else the
+		// back buffer as it is, its UI moved with the world)
+		const D3D12_RESOURCE_DESC dd = in.depth->GetDesc(), pd = in.picture->GetDesc();
+		const uint32_t rw = uint32_t(dd.Width), rh = dd.Height, dw = gen.sw, dh = gen.sh;
 		gen.apart = pd.Width == dw && pd.Height == dh;
-		if (!gen.made || rw != gen.rw || rh != gen.rh || dw != gen.dw || dh != gen.dh)
+		kit *k = gen.now.get();
+		if (k == nullptr || rw != k->rw || rh != k->rh || dw != k->dw || dh != k->dh)
 		{
 			ID3D12Device *device = nullptr;
-			const bool ok = SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) && make_generation(device, rw, rh, dw, dh, sd.Format, why);
+			const bool ok = SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) && make_kit(device, rw, rh, dw, dh, why);
 			if (device != nullptr)
 				device->Release();
 			if (!ok)
@@ -392,6 +448,7 @@ namespace hifi::framegen
 				gen.why = why;
 				return false;
 			}
+			k = gen.now.get();
 		}
 		FfxFrameInterpolationPrepareDescription p = {};
 		p.commandList = ffxGetCommandListDX12(list);
@@ -405,11 +462,11 @@ namespace hifi::framegen
 		p.cameraFovAngleVertical = in.fov;
 		p.depth = ffxGetResourceDX12(in.depth, ffxGetResourceDescriptionDX12(in.depth), L"hifixi: FSR 2's depth", FFX_RESOURCE_STATE_COMPUTE_READ);
 		p.motionVectors = ffxGetResourceDX12(in.motion, ffxGetResourceDescriptionDX12(in.motion), L"hifixi: FSR 2's motion", FFX_RESOURCE_STATE_COMPUTE_READ);
-		p.frameID = ++gen.frame_id;
-		p.dilatedDepth = gen.iface.fpGetResource(&gen.iface, gen.shared[generation::kDilatedDepth]);
-		p.dilatedMotionVectors = gen.iface.fpGetResource(&gen.iface, gen.shared[generation::kDilatedMotion]);
-		p.reconstructedPrevDepth = gen.iface.fpGetResource(&gen.iface, gen.shared[generation::kPrevDepth]);
-		FfxErrorCode e = ffxFrameInterpolationPrepare(&gen.fi, &p);
+		p.frameID = gen.dispatch_id + 1;
+		p.dilatedDepth = k->iface.fpGetResource(&k->iface, k->shared[kit::kDilatedDepth]);
+		p.dilatedMotionVectors = k->iface.fpGetResource(&k->iface, k->shared[kit::kDilatedMotion]);
+		p.reconstructedPrevDepth = k->iface.fpGetResource(&k->iface, k->shared[kit::kPrevDepth]);
+		const FfxErrorCode e = ffxFrameInterpolationPrepare(&k->fi, &p);
 		if (e != FFX_OK)
 		{
 			gen.failed++;
@@ -421,24 +478,40 @@ namespace hifi::framegen
 		gen.fresh = true;
 		gen.reset = in.reset;
 		gen.prepares++;
-
-		// AMD's swap chain told, each frame: generation on through generate(), this frame's id (one more each frame)
-		FfxFrameGenerationConfig c = {};
-		c.swapChain = gen.swapchain;
-		c.frameGenerationCallback = generate;
-		c.frameGenerationEnabled = true;
-		if (gen.apart)
-			c.HUDLessColor = gen.picture;
-		c.interpolationRect = { 0, 0, int(dw), int(dh) };
-		c.frameID = gen.frame_id;
-		if ((e = ffxSetFrameGenerationConfigToSwapchainDX12(&c)) != FFX_OK)
-		{
-			gen.failed++;
-			why = gen.why = "AMD's swap chain refused the configuration (error " + std::to_string(int(e)) + ")";
-			return false;
-		}
+		gen.prepared_at = GetTickCount64();
 		gen.why.clear();
 		return true;
+	}
+
+	void present()
+	{
+		FfxFrameGenerationConfig c = {};
+		{
+			std::lock_guard<std::mutex> lock(gen.mutex);
+			if (!g.installed || gen.swapchain == nullptr)
+				return;
+			// (on while FSR 2 hands its frames over; off a second after the last, else each frame is shown twice)
+			const bool want = gen.now != nullptr && GetTickCount64() - gen.prepared_at < 1000;
+			if (want == gen.enabled)
+				return;
+			gen.enabled = want;
+			gen.switches++;
+			c.swapChain = gen.swapchain;
+			c.frameGenerationCallback = generate;
+			c.frameGenerationEnabled = want;
+			c.interpolationRect = { 0, 0, int(gen.sw), int(gen.sh) };
+			c.frameID = gen.dispatch_id;
+		}
+		// (outside every lock: turning it on or off waits for the presents in flight, whose DXGI work goes through
+		// HiFi XI's hooks and generate())
+		const FfxErrorCode e = ffxSetFrameGenerationConfigToSwapchainDX12(&c);
+		if (e != FFX_OK)
+		{
+			std::lock_guard<std::mutex> lock(gen.mutex);
+			gen.enabled = !c.frameGenerationEnabled;
+			gen.failed++;
+			gen.why = "AMD's swap chain refused to turn generation " + std::string(c.frameGenerationEnabled ? "on" : "off") + " (error " + std::to_string(int(e)) + ")";
+		}
 	}
 
 	ID3D12Resource *last_made()
@@ -495,8 +568,9 @@ namespace hifi::framegen
 		if (g.installed)
 		{
 			std::lock_guard<std::mutex> glock(gen.mutex);
-			std::snprintf(line, sizeof(line), "frame generation: %s; %u frames prepared, %u made between, %u shown twice, %u failed%s%s",
-				!gen.made ? "contexts not made" : gen.apart ? "on, the UI kept apart" : "on, the UI moved with the world (FSR 2's picture isn't the screen's size)", gen.prepares, gen.generated, gen.repeated, gen.failed, gen.why.empty() ? "" : ": ", gen.why.c_str());
+			std::snprintf(line, sizeof(line), "frame generation: %s; %u frames prepared, %u made between, %u shown twice, %u failed, turned on/off %u times%s%s",
+				gen.now == nullptr ? "contexts not made" : !gen.enabled ? "off (no FSR 2 frames)" : gen.apart ? "on, the UI kept apart" : "on, the UI moved with the world (FSR 2's picture isn't the screen's size)",
+				gen.prepares, gen.generated, gen.repeated, gen.failed, gen.switches, gen.why.empty() ? "" : ": ", gen.why.c_str());
 			lines.push_back(line);
 		}
 		return lines;

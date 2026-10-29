@@ -932,6 +932,7 @@ public:
 		worldfx::set_blade_motion(hifi::upscale::temporal_running()); // (the grass's own motion for FSR 2)
 		hifi::game::jitter::set_phases(hifi::upscale::jitter_phases());
 		hifi::game::jitter::next_frame();
+		hifi::framegen::present(); // (frame generation on or off as FSR 2 runs, when HIFIXI_FRAMEGEN=1)
 		if (now >= m_next_update)
 		{
 			m_next_update = now + 0.5;
