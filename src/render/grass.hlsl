@@ -824,24 +824,37 @@ float trail_at(float2 xz)
 }
 
 // Settled snow's colour at p (what's drawn there at view depth z): lit as the scene around it is, its brightness on
-// that surface read as a mid-grey ground's light (sun, shade, night and the game's own lamps carry over), from a
-// small ring a tenth of a yalm and at most 6 pixels out on the same surface (four taps half a yalm out, up to 40
-// pixels, put four copies of every shadow and dark spot on the snow around it, and the whole snowy ground looked
-// blurred); a little uneven across the world (xz)
+// that surface read as a mid-grey ground's light (sun, shade, night and the game's own lamps carry over); a little
+// uneven across the world (xz). The light is the median of p and a ring of 8 around it on the same surface, 0.3 yalm
+// and 2 to 14 pixels out: the ground's own pattern under it (tile seams, cracks, stains: thinner than the ring) leaves
+// no mark on the snow, as the mean of a smaller ring let it show through as darker lines, while light and shade wider
+// than the ring keep their sharp edges (a mean over taps half a yalm out, up to 40 pixels, once put four copies of
+// every shadow and dark spot on the snow around it). A tap on another surface (a character, a wall) has no say: they
+// count as the brightest and the darkest there could be in turn, so they cancel out round the middle and the median
+// is the surface's own taps'. (Counting them as p's own let p outvote the rest where a grazing view's rows step far in
+// depth: a joint under the snow then stayed dark.)
 float3 snow_white(int2 p, float z, float px_per_yalm, float2 xz)
 {
-	float around = luma(texel(p)), taps = 1.0;
-	float r = clamp(0.1 * px_per_yalm, 1.0, 6.0);
+	float v[9];
+	v[0] = luma(texel(p));
+	float r = clamp(0.3 * px_per_yalm, 2.0, 14.0);
 	static const float2 ring[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
 		float2(0.7071, 0.7071), float2(-0.7071, 0.7071), float2(0.7071, -0.7071), float2(-0.7071, -0.7071) };
+	float other = 1e9;
 	[unroll] for (int k = 0; k < 8; ++k)
 	{
 		int2 q = p + int2(round(ring[k] * r));
-		bool same = abs(drawn_depth(q) - z) < 0.03 * z + 0.1;
-		around += same ? luma(texel(q)) : 0.0;
-		taps += same ? 1.0 : 0.0;
+		bool same = abs(drawn_depth(q) - z) < 0.06 * z + 0.2;
+		v[k + 1] = same ? luma(texel(q)) : other;
+		other = same ? other : -other;
 	}
-	float light = clamp(around / taps / 0.3, 0.1, 1.8);
+	// (the median of nine: Paeth's network, each step the pair's lower first)
+#define SNOW_SORT(a, b) { float lo_ = min(v[a], v[b]); v[b] = max(v[a], v[b]); v[a] = lo_; }
+	SNOW_SORT(1, 2) SNOW_SORT(4, 5) SNOW_SORT(7, 8) SNOW_SORT(0, 1) SNOW_SORT(3, 4) SNOW_SORT(6, 7) SNOW_SORT(1, 2)
+	SNOW_SORT(4, 5) SNOW_SORT(7, 8) SNOW_SORT(0, 3) SNOW_SORT(5, 8) SNOW_SORT(4, 7) SNOW_SORT(3, 6) SNOW_SORT(1, 4)
+	SNOW_SORT(2, 5) SNOW_SORT(4, 7) SNOW_SORT(4, 2) SNOW_SORT(6, 4) SNOW_SORT(4, 2)
+#undef SNOW_SORT
+	float light = clamp(v[4] / 0.3, 0.1, 1.8);
 	return min(float3(0.9, 0.93, 0.98) * light * (0.94 + 0.06 * noise2(xz * 9.0)), 1.0);
 }
 
@@ -1866,8 +1879,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 				float3 snow = snow_white(p, z, px_per_yalm, W.xz) * (1.0 - 0.22 * trodden);
 				[branch] if (hazy())
 					snow = lerp(haze_colour(), snow, clear_at(z));
-				col = lerp(col, snow, 0.95 * amount);
-				relief = lerp(relief, 1.0, 0.8 * amount);
+				col = lerp(col, snow, 0.98 * amount);
+				relief = lerp(relief, 1.0, 0.9 * amount);
 			}
 		}
 	}
@@ -3588,7 +3601,7 @@ float4 snow_layer_ps(layer_v2p i) : SV_Target
 	float3 snow = snow_white(p, z, lin.z * 0.5 * ground.y / depth, i.xz) * (1.0 - 0.22 * trodden);
 	const float3 L = sun_in_view(), world_up = -up_row.xyz;
 	float facing = (0.49 + 1.25 * saturate(dot(n, L))) / (0.49 + 1.25 * saturate(dot(world_up, L)));
-	snow = lerp(texel(p), min(snow * clamp(facing, 0.6, 1.35), 1.0), 0.95 * (1.0 - 0.3 * saturate(trodden)));
+	snow = lerp(texel(p), min(snow * clamp(facing, 0.6, 1.35), 1.0), 0.98 * (1.0 - 0.3 * saturate(trodden)));
 	// World FX's shadows and lamps on it, in the game's fog, as the shading pass's on the rest
 	float sunlit = sun_lit_at(p, z, n, i.P, cloud_shadows());
 	float3 glow = 0.0;

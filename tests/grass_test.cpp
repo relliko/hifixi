@@ -4399,13 +4399,13 @@ int main(int argc, char **argv)
 				return m;
 			};
 			auto snow_frame = [&](float cover, draw_stats &st, const D3D12_RECT *dark = nullptr, float depth = 0.0f, const float *who = nullptr,
-				bool trails = false) {
+				bool trails = false, UINT dark_count = 1) {
 				barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 				g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
 				if (dark != nullptr) // (a dark patch drawn on the ground: a shadow)
 				{
 					static const float black[4] = { 0.02f, 0.02f, 0.02f, 1.0f };
-					g.list->ClearRenderTargetView(world_rtv, black, 1, dark);
+					g.list->ClearRenderTargetView(world_rtv, black, dark_count, dark);
 				}
 				g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 				ground_depth(cam);
@@ -4464,6 +4464,70 @@ int main(int argc, char **argv)
 					ring_px++;
 				}
 			std::printf("  settled snow over a dark patch at %ld,%ld: %u of %u pixels 8 to 45 out from it darker\n", dark.left, dark.top, ghost_px, ring_px);
+			// (a floor's pattern under a whole layer: tile joints, dark lines 0.06 yalm wide on a 1-yalm grid across the open
+			// ground near the camera, each a run of pixels; the snow over them within 8 yalms as bright as without them, not
+			// the joints showing through as lines. Further off the grid's hard lines are a few pixels apart, where the game's
+			// own floors are mip-filtered to a soft grey: counted apart, not checked)
+			std::vector<D3D12_RECT> seams;
+			std::vector<uint8_t> is_seam(size_t(W) * H, 0);
+			uint32_t seam_px = 0, seam_dark_px = 0, far_px = 0, far_dark_px = 0;
+			double seam_diff = 0.0;
+			for (UINT y = 0; y < H; ++y)
+			{
+				LONG run = -1;
+				for (UINT x = 0; x <= W; ++x)
+				{
+					float gx = 0.0f, gz = 0.0f;
+					bool on = false;
+					if (x < W && ground_at(x, y, gx, gz) && open_side(gx - eye.x, gz - eye.z, gx - at.x, gz - at.z))
+					{
+						const float fx = gx - std::floor(gx), fz = gz - std::floor(gz);
+						on = fx < 0.06f || fz < 0.06f;
+					}
+					if (on)
+					{
+						const float ex = gx - eye.x, ez = gz - eye.z;
+						is_seam[size_t(y) * W + x] = ex * ex + ez * ez < 8.0f * 8.0f ? 1 : 2;
+						if (run < 0)
+							run = LONG(x);
+					}
+					else if (run >= 0)
+					{
+						seams.push_back({ run, LONG(y), LONG(x), LONG(y) + 1 });
+						run = -1;
+					}
+				}
+			}
+			if (!seams.empty())
+			{
+				draw_stats st_seams;
+				const std::vector<uint8_t> seamed = snow_frame(1.0f, st_seams, seams.data(), 0.0f, nullptr, false, UINT(seams.size()));
+				for (size_t k = 0; k < size_t(W) * H; ++k)
+				{
+					if (is_seam[k] == 0)
+						continue;
+					const size_t i = k * 4;
+					const double d = (0.3 * whole[i] + 0.59 * whole[i + 1] + 0.11 * whole[i + 2]) - (0.3 * seamed[i] + 0.59 * seamed[i + 1] + 0.11 * seamed[i + 2]);
+					if (is_seam[k] == 2)
+					{
+						far_dark_px += d > 12.0 ? 1 : 0;
+						far_px++;
+						continue;
+					}
+					seam_diff += std::fabs(d);
+					seam_dark_px += d > 12.0 ? 1 : 0;
+					seam_px++;
+				}
+				if (FILE *f = nullptr; fopen_s(&f, "build\\snow_seams_test.ppm", "wb") == 0 && f != nullptr)
+				{
+					std::fprintf(f, "P6 %u %u 255\n", W, H);
+					for (size_t i = 0; i < size_t(W) * H; ++i)
+						std::fwrite(&seamed[i * 4], 1, 3, f);
+					fclose(f);
+				}
+			}
+			std::printf("  settled snow over a floor's dark seams: within 8 yalms %u seam pixels, %u of them darker by over 12, %.1f darker on average; "
+				"further off %u of %u\n", seam_px, seam_dark_px, seam_px != 0 ? seam_diff / seam_px : 0.0, far_dark_px, far_px);
 			// The snow layer (look::snow_depth): half a layer with depth differs from the same flat on the open ground near
 			// the camera (its drifts' sides lit as they face, raised over the ground) and not on the roofed side; a whole layer
 			// with depth is about as bright as flat. Trails (look::snow_trails): someone standing on the open ground treads the
@@ -4596,6 +4660,10 @@ int main(int argc, char **argv)
 			check(half_px > n_open / 10 && half_px < open_px * 9 / 10, "  half a layer lies in patches over part of it");
 			check(nomap_px == 0, "  none without the rain map");
 			check(dark.right != 0 && st_dark.snow_cover && ring_px > 2000 && ghost_px == 0, "  a dark patch on it leaves no copies of itself on the snow around");
+			// (the floor's light under the snow from a median: hard black joints a few pixels apart at a grazing view can still
+			// fill most of its ring and leave a speck; the mean of a small ring before left every joint showing, 229 darker)
+			check(seam_px > 300 && seam_dark_px * 20 < seam_px && seam_diff / std::max(1u, seam_px) < 15.0,
+				"  a floor's thin dark seams don't show through a whole layer (the snow over them as bright as beside them)");
 		}
 		check(g.report_messages() == 0, "no debug-layer errors (rain)");
 	}
