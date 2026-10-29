@@ -6,7 +6,9 @@
  *   - every tab drawn, every ImGui begin and push matched by its end and pop (ImGui stops the game otherwise);
  *   - each tab's own settings on it; a setting that needs another greyed out while that's off;
  *   - a preset picked: its values saved and it shown picked; the frame rate's options on in every preset;
- *   - a slider moved: saved, and the preset Custom; the search finding settings by name and description.
+ *   - a slider moved: saved, and the preset Custom; the search finding settings by name and description;
+ *   - your own presets: saved by name from the dropdown's row (a file in presets\), in the dropdown, picked back,
+ *     updated under the same name, deleted; names that can't be one refused.
  *
  *   build\menu_test.exe     (from this folder: it works in build\test\menu)
  */
@@ -40,7 +42,8 @@ namespace
 		std::vector<std::string> drawn;
 		std::string click, slide;
 		float slide_to = 0.0f;
-		int windows = 0, children = 0, ids = 0, disabled = 0, greyed_depth = 0;
+		int windows = 0, children = 0, ids = 0, disabled = 0, greyed_depth = 0, combos = 0;
+		std::string type_into, type_text; // (an input box, by its hint, given this text once)
 		bool unbalanced = false;
 		std::vector<std::string> commands;
 
@@ -111,7 +114,16 @@ namespace
 		};
 		g.slider_int = [](const char *label, int *, int, int) { fake::widget(label); return false; };
 		g.color_edit3 = [](const char *label, float *) { fake::widget(label); return false; };
-		g.input_text = [](const char *, const char *hint, char *, size_t) { fake::drawn.push_back(std::string("input ") + hint); return false; };
+		g.input_text = [](const char *, const char *hint, char *buffer, size_t size) {
+			fake::drawn.push_back(std::string("input ") + hint);
+			if (fake::type_into.empty() || fake::type_into != hint)
+				return false;
+			fake::type_into.clear();
+			std::snprintf(buffer, size, "%s", fake::type_text.c_str());
+			return true;
+		};
+		g.begin_combo = [](const char *, const char *preview) { fake::combos++; fake::drawn.push_back(std::string("combo ") + preview); return true; };
+		g.end_combo = [] { fake::unbalanced |= --fake::combos < 0; };
 		g.tooltip = [](const char *) {};
 		g.command = [](const char *text) { fake::commands.push_back(text); };
 		return g;
@@ -232,7 +244,7 @@ int main()
 	auto draw = [&] {
 		fake::reset();
 		hifi::ui::draw_menu(g, &open);
-		return !fake::unbalanced && fake::windows == 0 && fake::children == 0 && fake::ids == 0 && fake::disabled == 0;
+		return !fake::unbalanced && fake::windows == 0 && fake::children == 0 && fake::ids == 0 && fake::disabled == 0 && fake::combos == 0;
 	};
 
 	// 2. Every tab, balanced, with its own settings on it
@@ -257,7 +269,7 @@ int main()
 	hifi::ui::show_tab(hifi::settings::tab::overview);
 	draw();
 	check(fake::has("[Off]") && fake::has("[Balanced]") && fake::has("[High]") && fake::has("[Ultra]") && !fake::has("[Ultra]*") && !fake::has("[Mine]") &&
-		fake::has("Custom"), "the presets across the top (Off, Balanced, High, Ultra), none picked: Custom");
+		fake::has("combo Custom"), "the presets in the dropdown (Off, Balanced, High, Ultra), none picked: Custom shown");
 	check(fake::has("Not started"), "the overview says HiFi XI's hooks aren't in (here, none)");
 
 	// 3. A preset picked: its values in use and saved, it picked
@@ -388,6 +400,56 @@ int main()
 		fake::click = "While one is on you";
 		draw();
 		check(hifi::game::option_text("chars", "enspell", "") == "auto", "back to following the en-spell on you");
+	}
+
+	// 10. Your own presets: saved, in the dropdown, picked back, updated, deleted
+	{
+		const std::wstring presets = folder + L"config\\hifixi\\presets\\";
+		DeleteFileW((presets + L"My look.ini").c_str());
+		hifi::ui::show_tab(hifi::settings::tab::world);
+		fake::slide = "Distance";
+		fake::slide_to = 90.0f;
+		draw();
+		fake::type_into = "Name to save as";
+		fake::type_text = "My look";
+		draw();
+		fake::click = "Save";
+		draw();
+		draw();
+		const std::string file = read_all(presets + L"My look.ini");
+		check(file.find("GrassDistance=90") != std::string::npos && file.find("hifps.limit=") != std::string::npos && hifi::backend::preset() == "saved:My look" &&
+			fake::has("combo My look") && fake::has("My look saved."), "saved as My look: its file (World FX's and HiFi XI's own settings), it picked and said so");
+		const std::vector<std::string> names = hifi::ui::saved_presets();
+		check(names.size() == 1 && names[0] == "My look" && fake::has("[My look]*"), "My look in the dropdown, picked");
+		fake::slide = "Distance";
+		fake::slide_to = 60.0f;
+		draw();
+		draw();
+		check(value("GrassDistance") == 60.0f && hifi::backend::preset() == "custom" && fake::has("combo Custom"), "a slider moved after: Custom");
+		fake::click = "My look";
+		draw();
+		draw();
+		check(value("GrassDistance") == 90.0f && hifi::backend::preset() == "saved:My look" && fake::has("combo My look"), "My look picked again: its values back");
+		fake::slide = "Distance";
+		fake::slide_to = 100.0f;
+		draw();
+		fake::click = "Save"; // (the name box still has My look)
+		draw();
+		draw();
+		check(read_all(presets + L"My look.ini").find("GrassDistance=100") != std::string::npos && hifi::ui::saved_presets().size() == 1,
+			"saved again under the same name: updated, still one");
+		std::string why;
+		check(!hifi::ui::save_preset("Ultra", why) && !hifi::ui::save_preset("../evil", why) && !hifi::ui::save_preset("   ", why) &&
+			!hifi::ui::save_preset("a name that is far too long to be a preset's name", why) && hifi::ui::saved_presets().size() == 1,
+			"names refused: a built-in preset's, with a path in it, empty, too long");
+		fake::click = "Delete";
+		draw();
+		draw();
+		check(hifi::ui::saved_presets().empty() && GetFileAttributesW((presets + L"My look.ini").c_str()) == INVALID_FILE_ATTRIBUTES &&
+			hifi::backend::preset() == "custom" && value("GrassDistance") == 100.0f && fake::has("My look deleted"),
+			"Delete: its file gone, the settings left as they were, Custom");
+		const bool balanced = draw();
+		check(balanced, "the menu's begins, pushes and dropdowns matched throughout");
 	}
 
 	check(read_all(reshade_ini) == old_ini, "ReShade.ini as it was, at the end");

@@ -40,6 +40,9 @@ namespace hifi::ui
 		bool (*slider_int)(const char *label, int *value, int low, int high) = nullptr;
 		bool (*color_edit3)(const char *label, float rgb[3]) = nullptr;
 		bool (*input_text)(const char *id, const char *hint, char *buffer, size_t size) = nullptr;
+		// A dropdown showing preview; true while open (its items drawn with selectable, then end_combo)
+		bool (*begin_combo)(const char *id, const char *preview) = nullptr;
+		void (*end_combo)() = nullptr;
 		// The tooltip for the item just drawn, while the mouse is over it
 		void (*tooltip)(const char *text) = nullptr;
 		// An Ashita command, as typed (/hifps)

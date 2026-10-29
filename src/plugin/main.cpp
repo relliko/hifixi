@@ -209,6 +209,8 @@ namespace
 			x.slider_int = [](const char *label, int *v, int low, int high) { return g_gui->SliderInt(label, v, low, high); };
 			x.color_edit3 = [](const char *label, float rgb[3]) { return g_gui->ColorEdit3(label, rgb, ImGuiColorEditFlags_NoInputs); };
 			x.input_text = [](const char *id, const char *hint, char *buffer, size_t size) { return g_gui->InputTextWithHint(id, hint, buffer, size); };
+			x.begin_combo = [](const char *id, const char *preview) { return g_gui->BeginCombo(id, preview, 0); };
+			x.end_combo = [] { g_gui->EndCombo(); };
 			x.tooltip = [](const char *text) {
 				if (!g_gui->IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
 					return;

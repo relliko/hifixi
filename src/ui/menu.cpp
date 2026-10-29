@@ -122,16 +122,11 @@ namespace hifi::ui
 			return end != text.c_str() && std::isfinite(v) ? v : e.fallback;
 		}
 
-		void set_option_value(const settings::entry &e, float v)
+		// A number as the settings file keeps it: a whole one without a point, else the fewest digits that read back the same
+		std::string number_text(float v, bool whole)
 		{
-			char section[32];
-			const char *name = nullptr;
-			if (!settings::split_option(e.key, section, sizeof(section), &name))
-				return;
 			char text[32];
-			if (e.kind == settings::option_kind::flag)
-				std::snprintf(text, sizeof(text), "%d", v >= 0.5f ? 1 : 0);
-			else if (e.kind == settings::option_kind::whole || (v == std::floor(v) && std::fabs(v) < 1e7f))
+			if (whole || (v == std::floor(v) && std::fabs(v) < 1e7f))
 				std::snprintf(text, sizeof(text), "%ld", std::lround(v));
 			else
 				for (int digits = 1; digits <= 9; ++digits)
@@ -140,7 +135,23 @@ namespace hifi::ui
 					if (std::strtof(text, nullptr) == v)
 						break;
 				}
-			backend::set_option(section, name, text);
+			return text;
+		}
+
+		std::string option_text(const settings::entry &e, float v)
+		{
+			if (e.kind == settings::option_kind::flag)
+				return v >= 0.5f ? "1" : "0";
+			return number_text(v, e.kind == settings::option_kind::whole);
+		}
+
+		void set_option_value(const settings::entry &e, float v)
+		{
+			char section[32];
+			const char *name = nullptr;
+			if (!settings::split_option(e.key, section, sizeof(section), &name))
+				return;
+			backend::set_option(section, name, option_text(e, v).c_str());
 		}
 
 		bool on(const char *key)
@@ -535,27 +546,90 @@ namespace hifi::ui
 			textf(g, "Zone files: %s (worldfx-grass and the rest)", narrow(backend::folder()).c_str());
 		}
 
+		// The preset row: a dropdown of the built-in presets and your own, a name and Save (every setting as it is now,
+		// under that name), Delete (the one of yours picked), the search; under it what the last of those did
+		char g_save_name[48] = "";
+		std::string g_preset_note;
+		bool g_preset_note_bad = false;
+
+		void note(bool ok, const std::string &text)
+		{
+			g_preset_note = text;
+			g_preset_note_bad = !ok;
+		}
+
 		void draw_presets(const gui &g)
 		{
-			const settings::preset now = settings::preset_from(backend::preset().c_str());
+			const std::string key = backend::preset();
+			const bool yours = key.rfind("saved:", 0) == 0;
+			const std::string your_name = yours ? key.substr(6) : std::string();
+			const settings::preset now = yours ? settings::preset::custom : settings::preset_from(key.c_str());
 			g.text("Preset");
-			for (int i = 0; i < settings::kFixedPresets; ++i)
+			g.same_line();
+			g.set_next_item_width(180.0f);
+			if (g.begin_combo("##preset", yours ? your_name.c_str() : settings::preset_label(now)))
 			{
-				const settings::preset p = settings::preset(i);
-				g.same_line();
-				if (g.toggle_button(settings::preset_label(p), p == now))
-					apply_preset(p);
-				g.tooltip(settings::preset_help(p));
+				for (int i = 0; i < settings::kFixedPresets; ++i)
+				{
+					const settings::preset p = settings::preset(i);
+					if (g.selectable(settings::preset_label(p), !yours && p == now))
+					{
+						apply_preset(p);
+						note(true, std::string(settings::preset_label(p)) + " picked.");
+					}
+					g.tooltip(settings::preset_help(p));
+				}
+				const std::vector<std::string> names = saved_presets();
+				if (!names.empty())
+				{
+					g.separator();
+					for (const std::string &name : names)
+					{
+						g.push_id(name.c_str());
+						if (g.selectable(name.c_str(), yours && name == your_name))
+						{
+							std::string why;
+							note(load_preset(name.c_str(), why), why.empty() ? name + " picked." : why);
+						}
+						g.tooltip("One of yours: every setting as it was when you saved it.");
+						g.pop_id();
+					}
+				}
+				g.end_combo();
 			}
-			if (now == settings::preset::custom)
+			g.tooltip(yours ? "One of yours: every setting as it was when you saved it." : settings::preset_help(now));
+			g.same_line();
+			g.set_next_item_width(150.0f);
+			g.input_text("##save-name", "Name to save as", g_save_name, sizeof(g_save_name));
+			g.tooltip("A name for your own preset: letters, digits, spaces and - _ ( ) ' . (up to 40).");
+			g.same_line();
+			if (g.button("Save"))
 			{
-				g.same_line();
-				g.text_disabled("Custom");
-				g.tooltip(settings::preset_help(settings::preset::custom));
+				std::string why;
+				const std::string name = g_save_name;
+				note(save_preset(g_save_name, why), why.empty() ? name + " saved." : why);
 			}
+			g.tooltip("Every setting as it is now, saved as a preset of your own under the name beside it (the same name again: updated). "
+				"It's in the dropdown from then on.");
+			g.same_line();
+			g.begin_disabled(!yours);
+			if (g.button("Delete"))
+			{
+				std::string why;
+				note(delete_preset(your_name.c_str(), why), why.empty() ? your_name + " deleted (your settings stay as they are)." : why);
+			}
+			g.tooltip(yours ? "The preset of yours picked, deleted. Your settings stay as they are." : "Pick one of your own presets to delete it.");
+			g.end_disabled();
 			g.same_line();
 			g.set_next_item_width(std::max(140.0f, g.available_width()));
 			g.input_text("##find", "Find a setting", g_search, sizeof(g_search));
+			if (!g_preset_note.empty())
+			{
+				if (g_preset_note_bad)
+					g.text_colored(kWarn, g_preset_note.c_str());
+				else
+					g.text_disabled(g_preset_note.c_str());
+			}
 		}
 	}
 
@@ -599,6 +673,226 @@ namespace hifi::ui
 			worldfx::set_setting(e.key, v);
 		}
 		backend::set_preset(settings::preset_key(p));
+	}
+
+	namespace
+	{
+		// (the name as typed, its spaces at the ends left out; false with why when it can't be a preset's)
+		bool preset_name(const char *typed, std::string &name, std::string &why)
+		{
+			name = typed != nullptr ? typed : "";
+			while (!name.empty() && name.back() == ' ')
+				name.pop_back();
+			while (!name.empty() && name.front() == ' ')
+				name.erase(name.begin());
+			if (name.empty())
+			{
+				why = "Type a name to save it as first.";
+				return false;
+			}
+			if (name.size() > 40)
+			{
+				why = "That name's too long (40 letters at most).";
+				return false;
+			}
+			bool letters = false;
+			for (char c : name)
+			{
+				const bool alnum = std::isalnum(static_cast<unsigned char>(c)) != 0 && static_cast<unsigned char>(c) < 128;
+				letters |= alnum;
+				if (!alnum && std::strchr(" -_()'.", c) == nullptr)
+				{
+					why = "A name can only have letters, digits, spaces and - _ ( ) ' .";
+					return false;
+				}
+			}
+			if (!letters)
+			{
+				why = "A name needs a letter or a digit in it.";
+				return false;
+			}
+			for (int i = 0; i <= int(settings::preset::custom); ++i)
+				if (_stricmp(name.c_str(), settings::preset_label(settings::preset(i))) == 0)
+				{
+					why = "That's a built-in preset's name: pick another.";
+					return false;
+				}
+			return true;
+		}
+
+		std::wstring presets_folder()
+		{
+			const std::wstring &file = backend::settings_file();
+			const size_t slash = file.find_last_of(L"\\/");
+			return (slash == std::wstring::npos ? std::wstring() : file.substr(0, slash + 1)) + L"presets\\";
+		}
+
+		std::wstring wide(const std::string &s)
+		{
+			return std::wstring(s.begin(), s.end()); // (names and values are ASCII)
+		}
+
+		std::wstring preset_path(const std::string &name)
+		{
+			return presets_folder() + wide(name) + L".ini";
+		}
+
+		// A setting's value as a preset file keeps it (a colour's three numbers with commas); empty for none
+		std::string entry_text(const settings::entry &e)
+		{
+			if (settings::is_option(e))
+				return option_text(e, option_value(e));
+			const worldfx::setting *s = worldfx::find_setting(e.key);
+			float v[3] = {};
+			if (s == nullptr || !worldfx::get_setting(e.key, v))
+				return std::string();
+			if (s->kind == worldfx::setting::colour)
+				return number_text(v[0], false) + "," + number_text(v[1], false) + "," + number_text(v[2], false);
+			return number_text(v[0], s->kind != worldfx::setting::number);
+		}
+
+		// And put back from that (false when the text isn't a number)
+		bool set_entry_text(const settings::entry &e, const std::string &text)
+		{
+			float v[3] = {};
+			int count = 0;
+			const char *at = text.c_str();
+			while (count < 3 && *at != 0)
+			{
+				char *end = nullptr;
+				const float x = std::strtof(at, &end);
+				if (end == at || !std::isfinite(x))
+					return false;
+				v[count++] = x;
+				at = *end == ',' ? end + 1 : end;
+			}
+			if (count == 0)
+				return false;
+			if (settings::is_option(e))
+			{
+				set_option_value(e, v[0]);
+				return true;
+			}
+			const worldfx::setting *s = worldfx::find_setting(e.key);
+			if (s == nullptr)
+				return false;
+			if (s->kind != worldfx::setting::colour || count < 3)
+			{
+				v[1] = s->fallback[1];
+				v[2] = s->fallback[2];
+			}
+			worldfx::set_setting(e.key, v);
+			return true;
+		}
+	}
+
+	std::vector<std::string> saved_presets()
+	{
+		std::vector<std::string> names;
+		if (backend::settings_file().empty())
+			return names;
+		WIN32_FIND_DATAW f;
+		const HANDLE h = FindFirstFileW((presets_folder() + L"*.ini").c_str(), &f);
+		if (h == INVALID_HANDLE_VALUE)
+			return names;
+		do
+		{
+			std::wstring file = f.cFileName;
+			if ((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 || file.size() <= 4)
+				continue;
+			file.resize(file.size() - 4);
+			std::string name, why, unused;
+			bool ascii = true;
+			for (wchar_t c : file)
+			{
+				ascii &= c < 128;
+				name += char(c);
+			}
+			if (ascii && preset_name(name.c_str(), unused, why) && unused == name)
+				names.push_back(name);
+		} while (FindNextFileW(h, &f));
+		FindClose(h);
+		std::sort(names.begin(), names.end(), [](const std::string &a, const std::string &b) { return _stricmp(a.c_str(), b.c_str()) < 0; });
+		return names;
+	}
+
+	bool save_preset(const char *typed, std::string &why)
+	{
+		std::string name;
+		if (!preset_name(typed, name, why))
+			return false;
+		if (backend::settings_file().empty())
+		{
+			why = "The settings file isn't known: nothing saved.";
+			return false;
+		}
+		CreateDirectoryW(presets_folder().c_str(), nullptr);
+		const std::wstring path = preset_path(name);
+		// (written fresh: an update keeps nothing of the old)
+		DeleteFileW(path.c_str());
+		bool ok = WritePrivateProfileStringW(L"hifixi", L"name", wide(name).c_str(), path.c_str()) != FALSE;
+		size_t n = 0;
+		const settings::entry *all = settings::entries(n);
+		for (size_t i = 0; i < n && ok; ++i)
+		{
+			const std::string text = entry_text(all[i]);
+			if (!text.empty())
+				ok = WritePrivateProfileStringW(L"settings", wide(all[i].key).c_str(), wide(text).c_str(), path.c_str()) != FALSE;
+		}
+		if (!ok)
+		{
+			why = "Couldn't write " + name + "'s file in the presets folder (error " + std::to_string(GetLastError()) + ").";
+			return false;
+		}
+		backend::set_preset(("saved:" + name).c_str());
+		std::snprintf(g_save_name, sizeof(g_save_name), "%s", name.c_str());
+		return true;
+	}
+
+	bool load_preset(const char *typed, std::string &why)
+	{
+		std::string name;
+		if (!preset_name(typed, name, why))
+			return false;
+		const std::wstring path = preset_path(name);
+		if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+		{
+			why = name + " isn't there any more (its file in the presets folder is gone).";
+			return false;
+		}
+		size_t n = 0;
+		const settings::entry *all = settings::entries(n);
+		for (size_t i = 0; i < n; ++i)
+		{
+			// (a setting the preset doesn't have, newer than it: left as it is)
+			wchar_t text[128] = L"";
+			GetPrivateProfileStringW(L"settings", wide(all[i].key).c_str(), L"", text, DWORD(std::size(text)), path.c_str());
+			std::string value;
+			for (const wchar_t *c = text; *c != 0; ++c)
+				value += *c < 128 ? char(*c) : '?';
+			if (!value.empty())
+				set_entry_text(all[i], value);
+		}
+		backend::set_preset(("saved:" + name).c_str());
+		std::snprintf(g_save_name, sizeof(g_save_name), "%s", name.c_str());
+		return true;
+	}
+
+	bool delete_preset(const char *typed, std::string &why)
+	{
+		std::string name;
+		if (!preset_name(typed, name, why))
+			return false;
+		if (!DeleteFileW(preset_path(name).c_str()))
+		{
+			why = "Couldn't delete " + name + " (error " + std::to_string(GetLastError()) + ").";
+			return false;
+		}
+		if (backend::preset() == "saved:" + name)
+			backend::set_preset(settings::preset_key(settings::preset::custom));
+		if (_stricmp(g_save_name, name.c_str()) == 0)
+			g_save_name[0] = 0;
+		return true;
 	}
 
 	void draw_menu(const gui &g, bool *open)
