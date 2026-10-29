@@ -12,7 +12,8 @@
 //   pieces                                  blended (bit 31): SRCALPHA / INVSRCALPHA, no depth writes; two-sided (bit
 //                                           29): no cull; else CULL CCW, CW for a mirrored object; in the game's order
 //
-// Options: per-pixel lighting on every piece (the sun and lamps per pixel, the normal maps' own frame from the UVs).
+// Options: per-pixel lighting on every piece (the sun and lamps per pixel, the normal maps' own frame from the UVs;
+// the lamps then every one of the frame's whose range reaches the object's box, not only the 4 the game names).
 //
 // Vertices and indices are read in the vertex shader from the zone's buffers (root SRVs), so nothing of the input
 // assembler's is touched. The caller binds nothing: record() sets the targets, viewport, heaps, root signature and

@@ -16,6 +16,7 @@
 
 #include <d3d12.h>
 #include "../render/grass_render.hpp" // (grass::list_state)
+#include "frame.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -63,6 +64,9 @@ namespace hifi::zone::inject
 		uint64_t at = 0;
 	};
 	bool last_camera(frame_camera &out);
+	// The lamps of that pass when HiFi XI drew it (its frame's: the ones its objects name, lit), for the native
+	// characters' lamp light (main.cpp hands them over: chars::inject::set_lamps); how many (0 when the game drew it)
+	uint32_t last_lamps(frame_lamp out[kMaxLamps]);
 	// The zone's end marker: the pass published under that seq drawn there when it's HiFi XI's
 	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
 

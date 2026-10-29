@@ -754,6 +754,38 @@ float3 lamp_light(float3 P, float3 n, float steep, float3 col)
 	return sum * (2.5 * col + 0.03) * saturate(1.2 - luma(col));
 }
 
+// lamp_light where the light split knows the pixel (light_at): the native zone and characters lit it with the zone's
+// lamps already (every lamp in reach, as this would: HiFi XI's src/zone/draw.cpp near_lamp_light), so their glow isn't
+// added again here. What's left of it: the effects' glows (c.w 0: a Home Point's, a spell's), added as lamp_light adds
+// them; and the strongest zone lamp's shadow, its light (as lamp_light would have put it there) taken away as far as
+// lamp_blocked says it's hidden, never more than the light the native passes drew without the sun (share: the sun's
+// share of it, light_at's). Returns the glow to add; hidden what to take from the colour drawn.
+float3 lamp_light_known(float3 P, float3 n, float3 col, float share, out float3 hidden)
+{
+	float4 head = actors[kLamps];
+	uint count = min(uint(head.x), kMaxLamps);
+	float3 glow = 0.0, strongest = 0.0, strongest_at = 0.0;
+	float most = 0.0;
+	[unroll] for (uint i = 0; i < kMaxLamps; ++i)
+	{
+		float4 a = actors[kLamps + 1 + 2 * i], c = actors[kLamps + 2 + 2 * i];
+		float3 v = a.xyz - P;
+		float d2 = dot(v, v);
+		float k = saturate(1.0 - d2 / (a.w * a.w));
+		float3 add = (i < count ? k * k * (0.3 + 0.7 * saturate(dot(n, v) * rsqrt(d2 + 1e-4))) : 0.0) * c.rgb;
+		bool zones = c.w > 0.5;
+		glow += zones ? 0.0 : add;
+		float amount = zones ? luma(add) : 0.0;
+		strongest = amount > most ? add : strongest;
+		strongest_at = amount > most ? a.xyz : strongest_at;
+		most = max(most, amount);
+	}
+	hidden = 0.0;
+	[branch] if (head.y > 0.0 && most > 0.002)
+		hidden = min(strongest * head.y * lamp_blocked(P, n, strongest_at) * (2.5 * col + 0.03), col * (1.0 - share));
+	return glow * (2.5 * col + 0.03) * saturate(1.2 - luma(col));
+}
+
 // Wet ground in rain (crowd.x rule bit 64; t2 after the fog: [kWet] the view's first row (a view-space point's world x
 // is eye.x + dot(it, the point)) and how wet, [kWet + 1] its third row (world z), [kWet + 2] the wet mask's corner (x, z)
 // and its squares a yalm, [kWet + 3] its width and height (squares) and words a row, [kWet + 4] the game's light's
@@ -1950,7 +1982,14 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	}
 	// Lamps lit near (lamp_light): their glow on top, darkened by the ambient occlusion like the rest
 	float3 glow = 0.0;
-	[branch] if (lamps)
+	// (where the light split knows the pixel the native passes lit it with the zone's lamps: lamp_light_known)
+	[branch] if (lamps && known)
+	{
+		float3 hidden;
+		glow = lamp_light_known(P, n, col, known_share, hidden) * ao;
+		col -= hidden;
+	}
+	else if (lamps)
 		glow = lamp_light(P, n, steep, col) * ao;
 	// Wet path and stone in rain (wet_here), on what faces up: darker (soaked), the overcast sky mirrored more the more
 	// grazing the view (water's own reflectance on the film), and a little highlight toward the game's light. A surface

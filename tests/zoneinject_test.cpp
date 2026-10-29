@@ -12,7 +12,10 @@
  *   - a pass not HiFi XI's, an old seq, a depth not yet followed: nothing drawn (and said why when it should have been);
  *   - the light split (src/zone/light_split.hpp) drawn with it once World FX has asked: a word on most of the zone's
  *     pixels, its depth the depth buffer's, the ground facing up, lit mostly by the sun, the walls turned from it not;
- *     under the character dgVoodoo drew afterwards, its depth not the depth buffer's (World FX leaves those words).
+ *     under the character dgVoodoo drew afterwards, its depth not the depth buffer's (World FX leaves those words);
+ *   - a lamp in the frame that no object names (the game's per-object lamps): per pixel it lights the street near it all
+ *     the same (draw.cpp near_lamps), per vertex it lights nothing (the game's own way); named by every object, per
+ *     vertex it lights them.
  *
  *   build\zoneinject_test.exe [out.bmp]
  */
@@ -317,7 +320,7 @@ int main(int argc, char **argv)
 	const zm::zone &d = gz.data();
 	const float eye[3] = { -27.1f, -4.5f, 35.1f };
 	const mat4 vp = camera(eye, 1.5708f, 0.12f);
-	auto fill = [&](uint32_t seq, bool native) {
+	auto fill = [&](uint32_t seq, bool native, const hifi::zone::frame_lamp *lamp = nullptr, bool named = false) {
 		hifi::zone::frame &f = hifi::zone::frame_slot(seq);
 		f.native = native;
 		f.zone = &gz;
@@ -349,8 +352,12 @@ int main(int argc, char **argv)
 			o.flags = p.flags;
 			for (uint32_t &l : o.lamps)
 				l = 0xFFFFFFFFu;
+			if (named)
+				o.lamps[0] = 0;
 		}
-		f.lamp_count = 0;
+		f.lamp_count = lamp != nullptr ? 1 : 0;
+		if (lamp != nullptr)
+			f.lamps[0] = *lamp;
 		hifi::zone::publish(f, seq);
 	};
 
@@ -640,6 +647,121 @@ int main(int argc, char **argv)
 		}
 		sun_back->Unmap(0, nullptr);
 		check(st.size() > 1 && st[1].find("1 drawn") != std::string::npos, "counted: " + (st.size() > 1 ? st[1] : std::string()));
+	}
+	// A lamp no object names (the game names up to 4 per object; this one none): a yalm in front of the street where the
+	// picture's middle column meets its lower third, and a yalm up. Per pixel (seq 7 without it, 8 with it) the street
+	// round it gets brighter; per vertex (seq 9) it's as the first pass drew it, unlit by it; and named by every object
+	// (seq 10), per vertex it lights the street (the game's 4 a byte each now).
+	{
+		const UINT lx = W / 2, ly = H * 7 / 10;
+		const double d = double(dz[size_t(ly) * W + lx] & 0xFFFFFF) / 16777215.0;
+		// (the point there, back through the view and projection: row vectors, so world = (ndc x w) x inverse)
+		double m[4][8] = {};
+		for (int i = 0; i < 4; ++i)
+		{
+			for (int j = 0; j < 4; ++j)
+				m[i][j] = vp.m[i * 4 + j];
+			m[i][4 + i] = 1.0;
+		}
+		for (int c = 0; c < 4; ++c)
+		{
+			int best = c;
+			for (int r = c + 1; r < 4; ++r)
+				best = std::fabs(m[r][c]) > std::fabs(m[best][c]) ? r : best;
+			for (int k = 0; k < 8; ++k)
+				std::swap(m[c][k], m[best][k]);
+			const double pivot = m[c][c];
+			for (int k = 0; k < 8; ++k)
+				m[c][k] /= pivot;
+			for (int r = 0; r < 4; ++r)
+				if (r != c)
+				{
+					const double f = m[r][c];
+					for (int k = 0; k < 8; ++k)
+						m[r][k] -= f * m[c][k];
+				}
+		}
+		const double ndc[4] = { (lx + 0.5) / W * 2.0 - 1.0, 1.0 - (ly + 0.5) / H * 2.0, d, 1.0 };
+		double q[4] = {};
+		for (int j = 0; j < 4; ++j)
+			for (int i = 0; i < 4; ++i)
+				q[j] += ndc[i] * m[i][4 + j];
+		const float P[3] = { float(q[0] / q[3]), float(q[1] / q[3]), float(q[2] / q[3]) };
+		float back[3] = { eye[0] - P[0], 0.0f, eye[2] - P[2] };
+		const float bl = std::sqrt(back[0] * back[0] + back[2] * back[2]);
+		hifi::zone::frame_lamp lamp = {};
+		lamp.pos[0] = P[0] + back[0] / bl;
+		lamp.pos[1] = P[1] - 1.0f;
+		lamp.pos[2] = P[2] + back[2] / bl;
+		lamp.range = 6.0f;
+		lamp.colour[0] = 1.0f;
+		lamp.colour[1] = 0.75f;
+		lamp.colour[2] = 0.4f;
+		lamp.attenuation2 = 0.5f;
+		// (the first pass's pixels round it, per vertex without the lamp, before the readback is used again)
+		auto luma_at = [&](const uint8_t *img) {
+			double sum = 0.0;
+			for (UINT y = ly - 6; y <= ly + 6; ++y)
+				for (UINT x = lx - 6; x <= lx + 6; ++x)
+				{
+					const uint8_t *p = img + (size_t(y) * W + x) * 4;
+					sum += 0.3 * p[0] + 0.59 * p[1] + 0.11 * p[2];
+				}
+			return sum / 169.0;
+		};
+		const double first_luma = luma_at(px);
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		inj::on_reset(list);
+		list->SetDescriptorHeaps(1, &srvh); // (dgVoodoo's heaps on its new list, as the stand-in's root table needs them)
+		inj::on_heaps(list, 1, &srvh);
+		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		ID3D12Resource *outs[4] = {};
+		bd.Width = UINT64(W) * 4 * H;
+		for (ID3D12Resource *&o : outs)
+			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&o));
+		const uint32_t seqs[4] = { 7, 8, 9, 10 };
+		for (int k = 0; k < 4; ++k)
+		{
+			fill(seqs[k], true, k == 0 ? nullptr : &lamp, k == 3);
+			inj::set_options(k < 2);
+			list->ClearRenderTargetView(rtv, sky, 0, nullptr);
+			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			inj::on_zone_end(list, bound, w, seqs[k]);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+			to.pResource = outs[k];
+			to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_TYPELESS, W, H, 1, W * 4 };
+			from.pResource = A;
+			from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}
+		inj::set_options(false);
+		list->Close();
+		direct->ExecuteCommandLists(1, lists);
+		direct->Signal(fence, 2);
+		fence->SetEventOnCompletion(2, e);
+		WaitForSingleObject(e, 60000);
+		check(device->GetDeviceRemovedReason() == S_OK, "the device still there (the lamp's passes)");
+		const uint32_t lamp_messages = debug_messages(info, first);
+		check(lamp_messages == 0, "the debug layer: nothing (" + std::to_string(lamp_messages) + (lamp_messages != 0 ? ": " + first : std::string()) + ")");
+		double lumas[4] = {};
+		for (int k = 0; k < 4; ++k)
+		{
+			uint8_t *img = nullptr;
+			outs[k]->Map(0, nullptr, reinterpret_cast<void **>(&img));
+			lumas[k] = luma_at(img);
+			outs[k]->Unmap(0, nullptr);
+			outs[k]->Release();
+		}
+		std::snprintf(line, sizeof(line), "a lamp no object names, at (%.1f %.1f %.1f): the street under it per pixel %.1f -> %.1f; per vertex %.1f (first pass %.1f)",
+			lamp.pos[0], lamp.pos[1], lamp.pos[2], lumas[0], lumas[1], lumas[2], first_luma);
+		check(d < 1.0 && lumas[1] > lumas[0] + 5.0, line);
+		check(std::fabs(lumas[2] - first_luma) < 0.5, "  per vertex, as the game lights: only the lamps an object names (none here)");
+		check(lumas[3] > first_luma + 5.0, "  ... and named by every object, per vertex it lights them: " + std::to_string(lumas[3]));
 	}
 	if (argc > 1)
 	{
