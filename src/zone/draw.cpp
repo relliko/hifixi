@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <d3dcompiler.h>
 #include "draw.hpp"
+#include "hemi_spec.hpp"
 #include "light_split.hpp"
 #include "zone_gpu.hpp"
 #include <algorithm>
@@ -62,6 +63,12 @@ Texture2D normal_map : register(t5);
 SamplerState wrap : register(s0);
 
 static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
+// HiFi XI's own look per pixel (hemi_spec.hpp). The ambient from a sky: x kSkyAbove on what faces up, x kSkyBelow on
+// what faces down, tinted kSkyTint toward the fog's hue from above and the sun's (its light off the ground) from below;
+// a town's street seen from it comes out as bright as the game's on the whole (the ground's a little brighter, walls a
+// little darker). The sun's highlight on pieces with a normal map: kSpec at a full one, sharper on brighter texels.
+static const float kSkyAbove = 1.1, kSkyBelow = 0.7, kSkyTint = 0.2;
+static const float kSpec = 0.05, kSpecBroad = 12, kSpecSharp = 40;
 
 // The piece's environment: its object's, or for a door's bit-28 piece the door's (never past the 8 there are)
 env_t env_of(object o)
@@ -107,6 +114,24 @@ float3 lamp_light(object o, float3 world, float3 n)
 		sum += edge * l.colour * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(l.att2 * d2, 1e-3);
 	}
 	return sum;
+}
+
+// (per pixel) The env's ambient a from its sky, at the facing n (world, its length the object's scale)
+float3 sky_ambient(env_t e, float3 a, float3 n)
+{
+	return hemi_ambient(a, n, kSkyBelow, kSkyAbove, kSkyTint, e.fog.rgb, e.sun.rgb);
+}
+// (per pixel) The sun's highlight on a piece with a normal map (none on others, nor on alpha-tested ones: leaves and
+// grilles only glitter with it): at the facing n, sun the sun's colour, t the texel. Glossier where the texel is
+// brighter (a worn flagstone, not the dirt in its joints) and where the vertex colour doesn't darken it (the game's
+// baked shade under eaves and in corners).
+float3 piece_spec(env_t e, float3 world, float3 n, float3 sun, float4 vcol, float4 t)
+{
+	if ((piece & (kMapped | kTested)) != kMapped)
+		return 0;
+	const float3 k = float3(0.2126, 0.7152, 0.0722);
+	const float gloss = smoothstep(0.1, 0.6, dot(t.rgb, k)) * saturate(2 * dot(vcol.rgb, k));
+	return sun_spec(n, e.sun_dir.xyz, options.yzw - world, sun, lerp(kSpecBroad, kSpecSharp, gloss), kSpec * gloss);
 }
 
 struct v2p
@@ -177,7 +202,7 @@ float4 shade(v2p i, out float share)
 	const float a = saturate(4 * t.a * i.vcol.a);
 	if ((piece & kTested) != 0 && a <= 96.0 / 255.0)
 		discard;
-	float3 lit;
+	float3 lit, spec = 0;
 	const bool bump = (piece & kBump) != 0;
 	const env_t e = env_of(objects[object_index]);
 	if (options.x > 0)
@@ -200,9 +225,12 @@ float4 shade(v2p i, out float share)
 		}
 		n *= scale;
 		const float3 s_rgb = bump ? e.sun_bump.rgb : e.sun.rgb, a_rgb = bump ? e.ambient_bump.rgb : e.ambient.rgb;
-		const float3 rest = i.vcol.rgb * a_rgb + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
+		const float3 rest = i.vcol.rgb * sky_ambient(e, a_rgb, n) + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
 		lit = saturate(i.vcol.rgb * s_rgb * saturate(dot(n, e.sun_dir.xyz)) + rest);
 		share = light_share(lit, saturate(rest));
+		// (the highlight goes on after the texture, the sun's all of it)
+		spec = piece_spec(e, i.world, n, s_rgb, i.vcol, t);
+		share = spec_share(share, 2 * lit * t.rgb, spec);
 	}
 	else if (bump)
 	{
@@ -221,7 +249,7 @@ float4 shade(v2p i, out float share)
 	// piece writes at least 2 instead, so the band where a ground layer's vertex alpha fades out doesn't come out 1 (Valkurm's
 	// sand outlined in lines, 2026-10-27); a blended one keeps its own (it's also its colour's share), and blended over 2 or
 	// more its result stays over 1.99)
-	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
+	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb + spec, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
 }
 float4 ps(v2p i) : SV_Target
 {
@@ -331,7 +359,7 @@ light_out ps_light(v2p i)
 			why = "d3dcompiler_47.dll isn't there";
 			return false;
 		}
-		const std::string source = std::string(light::kHlsl) + kShader;
+		const std::string source = std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
 		for (int k = 0; k < 3; ++k)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;

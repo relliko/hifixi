@@ -11,7 +11,7 @@
  *   - the debug layer says nothing (the planes' states, the heaps, the views);
  *   - a pass not HiFi XI's, an old seq, a depth not yet followed: nothing drawn (and said why when it should have been).
  *
- *   build\zoneinject_test.exe [out.bmp]
+ *   build\zoneinject_test.exe [out.bmp]       (ZONE_PERPIXEL=1: drawn with the per-pixel option)
  */
 
 #include <d3d12.h>
@@ -182,6 +182,7 @@ int main(int argc, char **argv)
 	std::string why;
 	check(gz.upload(device, copy, std::move(z), why) && gz.wait(10000), "on the GPU (its copy queue)" + why);
 	check(inj::prepare(device, why), "the renderer made" + (why.empty() ? "" : ": " + why));
+	inj::set_options(GetEnvironmentVariableA("ZONE_PERPIXEL", nullptr, 0) != 0); // (the per-pixel option: ZONE_PERPIXEL=1)
 
 	// dgVoodoo's world: typeless resources, UNORM / D24S8 views
 	D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, up = { D3D12_HEAP_TYPE_UPLOAD }, rb = { D3D12_HEAP_TYPE_READBACK };
