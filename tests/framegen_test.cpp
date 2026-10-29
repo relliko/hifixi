@@ -19,6 +19,7 @@
 #include "../src/framegen/framegen.hpp"
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -133,6 +134,7 @@ int main()
 
 	// Wanted: the factory's calls through ours
 	hifi::framegen::set_wanted(true);
+	hifi::framegen::set_automatic(false); // (on whatever the game's frame rate: the automatic choice has its own part, last)
 	check(hifi::framegen::wanted() && hifi::framegen::install(reinterpret_cast<void *>(create_factory1), why), "the setting on: the factory's swap chain calls through ours" + (why.empty() ? "" : ": " + why));
 	{
 		HWND tiny = make_window(64, 64);
@@ -248,10 +250,12 @@ int main()
 	std::string prepare_why;
 	// count frames as the game draws them at the swap chain's size w x h: FSR 2's frame prepared (unless without_fsr2),
 	// generation turned on or off as the game thread's present does, then presented; the frames prepared and presented
-	auto run = [&](UINT count, UINT w, UINT h, bool without_fsr2, uint32_t &prepared, uint32_t &presented) {
+	auto run = [&](UINT count, UINT w, UINT h, bool without_fsr2, uint32_t &prepared, uint32_t &presented, const std::function<bool()> &until = nullptr) {
 		prepared = presented = 0;
 		for (UINT f = 0; f < count; ++f)
 		{
+			if (until && until())
+				break;
 			const UINT index = chain->GetCurrentBackBufferIndex();
 			ID3D12Resource *buffer = nullptr;
 			if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer))))
@@ -432,6 +436,42 @@ int main()
 		run(20, 1280, 720, false, prepared, presented);
 		const counts on = counted();
 		check(prepared == 20 && on.made - off.made >= 18 && on.switches == off.switches + 1, "the setting on again: at once (" + std::to_string(on.made - off.made) + " made between)");
+	}
+	// Automatic: generation only while the game runs below half the refresh rate. The refresh rate given as twice 0.8
+	// of this loop's own frame rate with generation on: the game at or above half, generation off within a few seconds;
+	// then three times it: the game well below half, on again (each change at least 5 s after the last)
+	{
+		uint32_t n = 0;
+		const ULONGLONG t0 = GetTickCount64();
+		run(60, 1280, 720, false, prepared, presented);
+		const double fps = 60.0 * 1000.0 / double(std::max<ULONGLONG>(1, GetTickCount64() - t0 - 200));
+		auto off_now = [&]() { const std::vector<std::string> st = hifi::framegen::status(); return st.size() > 1 && st[1].find("off (automatic") != std::string::npos; };
+		auto on_now = [&]() { const std::vector<std::string> st = hifi::framegen::status(); return st.size() > 1 && st[1].find("on (automatic") != std::string::npos; };
+		hifi::framegen::set_refresh_for_tests(uint32_t(2.0 * 0.8 * fps + 0.5));
+		hifi::framegen::set_automatic(true);
+		const ULONGLONG t1 = GetTickCount64();
+		run(100000, 1280, 720, false, prepared, presented, [&]() { return off_now() || GetTickCount64() - t1 > 12000; });
+		const ULONGLONG went_off = GetTickCount64() - t1;
+		const counts a = counted();
+		check(off_now() && went_off >= 2500, "automatic, the game at or above half the refresh rate (" + std::to_string(int(fps)) + " fps, " +
+			std::to_string(uint32_t(2.0 * 0.8 * fps + 0.5)) + " Hz): generation off after " + std::to_string(went_off) + " ms");
+		// (its frame rate alone now: generation costs WARP far more than a GPU)
+		const ULONGLONG t_alone = GetTickCount64();
+		run(60, 1280, 720, false, prepared, presented);
+		const double alone = 60.0 * 1000.0 / double(std::max<ULONGLONG>(1, GetTickCount64() - t_alone - 200));
+		hifi::framegen::set_refresh_for_tests(uint32_t(2.0 * 3.0 * alone + 0.5));
+		const ULONGLONG t2 = GetTickCount64();
+		run(100000, 1280, 720, false, prepared, presented, [&]() { return on_now() || GetTickCount64() - t2 > 15000; });
+		const ULONGLONG went_on = GetTickCount64() - t2;
+		const counts b2 = counted();
+		run(20, 1280, 720, false, prepared, presented);
+		const counts c2 = counted();
+		check(on_now() && went_on >= 1500 && c2.made > b2.made && c2.failed == 0, "the game well below half (" + std::to_string(uint32_t(2.0 * 3.0 * alone + 0.5)) +
+			" Hz): on again after " + std::to_string(went_on) + " ms, frames made between again");
+		(void)a;
+		(void)n;
+		hifi::framegen::set_refresh_for_tests(0);
+		hifi::framegen::set_automatic(false);
 	}
 
 	const uint32_t errors = debug_messages(info, why);

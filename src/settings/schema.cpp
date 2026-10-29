@@ -270,6 +270,11 @@ namespace hifi::settings
 				"244 Hz) and answers a little later, so it pays most where the game runs below that. Turning it on takes effect "
 				"the next time the game starts; off right away. (/hifi upscale framegen)", nullptr, "upscale.temporal", false,
 				{ 0.0f, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
+			{ "upscale.framegen_auto", tab::upscaling, "Frame generation", "Only while the game runs below half the refresh rate",
+				"Frames are made between only while the game runs slower than half the screen's refresh rate (122 at 244 Hz), "
+				"where doubling them fills the screen; when it can run faster alone, it does (every frame a real one, answering "
+				"sooner). Checked every few seconds, so it doesn't flicker on and off.", nullptr, "upscale.framegen", false,
+				{ _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 
 			// Advanced
 			{ "GrassHue", tab::advanced, "Grass colour", "Grass colour where the ground hasn't been seen",

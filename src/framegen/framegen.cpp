@@ -49,6 +49,8 @@ namespace hifi::framegen
 			void (*log)(int, const char *) = nullptr;
 			std::atomic<bool> wanted{ false }; // (the setting at the start)
 			std::atomic<bool> on{ false };     // (and now)
+			std::atomic<bool> automatic{ true }; // (only while the game runs below half the refresh rate)
+			std::atomic<uint32_t> refresh_override{ 0 }; // (tests: the screen's refresh rate; 0 its monitor's)
 		};
 		state g;
 		thread_local int t_inside = 0; // (AMD's code making the real swap chain: straight to DXGI)
@@ -109,13 +111,23 @@ namespace hifi::framegen
 			uint64_t dispatch_id = 0;
 			uint64_t prepared_at = 0;  // (GetTickCount64 of the last prepare())
 			bool enabled = false;      // (as last told to AMD's swap chain, from present())
+			// Automatic (present()): the game's frame rate (its presents, smoothed), the screen's refresh rate (its
+			// window's monitor, read every 5 s), whether generation is wanted for it, since when what would change that
+			// has held, and when it last changed
+			HWND hwnd = nullptr;
+			uint32_t refresh = 0;
+			uint64_t refresh_at = 0;
+			LARGE_INTEGER last_present = {};
+			double fps = 0.0;
+			bool auto_wants = true;
+			uint64_t auto_since = 0, auto_switched = 0;
 			uint32_t prepares = 0, generated = 0, repeated = 0, failed = 0, switches = 0;
 			ID3D12Resource *last_output = nullptr;
 			std::string why;
 		};
 		generation gen;
 
-		void keep_swapchain(FfxSwapchain made, ID3D12CommandQueue *queue, UINT width, UINT height, DXGI_FORMAT format)
+		void keep_swapchain(FfxSwapchain made, ID3D12CommandQueue *queue, UINT width, UINT height, DXGI_FORMAT format, HWND hwnd)
 		{
 			std::lock_guard<std::mutex> lock(gen.mutex);
 			// (a swap chain made again: the kits made for the last are left, not destroyed under it)
@@ -134,6 +146,8 @@ namespace hifi::framegen
 			gen.sw = width;
 			gen.sh = height;
 			gen.format = format;
+			gen.hwnd = hwnd;
+			gen.refresh_at = 0;
 		}
 
 		bool patch(void **slot, void *to, void **was)
@@ -187,7 +201,7 @@ namespace hifi::framegen
 				t_inside--;
 				IDXGISwapChain4 *const chain = e == FFX_OK ? ffxGetDX12SwapchainPtr(made) : nullptr;
 				if (chain != nullptr)
-					keep_swapchain(made, queue, desc->Width, desc->Height, desc->Format);
+					keep_swapchain(made, queue, desc->Width, desc->Height, desc->Format, hwnd);
 				queue->Release();
 				if (chain != nullptr)
 				{
@@ -217,7 +231,7 @@ namespace hifi::framegen
 				t_inside--;
 				IDXGISwapChain4 *const chain = e == FFX_OK ? ffxGetDX12SwapchainPtr(made) : nullptr;
 				if (chain != nullptr)
-					keep_swapchain(made, queue, desc->BufferDesc.Width, desc->BufferDesc.Height, desc->BufferDesc.Format);
+					keep_swapchain(made, queue, desc->BufferDesc.Width, desc->BufferDesc.Height, desc->BufferDesc.Format, desc->OutputWindow);
 				queue->Release();
 				if (chain != nullptr)
 				{
@@ -490,6 +504,54 @@ namespace hifi::framegen
 		return true;
 	}
 
+	namespace
+	{
+		// (gen.mutex held) The screen's refresh rate: the game window's monitor's, read again every 5 s; 0 unknown
+		uint32_t refresh_rate(uint64_t now)
+		{
+			if (const uint32_t forced = g.refresh_override.load())
+				return gen.refresh = forced;
+			if (gen.refresh_at != 0 && now - gen.refresh_at < 5000)
+				return gen.refresh;
+			gen.refresh_at = now;
+			gen.refresh = 0;
+			MONITORINFOEXW mi = {};
+			mi.cbSize = sizeof(mi);
+			DEVMODEW dm = {};
+			dm.dmSize = sizeof(dm);
+			if (gen.hwnd != nullptr && GetMonitorInfoW(MonitorFromWindow(gen.hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
+				EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+				gen.refresh = dm.dmDisplayFrequency;
+			return gen.refresh;
+		}
+
+		// (gen.mutex held) Automatic: generation wanted while the game runs below half the refresh rate. With it on, the
+		// game's held at about half (each of its frames shown twice): at 96% of half or more for 3 s, off, to see what it
+		// runs at alone; with it off, below 90% of half for 2 s, on. Not changed again within 5 s of the last change.
+		bool automatic_wants(uint64_t now)
+		{
+			const uint32_t hz = refresh_rate(now);
+			if (hz == 0 || gen.fps <= 0.0)
+				return gen.auto_wants;
+			const double half = hz * 0.5;
+			const bool change = gen.auto_wants ? gen.fps >= 0.96 * half : gen.fps < 0.90 * half;
+			if (!change)
+			{
+				gen.auto_since = 0;
+				return gen.auto_wants;
+			}
+			if (gen.auto_since == 0)
+				gen.auto_since = now;
+			if (now - gen.auto_since >= (gen.auto_wants ? 3000u : 2000u) && now - gen.auto_switched >= 5000)
+			{
+				gen.auto_wants = !gen.auto_wants;
+				gen.auto_switched = now;
+				gen.auto_since = 0;
+			}
+			return gen.auto_wants;
+		}
+	}
+
 	void present()
 	{
 		FfxFrameGenerationConfig c = {};
@@ -497,9 +559,22 @@ namespace hifi::framegen
 			std::lock_guard<std::mutex> lock(gen.mutex);
 			if (!g.installed || gen.swapchain == nullptr)
 				return;
-			// (on while FSR 2 hands its frames over and the setting's on; off a second after the last, else each frame is
-			// shown twice)
-			const bool want = g.on.load() && gen.now != nullptr && GetTickCount64() - gen.prepared_at < 1000;
+			// (the game's frame rate from its presents, smoothed over about half a second)
+			LARGE_INTEGER t, f;
+			QueryPerformanceCounter(&t);
+			QueryPerformanceFrequency(&f);
+			if (gen.last_present.QuadPart != 0)
+			{
+				const double dt = double(t.QuadPart - gen.last_present.QuadPart) / double(f.QuadPart);
+				if (dt > 0.0 && dt < 0.5)
+					gen.fps = gen.fps <= 0.0 ? 1.0 / dt : gen.fps + (1.0 / dt - gen.fps) * std::min(1.0, dt / 0.5);
+			}
+			gen.last_present = t;
+			const uint64_t now = GetTickCount64();
+			// (on while FSR 2 hands its frames over and the setting's on, automatic: while the game runs below half the
+			// refresh rate; off a second after FSR 2's last frame, else each frame is shown twice)
+			const bool fsr2 = g.on.load() && gen.now != nullptr && now - gen.prepared_at < 1000;
+			const bool want = fsr2 && (!g.automatic.load() || automatic_wants(now));
 			if (want == gen.enabled)
 				return;
 			gen.enabled = want;
@@ -518,8 +593,8 @@ namespace hifi::framegen
 		if (g.log != nullptr)
 		{
 			char text[160];
-			std::snprintf(text, sizeof(text), "HiFi XI: frame generation turned %s%s (the game's thread waited %llu ms)", c.frameGenerationEnabled ? "on" : "off",
-				c.frameGenerationEnabled ? "" : " (no FSR 2 frames for a second, or the setting off)", GetTickCount64() - asked);
+			std::snprintf(text, sizeof(text), "HiFi XI: frame generation turned %s (the game at %.0f fps, the screen %u Hz; the game's thread waited %llu ms)",
+				c.frameGenerationEnabled ? "on" : "off", gen.fps, gen.refresh, GetTickCount64() - asked);
 			g.log(GetTickCount64() - asked > 250 ? 1 : 0, text);
 		}
 		if (e != FFX_OK)
@@ -557,6 +632,16 @@ namespace hifi::framegen
 	void set_on(bool on)
 	{
 		g.on = on;
+	}
+
+	void set_automatic(bool on)
+	{
+		g.automatic = on;
+	}
+
+	void set_refresh_for_tests(uint32_t hz)
+	{
+		g.refresh_override = hz;
 	}
 
 	bool install(void *create_factory1, std::string &why, void (*log)(int, const char *))
@@ -602,9 +687,20 @@ namespace hifi::framegen
 		if (g.installed)
 		{
 			std::lock_guard<std::mutex> glock(gen.mutex);
+			char state[160];
+			if (!g.on.load())
+				std::snprintf(state, sizeof(state), "off (turned off: on again at once from the menu)");
+			else if (gen.now == nullptr)
+				std::snprintf(state, sizeof(state), "contexts not made");
+			else if (!gen.enabled && GetTickCount64() - gen.prepared_at >= 1000)
+				std::snprintf(state, sizeof(state), "off (no FSR 2 frames)");
+			else if (!gen.enabled)
+				std::snprintf(state, sizeof(state), "off (automatic: the game runs %.0f fps, at or above half the screen's %u Hz)", gen.fps, gen.refresh);
+			else
+				std::snprintf(state, sizeof(state), "on%s, %s", g.automatic.load() ? " (automatic: the game below half the screen's refresh rate)" : "",
+					gen.apart ? "the UI kept apart" : "the UI moved with the world (FSR 2's picture isn't the screen's size)");
 			std::snprintf(line, sizeof(line), "frame generation: %s; %u frames prepared, %u made between, %u shown twice, %u failed, turned on/off %u times%s%s",
-				!g.on.load() ? "off (turned off: on again at once from the menu)" : gen.now == nullptr ? "contexts not made" : !gen.enabled ? "off (no FSR 2 frames)" : gen.apart ? "on, the UI kept apart" : "on, the UI moved with the world (FSR 2's picture isn't the screen's size)",
-				gen.prepares, gen.generated, gen.repeated, gen.failed, gen.switches, gen.why.empty() ? "" : ": ", gen.why.c_str());
+				state, gen.prepares, gen.generated, gen.repeated, gen.failed, gen.switches, gen.why.empty() ? "" : ": ", gen.why.c_str());
 			lines.push_back(line);
 		}
 		return lines;
