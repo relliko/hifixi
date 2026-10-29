@@ -326,7 +326,9 @@ int main(int argc, char **argv)
 	const bool look_only = argc > 1 && std::strcmp(argv[1], "look") == 0;
 	// ("lamps": the blades' first sections, then only the lamps' own, 1p below)
 	const bool lamps_only = argc > 1 && std::strcmp(argv[1], "lamps") == 0;
-	const char *path = argc > 1 && !clouds_only && !look_only && !lamps_only ? argv[1] : "build\\testdata\\grass\\100.bin";
+	// ("shadows": only the blades' first section, then the sun's shadows, 1j to 1o4: quick while working on them)
+	const bool shadows_only = argc > 1 && std::strcmp(argv[1], "shadows") == 0;
+	const char *path = argc > 1 && !clouds_only && !look_only && !lamps_only && !shadows_only ? argv[1] : "build\\testdata\\grass\\100.bin";
 	std::setvbuf(stdout, nullptr, _IONBF, 0); // (each line out as it's printed: a crash shows where it was)
 
 	compile_fn = reinterpret_cast<pD3DCompile>(GetProcAddress(LoadLibraryW(L"d3dcompiler_47.dll"), "D3DCompile"));
@@ -971,6 +973,7 @@ int main(int argc, char **argv)
 	// there, before the characters and effects): an effect drawn after them (depth-tested, no depth written, as the
 	// game's) stays on top of them; a character standing just behind a blade is hidden by it where the blade is in
 	// front, and seen beside it; the world's end then draws the rest (look::phase_t::rest) without blades again
+	if (!shadows_only)
 	{
 		ID3D12PipelineState *quad_pso = nullptr;
 		ID3D12RootSignature *quad_root = nullptr;
@@ -1125,6 +1128,7 @@ int main(int argc, char **argv)
 	}
 	// 1c. Pushed aside: someone standing on the looked-at blade changes the picture there (the tufts around
 	// bend away and flatten), and only around there
+	if (!shadows_only)
 	{
 		auto frame = [&](const float *who, uint32_t count) {
 			fresh_memory();
@@ -1178,6 +1182,7 @@ int main(int argc, char **argv)
 	// - A weapon skill's cut (a circle 1.5 yalms round the blade, just made) leaves stubs: far fewer green pixels there from
 	//   the next frame, the same away from it; growing back, more after 2 minutes, all after 4. A cut over kCutKeep old
 	//   is left out; and with no wear and no cut, the picture is as without a clock at all.
+	if (!shadows_only)
 	{
 		auto frame = [&](double clock, const float *who, uint32_t count, uint32_t fighting, const float *cuts, uint32_t cut_count, float wear, draw_stats *st = nullptr) {
 			const float ground[4] = { 0.35f, 0.3f, 0.2f, 0.5f };
@@ -1309,6 +1314,7 @@ int main(int argc, char **argv)
 
 	// 1d. Fireflies at night: added light only (nothing darker than the same frame by day), somewhere over the
 	// grass at some moment, none behind the near wall, the world's alpha untouched; with the grass off too
+	if (!shadows_only)
 	{
 		auto frame = [&](float night, float time, bool blades, draw_stats &st, float hours = 1.0f, float rain = 0.0f) {
 			fresh_memory();
@@ -1393,6 +1399,7 @@ int main(int argc, char **argv)
 	// 1d. What stands in front of a root isn't its ground: blades learn the ground, then someone reddish (as
 	// bright, so it isn't a sudden change) stands over the root for 30 frames, nearer the camera; when they
 	// step away, the blades there are the colour they were, not tinted red
+	if (!shadows_only)
 	{
 		const D3D12_RECT over = { LONG(px) - 40, LONG(py) - 50, LONG(px) + 40, LONG(py) + 20 };
 		auto frame = [&](bool someone) {
@@ -1445,6 +1452,7 @@ int main(int argc, char **argv)
 
 	// 1e. Bright specks at the ground's own depth (a name's glyphs, drawn into the world): white stripes over a
 	// half of the ground around the root don't make the blades there lighter than on plain ground
+	if (!shadows_only)
 	{
 		std::vector<D3D12_RECT> stripes;
 		for (LONG x = LONG(px) - 60; x < LONG(px) + 60; x += 2)
@@ -1488,6 +1496,7 @@ int main(int argc, char **argv)
 
 	// 1g. A closer view wins: blades first seen from 20 yalms on light (fog-lit) ground, then from the usual 5
 	// on dark ground, are dark within 20 frames (a fifth of a second), nearly as if they'd only ever been seen up close
+	if (!shadows_only)
 	{
 		const vec3 far_eye = { at.x + 16.0f, at.y - 6.0f, at.z + 12.0f };
 		camera far_cam;
@@ -1539,6 +1548,7 @@ int main(int argc, char **argv)
 	// 1h. The shading pass (grass off): flat plain ground comes out as it went in; ground just below
 	// something standing on it is darker (ambient occlusion), ground away from it isn't; striped ground has
 	// more contrast with surface relief on than off
+	if (!shadows_only)
 	{
 		const float plain[4] = { 0.45f, 0.42f, 0.36f, 0.5f }, dark_box[4] = { 0.2f, 0.2f, 0.2f, 0.5f };
 		// Something standing on the ground behind the root on screen: a box of the depth a tenth of the way to the
@@ -1610,6 +1620,7 @@ int main(int argc, char **argv)
 	// 1i. Shaders replaced while running (worldfx.hlsl next to the add-on): a source that doesn't compile is
 	// refused and the ones in use stay; one that does is drawn with from the next draw (here a shading pass
 	// painting the world magenta); then the built-in ones again
+	if (!shadows_only)
 	{
 		std::string source;
 		if (FILE *f = nullptr; fopen_s(&f, "src\\render\\grass.hlsl", "rb") == 0 && f != nullptr)
@@ -2519,7 +2530,7 @@ int main(int argc, char **argv)
 		std::printf("\n");
 		std::printf("  shadow map: the sun behind a slab off screen: looked-at ground %.1f without the map, %.1f with it; 55 yalms out %.1f, %.1f; beside the shadow %.1f, %.1f far out; drew cascades %u (%u triangles)\n",
 			here_off, here_on, far_off, far_on, side_on, far_side_on, first.sun_map_cascades, first.sun_map_triangles);
-		check(first.sun_map && first.sun_map_cascades == 3 && first.sun_map_triangles == 12, "the map drawn (both cascades, the far-off square left out) and read");
+		check(first.sun_map && first.sun_map_cascades == 7 && first.sun_map_triangles == 18, "the map drawn (all three cascades, the far-off square left out) and read");
 		// The light in the air (look::vol_*), the sun behind the slab: the air lit where the sun reaches it, not in the slab's
 		// shadow. The fog alone (its air black, no light) dims what's behind it; the sun's light added on top of that is the
 		// shafts: more over ground beside the shadow, seen through lit air, than far out along it, seen through shadowed air.
@@ -2766,9 +2777,9 @@ int main(int argc, char **argv)
 			std::printf("  the host's zone: looked-at ground %.1f, 4 yalms beside %.1f (went in %.1f); cascades drawn by it %u (stats %u, host %d); then %u for the same data, %u for new data; the sun behind the slab: %.1f with the host, %.1f with the meshes (host %d)\n",
 				here_hosted, beside_hosted, plain_luma, first_draws, first_host.sun_map_cascades, first_host.sun_map_host ? 1 : 0, still, new_data, slab_with_host, slab_with_meshes,
 				meshes_back.sun_map_host ? 1 : 0);
-			check(first_host.sun_map && first_host.sun_map_host && first_draws == 2 && first_host.sun_map_cascades == 3 && first_host.sun_map_triangles == 4, "with the host's zone, both cascades drawn by it");
+			check(first_host.sun_map && first_host.sun_map_host && first_draws == 3 && first_host.sun_map_cascades == 7 && first_host.sun_map_triangles == 6, "with the host's zone, all three cascades drawn by it");
 			check(here_hosted > 0.0 && here_hosted < plain_luma * 0.8 && beside_hosted > 0.0 && std::fabs(beside_hosted - plain_luma) < 1.5, "what it draws shadows the ground behind it, not beside it");
-			check(still == 0 && new_data == 3, "drawn again for new data (both cascades), not for the same");
+			check(still == 0 && new_data == 7, "drawn again for new data (all three cascades), not for the same");
 			check(slab_with_host > 0.0 && std::fabs(slab_with_host - plain_luma) < 1.5 && slab_with_meshes < plain_luma * 0.6 && !meshes_back.sun_map_host,
 				"the uploaded meshes aren't drawn while the host has the zone, and are again once it hasn't");
 		}
@@ -3101,12 +3112,13 @@ int main(int argc, char **argv)
 		};
 		// Two seconds of the sun turning, 60 frames a second, without and with the clock: the ground's change from frame
 		// to frame under the card, and the drawings of each cascade
+		uint32_t farthest_draws = 0;
 		auto run = [&](bool timed, uint32_t &near_draws, uint32_t &far_draws, std::vector<float> *fades) {
 			check(r.upload_shadow(zone, error), "the coarse-leaved card's meshes uploaded");
 			std::vector<double> before;
 			double change = 0.0;
 			size_t n = 0;
-			near_draws = far_draws = 0;
+			near_draws = far_draws = farthest_draws = 0;
 			for (int f = 0; f < 132; ++f)
 			{
 				const double clock = 100.0 + f / 60.0;
@@ -3115,6 +3127,7 @@ int main(int argc, char **argv)
 				{
 					near_draws += st.sun_map_cascades & 1;
 					far_draws += (st.sun_map_cascades >> 1) & 1;
+					farthest_draws += (st.sun_map_cascades >> 2) & 1;
 					for (size_t i = 0; i < now.size() && i < before.size(); ++i)
 						change += std::fabs(now[i] - before[i]);
 					n += now.size();
@@ -3129,10 +3142,10 @@ int main(int argc, char **argv)
 		std::vector<float> fades;
 		const double change_old = run(false, near_old, far_old, nullptr);
 		const double change_new = run(true, near_new, far_new, &fades);
-		std::printf("  the map in two seconds of the sun turning: near cascade drawn %u times, far %u, the ground under the leaves changing %.3f a pixel a frame; with the clock: %u, %u, %.3f\n",
-			near_old, far_old, change_old, near_new, far_new, change_new);
+		std::printf("  the map in two seconds of the sun turning: near cascade drawn %u times, far %u, the ground under the leaves changing %.3f a pixel a frame; with the clock: %u, %u (farthest %u), %.3f\n",
+			near_old, far_old, change_old, near_new, far_new, farthest_draws, change_new);
 		check(near_old >= 15, "without the clock: the near cascade drawn again each time the sun has turned a little (10 a second here)");
-		check(near_new <= 3 && far_new <= 3 && near_new >= 1, "with it: about once a second");
+		check(near_new <= 3 && far_new <= 3 && near_new >= 1 && farthest_draws <= 2, "with it: about once a second (the farthest cascade no more often)");
 		check(change_new < 0.35 * change_old, "and the leaves' edges change far less from frame to frame (faded, not flipped)");
 		// (the fade after the first drawing with the clock past the start: 0 at it, halfway half a second on)
 		size_t drawn = 0;
@@ -3163,6 +3176,177 @@ int main(int argc, char **argv)
 		check(settled_fade == 1.0f && most <= 1, "the fade ends on the picture a single drawing gives");
 		r.unload_shadow();
 		check(g.report_messages() == 0, "no debug-layer errors (the map faded between drawings)");
+	}
+
+	// 1o4. Soft by distance, and further (the map's contact hardening, grass.hlsl kSunSpread, and its farthest cascade):
+	// over the ground sheet, two opaque plates 19 yalms square with an edge on the same line a yalm to the left of the
+	// looked-at point (across x), one a yalm over the ground (on the near side of the looked-at point along z), the other
+	// 80 over it (on the far side); and, 250 yalms out from the looked-at point away from the camera, a slab 40 yalms long
+	// (along the view), 30 tall, standing 6 yalms to its right.
+	// - The sun overhead: each plate's shadow's edge on the ground, from wholly shaded to lit (10 to 90 %): under the low
+	//   plate as sharp as the map's 4 x 4 filter and shade_ps's blur make it, with or without the contact hardening
+	//   (kSunSpread 0: the shaders before); under the high one wider (a penumbra half a yalm each way), and wider than the
+	//   low one's; both whole inside. (Here, 640 x 360, the sun pass's half size and shade_ps's 4 x 4 blur alone make an
+	//   edge half a yalm wide: a canopy 25 yalms up hardly shows past that, as it would at 2560 x 1440.)
+	// - The sun 59 degrees up from the right, the camera 100 yalms up looking at the ground 250 yalms out (255 yalms across
+	//   the sun's rays from it: past the far cascade's 160, in the farthest's 600): the slab's shadow shades that ground,
+	//   ground 25 yalms past its far end isn't.
+	{
+		const float plain[4] = { 0.45f, 0.42f, 0.36f, 0.5f };
+		const vec3 dh = normalize({ eye.x - at.x, 0.0f, eye.z - at.z }), side = { -dh.z, 0.0f, dh.x };
+		auto along = [&](float d, float s, float up) { return vec3 { at.x + dh.x * d + side.x * s, at.y - up, at.z + dh.z * d + side.z * s }; };
+		shadow_file zone;
+		zone.zone = 996;
+		auto corner = [&](const vec3 &v) {
+			uint32_t bits[3];
+			std::memcpy(bits, &v, 12);
+			zone.triangles.insert(zone.triangles.end(), { bits[0], bits[1], bits[2], 0u });
+		};
+		auto quad = [&](const vec3 &a, const vec3 &b, const vec3 &c, const vec3 &d) {
+			corner(a), corner(b), corner(c);
+			corner(a), corner(c), corner(d);
+		};
+		quad(along(3000, 3000, 0), along(3001, 3000, 0), along(3001, 3001, 0), along(3000, 3001, 0));
+		zone.cells.push_back({ 90, 90, 0, zone.triangle_count() });
+		quad(along(-400, -400, 0), along(400, -400, 0), along(400, 400, 0), along(-400, 400, 0)); // the ground
+		zone.cells.push_back({ 0, 0, 2, 2 });
+		quad({ at.x - 20, at.y - 1, at.z - 20 }, { at.x - 1, at.y - 1, at.z - 20 }, { at.x - 1, at.y - 1, at.z }, { at.x - 20, at.y - 1, at.z }); // the low plate
+		zone.cells.push_back({ 1, 0, 4, 2 });
+		quad({ at.x - 20, at.y - 80, at.z }, { at.x - 1, at.y - 80, at.z }, { at.x - 1, at.y - 80, at.z + 20 }, { at.x - 20, at.y - 80, at.z + 20 }); // the high one
+		zone.cells.push_back({ 2, 0, 6, 2 });
+		quad(along(-270, 6, 0), along(-230, 6, 0), along(-230, 6, 30), along(-270, 6, 30)); // the slab
+		zone.cells.push_back({ 3, 0, 8, 2 });
+		check(r.upload_shadow(zone, error), "plates and a far slab uploaded for the shadow map");
+		draw_stats st;
+		auto frame = [&](const camera &c, const vec3 &to_sun) {
+			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
+			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			ground_depth(c);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			look l2 = l;
+			l2.grass = false;
+			l2.ao_strength = 0.0f;
+			l2.relief = 0.0f;
+			l2.water = false;
+			l2.sun[0] = to_sun.x;
+			l2.sun[1] = to_sun.y;
+			l2.sun[2] = to_sun.z;
+			l2.sun_shadow = 0.6f;
+			l2.sun_map = true;
+			st = r.draw(g.list, t, c, l2, error);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			std::vector<uint8_t> img = g.read(world, 4);
+			r.release_old(0);
+			return img;
+		};
+		auto luma_at = [&](const std::vector<uint8_t> &img, const camera &c, const vec3 &v, int rx, int ry) {
+			float m[16];
+			multiply(c.view, c.proj, m);
+			const float x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12], y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
+			const float w = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
+			const int sx = int((x / w + 1.0f) * 0.5f * W), sy = int((1.0f - y / w) * 0.5f * H);
+			if (w <= 0.0f || sx < rx || sy < ry || sx >= int(W) - rx || sy >= int(H) - ry)
+				return -1.0;
+			double sum = 0.0;
+			int n = 0;
+			for (int yy = sy - ry; yy <= sy + ry; ++yy)
+				for (int xx = sx - rx; xx <= sx + rx; ++xx)
+				{
+					const uint8_t *c8 = &img[(size_t(yy) * W + xx) * 4];
+					sum += 0.3 * c8[0] + 0.59 * c8[1] + 0.11 * c8[2];
+					n++;
+				}
+			return sum / n;
+		};
+		const double plain_luma = 0.3 * 0.45 * 255 + 0.59 * 0.42 * 255 + 0.11 * 0.36 * 255;
+		// (a plate's shadow edge along x at z: how wide from 10 to 90 % of the way from its inside, 3 yalms in, to lit, yalms;
+		// and how dark inside)
+		auto edge = [&](const std::vector<uint8_t> &img, float z, double &inside) {
+			inside = luma_at(img, cam, { at.x - 4.0f, at.y, z }, 1, 1);
+			const double lit = plain_luma;
+			float x10 = -100.0f, x90 = -100.0f; // (-100: not crossed yet)
+			for (int i = 0; i <= 100; ++i)
+			{
+				const float x = -2.5f + 0.03f * i; // (from 1.5 yalms in under the plate to 1.5 out)
+				const double v = luma_at(img, cam, { at.x + x, at.y, z }, 0, 0);
+				if (v < 0.0)
+					return -1.0f;
+				if (x10 < -50.0f && v > inside + 0.1 * (lit - inside))
+					x10 = x;
+				if (x90 < -50.0f && v > inside + 0.9 * (lit - inside))
+					x90 = x;
+			}
+			return x10 > -50.0f && x90 > -50.0f ? x90 - x10 : -1.0f;
+		};
+		const vec3 overhead = { 0.0f, -1.0f, 0.0f };
+		auto edges = [&](float &low, float &high, double &low_in, double &high_in) {
+			frame(cam, overhead);
+			const std::vector<uint8_t> img = frame(cam, overhead);
+			low = edge(img, at.z - 1.5f, low_in);
+			high = edge(img, at.z + 1.5f, high_in);
+		};
+		float low = 0.0f, high = 0.0f, low_before = 0.0f, high_before = 0.0f;
+		double low_in = 0.0, high_in = 0.0, low_in_before = 0.0, high_in_before = 0.0;
+		edges(low, high, low_in, high_in);
+		std::string source;
+		if (FILE *f = nullptr; fopen_s(&f, "src\\render\\grass.hlsl", "rb") == 0 && f != nullptr)
+		{
+			char buffer[4096];
+			size_t got;
+			while ((got = fread(buffer, 1, sizeof(buffer), f)) != 0)
+				source.append(buffer, got);
+			fclose(f);
+		}
+		const std::string marker = "static const float kSunSpread = 0.006545;";
+		const size_t at_marker = source.find(marker);
+		check(at_marker != std::string::npos, "kSunSpread found in the shaders' source");
+		if (at_marker != std::string::npos)
+		{
+			std::string point_sun = source;
+			point_sun.replace(at_marker, marker.size(), "static const float kSunSpread = 0.0;");
+			grass::shader_code code;
+			bool from_cache = false;
+			std::string why;
+			const bool compiled = grass::compile_shaders(point_sun, L"build\\test\\variant-cache", code, from_cache, why);
+			check(compiled, "the shaders without contact hardening compile");
+			if (compiled)
+			{
+				r.set_shader_code(std::move(code));
+				edges(low_before, high_before, low_in_before, high_in_before);
+			}
+			grass::shader_code restored;
+			if (grass::compile_shaders(source, L"build\\test\\variant-cache", restored, from_cache, why))
+				r.set_shader_code(std::move(restored));
+		}
+		std::printf("  the sun overhead, plates' shadow edges (10 to 90 %%, yalms): a yalm up %.3f, 80 up %.3f (inside %.1f, %.1f); without contact hardening %.3f, %.3f (inside %.1f, %.1f)\n",
+			low, high, low_in, high_in, low_before, high_before, low_in_before, high_in_before);
+		check(low > 0.0f && high > 0.0f && low_in < plain_luma * 0.75 && std::fabs(high_in - low_in) < 2.0, "both plates shade the ground under them wholly");
+		check(low_before > 0.0f && std::fabs(low - low_before) < 0.03f, "a yalm up: as sharp as before");
+		check(high > high_before + 0.2f && high > low + 0.15f, "80 up: wider, as far above as it is (a disc 0.52 yalms each way: 0.65 from 10 to 90 %)");
+
+		// The farthest cascade
+		camera up_high = cam;
+		const vec3 out = along(-250, 0, 0);
+		look_at({ at.x, at.y - 100.0f, at.z }, out, { 0.0f, -1.0f, 0.0f }, up_high.view);
+		const float e = 59.0f * 3.14159265f / 180.0f;
+		const vec3 from_right = normalize({ side.x * std::cos(e), -std::sin(e), side.z * std::cos(e) });
+		frame(up_high, from_right);
+		const std::vector<uint8_t> img = frame(up_high, from_right);
+		const double out_on = luma_at(img, up_high, out, 2, 2), past = luma_at(img, up_high, along(-295, 0, 0), 2, 2);
+		std::printf("  the camera 100 yalms up, ground 250 yalms out in the far slab's shadow %.1f, 25 yalms past its end %.1f (went in %.1f); farthest cascade faded in %.2f\n",
+			out_on, past, plain_luma, st.sun_map_fade[2]);
+		check(out_on > 0.0 && out_on < plain_luma * 0.75 && past > 0.0 && std::fabs(past - plain_luma) < 2.0, "past the far cascade, the farthest one's shadows: there, not beside");
+		r.unload_shadow();
+		check(g.report_messages() == 0, "no debug-layer errors (soft by distance, and further)");
+	}
+
+	if (shadows_only)
+	{
+		r.unload();
+		r.release_old(0);
+		std::printf(failures == 0 ? "\nall passed (shadows)\n" : "\n%d failed (shadows)\n", failures);
+		return failures == 0 ? 0 : 1;
 	}
 
 	// 1l. The water view: the zone's water collision over the world, each spot tinted by whether what's drawn
