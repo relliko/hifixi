@@ -13,6 +13,7 @@
 #include "upscale.hpp"
 #include "../render/grass_render.hpp"
 #include "../zone/inject.hpp"
+#include "../render/worldfx_core.hpp"
 #include "temporal.hpp"
 #include "fsr2_shaders.hpp"
 #include "fsr2/ffx_fsr2.h"
@@ -111,6 +112,7 @@ namespace hifi::upscale
 			std::vector<std::pair<std::unique_ptr<temporal::context>, ULONGLONG>> fsr2_old;
 			UINT want_rw = 0, want_rh = 0; // (A's size, asked for by dgVoodoo's thread for FSR 2)
 			uint32_t last_seq = 0;
+			uint64_t blade_frames = 0; // (World FX's count of frames its blades wrote their motion: a new one, this frame's)
 			LARGE_INTEGER last_qpc = {};
 			uint64_t fsr2_drawn = 0, fsr2_skipped = 0;
 			std::string fsr2_why, fsr2_failed;
@@ -352,8 +354,14 @@ namespace hifi::upscale
 			// (a zone pass missed: a zone change, a load, a camera cut: start over)
 			const bool reset = c.seq != g.last_seq + 1;
 			g.last_seq = c.seq;
+			// (the blades' own motion, when World FX's blades wrote it this frame)
+			ID3D12Resource *blades = nullptr;
+			uint64_t blade_frames = 0;
+			if (worldfx::blade_motion(blades, blade_frames) && blade_frames == g.blade_frames)
+				blades = nullptr;
+			g.blade_frames = blade_frames;
 			std::string fail;
-			const bool drawn = g.fsr2->record(list, l.world, l.world_state, depth, planes[0], cam, std::clamp(g.sharpen.load(), 0.0f, 1.0f), dt, reset, fail);
+			const bool drawn = g.fsr2->record(list, l.world, l.world_state, depth, planes[0], blades, cam, std::clamp(g.sharpen.load(), 0.0f, 1.0f), dt, reset, fail);
 			if (drawn)
 			{
 				// Its picture onto the back buffer
@@ -682,10 +690,10 @@ namespace hifi::upscale
 			uint32_t shaders = 0;
 			double ms = 0.0;
 			fsr2_shaders::stats(shaders, ms);
-			std::snprintf(line, sizeof(line), "upscale: FSR 2 %s; %llu frames drawn, %llu skipped%s%s%s; %u jitter phases; %u shaders compiled in %.0f ms",
+			std::snprintf(line, sizeof(line), "upscale: FSR 2 %s; %llu frames drawn (%u with the grass's own motion), %llu skipped%s%s%s; %u jitter phases; %u shaders compiled in %.0f ms",
 				!g.fsr2_failed.empty() ? ("not made (" + g.fsr2_failed + ")").c_str() : g.fsr2 != nullptr ? "made" : "not made yet",
-				static_cast<unsigned long long>(g.fsr2_drawn), static_cast<unsigned long long>(g.fsr2_skipped), g.fsr2_why.empty() ? "" : " (the last: ",
-				g.fsr2_why.c_str(), g.fsr2_why.empty() ? "" : ")", g.phases.load(), shaders, ms);
+				static_cast<unsigned long long>(g.fsr2_drawn), g.fsr2 != nullptr ? g.fsr2->blade_frames() : 0u, static_cast<unsigned long long>(g.fsr2_skipped),
+				g.fsr2_why.empty() ? "" : " (the last: ", g.fsr2_why.c_str(), g.fsr2_why.empty() ? "" : ")", g.phases.load(), shaders, ms);
 			lines.push_back(line);
 		}
 		return lines;

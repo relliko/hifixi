@@ -84,7 +84,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.51;
+	constexpr double kVersion = 0.52;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -926,6 +926,7 @@ public:
 		hifi::game::drawcull::frame(now);
 		// (the next frame's offset, before the camera tick builds its projection: only while FSR 2 draws to take it back out)
 		hifi::game::jitter::set_on(hifi::upscale::temporal_running());
+		worldfx::set_blade_motion(hifi::upscale::temporal_running()); // (the grass's own motion for FSR 2)
 		hifi::game::jitter::set_phases(hifi::upscale::jitter_phases());
 		hifi::game::jitter::next_frame();
 		if (now >= m_next_update)

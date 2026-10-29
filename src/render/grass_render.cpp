@@ -90,7 +90,13 @@ namespace grass
 		// where its results start in the sun's mask, the steps, the scattering's lean, the view's first and third rows
 		constexpr UINT kVolParams = 24;
 		constexpr UINT kVolOffset = kSnowOffset + kSnowParams;
-		constexpr UINT kActorBytes = (kVolOffset + kVolParams) * 4;
+		// ... and after the light in the air's the blades' motion's (grass.hlsl kMotion; rule bit 32768): the last frame's
+		// VIEW x PROJECTION and this frame's (both without the jitter), the last frame's seconds
+		constexpr UINT kMotionParams = 36;
+		constexpr UINT kMotionOffset = kVolOffset + kVolParams;
+		constexpr UINT kActorBytes = (kMotionOffset + kMotionParams) * 4;
+		constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		constexpr D3D12_RESOURCE_STATES kMotionRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		// (how far its march reaches, yalms; past that the game's own fog is the air; how high the air thins to 1/e)
 		constexpr float kVolReach = 80.0f, kVolThinning = 9.0f;
 		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
@@ -153,7 +159,7 @@ namespace grass
 			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" }, { "leaf_vs", "vs_5_0" }, { "leaf_ps", "ps_5_0" },
 			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" }, { "cloud_ps", "ps_5_0" }, { "cloud_shadow_ps", "ps_5_0" },
 			{ "look_first_ps", "ps_5_0" }, { "look_down_ps", "ps_5_0" }, { "look_exposure_ps", "ps_5_0" }, { "look_up_ps", "ps_5_0" }, { "look_ps", "ps_5_0" },
-			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" }, { "vol_ps", "ps_5_0" } };
+			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" }, { "vol_ps", "ps_5_0" }, { "ps_motion", "ps_5_0" } };
 		constexpr size_t kShaderEntryCount = sizeof(kShaderEntries) / sizeof(kShaderEntries[0]);
 		constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
@@ -1873,6 +1879,13 @@ namespace grass
 		for (pso_entry &e : _psos)
 			release(e.pso);
 		_psos.clear();
+		for (pso_entry &e : _motion_psos)
+			release(e.pso);
+		_motion_psos.clear();
+		release(_motion);
+		release(_motion_rtv_heap);
+		_motion_w = _motion_h = 0;
+		_motion_have_last = false;
 		for (pso_entry &e : _shade_psos)
 			release(e.pso);
 		_shade_psos.clear();
@@ -2182,6 +2195,91 @@ namespace grass
 		return pso;
 	}
 
+	ID3D12PipelineState *renderer::motion_pipeline_for(const target &t, std::string &error)
+	{
+		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
+		for (const pso_entry &e : _motion_psos)
+			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
+				return e.pso;
+		if (_ps_motion.empty() || rt_desc.SampleDesc.Count != 1)
+			return nullptr;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _vs.data(), _vs.size() };
+		desc.PS = { _ps_motion.data(), _ps_motion.size() };
+		desc.BlendState.IndependentBlendEnable = TRUE;
+		desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE; // the world's alpha is left alone
+		desc.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.DepthStencilState.DepthEnable = TRUE;
+		desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 2;
+		desc.RTVFormats[0] = t.rtv_format;
+		desc.RTVFormats[1] = kMotionFormat;
+		desc.DSVFormat = kBladeDepthFormat;
+		desc.SampleDesc = rt_desc.SampleDesc;
+		ID3D12PipelineState *pso = nullptr;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		if (FAILED(hr))
+		{
+			char text[96];
+			std::snprintf(text, sizeof(text), "the blades' motion pipeline failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			return nullptr;
+		}
+		pso->SetName(L"worldfx: grass pipeline with motion");
+		_motion_psos.push_back({ t.rtv_format, kBladeDepthFormat, rt_desc.SampleDesc, pso });
+		return pso;
+	}
+
+	bool renderer::motion_target_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error)
+	{
+		const UINT w = UINT(rt_desc.Width), h = rt_desc.Height;
+		if (_motion != nullptr && _motion_w == w && _motion_h == h)
+			return true;
+		if (_motion != nullptr)
+			_old.push_back({ _motion, 0 }); // (lists recorded with it may still be running)
+		_motion = nullptr;
+		if (_motion_rtv_heap == nullptr)
+		{
+			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+			if (FAILED(_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_motion_rtv_heap))))
+			{
+				error = "the blades' motion target's view heap couldn't be made";
+				return false;
+			}
+		}
+		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_RESOURCE_DESC td = {};
+		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		td.Width = w;
+		td.Height = h;
+		td.DepthOrArraySize = 1;
+		td.MipLevels = 1;
+		td.Format = kMotionFormat;
+		td.SampleDesc.Count = 1;
+		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = kMotionFormat;
+		if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, kMotionRead, &cv, IID_PPV_ARGS(&_motion))))
+		{
+			_motion = nullptr;
+			error = "the blades' motion target couldn't be made";
+			return false;
+		}
+		_motion->SetName(L"worldfx: the blades' motion");
+		_device->CreateRenderTargetView(_motion, nullptr, _motion_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+		_motion_w = w;
+		_motion_h = h;
+		_motion_frames = 0;
+		return true;
+	}
+
 	// Compiles the shaders from source; on success they replace the ones in use (the pipelines built from
 	// those are released a few frames later: lists recorded with them may still be running)
 	bool renderer::set_shader_source(const std::string &source, std::string &error)
@@ -2199,7 +2297,7 @@ namespace grass
 		std::vector<uint8_t> *const into[kShaderEntryCount] = { &_vs, &_ps, &_shade_vs, &_shade_ps, &_sun_ps, &_shadow_vs, &_shadow_ps,
 			&_water_vs, &_water_ps, &_water_debug_vs, &_water_debug_ps, &_firefly_vs, &_firefly_ps, &_rain_vs, &_rain_ps,
 			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps, &_cloud_ps, &_cloud_shadow_ps,
-			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps, &_vol_ps };
+			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps, &_vol_ps, &_ps_motion };
 		if (code.blobs.size() != kShaderEntryCount)
 			return;
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
@@ -2242,6 +2340,9 @@ namespace grass
 			c.forget(); // (drawn again with the new shaders)
 		for (pso_entry &e : _psos)
 			_old.push_back({ e.pso, 0 });
+		for (pso_entry &e : _motion_psos)
+			_old.push_back({ e.pso, 0 });
+		_motion_psos.clear();
 		for (pso_entry &e : _shade_psos)
 			_old.push_back({ e.pso, 0 });
 		for (pso_entry &e : _water_psos)
@@ -4787,7 +4888,10 @@ namespace grass
 		float *actor_data = nullptr;
 		// (the zone's casters from the uploaded meshes, or the host's own zone: set_zone_casters)
 		const bool sun_map = l.sun_map && sun_shadow > 0.0f && (_shadow_geo != nullptr || (_zone_bounds != nullptr && _zone_draw != nullptr)) && shading;
-		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies)
+		// (the blades' motion: drawn with them, into a second target, from the last frame's camera; the rest of the frame
+		// as without it)
+		const bool motion_wanted = l.blade_motion && grass && !_ps_motion.empty() && rt_desc.SampleDesc.Count == 1;
+		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies || motion_wanted)
 		{
 			const uint32_t slot = _actor_slot++ % kActorSlots;
 			if (_actors[slot] == nullptr)
@@ -4821,6 +4925,24 @@ namespace grass
 				actor_buffer = _actors[slot];
 				actor_data = _actor_data[slot];
 			}
+		}
+		// This frame's camera without the jitter (its _31, _32: the upscale's), for the blades' motion and the next frame's
+		float motion_now[16];
+		{
+			float unjittered[16];
+			std::memcpy(unjittered, cam.proj, sizeof(unjittered));
+			unjittered[8] = unjittered[9] = 0.0f;
+			multiply(cam.view, unjittered, motion_now);
+		}
+		const bool motion_on = motion_wanted && actor_data != nullptr && _motion_have_last;
+		if (motion_on)
+		{
+			float *const q = actor_data + kMotionOffset;
+			std::memcpy(q, _motion_last, 64);
+			std::memcpy(q + 16, motion_now, 64);
+			q[32] = _motion_last_time;
+			q[33] = 1.0f;
+			q[34] = q[35] = 0.0f;
 		}
 		// The lamps after the shadow map's parameters, in view space (as the shading pass rebuilds each pixel's
 		// point), all kMaxLamps of them: the ones not lit far off with no glow (crowd's rule bit 16 says they're there)
@@ -5103,7 +5225,7 @@ namespace grass
 		}
 		const uint32_t rules = (l.rule_in_front ? 1u : 0u) | (l.rule_outliers ? 2u : 0u) | (l.sun_characters ? 4u : 0u) | (lamps_written != 0 ? 16u : 0u) |
 			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u) |
-			(clouds ? 1024u : 0u) | (cloud_shade ? 2048u : 0u) | (snow_written ? 8192u : 0u);
+			(clouds ? 1024u : 0u) | (cloud_shade ? 2048u : 0u) | (snow_written ? 8192u : 0u) | (motion_on ? 32768u : 0u);
 		const uint32_t crowd = actor_count | (rules << 16);
 		std::memcpy(&constants[32], &crowd, 4);
 		// Toward the sun in view space (row vectors: v * the view's rotation)
@@ -5610,10 +5732,25 @@ namespace grass
 
 			section(list, L"worldfx: grass");
 			stats.bound = true;
+			// (with their motion: the second target cleared to nothing (w 0: no blade), then written beside them)
+			ID3D12PipelineState *motion_pso = nullptr;
+			std::string motion_error;
+			if (motion_on && motion_target_for(rt_desc, motion_error))
+				motion_pso = motion_pipeline_for(t, motion_error);
+			const D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = motion_pso != nullptr ? _motion_rtv_heap->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE {};
 			list->SetGraphicsRootSignature(_root);
-			list->SetPipelineState(pso);
+			list->SetPipelineState(motion_pso != nullptr ? motion_pso : pso);
 			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			list->OMSetRenderTargets(1, &world_rtv, FALSE, &grass_dsv);
+			if (motion_pso != nullptr)
+			{
+				transition(list, _motion, kMotionRead, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				const float none[4] = {};
+				list->ClearRenderTargetView(motion_rtv, none, 0, nullptr);
+				const D3D12_CPU_DESCRIPTOR_HANDLE both[2] = { world_rtv, motion_rtv };
+				list->OMSetRenderTargets(2, both, FALSE, &grass_dsv);
+			}
+			else
+				list->OMSetRenderTargets(1, &world_rtv, FALSE, &grass_dsv);
 			list->RSSetViewports(1, &viewport);
 			list->RSSetScissorRects(1, &scissor);
 			list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
@@ -5650,6 +5787,20 @@ namespace grass
 				stats.blades += runs[i].count * runs[i].tuft;
 				stats.draws++;
 			}
+			if (motion_pso != nullptr)
+			{
+				transition(list, _motion, D3D12_RESOURCE_STATE_RENDER_TARGET, kMotionRead);
+				list->OMSetRenderTargets(1, &world_rtv, FALSE, &grass_dsv); // (the second target let go before it's read)
+				_motion_frames++;
+				stats.blade_motion = true;
+			}
+		}
+		// (this frame's camera and time for the next frame's motion, from the frame that draws its blades)
+		if (grass)
+		{
+			std::memcpy(_motion_last, motion_now, sizeof(_motion_last));
+			_motion_last_time = std::isfinite(l.time) ? l.time : 0.0f;
+			_motion_have_last = true;
 		}
 
 		// Fireflies, after the blades (hidden behind them): their own constants in the shading pass's place

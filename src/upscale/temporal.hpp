@@ -7,7 +7,9 @@
 //   - A's depth (its plane 0, D24: dgVoodoo's depth may not be readable through a view) copied into a buffer of ours;
 //   - one compute pass from it: the depth as floats (FSR 2's depth) and the camera's motion (FSR 2's motion vectors,
 //     in UV units, current to last frame, without the jitter), the point under each pixel moved through this frame's
-//     view (unjittered) and the last one's view x projection. Characters and effects move only as the camera does here;
+//     view (unjittered) and the last one's view x projection; where a blade of World FX's grass is still what's seen
+//     (its view depth the world's), the blade's own motion instead, its sway in the wind in it (grass::renderer::
+//     blade_motion). Characters and effects move only as the camera does here;
 //   - FSR 2's dispatch: auto exposure, depth not inverted with its far plane at infinity (near 0.1: the game's), its
 //     sharpening (RCAS) at the setting's sharpness;
 //   - A, the depth and motion textures and the output put back in the states they're expected in (FSR 2 leaves them
@@ -47,11 +49,14 @@ namespace hifi::upscale::temporal
 		// The frame (dgVoodoo's thread): A (color) in color_state, its depth (plane 0 in depth_state); its output left in
 		// PIXEL_SHADER_RESOURCE (output()). Sets its own heaps, root signatures and pipelines: the caller puts dgVoodoo's
 		// back. False with why when nothing was drawn.
+		// blades: World FX's blades' motion this frame (A's size, shader-readable), or nullptr.
 		bool record(ID3D12GraphicsCommandList *list, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state, ID3D12Resource *depth,
-			D3D12_RESOURCE_STATES depth_state, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why);
+			D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why);
 		ID3D12Resource *output() const { return _output; }
+		ID3D12Resource *motion() const { return _mv; } // (the motion FSR 2 was given: NON_PIXEL_SHADER_RESOURCE after record)
 		DXGI_FORMAT output_format() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
 		uint32_t frames() const { return _frames; }
+		uint32_t blade_frames() const { return _blade_frames; } // (of them, with the blades' own motion)
 
 	private:
 		bool _made = false;
@@ -72,6 +77,6 @@ namespace hifi::upscale::temporal
 		uint32_t _slot = 0;
 		bool _have_last = false;
 		float _last_view_proj[16] = {}; // (the last frame's VIEW x PROJECTION without the jitter)
-		uint32_t _frames = 0;
+		uint32_t _frames = 0, _blade_frames = 0;
 	};
 }

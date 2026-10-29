@@ -273,6 +273,12 @@ static const uint kSnowWindow = 256;
 bool snowy() { return ((crowd.x >> 16) & 8192) != 0; }
 bool weather_fx() { return ((crowd.x >> 16) & 512) != 0; }
 
+// The blades' own motion for FSR 2 (ps_motion), after the light in the air's (kVol, its 6): [kMotion .. + 3] the last
+// frame's VIEW x PROJECTION, [kMotion + 4 .. + 7] this frame's (rows; both without the jitter), [kMotion + 8] x the last
+// frame's seconds (color.w's clock). Only with rule bit 32768 (the actors' buffer is the blades' own without it).
+static const uint kMotion = kSnow + 4 + 2 * 32 + 6;
+bool blade_motion() { return ((crowd.x >> 16) & 32768) != 0; }
+
 // Each point's wear, after its colour in the memory (+12, +16: when its trampling will have worn off, and when it'll
 // have grown back from a cut; seconds on the memory's clock, 0 never). Whoever stands within their radius of it (its
 // own height within 3 yalms) pushes the first on by the frame's length, more the nearer: full (kWearHold ahead, the
@@ -323,12 +329,38 @@ struct v2p
 {
 	float4 pos : SV_Position;
 	float3 col : COLOR;
+	float3 motion : MOTION; // (FSR 2's: from here to where the blade was last frame, UV units; and its view depth)
 };
+
+// The wind's sway of a blade at a time (seconds, color.w's clock): its tip's lean across (yalms a yalm of height, at the
+// tip: the breeze's and the weather's wind's, kWx) and how far it's bowed over (0 upright .. 1 flat)
+void blade_wind(float time, float2 root_xz, float seed, out float2 sway, out float bowed)
+{
+	float2 wind = float2(0.8, 0.6) * (0.5 + 0.5 * sin(time * 1.6 + dot(root_xz, float2(0.23, 0.17))))
+		+ 0.25 * sin(time * 3.7 + seed * 6.28);
+	// The weather's wind (weather_fx: [kWx] toward where it blows times how hard): the blades lean the way it blows, in
+	// gusts that roll across the grass along it, a tip bent over coming down as much as it goes across (about half a
+	// radian in a wind, a radian in gales); they flutter the more the harder it blows
+	float2 blown = 0.0;
+	bowed = 0.0;
+	[branch] if (weather_fx())
+	{
+		float4 wv = actors[kWx];
+		float2 way = wv.z > 0.0 ? wv.xy / wv.z : float2(1.0, 0.0);
+		float gust = 0.65 + 0.35 * sin(time * 1.9 - dot(root_xz, way) * 0.3) + 0.12 * sin(time * 5.3 + seed * 6.28);
+		float tilt = min(0.55 * wv.z * gust, 1.15);
+		blown = way * sin(tilt);
+		bowed = 1.0 - cos(tilt);
+		wind *= 1.0 + 0.8 * wv.z;
+	}
+	sway = wind * 0.15 + blown;
+}
 
 v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 {
 	v2p o;
 	o.col = 0.0;
+	o.motion = 0.0;
 	uint tuft = max(1, uint(blade.z));
 	float4 b = blades[iid / tuft + asuint(blade.w)];
 	uint k = iid % tuft;
@@ -417,30 +449,33 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 	float2 across = float2(cos(a), sin(a));
 	float2 lean = float2(-across.y, across.x) * (hash(seed * 5.3) < 0.5 ? -1.0 : 1.0);
 	float bend = 0.2 + 0.45 * hash(seed * 7.31);
-	float2 wind = float2(0.8, 0.6) * (0.5 + 0.5 * sin(color.w * 1.6 + dot(root.xz, float2(0.23, 0.17))))
-		+ 0.25 * sin(color.w * 3.7 + seed * 6.28);
-	// The weather's wind (weather_fx: [kWx] toward where it blows times how hard): the blades lean the way it blows, in
-	// gusts that roll across the grass along it, a tip bent over coming down as much as it goes across (about half a
-	// radian in a wind, a radian in gales); they flutter the more the harder it blows
-	float2 blown = 0.0;
-	float bowed = 0.0;
-	[branch] if (weather_fx())
-	{
-		float4 wv = actors[kWx];
-		float2 way = wv.z > 0.0 ? wv.xy / wv.z : float2(1.0, 0.0);
-		float gust = 0.65 + 0.35 * sin(color.w * 1.9 - dot(root.xz, way) * 0.3) + 0.12 * sin(color.w * 5.3 + seed * 6.28);
-		float tilt = min(0.55 * wv.z * gust, 1.15);
-		blown = way * sin(tilt);
-		bowed = 1.0 - cos(tilt);
-		wind *= 1.0 + 0.8 * wv.z;
-	}
+	float2 sway;
+	float bowed;
+	blade_wind(color.w, root.xz, seed, sway, bowed);
 
 	float w = blade.y * (row == kSegments ? 0.0 : pow(1.0 - t, 0.8)) * (side ? 1.0 : -1.0);
 	float3 p = root;
 	float down = max(pushed, flat);
-	p.xz += across * w + (lean * (bend + 1.2 * flat) + (wind * 0.15 + blown) * (1.0 - down)) * h * t * t + push * h * (0.5 * t + 0.6 * t * t);
-	p.y -= h * t * (1.0 - 0.25 * bend * t) * (1.0 - 0.6 * down) * (1.0 - bowed * t);
+	p.xz += across * w + (lean * (bend + 1.2 * flat) + sway * (1.0 - down)) * h * t * t + push * h * (0.5 * t + 0.6 * t * t);
+	const float sink = h * t * (1.0 - 0.25 * bend * t) * (1.0 - 0.6 * down);
+	p.y -= sink * (1.0 - bowed * t);
 	o.pos = mul(float4(p, 1.0), view_proj);
+	// Its motion (kMotion): the same point as the wind had it at the last frame's time, through the last frame's camera,
+	// against this one's (both without the jitter); how far it's pushed is taken as it is now
+	[branch] if (blade_motion())
+	{
+		float2 sway0;
+		float bowed0;
+		blade_wind(actors[kMotion + 8].x, root.xz, seed, sway0, bowed0);
+		float3 q = p;
+		q.xz -= (sway - sway0) * (1.0 - down) * h * t * t;
+		q.y += sink * t * (bowed0 - bowed);
+		const float4x4 last = float4x4(actors[kMotion], actors[kMotion + 1], actors[kMotion + 2], actors[kMotion + 3]);
+		const float4x4 now = float4x4(actors[kMotion + 4], actors[kMotion + 5], actors[kMotion + 6], actors[kMotion + 7]);
+		const float4 c0 = mul(float4(p, 1.0), now), c1 = mul(float4(q, 1.0), last);
+		o.motion.xy = c0.w > 1e-4 && c1.w > 1e-4 ? (c1.xy / c1.w - c0.xy / c0.w) * float2(0.5, -0.5) : float2(0.0, 0.0);
+		o.motion.z = o.pos.w;
+	}
 
 	// Colour: the ground's, turned towards the grass's hue at the ground's brightness; dark at the root
 	float lum = dot(g, float3(0.3, 0.59, 0.11));
@@ -2793,6 +2828,21 @@ float4 ps_main(v2p i) : SV_Target
 	if (i.pos.z > d + (zinfo.w == 1 ? 1.0 / 16777215.0 : 0.0))
 		discard;
 	return float4(i.col, 1.0);
+}
+
+// The blades with their motion for FSR 2 (kMotion), into a second target: xy the motion (UV units, to where the blade
+// was last frame), z its view depth (what the motion pass checks it's still the blade that's seen there), w 1 (a blade)
+struct blade_out
+{
+	float4 col : SV_Target0;
+	float4 motion : SV_Target1;
+};
+blade_out ps_motion(v2p i)
+{
+	blade_out o;
+	o.col = ps_main(i);
+	o.motion = float4(i.motion, 1.0);
+	return o;
 }
 
 // The sun's shadow map is drawn from the zone's own meshes (tools/bake_shadow_geo.py): t0 their triangles, three

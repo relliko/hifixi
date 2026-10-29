@@ -16,6 +16,8 @@
  *     (FSR 2's shaders compiled with d3dcompiler_47 and reflected), then each frame FSR 2's picture: at twice the world's
  *     size close to the stretch, its colours kept, the UI on top as meant; with the world as big as the screen (FSR 2's
  *     anti-aliasing alone) close to the world itself; temporal_running while it draws; a jittered run stays finite;
+ *   - FSR 2's motion pass, with World FX's blades' motion: taken where a blade is still what's seen (its view depth the
+ *     world's), the camera's where something nearer was drawn over it and where there's no blade;
  *   - the debug layer says nothing.
  *
  *   build\upscale_test.exe [out.bmp]
@@ -26,6 +28,8 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "../src/upscale/upscale.hpp"
+#include "../src/upscale/temporal.hpp"
+#include <DirectXPackedVector.h>
 #include "../src/zone/frame.hpp"
 #include "../src/zone/inject.hpp"
 #include <chrono>
@@ -631,6 +635,105 @@ int main(int argc, char **argv)
 			check(fsr2_drawn() == 22 && diff < 4.0, "the world as big as the screen: FSR 2 drawn, close to the world itself");
 		}
 		up::set_options(false, false, 0.8f);
+
+		// FSR 2's motion pass with the blades' motion (World FX's target: R16G16B16A16_FLOAT, xy the motion, z the view
+		// depth, w 1 for a blade): the left third blades seen (at the world's depth there, 20 yalms), the middle third blades
+		// with something nearer drawn over them since (their depth 5 yalms), the right third none. The camera still.
+		{
+			namespace tp = hifi::upscale::temporal;
+			tp::context tc;
+			check(tc.make(device, IW, IH, OW, OH, why), "FSR 2's context on its own" + (why.empty() ? "" : ": " + why));
+			D3D12_RESOURCE_DESC md = {};
+			md.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			md.Width = IW;
+			md.Height = IH;
+			md.DepthOrArraySize = 1;
+			md.MipLevels = 1;
+			md.SampleDesc.Count = 1;
+			md.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			md.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			ID3D12Resource *blades = nullptr;
+			device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&blades));
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+			UINT64 total = 0;
+			device->GetCopyableFootprints(&md, 0, 1, 0, &fp, nullptr, nullptr, &total);
+			D3D12_RESOURCE_DESC ud = {};
+			ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			ud.Width = total;
+			ud.Height = ud.DepthOrArraySize = ud.MipLevels = 1;
+			ud.SampleDesc.Count = 1;
+			ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			ID3D12Resource *ub = nullptr;
+			device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &ud, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&ub));
+			uint8_t *m = nullptr;
+			ub->Map(0, nullptr, reinterpret_cast<void **>(&m));
+			using DirectX::PackedVector::XMConvertFloatToHalf;
+			for (UINT y = 0; y < IH; ++y)
+				for (UINT x = 0; x < IW; ++x)
+				{
+					const UINT band = x * 3 / IW;
+					const float v[4] = { band == 2 ? 0.0f : 0.01f, band == 2 ? 0.0f : -0.02f, band == 0 ? 20.0f : band == 1 ? 5.0f : 0.0f, band == 2 ? 0.0f : 1.0f };
+					uint16_t *q = reinterpret_cast<uint16_t *>(m + fp.Offset + size_t(y) * fp.Footprint.RowPitch + size_t(x) * 8);
+					for (int k = 0; k < 4; ++k)
+						q[k] = XMConvertFloatToHalf(v[k]);
+				}
+			ub->Unmap(0, nullptr);
+			D3D12_TEXTURE_COPY_LOCATION src = { ub, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, dst = { blades, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+			src.PlacedFootprint = fp;
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			barrier(list, blades, D3D12_RESOURCE_STATE_COPY_DEST, read);
+			tp::camera cam;
+			std::memcpy(cam.view, view, 64);
+			std::memcpy(cam.proj, proj, 64);
+			cam.jitter[0] = cam.jitter[1] = 0.0f;
+			std::string fail;
+			// (A's depth: DEPTH_READ, as follow_depth left it; A a target, as frame() leaves it)
+			const bool recorded = tc.record(list, A, D3D12_RESOURCE_STATE_RENDER_TARGET, Az, D3D12_RESOURCE_STATE_DEPTH_READ, blades, cam, 0.5f, 16.0f, true, fail);
+			// (its motion read back)
+			ID3D12Resource *mv = tc.motion();
+			barrier(list, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_RESOURCE_DESC vd = mv->GetDesc();
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT vfp = {};
+			UINT64 vtotal = 0;
+			device->GetCopyableFootprints(&vd, 0, 1, 0, &vfp, nullptr, nullptr, &vtotal);
+			D3D12_RESOURCE_DESC rd = ud;
+			rd.Width = vtotal;
+			ID3D12Resource *rbuf = nullptr;
+			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rbuf));
+			D3D12_TEXTURE_COPY_LOCATION rdst = { rbuf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, rsrc = { mv, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+			rdst.PlacedFootprint = vfp;
+			list->CopyTextureRegion(&rdst, 0, 0, 0, &rsrc, nullptr);
+			barrier(list, mv, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			g.run();
+			uint8_t *r = nullptr;
+			rbuf->Map(0, nullptr, reinterpret_cast<void **>(&r));
+			using DirectX::PackedVector::XMConvertHalfToFloat;
+			uint32_t taken = 0, camera_mid = 0, camera_right = 0, band_px[3] = {};
+			for (UINT y = 0; y < IH; ++y)
+				for (UINT x = 0; x < IW; ++x)
+				{
+					const uint16_t *q = reinterpret_cast<const uint16_t *>(r + size_t(y) * vfp.Footprint.RowPitch + size_t(x) * 4);
+					const float mx = XMConvertHalfToFloat(q[0]), my = XMConvertHalfToFloat(q[1]);
+					const UINT band = x * 3 / IW;
+					band_px[band]++;
+					const bool blade = std::fabs(mx - 0.01f) < 1e-4f && std::fabs(my + 0.02f) < 1e-4f;
+					const bool none = std::fabs(mx) < 1e-5f && std::fabs(my) < 1e-5f;
+					taken += band == 0 && blade ? 1 : 0;
+					camera_mid += band == 1 && none ? 1 : 0;
+					camera_right += band == 2 && none ? 1 : 0;
+				}
+			rbuf->Unmap(0, nullptr);
+			std::printf("  the motion pass with the blades' motion: %u of %u seen blades' pixels took it; %u of %u covered and %u of %u without blades the camera's\n",
+				taken, band_px[0], camera_mid, band_px[1], camera_right, band_px[2]);
+			check(recorded && taken == band_px[0] && camera_mid == band_px[1] && camera_right == band_px[2],
+				"a blade's own motion where it's still seen; the camera's where something was drawn over it, and where there's none" + (fail.empty() ? "" : " (" + fail + ")"));
+			check(tc.blade_frames() == 1, "  counted as a frame with the grass's own motion");
+			rbuf->Release();
+			ub->Release();
+			blades->Release();
+			tc.release();
+		}
 		Az->Release();
 		bigz->Release();
 	}

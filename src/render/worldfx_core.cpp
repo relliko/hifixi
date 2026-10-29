@@ -2522,6 +2522,20 @@ namespace worldfx
 		g.camera_source_context = context;
 	}
 
+	void set_blade_motion(bool on)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.look.blade_motion = on;
+	}
+
+	bool blade_motion(ID3D12Resource *&texture, uint64_t &frames)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		texture = nullptr;
+		frames = 0;
+		return g.renderer != nullptr && g.renderer->blade_motion(texture, frames);
+	}
+
 	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);

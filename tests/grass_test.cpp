@@ -1680,7 +1680,7 @@ int main(int argc, char **argv)
 				for (const char *vs : { "vs_main", "shade_vs", "shadow_vs", "water_vs", "water_debug_vs", "firefly_vs", "rain_vs", "splash_vs", "snow_vs", "leaf_vs", "snow_layer_vs" })
 					s += std::string("float4 ") + vs + "(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }\n";
 				for (const char *ps : { "ps_main", "shade_ps", "sun_ps", "shadow_ps", "water_ps", "water_debug_ps", "firefly_ps", "rain_ps", "splash_ps", "snow_ps", "vis_ps", "leaf_ps", "air_ps", "flash_ps", "cloud_ps", "cloud_shadow_ps", "look_first_ps",
-					"look_down_ps", "look_exposure_ps", "look_up_ps", "look_ps", "trail_ps", "snow_layer_ps", "vol_ps" })
+					"look_down_ps", "look_exposure_ps", "look_up_ps", "look_ps", "trail_ps", "snow_layer_ps", "vol_ps", "ps_motion" })
 					s += std::string("float4 ") + ps + "() : SV_Target { return float4(1, 0, 0, 1); }\n";
 				return s + "// " + std::to_string(n) + "\n";
 			};
@@ -1706,7 +1706,7 @@ int main(int argc, char **argv)
 			std::string cache_why;
 			const bool compiled = grass::compile_shaders(tiny(0), folder, first, from_first, cache_why);
 			const bool read_back = grass::compile_shaders(tiny(0), folder, again, from_again, cache_why);
-			check(compiled && !from_first && exists(file_of(tiny(0))) && first.blobs.size() == 35, "a source compiled is written to the cache");
+			check(compiled && !from_first && exists(file_of(tiny(0))) && first.blobs.size() == 36, "a source compiled is written to the cache");
 			check(read_back && from_again && again.blobs == first.blobs && again.key == first.key, "and read back from it the same");
 			grass::compile_shaders(tiny(0), std::wstring(), fresh, from_fresh, cache_why);
 			check(!from_fresh && fresh.blobs == first.blobs, "(the same as compiled without the cache)");
@@ -6206,6 +6206,101 @@ float4 ps_main(vout i) : SV_Target { return i.c; }
 		check(!calm.second.weather && gales.second.weather && gales.second.blades == calm.second.blades && gale_x > calm_x + 2.0 && gale_n > 1000,
 			"in gales the grass leans hard with the wind");
 		check(g.report_messages() == 0, "no debug-layer errors (wind)");
+	}
+
+	// 1za. The blades' own motion (look::blade_motion: FSR 2's, the upscale's), in gales blowing to the picture's right, the
+	// camera still: a frame at 1 s, then one at 1.1 s writes beside the blades where each was at 1 s (their sway in the
+	// wind): w 1 on most blade pixels and a motion there, nothing (w 0) elsewhere, the view depth in z; the picture the same
+	// to the byte as without it; and two frames at the same moment: no motion at all
+	{
+		auto half = [](uint16_t h) {
+			const uint32_t sign = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+			uint32_t bits = 0;
+			if (e == 0)
+				bits = sign; // (zero and the tiny ones: none here)
+			else if (e == 31)
+				bits = sign | 0x7F800000u | (m << 13);
+			else
+				bits = sign | ((e + 112) << 23) | (m << 13);
+			float f = 0.0f;
+			std::memcpy(&f, &bits, 4);
+			return f;
+		};
+		auto frame = [&](float time, bool motion, draw_stats &st, std::vector<uint8_t> *motion_px) {
+			fresh_memory();
+			const float ground[4] = { 0.35f, 0.3f, 0.2f, 0.5f };
+			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			g.list->ClearRenderTargetView(world_rtv, ground, 0, nullptr);
+			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			ground_depth(cam);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			look l2 = l;
+			l2.time = time;
+			l2.wx.wind[0] = cam.view[0];
+			l2.wx.wind[1] = cam.view[8];
+			l2.wx.wind_strength = 2.0f;
+			l2.wx.ground_y = at.y;
+			l2.blade_motion = motion;
+			st = r.draw(g.list, t, cam, l2, error);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			std::vector<uint8_t> img = g.read(world, 4);
+			if (motion_px != nullptr)
+			{
+				ID3D12Resource *tex = nullptr;
+				uint64_t frames = 0;
+				motion_px->clear();
+				if (r.blade_motion(tex, frames))
+				{
+					const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					barrier(g.list, tex, read, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					*motion_px = g.read(tex, 8);
+					barrier(g.list, tex, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
+					g.run();
+				}
+			}
+			r.release_old(0);
+			return img;
+		};
+		draw_stats st_prime, st_moving, st_plain, st_still;
+		std::vector<uint8_t> moving_mv, still_mv;
+		frame(1.0f, true, st_prime, nullptr);
+		const std::vector<uint8_t> moving = frame(1.1f, true, st_moving, &moving_mv);
+		const std::vector<uint8_t> plain = frame(1.1f, false, st_plain, nullptr);
+		frame(1.1f, true, st_prime, nullptr);
+		frame(1.1f, true, st_still, &still_mv);
+		uint32_t blade_px = 0, moved = 0, other = 0, depth_ok = 0, still_moved = 0;
+		double most = 0.0;
+		for (size_t i = 0; i + 8 <= moving_mv.size() && moving_mv.size() == size_t(W) * H * 8; i += 8)
+		{
+			uint16_t h[4];
+			std::memcpy(h, &moving_mv[i], 8);
+			const float mx = half(h[0]), my = half(h[1]), z = half(h[2]), w = half(h[3]);
+			if (w > 0.5f)
+			{
+				blade_px++;
+				const double len = std::sqrt(double(mx) * mx + double(my) * my) * W; // (pixels)
+				moved += len > 0.05 ? 1 : 0;
+				most = std::max(most, len);
+				depth_ok += z > 0.5f && z < 200.0f ? 1 : 0;
+			}
+			else
+				other += (mx != 0.0f || my != 0.0f || z != 0.0f) ? 1 : 0;
+		}
+		for (size_t i = 0; i + 8 <= still_mv.size(); i += 8)
+		{
+			uint16_t h[4];
+			std::memcpy(h, &still_mv[i], 8);
+			if (half(h[3]) > 0.5f && std::sqrt(double(half(h[0])) * half(h[0]) + double(half(h[1])) * half(h[1])) * W > 0.01)
+				still_moved++;
+		}
+		std::printf("  the blades' motion: %u blade pixels, %u of them moved (the most %.2f px), %u with their depth, %u others not empty; the same moment twice: %u moved\n",
+			blade_px, moved, most, depth_ok, other, still_moved);
+		check(st_moving.blade_motion && !st_plain.blade_motion && blade_px > 1000 && depth_ok == blade_px && other == 0,
+			"written beside the blades (w 1, their view depth), nothing elsewhere");
+		check(moved > blade_px / 2 && most > 0.2 && most < 40.0, "their sway in gales over a tenth of a second: a motion on most of them");
+		check(moving == plain, "the picture the same to the byte with the motion as without");
+		check(st_still.blade_motion && still_moved == 0, "two frames at the same moment, the camera still: no motion");
+		check(g.report_messages() == 0, "no debug-layer errors (the blades' motion)");
 	}
 
 	// 2. The game's state put back

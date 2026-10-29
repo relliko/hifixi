@@ -128,6 +128,10 @@ namespace worldfx
 	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called under the core's mutex.
 	using camera_source_fn = bool (*)(void *context, float view[16], float proj[16]);
 	void set_camera_source(camera_source_fn source, void *context);
+	// The blades' own motion written beside them (FSR 2's: the host's upscale), and its target (grass::renderer::
+	// blade_motion: the world's size, in a shader-readable state; frames counts the frames that wrote it)
+	void set_blade_motion(bool on);
+	bool blade_motion(ID3D12Resource *&texture, uint64_t &frames);
 	// At process exit: the device may be gone, its objects are left to the process's end
 	void shutdown();
 

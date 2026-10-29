@@ -1,10 +1,11 @@
 /*
  * AMD FSR 2 over the world (temporal.hpp). The motion pass's root signature:
- *   0  24 constants b0  A's width, height, the depth copy's row pitch (words); the jitter (NDC); PROJECTION's _11 and
- *                       _22 (without the jitter); the reprojection: this frame's view space to the last frame's clip
- *                       (inverse VIEW x last VIEW x last PROJECTION, row vectors)
- *   1  table            t0 the depth copy (raw), u0 the depth (R32_FLOAT), u1 the motion (R16G16_FLOAT)
- * Its descriptors: kSlots triples in a shader-visible heap of its own, a triple a frame.
+ *   0  24 constants b0  A's width, height, the depth copy's row pitch (words), whether the blades' motion is there; the
+ *                       jitter (NDC); PROJECTION's _11 and _22 (without the jitter); the reprojection: this frame's view
+ *                       space to the last frame's clip (inverse VIEW x last VIEW x last PROJECTION, row vectors)
+ *   1  table            t0 the depth copy (raw), t1 the blades' motion (World FX's; a null view when there's none),
+ *                       u0 the depth (R32_FLOAT), u1 the motion (R16G16_FLOAT)
+ * Its descriptors: kSlots fours in a shader-visible heap of its own, four a frame.
  */
 
 #include <windows.h>
@@ -24,12 +25,13 @@ namespace hifi::upscale::temporal
 		const char *kMotion = R"(
 cbuffer motion_constants : register(b0)
 {
-	uint width, height, pitch, unused;
+	uint width, height, pitch, use_blades;
 	float2 jitter_ndc;
 	float p11, p22;
 	row_major float4x4 reproject;
 };
 ByteAddressBuffer depth_in : register(t0);
+Texture2D<float4> blades_in : register(t1);
 RWTexture2D<float> depth_out : register(u0);
 RWTexture2D<float2> motion_out : register(u1);
 
@@ -46,7 +48,16 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 	const float d = z < 0.9999995 ? 0.1 / max(1.0 - z, 1e-7) : 200000.0;
 	const float4 last = mul(float4(ndc.x * d / p11, ndc.y * d / p22, -d, 1.0), reproject);
 	// (UV units, from this frame's place to the last frame's; none for a point the last camera had behind it)
-	motion_out[id.xy] = last.w > 1e-4 ? (last.xy / last.w - ndc) * float2(0.5, -0.5) : float2(0.0, 0.0);
+	float2 motion = last.w > 1e-4 ? (last.xy / last.w - ndc) * float2(0.5, -0.5) : float2(0.0, 0.0);
+	// A blade still the one seen here (nothing drawn over it since: its view depth the world's): its own motion, the wind's
+	// sway in it
+	if (use_blades != 0)
+	{
+		const float4 b = blades_in[id.xy];
+		if (b.w > 0.5 && abs(b.z - d) <= 0.004 * b.z + 0.02)
+			motion = b.xy;
+	}
+	motion_out[id.xy] = motion;
 }
 )";
 
@@ -186,7 +197,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			return false;
 		}
 		drop(errors);
-		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1 } };
+		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 2 } };
 		D3D12_ROOT_PARAMETER p[2] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		p[0].Constants.Num32BitValues = kConstants;
@@ -211,7 +222,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 		drop(cs);
 		if (ok)
 		{
-			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
 			ok = SUCCEEDED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap)));
 			_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		}
@@ -286,7 +297,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 	}
 
 	bool context::record(ID3D12GraphicsCommandList *list, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state, ID3D12Resource *depth,
-		D3D12_RESOURCE_STATES depth_state, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why)
+		D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why)
 	{
 		if (!_made)
 		{
@@ -342,7 +353,13 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 
 		// The motion pass: the depth as floats and the camera's motion
 		const UINT slot = _slot++ % kSlots;
-		const D3D12_CPU_DESCRIPTOR_HANDLE cpu = { _heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(slot * 3) * _step };
+		const D3D12_CPU_DESCRIPTOR_HANDLE cpu = { _heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(slot * 4) * _step };
+		if (blades != nullptr)
+		{
+			const D3D12_RESOURCE_DESC bd = blades->GetDesc();
+			if (bd.Width != _rw || bd.Height != _rh)
+				blades = nullptr; // (another size: drawn for another world)
+		}
 		{
 			D3D12_SHADER_RESOURCE_VIEW_DESC s = {};
 			s.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -351,12 +368,19 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			s.Buffer.NumElements = UINT(_depth_copy->GetDesc().Width / 4);
 			s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
 			_device->CreateShaderResourceView(_depth_copy, &s, cpu);
+			// (the blades' motion, or a null view of its kind)
+			D3D12_SHADER_RESOURCE_VIEW_DESC b = {};
+			b.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			b.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			b.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			b.Texture2D.MipLevels = 1;
+			_device->CreateShaderResourceView(blades, &b, { cpu.ptr + _step });
 			D3D12_UNORDERED_ACCESS_VIEW_DESC u = {};
 			u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 			u.Format = DXGI_FORMAT_R32_FLOAT;
-			_device->CreateUnorderedAccessView(_depth, nullptr, &u, { cpu.ptr + _step });
+			_device->CreateUnorderedAccessView(_depth, nullptr, &u, { cpu.ptr + 2 * _step });
 			u.Format = DXGI_FORMAT_R16G16_FLOAT;
-			_device->CreateUnorderedAccessView(_mv, nullptr, &u, { cpu.ptr + 2 * _step });
+			_device->CreateUnorderedAccessView(_mv, nullptr, &u, { cpu.ptr + 3 * _step });
 		}
 		transition(list, _depth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _depth_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		transition(list, _mv, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _mv_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -365,6 +389,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			c[0] = _rw;
 			c[1] = _rh;
 			c[2] = _pitch_words;
+			c[3] = blades != nullptr ? 1u : 0u;
 			const float f[4] = { 2.0f * cam.jitter[0] / float(_rw), -2.0f * cam.jitter[1] / float(_rh), float(proj[0]), float(proj[5]) };
 			std::memcpy(&c[4], f, sizeof(f));
 			for (int i = 0; i < 16; ++i)
@@ -376,7 +401,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			list->SetComputeRootSignature(_root);
 			list->SetPipelineState(_motion);
 			list->SetComputeRoot32BitConstants(0, kConstants, c, 0);
-			list->SetComputeRootDescriptorTable(1, { _heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 3) * _step });
+			list->SetComputeRootDescriptorTable(1, { _heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 4) * _step });
 			list->Dispatch((_rw + 7) / 8, (_rh + 7) / 8, 1);
 		}
 		const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -420,6 +445,8 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			return false;
 		}
 		_frames++;
+		if (blades != nullptr)
+			_blade_frames++;
 		return true;
 	}
 }

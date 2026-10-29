@@ -302,6 +302,8 @@ namespace grass
 		float water_rings = 1.0f;  // how strong (0 none, up to 2)
 		// The zone's water collision drawn over the world (a debug view)
 		bool water_debug = false;
+		// The blades' own motion written beside them (FSR 2's: blade_motion), while the upscale draws with it
+		bool blade_motion = false;
 		// Fireflies over the grass points at night: how many (0 none, 1 the usual, up to 2), how deep into the
 		// night it is (0 day .. 1 full night: they fade in at dusk), the glow's radius and how far they're drawn
 		float fireflies = 1.0f, night = 0.0f;
@@ -524,6 +526,7 @@ namespace grass
 		uint32_t blades = 0;
 		uint32_t draws = 0;
 		bool shaded = false; // the shading pass ran
+		bool blade_motion = false; // the blades wrote their motion (look::blade_motion)
 		bool sun = false;    // with the sun's shadows (their half-size pass ran before it)
 		bool sun_map = false;           // ... and the shadow map read in it
 		uint32_t sun_map_cascades = 0;  // cascades of the shadow map drawn again this frame (bits: 1 near, 2 far)
@@ -642,6 +645,15 @@ namespace grass
 		bool upload_water(const blade_file &file, std::string &error);
 		void unload_water();
 		bool water_loaded() const { return _water != nullptr; }
+		// The blades' motion target (the world target's size, R16G16B16A16_FLOAT: xy the motion, UV units, to where each
+		// blade was last frame; z its view depth; w 1 where a blade is, 0 elsewhere) in NON_PIXEL_SHADER_RESOURCE |
+		// PIXEL_SHADER_RESOURCE, and how many frames have written it (a new number: written since); false before the first
+		bool blade_motion(ID3D12Resource *&texture, uint64_t &frames) const
+		{
+			texture = _motion;
+			frames = _motion_frames;
+			return _motion != nullptr && _motion_frames != 0;
+		}
 		uint32_t water_zone() const { return _water_zone; }
 		uint32_t water_corners() const { return _water_corners; }
 		// The zone's sea sheets (read_sea_file), for the sea; the previous ones go like the blades'
@@ -721,6 +733,9 @@ namespace grass
 
 	private:
 		ID3D12PipelineState *pipeline_for(const target &t, std::string &error);
+		// The blades with their motion into a second target (ps_motion), and that target for the world's size
+		ID3D12PipelineState *motion_pipeline_for(const target &t, std::string &error);
+		bool motion_target_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
 		struct copy;
 		bool copy_buffer(copy &c, UINT64 size, std::string &error);
 		void finish_timing(ID3D12GraphicsCommandList *list, bool shaded);
@@ -760,7 +775,16 @@ namespace grass
 
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
-		std::vector<uint8_t> _vs, _ps;
+		std::vector<uint8_t> _vs, _ps, _ps_motion;
+		// The blades' motion (look::blade_motion): its target and view, the frames that wrote it, the last frame's camera
+		// (VIEW x PROJECTION without the jitter) and seconds
+		ID3D12Resource *_motion = nullptr;
+		ID3D12DescriptorHeap *_motion_rtv_heap = nullptr;
+		UINT _motion_w = 0, _motion_h = 0;
+		uint64_t _motion_frames = 0;
+		float _motion_last[16] = {};
+		float _motion_last_time = 0.0f;
+		bool _motion_have_last = false;
 		struct pso_entry
 		{
 			DXGI_FORMAT rtv, dsv;
@@ -769,6 +793,7 @@ namespace grass
 		};
 		std::vector<pso_entry> _psos, _shade_psos, _water_psos, _water_debug_psos, _firefly_psos, _rain_psos, _splash_psos, _snow_psos, _leaf_psos, _air_psos, _flash_psos;
 		std::vector<pso_entry> _water_whole_psos, _sea_psos, _water_fading_psos;
+		std::vector<pso_entry> _motion_psos;
 		std::vector<uint8_t> _shade_vs, _shade_ps, _water_vs, _water_ps, _water_debug_vs, _water_debug_ps, _sun_ps, _shadow_vs, _shadow_ps, _firefly_vs, _firefly_ps;
 		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps, _leaf_vs, _leaf_ps, _air_ps, _flash_ps, _cloud_ps, _cloud_shadow_ps;
 		// The look pass: its shaders, its pipelines (the small sizes' with no render target, made once; the world's by its
