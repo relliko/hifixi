@@ -17,7 +17,7 @@
  *     the same (draw.cpp near_lamps), per vertex it lights nothing (the game's own way); named by every object, per
  *     vertex it lights them.
  *
- *   build\zoneinject_test.exe [out.bmp]
+ *   build\zoneinject_test.exe [out.bmp]       (ZONE_PERPIXEL=1: drawn with the per-pixel option)
  */
 
 #include <d3d12.h>
@@ -189,6 +189,7 @@ int main(int argc, char **argv)
 	std::string why;
 	check(gz.upload(device, copy, std::move(z), why) && gz.wait(10000), "on the GPU (its copy queue)" + why);
 	check(inj::prepare(device, why), "the renderer made" + (why.empty() ? "" : ": " + why));
+	inj::set_options(GetEnvironmentVariableA("ZONE_PERPIXEL", nullptr, 0) != 0); // (the per-pixel option: ZONE_PERPIXEL=1)
 
 	// dgVoodoo's world: typeless resources, UNORM / D24S8 views
 	D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, up = { D3D12_HEAP_TYPE_UPLOAD }, rb = { D3D12_HEAP_TYPE_READBACK };
@@ -760,7 +761,10 @@ int main(int argc, char **argv)
 		std::snprintf(line, sizeof(line), "a lamp no object names, at (%.1f %.1f %.1f): the street under it per pixel %.1f -> %.1f; per vertex %.1f (first pass %.1f)",
 			lamp.pos[0], lamp.pos[1], lamp.pos[2], lumas[0], lumas[1], lumas[2], first_luma);
 		check(d < 1.0 && lumas[1] > lumas[0] + 5.0, line);
-		check(std::fabs(lumas[2] - first_luma) < 0.5, "  per vertex, as the game lights: only the lamps an object names (none here)");
+		// (the first pass per vertex as the game draws it, unless ZONE_PERPIXEL drew it per pixel: then there's no per-vertex
+		// picture without the lamp to hold this one to)
+		const bool first_per_vertex = GetEnvironmentVariableA("ZONE_PERPIXEL", nullptr, 0) == 0;
+		check(!first_per_vertex || std::fabs(lumas[2] - first_luma) < 0.5, "  per vertex, as the game lights: only the lamps an object names (none here)");
 		check(lumas[3] > first_luma + 5.0, "  ... and named by every object, per vertex it lights them: " + std::to_string(lumas[3]));
 	}
 	if (argc > 1)

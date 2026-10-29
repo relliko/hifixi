@@ -13,6 +13,7 @@
 #include <d3dcompiler.h>
 #include "chardraw.hpp"
 #include "cache.hpp"
+#include "../zone/hemi_spec.hpp"
 #include "../zone/light_split.hpp"
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,7 @@ cbuffer frame_constants : register(b0)
 	float4 fog_end;      // x: end
 	float4 options;      // x: per-pixel lighting; y: the frame's models
 	float4 sun_dir;      // toward the zone's sun (world), w: 1 when it's known (the light split's share: which light is it)
+	float4 camera;       // the camera (world), w: 1 when it's known (the sun's highlight)
 };
 cbuffer draw_constants : register(b1)
 {
@@ -70,6 +72,12 @@ StructuredBuffer<bone_t> last_palette : register(t5);
 SamplerState clamp_linear : register(s0);
 
 static const float kMaterialDiffuse = 0.5;
+// HiFi XI's own look per pixel (hemi_spec.hpp). The ambient from a sky as the zone's, x kSkyAbove on what faces up,
+// x kSkyBelow on what faces down: a body faces sideways mostly, so as bright as the game's on the whole. The sun's
+// highlight: kSpec on a shine's metal by its texture's alpha (the game's own mask for its reflection), kSpecMatte on
+// everything else, broad (cloth and skin only take the sheen of it).
+static const float kSkyAbove = 1.2, kSkyBelow = 0.8, kSkyTint = 0.2;
+static const float kSpec = 0.08, kSpecMatte = 0.015, kSpecBroad = 8, kSpecSharp = 32;
 
 float3 bone_point(uint b, float4 p)
 {
@@ -89,6 +97,39 @@ float3 bone_dir(uint b, float3 n)
 float3 flip(uint axis)
 {
 	return float3(axis == 1 ? -1 : 1, axis == 2 ? -1 : 1, axis == 3 ? -1 : 1);
+}
+
+// The sun among the model's lights (the one from the zone's sun, as lit takes it): its colour as it lights (0: none
+// there, or the sun not known) and toward it
+float3 sun_light(model_t m, out float3 dir)
+{
+	float3 colour = 0;
+	dir = sun_dir.xyz;
+	[unroll] for (int k = 0; k < 4; ++k)
+		if (sun_dir.w > 0 && m.light_dir[k].w > 0 && dot(m.light_dir[k].xyz, sun_dir.xyz) > 0.985)
+		{
+			colour = m.light_diffuse[k].rgb * light_scale;
+			dir = m.light_dir[k].xyz;
+		}
+	return colour;
+}
+// The ambient a from the zone's sky at the facing n (world), per pixel only (the fixed-function colour is the game's)
+float3 sky_ambient(model_t m, float3 a, float3 n)
+{
+	if (options.x <= 0)
+		return a;
+	float3 dir;
+	return hemi_ambient(a, n, kSkyBelow, kSkyAbove, kSkyTint, fog.rgb, sun_light(m, dir));
+}
+// The sun's highlight at the facing n, world and texel t, per pixel only (added after the texture)
+float3 char_spec(model_t m, float3 n, float3 world, float4 t)
+{
+	if (options.x <= 0 || camera.w <= 0)
+		return 0;
+	float3 dir;
+	const float3 sun = sun_light(m, dir);
+	const bool shine = (flags & 1) != 0;
+	return sun_spec(n, dir, camera.xyz - world, sun, shine ? kSpecSharp : kSpecBroad, shine ? kSpec * saturate(2 * t.a) : kSpecMatte);
 }
 
 // Direct3D 8's fixed-function colour for a normal (the game's states: directional lights, no specular, no emissive); share:
@@ -113,7 +154,7 @@ float4 lit(model_t m, float3 n, float3 world, out float share)
 		const float edge = d2 < r2 ? 1.0 - smoothstep(0.36, 1.0, d2 / max(r2, 1e-6)) : 0.0;
 		diffuse += edge * m.lamp_colour[j].rgb * light_scale * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(m.lamp_colour[j].w * d2, 1e-3);
 	}
-	const float3 c = m.material_ambient.rgb * (m.ambient.rgb * light_scale + light_ambient) + kMaterialDiffuse * diffuse;
+	const float3 c = m.material_ambient.rgb * sky_ambient(m, m.ambient.rgb * light_scale + light_ambient, n) + kMaterialDiffuse * diffuse;
 	share = light_share(saturate(c), saturate(c - kMaterialDiffuse * sun));
 	return float4(saturate(c), kMaterialDiffuse);
 }
@@ -127,7 +168,7 @@ struct v2p
 	float3 normal : TEXCOORD2;
 	float share : TEXCOORD4;    // the sun's share of colour (lit)
 	float4 motion : TEXCOORD3; // xyz the move since the last frame (world), w the view depth
-	float3 world : TEXCOORD5;  // (for the lamps per pixel)
+	float3 world : TEXCOORD5;  // (for the lamps per pixel and the sun's highlight)
 };
 
 v2p vs(uint vid : SV_VertexID)
@@ -181,7 +222,10 @@ float4 shade(v2p i, out float share)
 		if (a * 255 <= 69.5)
 			discard; // (ALPHAFUNC GREATER, ALPHAREF 0x45)
 	}
-	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb, i.fog), a);
+	// (the sun's highlight after the texture, the sun's all of it)
+	const float3 spec = char_spec(m, i.normal, i.world, t);
+	share = spec_share(share, rgb, spec);
+	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb + spec, i.fog), a);
 }
 float4 ps(v2p i) : SV_Target
 {
@@ -1019,8 +1063,39 @@ float4 pps(p2p i) : SV_Target
 			float fog_end[4];
 			float options[4];
 			float sun_dir[4];
+			float camera[4];
 		};
 		static_assert(sizeof(gpu_constants) <= kConstantsBytes);
+
+		// The camera (world) a VIEW x PROJECTION (row vectors) looks from: the one point it takes to clip x, y and w 0. False
+		// for none (an orthographic one, a matrix not read).
+		bool camera_of(const float m[16], float eye[3])
+		{
+			// (p x M[0..2][j] = -M[3][j] for the columns j 0, 1, 3, by Cramer's rule)
+			const int col[3] = { 0, 1, 3 };
+			double a[3][3], b[3];
+			for (int r = 0; r < 3; ++r)
+			{
+				for (int i = 0; i < 3; ++i)
+					a[r][i] = m[i * 4 + col[r]];
+				b[r] = -m[12 + col[r]];
+			}
+			auto det3 = [](const double x[3][3]) {
+				return x[0][0] * (x[1][1] * x[2][2] - x[1][2] * x[2][1]) - x[0][1] * (x[1][0] * x[2][2] - x[1][2] * x[2][0]) + x[0][2] * (x[1][0] * x[2][1] - x[1][1] * x[2][0]);
+			};
+			const double d = det3(a);
+			if (!(std::fabs(d) > 1e-12))
+				return false;
+			for (int i = 0; i < 3; ++i)
+			{
+				double t[3][3];
+				std::memcpy(t, a, sizeof(t));
+				for (int r = 0; r < 3; ++r)
+					t[r][i] = b[r];
+				eye[i] = float(det3(t) / d);
+			}
+			return std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2]);
+		}
 		// (a slot: the frame's draw's constants and models, then its shadow's: record_casters may come while the GPU has yet
 		// to read the draw's)
 		constexpr UINT64 kHalfSlotBytes = (kConstantsBytes + UINT64(kMaxModels) * sizeof(gpu_model) + 255) & ~UINT64(255);
@@ -1241,7 +1316,7 @@ float4 pps(p2p i) : SV_Target
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
 			const bool en = e.out == &_en_svs || e.out == &_en_sps || e.out == &_en_pvs || e.out == &_en_pps;
-			const std::string src = en ? std::string(kEnShader) : std::string(light::kHlsl) + kShader;
+			const std::string src = en ? std::string(kEnShader) : std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
 			if (FAILED(compile(src.data(), src.size(), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the character shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
@@ -1458,6 +1533,9 @@ float4 pps(p2p i) : SV_Target
 			std::memcpy(c.sun_dir, o.sun, 12);
 			c.sun_dir[3] = 1.0f;
 		}
+		// (the frame's own camera, whatever view_proj the draw's seen through)
+		if (f.camera && camera_of(f.view_proj, c.camera))
+			c.camera[3] = 1.0f;
 		std::memcpy(_mapped + slot, &c, sizeof(c));
 		gpu_model *gm = reinterpret_cast<gpu_model *>(_mapped + slot + kModelsAt);
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
