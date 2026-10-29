@@ -59,6 +59,8 @@ namespace hifi::zone::inject
 			// The camera of the last zone pass whose end was recorded (last_camera)
 			frame_camera camera;
 			bool have_camera = false;
+			frame_lamp lamps[kMaxLamps]; // (and its lamps, when it was drawn here: last_lamps)
+			uint32_t lamp_count = 0;
 			// What's been drawn
 			uint32_t last_seq = 0;
 			uint64_t frame_number = 0, drawn = 0, failed = 0;
@@ -313,6 +315,15 @@ namespace hifi::zone::inject
 		return true;
 	}
 
+	uint32_t last_lamps(frame_lamp out[kMaxLamps])
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (!g.have_camera)
+			return 0;
+		std::memcpy(out, g.lamps, size_t(g.lamp_count) * sizeof(frame_lamp));
+		return g.lamp_count;
+	}
+
 	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
 	{
 		const frame *f = published(seq_low4);
@@ -329,6 +340,8 @@ namespace hifi::zone::inject
 			g.camera.seq = f->seq.load(std::memory_order_acquire);
 			g.camera.at = GetTickCount64();
 			g.have_camera = true;
+			g.lamp_count = f->native ? std::min(f->lamp_count, kMaxLamps) : 0;
+			std::memcpy(g.lamps, f->lamps, size_t(g.lamp_count) * sizeof(frame_lamp));
 		}
 		if (!f->native)
 			return;

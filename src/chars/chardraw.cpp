@@ -58,6 +58,8 @@ struct model_t
 	float4 tfactor;          // TEXTUREFACTOR (alpha 0x80)
 	float4 fog;              // the actor's own fog: rgb; w: 1 / (end - start), 0 for none; or all 0 (w -1): the frame's
 	float4 fog_end;          // x: end
+	float4 lamp_pos[4];      // the zone's lamps near it (chardraw.hpp "Lamps"): where, w the range (0: none)
+	float4 lamp_colour[4];   // ... their colour, w the attenuation (a2)
 };
 StructuredBuffer<vertex_t> vertices : register(t0);
 StructuredBuffer<corner_t> corners : register(t1);
@@ -91,8 +93,10 @@ float3 flip(uint axis)
 
 // Direct3D 8's fixed-function colour for a normal (the game's states: directional lights, no specular, no emissive); share:
 // the sun's share of it (light_share), the sun being the light that comes from the zone's sun (the game eases an actor's
-// sun toward it: within about 10 degrees; a lamp is turned into a light from the lamp)
-float4 lit(model_t m, float3 n, out float share)
+// sun toward it: within about 10 degrees; a lamp is turned into a light from the lamp). The zone's lamps near it
+// (world: the point lit) light it as they light the zone, through the diffuse as the game's own lamp slot would: never
+// the sun's share.
+float4 lit(model_t m, float3 n, float3 world, out float share)
 {
 	float3 diffuse = 0, light_ambient = 0, sun = 0;
 	[unroll] for (int k = 0; k < 4; ++k)
@@ -101,6 +105,13 @@ float4 lit(model_t m, float3 n, out float share)
 		diffuse += d;
 		sun += sun_dir.w > 0 && dot(m.light_dir[k].xyz, sun_dir.xyz) > 0.985 ? d : 0;
 		light_ambient += m.light_dir[k].w * m.light_ambient[k].rgb;
+	}
+	[unroll] for (int j = 0; j < 4; ++j)
+	{
+		const float3 d = m.lamp_pos[j].xyz - world;
+		const float d2 = dot(d, d), r2 = m.lamp_pos[j].w * m.lamp_pos[j].w;
+		const float edge = d2 < r2 ? 1.0 - smoothstep(0.36, 1.0, d2 / max(r2, 1e-6)) : 0.0;
+		diffuse += edge * m.lamp_colour[j].rgb * light_scale * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(m.lamp_colour[j].w * d2, 1e-3);
 	}
 	const float3 c = m.material_ambient.rgb * (m.ambient.rgb * light_scale + light_ambient) + kMaterialDiffuse * diffuse;
 	share = light_share(saturate(c), saturate(c - kMaterialDiffuse * sun));
@@ -116,6 +127,7 @@ struct v2p
 	float3 normal : TEXCOORD2;
 	float share : TEXCOORD4;    // the sun's share of colour (lit)
 	float4 motion : TEXCOORD3; // xyz the move since the last frame (world), w the view depth
+	float3 world : TEXCOORD5;  // (for the lamps per pixel)
 };
 
 v2p vs(uint vid : SV_VertexID)
@@ -140,7 +152,8 @@ v2p vs(uint vid : SV_VertexID)
 	r.fog = f.w > 0 ? saturate((e - r.pos.w) * f.w) : 1;
 	r.uv = c.uv;
 	r.normal = nn;
-	r.colour = lit(models[min(model_index, (uint)options.y - 1)], nn, r.share);
+	r.world = world;
+	r.colour = lit(models[min(model_index, (uint)options.y - 1)], nn, world, r.share);
 	return r;
 }
 
@@ -149,7 +162,7 @@ float4 shade(v2p i, out float share)
 	const model_t m = models[min(model_index, (uint)options.y - 1)];
 	const float4 t = colour_map.Sample(clamp_linear, i.uv);
 	share = i.share;
-	const float4 colour = options.x > 0 ? lit(m, normalize(i.normal), share) : i.colour;
+	const float4 colour = options.x > 0 ? lit(m, normalize(i.normal), i.world, share) : i.colour;
 	const float3 s0 = saturate(2 * t.rgb * colour.rgb);
 	const float a0 = saturate(2 * t.a * m.tfactor.a);
 	float3 rgb;
@@ -995,8 +1008,10 @@ float4 pps(p2p i) : SV_Target
 			float tfactor[4];
 			float fog[4];
 			float fog_end[4];
+			float lamp_pos[kModelLamps][4];    // (model_lamps)
+			float lamp_colour[kModelLamps][4];
 		};
-		static_assert(sizeof(gpu_model) == 272, "the shader's model_t");
+		static_assert(sizeof(gpu_model) == 400 && kModelLamps == 4, "the shader's model_t");
 		struct gpu_constants
 		{
 			float view_proj[16];
@@ -1066,6 +1081,89 @@ float4 pps(p2p i) : SV_Target
 			}
 			else
 				g.fog[3] = -1.0f; // (the frame's)
+		}
+
+		// The zone's lamps whose range reaches the model's bones' box (its instances' palette rows' places, half a yalm
+		// round for the skin), up to kModelLamps, the strongest at the box first; and the game's own lamp slots left out
+		// where they're one of those (chardraw.hpp "Lamps"): a slot not the sun's (as lit's share tells it) pointing from
+		// the model's root (its first instance's first row: the actor's place) toward one of them within about 18 degrees.
+		// The model's place is the palette's, world space (WORLD is identity for characters).
+		void model_lamps(const frame &f, const model_entry &m, const char_options &o, gpu_model &g)
+		{
+			if (o.lamp_count == 0 || !o.sun_known)
+				return;
+			float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f }, root[3] = {};
+			bool any = false;
+			for (uint32_t ii = 0; ii < m.instances && m.first_instance + ii < kMaxInstances; ++ii)
+			{
+				const instance_entry &ie = f.instance[m.first_instance + ii];
+				for (uint32_t b = 0; b < ie.bones && ie.first_bone + b < kMaxBones; ++b)
+				{
+					const float *t = f.palette[ie.first_bone + b].m + 9;
+					if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2]))
+						continue;
+					if (!any)
+						std::memcpy(root, t, sizeof(root));
+					any = true;
+					for (int k = 0; k < 3; ++k)
+					{
+						lo[k] = std::min(lo[k], t[k] - 0.5f);
+						hi[k] = std::max(hi[k], t[k] + 0.5f);
+					}
+				}
+			}
+			if (!any)
+				return;
+			uint32_t index[kFrameLamps];
+			float strength[kFrameLamps];
+			uint32_t n = 0;
+			for (uint32_t i = 0; i < std::min(o.lamp_count, kFrameLamps); ++i)
+			{
+				const char_lamp &l = o.lamps[i];
+				if (!(l.range > 0.0f) || !std::isfinite(l.range))
+					continue;
+				float d2 = 0.0f;
+				for (int k = 0; k < 3; ++k)
+				{
+					const float out_by = std::max(lo[k] - l.pos[k], l.pos[k] - hi[k]);
+					d2 += out_by > 0.0f ? out_by * out_by : 0.0f;
+				}
+				if (!(d2 < l.range * l.range))
+					continue;
+				index[n] = i;
+				strength[n] = (0.2126f * l.colour[0] + 0.7152f * l.colour[1] + 0.0722f * l.colour[2]) / std::max(l.attenuation2 * d2, 1e-3f);
+				n++;
+			}
+			for (uint32_t a = 0; a < n && a < kModelLamps; ++a)
+			{
+				uint32_t best = a;
+				for (uint32_t b = a + 1; b < n; ++b)
+					best = strength[b] > strength[best] ? b : best;
+				std::swap(index[a], index[best]);
+				std::swap(strength[a], strength[best]);
+				const char_lamp &l = o.lamps[index[a]];
+				std::memcpy(g.lamp_pos[a], l.pos, 12);
+				g.lamp_pos[a][3] = l.range;
+				std::memcpy(g.lamp_colour[a], l.colour, 12);
+				g.lamp_colour[a][3] = l.attenuation2 > 0.0f ? l.attenuation2 : 0.5f;
+			}
+			// (the game's lamp slot: its light is one of these now)
+			for (int k = 0; k < 4; ++k)
+			{
+				const float *d = g.light_dir[k];
+				if (d[3] == 0.0f || d[0] * o.sun[0] + d[1] * o.sun[1] + d[2] * o.sun[2] > 0.985f)
+					continue;
+				for (uint32_t a = 0; a < n && a < kModelLamps; ++a)
+				{
+					const float v[3] = { g.lamp_pos[a][0] - root[0], g.lamp_pos[a][1] - root[1], g.lamp_pos[a][2] - root[2] };
+					const float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+					if (len > 1e-3f && (v[0] * d[0] + v[1] * d[1] + v[2] * d[2]) / len > 0.95f)
+					{
+						g.light_dir[k][3] = 0.0f;
+						break;
+					}
+				}
+			}
 		}
 
 		enum kind
@@ -1363,7 +1461,10 @@ float4 pps(p2p i) : SV_Target
 		std::memcpy(_mapped + slot, &c, sizeof(c));
 		gpu_model *gm = reinterpret_cast<gpu_model *>(_mapped + slot + kModelsAt);
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
+		{
 			model_constants(f.model[i], gm[i]);
+			model_lamps(f, f.model[i], o, gm[i]);
+		}
 		return _ring->GetGPUVirtualAddress() + slot;
 	}
 

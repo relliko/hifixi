@@ -69,6 +69,7 @@
 #include "../chars/cache.hpp"     // (native characters)
 #include "../chars/charframe.hpp"     // (native characters)
 #include "../chars/charinject.hpp"    // (native characters)
+#include "../chars/chardraw.hpp"      // (native characters: their lamps)
 #include "../chars/charoptions.hpp"   // (native characters)
 #include "../zone/zoneoptions.hpp"
 #include "../zone/inject.hpp"
@@ -566,6 +567,11 @@ class hifixi final : public IPlugin
 			hifi::zone::inject::frame_camera c;
 			const bool known = hifi::zone::inject::last_camera(c) && GetTickCount64() - c.at <= 250;
 			hifi::chars::inject::set_sun(known ? c.sun_dir : nullptr);
+			// (and its lamps, when it drew the zone itself: the characters lit by the lamps the zone is lit by)
+			static_assert(sizeof(hifi::zone::frame_lamp) == sizeof(hifi::chars::char_lamp) && hifi::zone::kMaxLamps == hifi::chars::kFrameLamps);
+			hifi::zone::frame_lamp lamps[hifi::zone::kMaxLamps];
+			const uint32_t lamp_count = known ? hifi::zone::inject::last_lamps(lamps) : 0;
+			hifi::chars::inject::set_lamps(lamp_count != 0 ? &lamps[0].pos[0] : nullptr, lamp_count);
 		}
 		// (their sun shadows from their meshes: World FX calls for them in its shading pass, once its renderer is up)
 		if (!m_casters_set && hifi::chars::inject::ready())

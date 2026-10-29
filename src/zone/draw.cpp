@@ -16,6 +16,7 @@
 #include "light_split.hpp"
 #include "zone_gpu.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -51,7 +52,9 @@ cbuffer draw_constants : register(b1)
 	uint unused;
 };
 struct vertex { float3 pos; float3 normal; uint colour; float2 uv; float3 sway; };
-struct object { float4 c0; float4 c1; float4 c2; uint flags; uint model; float sway; uint env; uint4 lamp; }; // (env: its own | a door's << 8)
+// (env: its own | a door's << 8; lamp: x the game's 4 lamps, a byte each, then yzw the frame's lamps whose range
+// reaches its box, up to 12, a byte each in order (near_lamps): 255 none, and none after the first none)
+struct object { float4 c0; float4 c1; float4 c2; uint flags; uint model; float sway; uint env; uint4 lamp; };
 struct lamp_t { float3 pos; float range; float3 colour; float att2; };
 StructuredBuffer<vertex> vertices : register(t0);
 StructuredBuffer<uint> indices : register(t1);
@@ -86,25 +89,42 @@ float4 unpack(uint c) { return float4((c >> 16) & 255, (c >> 8) & 255, c & 255, 
 // range, still at an eighth of its colour (a2 0.5, range 3-6): a hard circle round each lamp that the eye takes for a
 // dark ring past it (in game, 2026-10-26; the game's own drawing has it too, softened by its vertices). Here it fades
 // to none over the outer 40% of the range instead.
+float3 one_lamp(uint i, float3 world, float3 n)
+{
+	// (an index past the frame's lamps, 255 for none, is never read: the compiler may load before the test, and a root
+	// SRV has no bounds: on the GPU such a read went to a wild address and hung it. Lamp 0 is read instead.)
+	const bool used = i < kMaxLamps;
+	const lamp_t l = lamps[used ? i : 0];
+	const float3 d = l.pos - world;
+	const float d2 = dot(d, d);
+	const float r2 = l.range * l.range;
+	if (!used || d2 > r2)
+		return 0;
+	const float edge = 1.0 - smoothstep(0.36, 1.0, d2 / max(r2, 1e-6));
+	return edge * l.colour * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(l.att2 * d2, 1e-3);
+}
+// The game's own: the 4 its object names (per vertex, as the game lights it)
 float3 lamp_light(object o, float3 world, float3 n)
 {
 	float3 sum = 0;
-	[unroll] for (int k = 0; k < 4; ++k)
+	[unroll] for (uint k = 0; k < 4; ++k)
+		sum += one_lamp((o.lamp.x >> (8 * k)) & 255, world, n);
+	return sum;
+}
+// Per pixel: every lamp of the frame whose range reaches the object (near_lamps on the CPU), not only the 4 the game
+// named, so a wall beside a lamp its own object doesn't name is lit as the floor under it is (one lamp light, the same
+// for World FX: it no longer adds the zone's lamps where the light split knows the pixel). The object's list is the
+// same for each of its pixels: the loop ends at its first empty byte, alike across a draw.
+float3 near_lamp_light(object o, float3 world, float3 n)
+{
+	float3 sum = 0;
+	[loop] for (uint w = 0; w < 3; ++w)
 	{
-		// (an index past the frame's lamps, 0xFFFFFFFF for none, is never read: the compiler may load before the test,
-		// and a root SRV has no bounds: on the GPU such a read went to a wild address and hung it. Lamp 0 is read instead.)
-		const uint i = o.lamp[k];
-		const bool used = i < kMaxLamps;
-		const lamp_t l = lamps[used ? i : 0];
-		if (!used)
-			continue;
-		const float3 d = l.pos - world;
-		const float d2 = dot(d, d);
-		const float r2 = l.range * l.range;
-		if (d2 > r2)
-			continue;
-		const float edge = 1.0 - smoothstep(0.36, 1.0, d2 / max(r2, 1e-6));
-		sum += edge * l.colour * max(0, dot(n, d * rsqrt(max(d2, 1e-6)))) / max(l.att2 * d2, 1e-3);
+		const uint word = w == 0 ? o.lamp.y : w == 1 ? o.lamp.z : o.lamp.w;
+		if ((word & 255) == 255)
+			break;
+		[unroll] for (uint k = 0; k < 4; ++k)
+			sum += one_lamp((word >> (8 * k)) & 255, world, n);
 	}
 	return sum;
 }
@@ -200,7 +220,7 @@ float4 shade(v2p i, out float share)
 		}
 		n *= scale;
 		const float3 s_rgb = bump ? e.sun_bump.rgb : e.sun.rgb, a_rgb = bump ? e.ambient_bump.rgb : e.ambient.rgb;
-		const float3 rest = i.vcol.rgb * a_rgb + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
+		const float3 rest = i.vcol.rgb * a_rgb + i.vcol.rgb * near_lamp_light(objects[object_index], i.world, n);
 		lit = saturate(i.vcol.rgb * s_rgb * saturate(dot(n, e.sun_dir.xyz)) + rest);
 		share = light_share(lit, saturate(rest));
 	}
@@ -257,10 +277,10 @@ light_out ps_light(v2p i)
 			uint32_t flags, model;
 			float sway;
 			uint32_t env; // (its own | a door's << 8)
-			uint32_t lamps[4];
+			uint32_t lamps[4]; // (the game's 4 a byte each; then its near ones, 12 bytes: the shader's object)
 		};
 		static_assert(sizeof(gpu_object) == 80);
-		static_assert(kMaxLamps == 64); // (the shader's kMaxLamps)
+		static_assert(kMaxLamps == 64); // (the shader's kMaxLamps; and under 255: a lamp's byte)
 		struct gpu_env
 		{
 			float sun_dir[4], sun[4], sun_bump[4], ambient[4], ambient_bump[4], fog[4], fog_end[4];
@@ -290,6 +310,56 @@ light_out ps_light(v2p i)
 			to[1] = from[1];
 			to[2] = from[2];
 			to[3] = w;
+		}
+
+		// The frame's lamps whose range reaches an object's box (its model's, sways included, through its matrix), for
+		// per-pixel lighting: up to kNearLamps, the strongest at the box first (colour / (a2 d^2) at its nearest point),
+		// a byte each into out (255 none). A box test per lamp: a frame has at most 64, and none by day outdoors.
+		constexpr uint32_t kNearLamps = 12;
+		void near_lamps(const frame &f, uint32_t lamp_count, const frame_object &fo, const zm::model &mo, uint32_t out[3])
+		{
+			out[0] = out[1] = out[2] = 0xFFFFFFFFu;
+			if (lamp_count == 0)
+				return;
+			const float c[3] = { 0.5f * (mo.lo[0] + mo.hi[0]), 0.5f * (mo.lo[1] + mo.hi[1]), 0.5f * (mo.lo[2] + mo.hi[2]) };
+			const float h[3] = { 0.5f * (mo.hi[0] - mo.lo[0]), 0.5f * (mo.hi[1] - mo.lo[1]), 0.5f * (mo.hi[2] - mo.lo[2]) };
+			float centre[3], half[3];
+			for (int k = 0; k < 3; ++k)
+			{
+				const float *r = fo.world + k * 4;
+				centre[k] = c[0] * r[0] + c[1] * r[1] + c[2] * r[2] + r[3];
+				half[k] = std::fabs(r[0]) * h[0] + std::fabs(r[1]) * h[1] + std::fabs(r[2]) * h[2];
+			}
+			uint8_t index[kMaxLamps];
+			float strength[kMaxLamps];
+			uint32_t n = 0;
+			for (uint32_t i = 0; i < lamp_count; ++i)
+			{
+				const frame_lamp &l = f.lamps[i];
+				if (!(l.range > 0.0f) || !std::isfinite(l.range))
+					continue;
+				float d2 = 0.0f;
+				for (int k = 0; k < 3; ++k)
+				{
+					const float out_by = std::fabs(l.pos[k] - centre[k]) - half[k];
+					d2 += out_by > 0.0f ? out_by * out_by : 0.0f;
+				}
+				if (!(d2 < l.range * l.range))
+					continue;
+				index[n] = uint8_t(i);
+				strength[n] = (0.2126f * l.colour[0] + 0.7152f * l.colour[1] + 0.0722f * l.colour[2]) / std::max(l.attenuation2 * d2, 1e-3f);
+				n++;
+			}
+			// (the strongest first: a box with more in reach keeps those that light it most)
+			for (uint32_t a = 0; a < n && a < kNearLamps; ++a)
+			{
+				uint32_t best = a;
+				for (uint32_t b = a + 1; b < n; ++b)
+					best = strength[b] > strength[best] ? b : best;
+				std::swap(index[a], index[best]);
+				std::swap(strength[a], strength[best]);
+				out[a / 4] = (out[a / 4] & ~(0xFFu << (8 * (a % 4)))) | uint32_t(index[a]) << (8 * (a % 4));
+			}
 		}
 	}
 
@@ -514,7 +584,15 @@ light_out ps_light(v2p i)
 			go[i].model = fo.model;
 			go[i].sway = fo.sway;
 			go[i].env = (fo.env < kMaxEnvs ? fo.env : 0) | (fo.door_env < kMaxEnvs ? fo.door_env : 0) << 8;
-			std::memcpy(go[i].lamps, fo.lamps, sizeof(go[i].lamps));
+			// (the game's 4 a byte each; per pixel, the frame's lamps in reach of the object as well: near_lamps)
+			go[i].lamps[0] = 0;
+			for (uint32_t k = 0; k < 4; ++k)
+				go[i].lamps[0] |= (fo.lamps[k] < lamp_count ? fo.lamps[k] : 255u) << (8 * k);
+			gpu_zone *const z = fo.zone < 2 ? zones[fo.zone] : nullptr;
+			if (o.per_pixel && z != nullptr && fo.model < z->data().models.size())
+				near_lamps(f, lamp_count, fo, z->data().models[fo.model], go[i].lamps + 1);
+			else
+				go[i].lamps[1] = go[i].lamps[2] = go[i].lamps[3] = 0xFFFFFFFFu;
 		}
 		std::memcpy(at + kLampsAt, f.lamps, size_t(lamp_count) * sizeof(frame_lamp));
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;

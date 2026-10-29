@@ -45,6 +45,8 @@ namespace hifi::chars::inject
 			std::mutex sun_mutex;
 			bool sun_known = false;
 			float sun[3] = {};
+			uint32_t lamp_count = 0; // (and its lamps: set_lamps)
+			char_lamp lamps[kFrameLamps] = {};
 			std::atomic<double> clock { -1.0 }; // (the en-spells' time: below 0, the real one)
 			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
 			ID3D12Resource *depth = nullptr;
@@ -506,6 +508,8 @@ namespace hifi::chars::inject
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;
 			std::memcpy(o.sun, g.sun, sizeof(o.sun));
+			o.lamp_count = g.lamp_count;
+			std::memcpy(o.lamps, g.lamps, sizeof(char_lamp) * g.lamp_count);
 		}
 		const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -562,6 +566,14 @@ namespace hifi::chars::inject
 		g.sun_known = toward != nullptr;
 		for (int i = 0; i < 3; ++i)
 			g.sun[i] = toward != nullptr ? toward[i] : 0.0f;
+	}
+
+	void set_lamps(const float *lamps, uint32_t count)
+	{
+		std::lock_guard<std::mutex> lock(g.sun_mutex);
+		g.lamp_count = lamps != nullptr ? std::min(count, kFrameLamps) : 0;
+		if (g.lamp_count != 0)
+			std::memcpy(g.lamps, lamps, sizeof(char_lamp) * g.lamp_count);
 	}
 
 	void set_motion_wanted(bool wanted)
@@ -641,6 +653,8 @@ namespace hifi::chars::inject
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;
 			std::memcpy(o.sun, g.sun, sizeof(o.sun));
+			o.lamp_count = g.lamp_count;
+			std::memcpy(o.lamps, g.lamps, sizeof(char_lamp) * g.lamp_count);
 		}
 		const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);

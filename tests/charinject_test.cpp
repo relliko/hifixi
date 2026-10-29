@@ -11,7 +11,10 @@
  *   - the middle one in the target and its depth, inside its skinned vertices' projected box and filling it;
  *   - the see-through one blended about halfway between the sky and what the opaque one shows, its depth written;
  *   - the left one not drawn;
- *   - dgVoodoo's own draw as it meant it; the debug layer says nothing; the counts.
+ *   - dgVoodoo's own draw as it meant it; the debug layer says nothing; the counts;
+ *   - the zone's lamps (set_lamps): a lamp 1.5 yalms in front of the middle one lights it (against the sun alone), and
+ *     its light then stands in for the game's own lamp slot (the lamp turned directional, left out): about as bright as
+ *     the game's own, not both added; without the zone's lamps the game's slot as it is.
  *
  *   build\charinject_test.exe <pose.bin> [out.bmp]
  */
@@ -1020,6 +1023,122 @@ int main(int argc, char **argv)
 		const inj::counts nc = inj::get_counts();
 		check(nc.caster_frames == 1 && nc.caster_models == 3, "counted: 1 casters' frame, 3 models (" + std::to_string(nc.caster_models) + ")");
 		caster_back->Unmap(0, nullptr);
+	}
+	// The zone's lamps (chardraw.hpp "Lamps"): the middle one alone again (seqs 22-24), a lamp 1.5 yalms in front of it
+	// toward the camera at its middle's height. 22: the game's own lamp slot (the lamp turned directional from the actor's
+	// root, its colour times its weight there), no zone lamps; 23: the same slot and the zone's lamp handed over; 24: the
+	// sun alone. Its pixels' mean brightness: 23 above 24, and within half again of 22 (the slot left out, not added to).
+	if (samples == 1)
+	{
+		const ch::model_entry &mm = f.model[0];
+		const ch::instance_entry &mi = f.instance[mm.first_instance];
+		const float *root = f.palette[mi.first_bone].m + 9;
+		float way[3] = { eye[0] - centre[0], 0.0f, eye[2] - centre[2] };
+		const float wl = std::sqrt(way[0] * way[0] + way[2] * way[2]);
+		const float lamp_at[3] = { centre[0] + 1.5f * way[0] / wl, centre[1], centre[2] + 1.5f * way[2] / wl };
+		const float lamp_colour[3] = { 0.6f, 0.5f, 0.3f };
+		const float to_actor[3] = { root[0] - lamp_at[0], root[1] - lamp_at[1], root[2] - lamp_at[2] };
+		const float d2 = to_actor[0] * to_actor[0] + to_actor[1] * to_actor[1] + to_actor[2] * to_actor[2];
+		const float weight = 1.0f / std::max(d2 * 0.5f, 1e-4f);
+		auto lamp_frame = [&](uint32_t s, bool game_lamp) {
+			ch::frame &lf = ch::begin_frame(s);
+			std::memcpy(lf.view_proj, vp.m, 64);
+			lf.camera = true;
+			lf.model[0] = mm;
+			lf.model[0].first_instance = 0;
+			lf.model[0].actor = 0xAC710000u;
+			if (game_lamp)
+			{
+				ch::light8 l = {};
+				l.type = 3;
+				for (int k = 0; k < 3; ++k)
+				{
+					l.diffuse[k] = lamp_colour[k] * weight;
+					l.direction[k] = to_actor[k] / std::sqrt(d2);
+				}
+				lf.model[0].lights[1] = l;
+			}
+			lf.instance[0] = mi;
+			lf.instance[0].first_bone = 0;
+			lf.instance[0].first_mesh = 0;
+			for (uint32_t b = 0; b < mi.bones; ++b)
+				lf.palette[b] = f.palette[mi.first_bone + b];
+			for (uint32_t k = 0; k < mi.meshes; ++k)
+				lf.mesh[k] = f.mesh[mi.first_mesh + k];
+			lf.models = 1;
+			lf.instances = 1;
+			lf.bones = mi.bones;
+			lf.meshes = mi.meshes;
+			ch::publish_opaque(lf);
+			ch::publish_see_through(lf);
+			ch::cache::publish_palettes(lf, 0, lf.bones);
+		};
+		const float sun_toward[3] = { -0.31f / 1.00025f, -0.951f / 1.00025f, 0.0f };
+		inj::set_sun(sun_toward);
+		const float zone_lamp[8] = { lamp_at[0], lamp_at[1], lamp_at[2], 6.0f, lamp_colour[0], lamp_colour[1], lamp_colour[2], 0.5f };
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		inj::on_reset(list);
+		list->SetDescriptorHeaps(1, &srvh);
+		inj::on_heaps(list, 1, &srvh);
+		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		ID3D12Resource *outs[3] = {};
+		bd.Width = UINT64(W) * 4 * H;
+		for (int k = 0; k < 3; ++k)
+		{
+			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&outs[k]));
+			const uint32_t s = 22 + k;
+			lamp_frame(s, k < 2);
+			inj::set_lamps(k == 1 ? zone_lamp : nullptr, k == 1 ? 1 : 0);
+			list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
+			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			inj::on_chars_end(list, bound, w, s & 15);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+			to.pResource = outs[k];
+			to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_TYPELESS, W, H, 1, W * 4 };
+			from.pResource = A;
+			from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}
+		inj::set_lamps(nullptr, 0);
+		inj::set_sun(nullptr);
+		list->Close();
+		direct->ExecuteCommandLists(1, lists);
+		direct->Signal(fence, 2);
+		fence->SetEventOnCompletion(2, e);
+		WaitForSingleObject(e, 60000);
+		check(device->GetDeviceRemovedReason() == S_OK, "the device still there (the lamps' frames)");
+		const uint32_t lamp_messages = debug_messages(info, first);
+		check(lamp_messages == 0, "the debug layer: nothing (" + std::to_string(lamp_messages) + (lamp_messages != 0 ? ": " + first : std::string()) + ")");
+		double mean[3] = {};
+		uint32_t count[3] = {};
+		for (int k = 0; k < 3; ++k)
+		{
+			uint8_t *img = nullptr;
+			outs[k]->Map(0, nullptr, reinterpret_cast<void **>(&img));
+			for (UINT y = 0; y < H; ++y)
+				for (UINT x = 0; x < W; ++x)
+				{
+					const uint8_t *p = img + (size_t(y) * W + x) * 4;
+					if (middle.inside(float(x) + 0.5f, float(y) + 0.5f, 2) && !is_sky(p))
+					{
+						mean[k] += 0.3 * p[0] + 0.59 * p[1] + 0.11 * p[2];
+						count[k]++;
+					}
+				}
+			mean[k] /= std::max(count[k], 1u);
+			outs[k]->Unmap(0, nullptr);
+			outs[k]->Release();
+		}
+		std::snprintf(line, sizeof(line), "a lamp before the middle one (%u, %u, %u pixels): the game's lamp slot %.1f, the zone's lamp in its stead %.1f, the sun alone %.1f",
+			count[0], count[1], count[2], mean[0], mean[1], mean[2]);
+		check(count[1] > 1000 && mean[1] > mean[2] + 3.0, line);
+		check(mean[1] - mean[2] < 1.5 * (mean[0] - mean[2]) && mean[1] - mean[2] > 0.4 * (mean[0] - mean[2]),
+			"  the zone's lamp stands in for the game's lamp slot (about as bright: the slot left out, not added to)");
 	}
 	if (argc > 2)
 	{

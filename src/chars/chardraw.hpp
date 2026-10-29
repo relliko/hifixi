@@ -20,6 +20,13 @@
 //
 // Option: per-pixel lighting (the same lights at each pixel, the normal interpolated).
 //
+// Lamps (char_options::lamps: the native zone's frame's, as the zone is lit by them): each model is lit by up to
+// kModelLamps of them whose range reaches its bones' box, as point lights the way the zone's are (1 / (a2 d^2), fading
+// to none over the outer 40% of the range), per vertex or per pixel as the rest. The game's own lamp light for the
+// actor (0CB4E0: its strongest lamp turned into a directional light from the lamp) is then left out where it's one of
+// those: a light slot that points from the model's root to one of its lamps, and isn't the sun's. Without the zone's
+// lamps (the game drew the zone, or it's stale) the game's slots stand as they are.
+//
 // Motion (for FSR, src/upscale): with a motion target (char_target::motion_rtv, R16G16B16A16_FLOAT) the opaque models
 // also write, at each pixel, how far that point moved in the world since the last frame (this frame's skinning less
 // the last frame's: the same model and instance in the last frame's record, its palette still in the cache's ring)
@@ -59,11 +66,24 @@ namespace hifi::chars
 		D3D12_CPU_DESCRIPTOR_HANDLE light_rtv = {};  // (the opaque models' light split: light_split.hpp; or none)
 	};
 
+	// A lamp of the native zone's frame (zone/frame.hpp's frame_lamp, the same layout: main.cpp hands them over)
+	struct char_lamp
+	{
+		float pos[3];
+		float range;
+		float colour[3];
+		float attenuation2;
+	};
+	constexpr uint32_t kFrameLamps = 64; // (zone/frame.hpp's kMaxLamps)
+	constexpr uint32_t kModelLamps = 4;  // a model's own (the shader's)
+
 	struct char_options
 	{
 		bool per_pixel = false;
 		bool sun_known = false; // sun: toward the zone's sun (world), for the light split's share
 		float sun[3] = {};
+		uint32_t lamp_count = 0; // the zone's lamps (0: none known; the game's own lamp light then)
+		char_lamp lamps[kFrameLamps] = {};
 	};
 
 	struct char_stats

@@ -32,6 +32,9 @@ namespace hifi::chars::inject
 	void set_motion_wanted(bool wanted);
 	// Toward the zone's sun (world; nullptr: not known), for the light split's share of the sun (light_split.hpp)
 	void set_sun(const float *toward);
+	// The native zone's lamps of its last pass (8 floats each: chardraw.hpp's char_lamp; nullptr or 0: none known), the
+	// models' lamp light (chardraw.hpp "Lamps")
+	void set_lamps(const float *lamps, uint32_t count);
 	bool motion(ID3D12Resource *&texture, uint64_t &frames);
 	std::vector<std::string> status();
 

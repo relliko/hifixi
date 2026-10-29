@@ -324,7 +324,9 @@ int main(int argc, char **argv)
 	const bool clouds_only = argc > 1 && std::strcmp(argv[1], "clouds") == 0;
 	// ("look": only the look pass's own section, L below: quick while working on it)
 	const bool look_only = argc > 1 && std::strcmp(argv[1], "look") == 0;
-	const char *path = argc > 1 && !clouds_only && !look_only ? argv[1] : "build\\testdata\\grass\\100.bin";
+	// ("lamps": the blades' first sections, then only the lamps' own, 1p below)
+	const bool lamps_only = argc > 1 && std::strcmp(argv[1], "lamps") == 0;
+	const char *path = argc > 1 && !clouds_only && !look_only && !lamps_only ? argv[1] : "build\\testdata\\grass\\100.bin";
 	std::setvbuf(stdout, nullptr, _IONBF, 0); // (each line out as it's printed: a crash shows where it was)
 
 	compile_fn = reinterpret_cast<pD3DCompile>(GetProcAddress(LoadLibraryW(L"d3dcompiler_47.dll"), "D3DCompile"));
@@ -962,6 +964,9 @@ int main(int argc, char **argv)
 	// (sections 1c to 1w skipped with "clouds": not indented again for it)
 	if (!clouds_only)
 	{
+	// (with "lamps", on to 1p: every section between is a block of its own)
+	if (lamps_only)
+		goto lamps;
 	// 1b2. The blades at the zone's end marker (look::phase_t::blades into the world's own depth: HiFi XI draws them
 	// there, before the characters and effects): an effect drawn after them (depth-tested, no depth written, as the
 	// game's) stays on top of them; a character standing just behind a blade is hidden by it where the blade is in
@@ -3691,6 +3696,7 @@ int main(int argc, char **argv)
 		check(g.report_messages() == 0, "no debug-layer errors (shadow over the grass)");
 	}
 
+lamps:
 	// 1p. Lamps (grass off, the shading pass on for them alone): a San d'Oria street lamp (its colour, range 4,
 	// brightness 6, the glow at its default 0.5 and reach 1.5 times the range, as the add-on works them out) 3 yalms
 	// over the looked-at point on dark flat ground. The ground at its foot gets brighter, and warmer (red more than
@@ -3938,7 +3944,97 @@ int main(int argc, char **argv)
 			check(floor_lit.luma > floor_unlit.luma + 5.0 && floor_lit.b - floor_unlit.b > 2.0 * (floor_lit.r - floor_unlit.r), "the floor at its foot too");
 			check(hp_dark_diff <= 1, "its glow gone (none sent) changes nothing");
 		}
+
+		// 1p2. With the light split (HiFi XI's native zone and characters drew these pixels, lit by the zone's lamps
+		// already: grass.hlsl lamp_light_known): the lantern 0.6 yalms in front of a wall facing the camera, the wall over
+		// the whole picture and every pixel of it in the light split (its depth, facing the camera, no sun). The wall beside
+		// the lantern comes out as it went in (the lamp's glow isn't added again; without the split it is); the same light
+		// sent as an effect's glow still lights it; and with lamp shadows on, a pillar standing between the lantern and the
+		// wall 2.6 yalms to its side darkens the wall there (the lamp's light the native pass drew there taken away), the
+		// wall as far to the other side, whose way is clear, as it went in.
+		{
+			const vec3 f = normalize(sub(at, eye));
+			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] };
+			auto at_side = [&](const vec3 &p, float d) { return vec3 { p.x + right.x * d, p.y + right.y * d, p.z + right.z * d }; };
+			auto pushed = [&](const vec3 &p, float d) { return vec3 { p.x + f.x * d, p.y + f.y * d, p.z + f.z * d }; };
+			auto view_depth = [&](const vec3 &p) { return p.x * vp[3] + p.y * vp[7] + p.z * vp[11] + vp[15]; };
+			const vec3 wall_at = pushed(at, 1.0f), light = pushed(wall_at, -0.6f), pillar_at = pushed(wall_at, -0.45f);
+			float wall_ndc = 0.0f, pillar_ndc = 0.0f;
+			on_screen(wall_at, &wall_ndc);
+			on_screen(pillar_at, &pillar_ndc);
+			const LONG p0 = LONG(on_screen(at_side(pillar_at, 1.1f), nullptr).first), p1 = LONG(on_screen(at_side(pillar_at, 1.9f), nullptr).first);
+			cards = { { { 0, 0, LONG(W), LONG(H) }, wall_ndc }, { { p0, 0, p1, LONG(H) }, pillar_ndc } };
+			// The light split's words (light_split.hpp): each pixel the topmost card's view depth, facing the camera, no sun
+			auto word = [](float depth, vec3 n) {
+				const uint32_t code = uint32_t(std::clamp(std::round((std::log2(std::max(depth, 1e-3f)) + 3.0f) * 128.0f), 1.0f, 2047.0f));
+				const float s = std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z);
+				n = { n.x / s, n.y / s, n.z / s };
+				const float ox = n.z >= 0.0f ? n.x : (1.0f - std::fabs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f);
+				const float oy = n.z >= 0.0f ? n.y : (1.0f - std::fabs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f);
+				const uint32_t qx = uint32_t(std::round(std::clamp(ox * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f));
+				const uint32_t qy = uint32_t(std::round(std::clamp(oy * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f));
+				return code | qx << 11 | qy << 18;
+			};
+			const vec3 facing = { -f.x, -f.y, -f.z };
+			const uint32_t wall_word = word(view_depth(wall_at), facing), pillar_word = word(view_depth(pillar_at), facing);
+			ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+			ID3D12Resource *split_up = g.buffer(D3D12_HEAP_TYPE_UPLOAD, UINT64(W) * 4 * H, D3D12_RESOURCE_STATE_GENERIC_READ);
+			{
+				uint32_t *words = nullptr;
+				split_up->Map(0, nullptr, reinterpret_cast<void **>(&words));
+				for (UINT y = 0; y < H; ++y)
+					for (UINT x = 0; x < W; ++x)
+						words[size_t(y) * W + x] = LONG(x) >= p0 && LONG(x) < p1 ? pillar_word : wall_word;
+				split_up->Unmap(0, nullptr);
+				D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src = { split_up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+				dst.SubresourceIndex = 0;
+				src.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
+				g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				g.run();
+			}
+			const float lantern[8] = { light.x, light.y, light.z, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
+			float lantern_glow[8];
+			std::memcpy(lantern_glow, lantern, sizeof(lantern_glow));
+			lantern_glow[7] = 0.0f;
+			const std::vector<uint8_t> unknown = frame(lantern, 1, 0.0f);
+			r.set_light_source([](void *c) { return static_cast<ID3D12Resource *>(c); }, split);
+			const std::vector<uint8_t> wall_unlit = frame(nullptr, 0, 0.0f), known = frame(lantern, 1, 0.0f), known_glow = frame(lantern_glow, 1, 0.0f),
+				known_shadow = frame(lantern, 1, 1.0f);
+			r.set_light_source(nullptr, nullptr);
+			cards.clear();
+			release(split);
+			release(split_up);
+			auto beside_lantern = [&](const std::vector<uint8_t> &img) {
+				double sum = 0.0;
+				uint32_t n = 0;
+				for (float d = 0.4f; d <= 0.9f; d += 0.1f)
+					for (float side : { -1.0f, 1.0f })
+					{
+						sum += around(img, on_screen(at_side(wall_at, d * side), nullptr)).luma;
+						n++;
+					}
+				return sum / n;
+			};
+			const double near_dark = beside_lantern(wall_unlit), near_unknown = beside_lantern(unknown), near_known = beside_lantern(known),
+				near_glow = beside_lantern(known_glow);
+			const auto walled = on_screen(at_side(wall_at, 2.6f), nullptr), clear = on_screen(at_side(wall_at, -2.6f), nullptr);
+			const double walled_lit = around(known, walled).luma, walled_shadow = around(known_shadow, walled).luma, walled_dark = around(wall_unlit, walled).luma;
+			const double clear_lit = around(known, clear).luma, clear_shadow = around(known_shadow, clear).luma;
+			std::printf("  with the light split: the wall beside a lantern %.1f unlit, %.1f lit without the split, %.1f with it, %.1f lit by a glow; behind a pillar %.1f -> %.1f with lamp shadows (%.1f unlit); clear the other side %.1f -> %.1f\n",
+				near_dark, near_unknown, near_known, near_glow, walled_lit, walled_shadow, walled_dark, clear_lit, clear_shadow);
+			check(near_unknown > near_dark + 5.0, "without the light split the lamp's glow is added as before");
+			check(std::fabs(near_known - near_dark) < 0.5, "with it the zone's lamp isn't added again (the native passes lit it)");
+			check(near_glow > near_dark + 5.0, "an effect's glow still lights what the light split knows");
+			check(walled_shadow < walled_lit - 2.0 && walled_shadow >= 0.0, "a lamp shadow takes the lamp's light away where the light split knows the pixel");
+			check(std::fabs(clear_shadow - clear_lit) < 0.5, "and leaves it where the way to the lamp is clear");
+		}
 		check(g.report_messages() == 0, "no debug-layer errors (lamps)");
+	}
+	if (lamps_only)
+	{
+		std::printf(failures == 0 ? "\nall passed (the lamps only)\n" : "\n%d failed (the lamps only)\n", failures);
+		return failures == 0 ? 0 : 1;
 	}
 
 	// 1q. The game's fog (its weather's, linear by view depth from where it starts to where it ends, toward its colour):
