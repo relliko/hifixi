@@ -2195,28 +2195,50 @@ float actor_shadow(float3 o, float3 d, uint self, float t_start)
 // the wear's: [kSunMapPrev..+2] the near one's rows, [+3..+5] the far one's, [+6] how far each last drawing has faded in
 // (near, far; 1: wholly, the one before not read), where each one before starts (uints, as bits: near, far), [+7]
 // their depth a yalm (near, far).
+// A third, farthest cascade (600 yalms each way, 1,024 texels a side: grass_render.cpp kFarMapReach) after the blades'
+// motion's, its two drawings in the copy after the casters' map: [kSunMapFar..+2] its rows, [+3..+5] its drawing
+// before's, [+6] its depth a yalm, where it starts (uint bits), a texel's size (yalms), how far faded in; [+7] the one
+// before's depth a yalm and start, its texels a side (0: not drawn, never read) and the copy's row pitch for it (uints).
 ByteAddressBuffer sun_map : register(t0);
 static const uint kSunMap = 32;
 static const uint kSunMapPrev = kWear + 2 + 2 * kMaxCuts;
+static const uint kSunMapFar = kMotion + 9;
 
-// How much of the sun the map says is blocked at P (view space, n its facing), from the near cascade where P is
-// well inside it, else the far one; covered: 1 inside them, fading out over the far cascade's last twentieth,
-// 0 beyond it (nothing read then). P is moved off its surface by a texel and a half and toward the sun by one,
-// and a texel and 3 cm more is allowed in depth, so a surface doesn't shade itself; then the 4 x 4 texels around
-// are tested, weighted as three bilinear taps a side (a soft edge a texel or two wide), its middle stretched by
-// kSunMapEdge (below). above: the part of it blocked by something over 2 yalms nearer the sun than P (not the
-// surface's own other side)
 // kSunMapEdge: 0 leaves the filtered edge as it is (10 to 90 % across about 2.5 texels: 10 cm near, and as 1 / sin
 // of the light's height more where the edge runs across its rays); over 0, smoothstep(kSunMapEdge, 1 - kSunMapEdge)
 // of it: at 0.15 about half as wide, still placed between texels (no stair steps), for no measurable time. The
 // shadow of something a texel or less across (4 cm near, 16 cm far) comes out lighter then (a 4 cm pole's: 17 % of
 // a whole shadow's darkness, 33 % at 0), of one two texels across darker (66 to 82 %). On at 0.15 since 2026-10-21:
-// the shadows near the camera looked soft in game.
+// the shadows near the camera looked soft in game. (Only where the edge is the map's own: a penumbra wider than that,
+// below, is left as wide as it is.)
 static const float kSunMapEdge = 0.15;
 
+// Contact hardening: the sun is a disc about three quarters of a degree across (a little over the real one's half a
+// degree: the bright sky around it softens shadows too), not a point, so a shadow's edge is as soft as what casts it is
+// far above what it falls on: kSunSpread yalms of penumbra each way for every yalm between them (a post's foot sharp,
+// a canopy 10 yalms up 6.5 cm each way, a cliff 50 yalms up a third of a yalm). Below kPenumbraMin texels each way the
+// map's own 4 x 4 filter is as soft (and steadier: leaf dapples, a character's feet); past it a disc of taps that wide
+// takes over over a texel, up to kPenumbraMax texels (60 cm near, 2.5 yalms far). So only what's well above shows it:
+// over 12 yalms in the near cascade, 48 in the far one (whose texels are that coarse anyway). (2026-10-29, offline: a
+// plate 80 yalms up casts an edge 0.78 yalms wide from 10 to 90 % at 640 x 360, 0.45 before; one a yalm up as sharp as
+// before: grass_test 1o4.)
+static const float kSunSpread = 0.006545; // (tan of 0.375 degrees)
+static const float kPenumbraMin = 2.0, kPenumbraMax = 16.0;
+// The wide taps are tested against the surface's own plane through P (its facing; a flat ground at a low sun is a yalm
+// nearer the sun 16 texels on), so it doesn't shade itself; less what a facing kPlaneSlack off (3 degrees, more as the
+// sun grazes it: the plane's slope then turns fast with its facing) would make of it, so a curved one doesn't either
+static const float kPlaneSlack = 0.05;
+
 // One drawing of a cascade at q (its rows from actors[rows]; per_yalm its depth a yalm, base where it starts in the
-// copy): the 4 x 4 texels around, weighted as three bilinear taps a side: (blocked, blocked from well above)
-float2 map_drawing(float4 q, uint rows, float per_yalm, uint base, float texel, float size, uint pitch)
+// copy; n the surface's facing, view space): (blocked, blocked from well above: by something over 2 yalms nearer the
+// sun than P, not the surface's own other side). First the 4 x 4 texels around, weighted as three bilinear taps a side
+// (a soft edge a texel or two wide), its middle stretched by kSunMapEdge; and, wide over 0 (the facing known well enough
+// to test the plane; how much more slack it takes: 1 for a facing known, more for one told from a depth seen at a slant),
+// 8 more taps out to kPenumbraMax texels, spun by spin (radians: each of a 4 x 4 block of the sun pass's pixels its own
+// sixteenth of a turn, which shade_ps's 4 x 4 average puts together). Whatever of those 24 blocks
+// says how far above P the casters are, on average; where that makes a penumbra wider than kPenumbraMin texels each way,
+// 16 taps over a disc that wide (spun as well) are its answer instead. Lit all round or blocked all round: the 4 x 4.
+float2 map_drawing(float4 q, float3 n, uint rows, float per_yalm, uint base, float texel, float size, uint pitch, float spin, float wide)
 {
 	float2 t = float2(dot(q, actors[rows]), dot(q, actors[rows + 1]));
 	float depth = dot(q, actors[rows + 2]) - (0.03 + texel) * per_yalm;
@@ -2226,6 +2248,7 @@ float2 map_drawing(float4 q, uint rows, float per_yalm, uint base, float texel, 
 	float2 w = f - floor(f);
 	float wx[4] = { 1.0 - w.x, 1.0, 1.0, w.x }, wy[4] = { 1.0 - w.y, 1.0, 1.0, w.y };
 	float2 r = 0.0;
+	float found = 0.0, between = 0.0; // (taps blocked, and how much depth between P and what blocks them, all told)
 	[unroll] for (int j = 0; j < 16; ++j)
 	{
 		int2 at = clamp(corner + int2(j & 3, j >> 2), int2(0, 0), int2(size, size) - 1);
@@ -2233,49 +2256,155 @@ float2 map_drawing(float4 q, uint rows, float per_yalm, uint base, float texel, 
 		// from the sun than anything in the zone, past the map's depth)
 		float d = asfloat(sun_map.Load((base + at.y * pitch + at.x) * 4));
 		float k = wx[j & 3] * wy[j >> 2];
-		r.x += (d < depth && d < 1.0 ? 1.0 : 0.0) * k;
+		bool blocked = d < depth && d < 1.0;
+		r.x += blocked ? k : 0.0;
 		r.y += (d < well_above && d < 1.0 ? 1.0 : 0.0) * k;
+		found += blocked ? 1.0 : 0.0;
+		between += blocked ? depth - d : 0.0;
 	}
-	return r / 9.0;
+	r /= 9.0;
+	if (kSunMapEdge > 0.0)
+		r = smoothstep(kSunMapEdge, 1.0 - kSunMapEdge, r);
+	[branch] if (wide <= 0.0)
+		return r;
+	// The surface's plane in the map: its depth a texel on across each way (as a texel's depth, at most 8: the sun
+	// within 7 degrees of grazing it), from its facing through the rows (the plane's normal by the rows' cofactors)
+	const float3 r0 = actors[rows].xyz, r1 = actors[rows + 1].xyz, r2 = actors[rows + 2].xyz;
+	const float3 m = float3(dot(cross(r1, r2), n), dot(cross(r2, r0), n), dot(cross(r0, r1), n));
+	const float unit = texel * per_yalm;
+	const float den = m.z * unit;
+	const float2 slope = -m.xy / ((den < 0.0 ? -1.0 : 1.0) * max(abs(den), length(m.xy) / 8.0 + 1e-30));
+	const float slack = kPlaneSlack * wide * (1.0 + dot(slope, slope));
+	static const float kGolden = 2.3999632; // (radians: the golden angle, taps spread evenly over a disc)
+	[unroll] for (int i = 0; i < 8; ++i)
+	{
+		const float a = spin + kGolden * i, reach = kPenumbraMax * sqrt((i + 0.5) / 8.0);
+		const int2 at = clamp(int2(floor(t + reach * float2(cos(a), sin(a)))), int2(0, 0), int2(size, size) - 1);
+		const float d = asfloat(sun_map.Load((base + at.y * pitch + at.x) * 4));
+		// (against the plane at the texel's middle, less the slack that far out)
+		const float2 o = float2(at) + 0.5 - t;
+		const float expect = depth + (dot(slope, o) - slack * length(o)) * unit;
+		const bool blocked = d < expect && d < 1.0;
+		found += blocked ? 1.0 : 0.0;
+		between += blocked ? expect - d : 0.0;
+	}
+	const float radius = found > 0.0 ? min(between / (found * per_yalm) * kSunSpread / texel, kPenumbraMax) : 0.0;
+	const float wider = saturate(radius - kPenumbraMin);
+	[branch] if (wider <= 0.0 || found >= 24.0)
+		return r;
+	float2 disc = 0.0;
+	[unroll] for (int i2 = 0; i2 < 16; ++i2)
+	{
+		const float a = spin + 1.3 + kGolden * i2, reach = radius * sqrt((i2 + 0.5) / 16.0);
+		const int2 at = clamp(int2(floor(t + reach * float2(cos(a), sin(a)))), int2(0, 0), int2(size, size) - 1);
+		const float d = asfloat(sun_map.Load((base + at.y * pitch + at.x) * 4));
+		const float2 o = float2(at) + 0.5 - t;
+		const float expect = depth + (dot(slope, o) - slack * length(o)) * unit;
+		disc.x += d < expect && d < 1.0 ? 1.0 : 0.0;
+		disc.y += d < expect - 2.0 * per_yalm && d < 1.0 ? 1.0 : 0.0;
+	}
+	return lerp(r, disc / 16.0, wider);
 }
 
-// The cascade's last drawing, faded in over the one before as far as kSunMapPrev+6 says (where the one before covers
-// the point, two texels in from its edge; else the last alone)
-float sun_from_map(float3 P, float3 n, float3 to_sun, out float covered, out float above)
+// One cascade of the map: near (0), far (1) or farthest (2): where its rows are (and its drawing before's), where it
+// starts in the copy (and the one before), its row pitch, depth a yalm (and the one before's), a texel's size (yalms),
+// texels a side (0: the farthest not drawn), how far its last drawing has faded in over the one before
+struct sun_cascade
 {
-	float4 info = actors[kSunMap + 6], info2 = actors[kSunMap + 7], fade = actors[kSunMapPrev + 6], prev_per_yalm = actors[kSunMapPrev + 7];
-	float size = info.x;
-	float4 q = float4(P + n * (1.5 * info2.x) + to_sun * info2.x, 1.0);
-	float2 t = float2(dot(q, actors[kSunMap]), dot(q, actors[kSunMap + 1]));
-	bool near = min(min(t.x, t.y), size - max(t.x, t.y)) > 4.0;
-	float texel = near ? info2.x : info2.y;
-	uint c = near ? kSunMap : kSunMap + 3;
-	q = float4(P + n * (1.5 * texel) + to_sun * texel, 1.0);
-	t = float2(dot(q, actors[c]), dot(q, actors[c + 1]));
-	covered = near ? 1.0 : saturate(min(min(t.x, t.y), size - max(t.x, t.y)) / (0.05 * size));
-	float shadow = 0.0;
-	above = 0.0;
-	[branch] if (covered > 0.0)
+	uint rows, prev_rows, base, prev_base, pitch;
+	float per_yalm, prev_per_yalm, texel, size, faded;
+};
+
+sun_cascade cascade_of(uint k)
+{
+	sun_cascade c;
+	if (k < 2)
 	{
-		uint pitch = uint(info.w);
-		float2 r = map_drawing(q, c, near ? info.y : info.z, asuint(near ? info2.w : info2.z), texel, size, pitch);
-		float faded = near ? fade.x : fade.y;
-		[branch] if (faded < 1.0)
-		{
-			uint pc = near ? kSunMapPrev : kSunMapPrev + 3;
-			float2 tp = float2(dot(q, actors[pc]), dot(q, actors[pc + 1]));
-			if (min(min(tp.x, tp.y), size - max(tp.x, tp.y)) > 2.0)
-				r = lerp(map_drawing(q, pc, near ? prev_per_yalm.x : prev_per_yalm.y, asuint(near ? fade.z : fade.w), texel, size, pitch), r, faded);
-		}
-		shadow = r.x;
-		above = r.y;
-		if (kSunMapEdge > 0.0)
-		{
-			shadow = smoothstep(kSunMapEdge, 1.0 - kSunMapEdge, shadow);
-			above = smoothstep(kSunMapEdge, 1.0 - kSunMapEdge, above);
-		}
+		const float4 info = actors[kSunMap + 6], info2 = actors[kSunMap + 7], fade = actors[kSunMapPrev + 6], prev = actors[kSunMapPrev + 7];
+		const bool near = k == 0;
+		c.rows = kSunMap + 3 * k;
+		c.prev_rows = kSunMapPrev + 3 * k;
+		c.base = asuint(near ? info2.w : info2.z);
+		c.prev_base = asuint(near ? fade.z : fade.w);
+		c.pitch = uint(info.w);
+		c.per_yalm = near ? info.y : info.z;
+		c.prev_per_yalm = near ? prev.x : prev.y;
+		c.texel = near ? info2.x : info2.y;
+		c.size = info.x;
+		c.faded = near ? fade.x : fade.y;
 	}
-	return shadow;
+	else
+	{
+		const float4 a = actors[kSunMapFar + 6], b = actors[kSunMapFar + 7];
+		c.rows = kSunMapFar;
+		c.prev_rows = kSunMapFar + 3;
+		c.per_yalm = a.x;
+		c.base = asuint(a.y);
+		c.texel = a.z;
+		c.faded = a.w;
+		c.prev_per_yalm = b.x;
+		c.prev_base = asuint(b.y);
+		c.size = b.z;
+		c.pitch = uint(b.w);
+	}
+	return c;
+}
+
+// How far inside cascade c P is (texels in from its nearest edge; under 0 outside it), and q: P moved off its surface
+// by a texel and a half of it and toward the sun by one, and a texel and 3 cm more is allowed in depth (map_drawing),
+// so a surface doesn't shade itself
+float cascade_inside(sun_cascade c, float3 P, float3 n, float3 to_sun, out float4 q)
+{
+	q = float4(P + n * (1.5 * c.texel) + to_sun * c.texel, 1.0);
+	const float2 t = float2(dot(q, actors[c.rows]), dot(q, actors[c.rows + 1]));
+	return min(min(t.x, t.y), c.size - max(t.x, t.y));
+}
+
+// The cascade's last drawing at q, faded in over the one before as far as it says (where the one before covers the
+// point, two texels in from its edge; else the last alone)
+float2 cascade_shadow(sun_cascade c, float4 q, float3 n, float spin, float wide)
+{
+	float2 r = map_drawing(q, n, c.rows, c.per_yalm, c.base, c.texel, c.size, c.pitch, spin, wide);
+	[branch] if (c.faded < 1.0)
+	{
+		const float2 tp = float2(dot(q, actors[c.prev_rows]), dot(q, actors[c.prev_rows + 1]));
+		if (min(min(tp.x, tp.y), c.size - max(tp.x, tp.y)) > 2.0)
+			r = lerp(map_drawing(q, n, c.prev_rows, c.prev_per_yalm, c.prev_base, c.texel, c.size, c.pitch, spin, wide), r, c.faded);
+	}
+	return r;
+}
+
+// How much of the sun the map says is blocked at P (view space, n its facing; spin and wide as map_drawing's), from the
+// near cascade where P is well inside it (the widest taps' reach and two texels more), else the far one, handing over to
+// the farthest over the far one's last tenth; covered: 1 inside them, fading out over the farthest's last twentieth
+// (the far one's without it), 0 beyond (nothing read then). above: the part of it blocked from well above
+float sun_from_map(float3 P, float3 n, float3 to_sun, float spin, float wide, out float covered, out float above)
+{
+	static const float kMargin = kPenumbraMax + 2.0;
+	float4 q;
+	float2 r = 0.0;
+	const sun_cascade c0 = cascade_of(0);
+	[branch] if (cascade_inside(c0, P, n, to_sun, q) > kMargin)
+	{
+		r = cascade_shadow(c0, q, n, spin, wide);
+		covered = 1.0;
+	}
+	else
+	{
+		const sun_cascade c1 = cascade_of(1), c2 = cascade_of(2);
+		float4 q2 = q;
+		const float in1 = cascade_inside(c1, P, n, to_sun, q);
+		const bool farthest = c2.size > 0.0;
+		const float in2 = farthest ? cascade_inside(c2, P, n, to_sun, q2) : -1.0;
+		const float handed = farthest ? saturate(1.0 - (in1 - kMargin) / (0.1 * c1.size)) : 0.0;
+		covered = farthest ? (handed < 1.0 ? 1.0 : saturate(in2 / (0.05 * c2.size))) : saturate(in1 / (0.05 * c1.size));
+		[branch] if (handed < 1.0 && in1 > 0.0)
+			r = cascade_shadow(c1, q, n, spin, wide);
+		[branch] if (handed > 0.0 && in2 > 0.0)
+			r = lerp(r, cascade_shadow(c2, q2, n, spin, wide), handed);
+	}
+	above = r.y;
+	return r.x;
 }
 
 // The host's casters' map (rule bit 4096; grass_render.cpp draw_casters: HiFi XI's characters and monsters drawn from
@@ -2286,9 +2415,10 @@ float sun_from_map(float3 P, float3 n, float3 to_sun, out float covered, out flo
 static const uint kCaster = kCloud + 10;
 bool casters_mapped() { return ((crowd.x >> 16) & 4096) != 0; }
 
-// How much of the sun the casters block at P (n its facing); covered: 1 well inside the map, fading out over its last
-// twentieth
-float casters_from_map(float3 P, float3 n, float3 to_sun, out float covered)
+// How much of the sun the casters block at P (n its facing; spin and wide as map_drawing's: a body casts within a
+// yalm or two of what it shades, so its shadow is the 4 x 4's but for something standing high over it); covered: 1 well
+// inside the map, fading out over its last twentieth
+float casters_from_map(float3 P, float3 n, float3 to_sun, float spin, float wide, out float covered)
 {
 	float4 info = actors[kCaster + 3];
 	float size = actors[kSunMap + 6].x;
@@ -2299,11 +2429,7 @@ float casters_from_map(float3 P, float3 n, float3 to_sun, out float covered)
 	covered = saturate(min(min(t.x, t.y), size - max(t.x, t.y)) / (0.05 * size));
 	float shadow = 0.0;
 	[branch] if (covered > 0.0)
-	{
-		shadow = map_drawing(q, kCaster, info.x, asuint(info.y), texel, size, pitch).x;
-		if (kSunMapEdge > 0.0)
-			shadow = smoothstep(kSunMapEdge, 1.0 - kSunMapEdge, shadow);
-	}
+		shadow = map_drawing(q, n, kCaster, info.x, asuint(info.y), texel, size, pitch, spin, wide).x;
 	return shadow;
 }
 
@@ -2378,15 +2504,24 @@ void sun_ps(float4 pos : SV_Position)
 	}
 	float facing = dot(n, to_sun);
 	const bool unsure = steep > 4.0; // (seen too nearly edge on for its facing to be told)
+	// (each of a 4 x 4 block of these pixels its own sixteenth, which shade_ps's 4 x 4 average puts together: the march's
+	// start within its first step, the map's taps' turn)
+	static const float bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+	const float sixteenth = (bayer[(h.y & 3) * 4 + (h.x & 3)] + 0.5) / 16.0;
+	const float spin = 6.2831853 * sixteenth;
+	// (the map's wide taps: on a surface facing the sun whose facing is known, or told from the depth even at a slant, as
+	// flat ground a few yalms off a low camera is (it isn't edge on: unsure only for its sign), with more slack the more
+	// slanted; not along an edge, where the depth's facing is anyone's)
+	const float wide = facing > 0.0 && steep < 16.0 ? max(steep / 4.0, 1.0) : 0.0;
 	float covered = 0.0, mapped = 0.0, above = 0.0;
 	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && ((crowd.x >> 16) & 8) != 0)
-		mapped = sun_from_map(P, n, to_sun, covered, above);
+		mapped = sun_from_map(P, n, to_sun, spin, wide, covered, above);
 	// The characters and monsters from their meshes (casters_from_map): on one of them, from just past their own body
 	// toward the sun (their chest outward by their capsule's radius and a bit: the map has their own body too, and it
 	// was never meant to shade itself here, as the march from the chest leaves it out); elsewhere at the surface
 	float cast = 0.0, cast_covered = 0.0;
 	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && casters_mapped())
-		cast = casters_from_map(on_actor ? P + to_sun * (self_radius + 0.3) : P, n, to_sun, cast_covered);
+		cast = casters_from_map(on_actor ? P + to_sun * (self_radius + 0.3) : P, n, to_sun, spin, wide, cast_covered);
 	// (at the share a surface facing up would lose: not all of it. Ground seen at a grazing angle is "unsure" from
 	// about 10 yalms off when the camera is low, so taken whole it was shaded twice as dark as the same ground nearer
 	// at a low sun, along a line that moved with the camera)
@@ -2396,10 +2531,8 @@ void sun_ps(float4 pos : SV_Position)
 	{
 		static const float kGrow = 1.25;
 		static const float kLast = 60.58; // (the 32nd step's t: 0.06 x 1.25^31)
-		// (the start within the first step: each of a 4 x 4 block of these pixels its own sixteenth, which
-		// shade_ps's 4 x 4 average puts together)
-		static const float bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
-		float t = 0.06 * pow(kGrow, (bayer[(h.y & 3) * 4 + (h.x & 3)] + 0.5) / 16.0);
+		// (the start within the first step: this pixel's sixteenth, above)
+		float t = 0.06 * pow(kGrow, sixteenth);
 		static const float kContact = 1.705; // (the 16th step's t: 0.06 x 1.25^15)
 		// The march starts two pixel widths off the surface along its facing, and takes no hit nearer than two
 		// pixel widths times how steeply the surface is seen: on a rough wall seen at an angle, the first steps

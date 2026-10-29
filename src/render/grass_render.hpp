@@ -536,8 +536,8 @@ namespace grass
 		bool blade_motion = false; // the blades wrote their motion (look::blade_motion)
 		bool sun = false;    // with the sun's shadows (their half-size pass ran before it)
 		bool sun_map = false;           // ... and the shadow map read in it
-		uint32_t sun_map_cascades = 0;  // cascades of the shadow map drawn again this frame (bits: 1 near, 2 far)
-		float sun_map_fade[2] = { 1.0f, 1.0f }; // how far each cascade's last drawing has faded in over the one before
+		uint32_t sun_map_cascades = 0;  // cascades of the shadow map drawn again this frame (bits: 1 near, 2 far, 4 farthest)
+		float sun_map_fade[3] = { 1.0f, 1.0f, 1.0f }; // how far each cascade's last drawing has faded in over the one before
 		uint32_t sun_map_triangles = 0; // triangles drawn into them
 		bool casters = false;           // the host's casters drew into their map, read with it (set_casters)
 		bool sun_map_host = false;      // the cascades are the host's zone casters' (set_zone_casters), not the uploaded meshes'
@@ -786,7 +786,7 @@ namespace grass
 		bool sun_map_for(std::string &error);
 		ID3D12PipelineState *shadow_pipeline(std::string &error);
 		uint32_t draw_sun_map(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3], double clock, uint32_t &triangles, std::string &error);
-		void sun_map_params(const camera &cam, double clock, float out[32], float prev[32]) const;
+		void sun_map_params(const camera &cam, double clock, float out[32], float prev[32], float farthest[32]) const;
 		bool draw_casters(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3]);
 		void caster_params(const camera &cam, float out[16]) const;
 		ID3D12PipelineState *vis_pipeline(std::string &error);
@@ -873,7 +873,8 @@ namespace grass
 		uint32_t _cloud_picture = 0, _cloud_frames = 0;
 
 		// The sun's shadow map: two cascades side by side in one D32 texture (each kSunMapSize square, around the
-		// camera, the near one kSunMapReach[0] yalms each way, the far one kSunMapReach[1]), drawn from the zone's
+		// camera, the near one kSunMapReach[0] yalms each way, the far one kSunMapReach[1]; the farthest in its own,
+		// _far_map below), drawn from the zone's
 		// meshes looking down the sun's rays, and copied into a buffer the sun pass reads (t0: root SRVs only take
 		// buffers, and the add-on binds no descriptor heap of its own over the game's)
 		ID3D12Resource *_shadow_geo = nullptr;     // the triangles, 48 bytes each (default heap)
@@ -891,6 +892,11 @@ namespace grass
 		UINT _sun_map_pitch = 0;
 		UINT64 _sun_map_half = 0;        // (bytes from the copy's first half to its second: each a drawing of both cascades)
 		UINT64 _sun_map_offset[2] = {};  // (where each cascade starts within a half)
+		// The farthest cascade (its own D32 texture, kFarMapSize square; its view the sun map heap's fourth), its two
+		// drawings in the copy after the casters' map: where the first starts (bytes), from one to the other, its row pitch
+		ID3D12Resource *_far_map = nullptr;
+		UINT64 _far_map_start = 0, _far_map_slot = 0;
+		UINT _far_map_pitch = 0;
 		ID3D12PipelineState *_shadow_pso = nullptr;
 		struct cascade
 		{
@@ -906,8 +912,8 @@ namespace grass
 			uint32_t slot = 0;
 			void forget() { valid = prev_valid = false; }
 		};
-		cascade _cascades[2];
-		uint32_t _sun_map_turn = 0; // (counts the map's frames: the far cascade's turn on every other one)
+		cascade _cascades[3]; // (near, far, farthest)
+		uint32_t _sun_map_turn = 0; // (counts the map's frames: the far cascade's turn on every other one, the farthest's every fourth)
 		// The host's casters (set_casters): their map (D32, kSunMapSize square, DEPTH_WRITE between draws; its view the
 		// sun map heap's third), copied after the sun map's two halves in its copy; its matrix this frame, whether drawn
 		caster_fn _casters = nullptr;
