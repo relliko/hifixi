@@ -158,6 +158,7 @@ extern "C" const char *__cdecl worldfx_folder() { return ""; }
 
 int main(int argc, char **argv)
 {
+	std::setvbuf(stdout, nullptr, _IONBF, 0); // (each line out as it's printed: a crash shows where it was)
 	namespace inj = hifi::zone::inject;
 	uintptr_t base = 0;
 	if (dump::map(dump::kDumps[0], base) == 0)
@@ -745,6 +746,9 @@ int main(int argc, char **argv)
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		}
 		inj::set_options(false);
+		// (the target and its depth back as the first pass left them, for the parts after this one)
+		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		list->Close();
 		direct->ExecuteCommandLists(1, lists);
 		direct->Signal(fence, 2);
@@ -976,8 +980,8 @@ int main(int argc, char **argv)
 		map_out(4, [&] { lamp_triangles = inj::record_zone_casters(list, m_lamp, small_dsv, kSmall); });
 		list->Close();
 		direct->ExecuteCommandLists(1, lists);
-		direct->Signal(fence, 2);
-		fence->SetEventOnCompletion(2, e);
+		direct->Signal(fence, 3); // (2 was the lamp's passes')
+		fence->SetEventOnCompletion(3, e);
 		WaitForSingleObject(e, 60000);
 		check(device->GetDeviceRemovedReason() == S_OK, "the device still there after the moving layer");
 		const uint32_t later = debug_messages(info, first);
