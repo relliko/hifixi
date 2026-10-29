@@ -546,7 +546,7 @@ int main(int argc, char **argv)
 			const std::vector<std::string> st = up::status();
 			unsigned long long n = 0;
 			for (const std::string &line : st)
-				if (line.rfind("upscale: FSR 2", 0) == 0)
+				if (line.rfind("upscale: FSR 2", 0) == 0 || line.rfind("upscale: FSR 3.1", 0) == 0)
 				{
 					const size_t at = line.find(" frames drawn");
 					size_t from = at;
@@ -557,9 +557,9 @@ int main(int argc, char **argv)
 			return n;
 		};
 
-		// Twice the world's size
+		// Twice the world's size (FSR 2 here: FSR 3.1's upscaler after)
 		follow_depth(Az);
-		up::set_options(true, true, 0.8f);
+		up::set_options(true, true, 0.8f, false);
 		publish(0.0f, 0.0f, IW, IH);
 		frame(A, 0, 6, after_resolve::draw);
 		const auto t0 = std::chrono::steady_clock::now();
@@ -634,6 +634,47 @@ int main(int argc, char **argv)
 			std::printf("  FSR 2 at the world's own size against the world: %.2f levels apart on average\n", diff);
 			check(fsr2_drawn() == 22 && diff < 4.0, "the world as big as the screen: FSR 2 drawn, close to the world itself");
 		}
+		// FSR 3.1's upscaler in FSR 2's place (upscale.fsr3): a context of its own for twice the world's size, its shaders
+		// built in (DXC); the same picture as FSR 2's would be, the UI on top as drawn
+		{
+			// (A's depth back to a target first: follow_depth takes it from one, and the first part left it read)
+			D3D12_RESOURCE_BARRIER back[2] = {};
+			for (UINT k = 0; k < 2; ++k)
+				back[k].Transition = { Az, k, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE };
+			list->ResourceBarrier(2, back);
+			g.run();
+			follow_depth(Az);
+			up::set_options(true, true, 0.8f, true);
+			publish(0.0f, 0.0f, IW, IH);
+			frame(A, 0, 6, after_resolve::draw);
+			const auto t3 = std::chrono::steady_clock::now();
+			check(up::prepare(device, why), "FSR 3.1's upscaler made off dgVoodoo's thread" + (why.empty() ? "" : ": " + why));
+			const double make3 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t3).count();
+			const unsigned long long before = fsr2_drawn();
+			std::vector<uint8_t> fsr3;
+			for (int k = 0; k < 8; ++k)
+			{
+				publish(0.0f, 0.0f, IW, IH);
+				fsr3 = frame(A, 0, 6, after_resolve::draw);
+			}
+			bool named = false;
+			for (const std::string &line : up::status())
+			{
+				std::printf("  %s\n", line.c_str());
+				named |= line.rfind("upscale: FSR 3.1 made", 0) == 0;
+			}
+			check(named && fsr2_drawn() - before == 8, "FSR 3.1's upscaler drawn each frame (8) once made, in " + std::to_string(make3) + " s");
+			double diff = 0.0;
+			for (UINT y = UI; y < OH; ++y)
+				for (UINT x = 0; x < OW; ++x)
+					diff += std::fabs(luma(fsr3, x, y) - luma(stretch, x, y));
+			diff /= double(OH - UI) * OW;
+			const uint8_t *red = &fsr3[(size_t(340) * OW + 400) * 4];
+			std::printf("  FSR 3.1 at twice the size against the stretch: %.2f levels apart on average; the red band %u %u %u\n", diff, red[0], red[1], red[2]);
+			check(diff < 8.0 && same(fsr3, stretch, false) > 1000, "FSR 3.1's picture: its own, close to the stretch overall");
+			check(std::abs(int(red[0]) - 200) <= 8 && std::abs(int(red[1]) - 30) <= 8 && std::abs(int(red[2]) - 30) <= 8, "  colours kept (the red band)");
+			check(same(fsr3, stretch, true) == 0, "  the UI drawn on top as dgVoodoo meant it");
+		}
 		up::set_options(false, false, 0.8f);
 
 		// FSR 2's motion pass with the blades' motion (World FX's target: R16G16B16A16_FLOAT, xy the motion, z the view
@@ -642,7 +683,7 @@ int main(int argc, char **argv)
 		{
 			namespace tp = hifi::upscale::temporal;
 			tp::context tc;
-			check(tc.make(device, IW, IH, OW, OH, why), "FSR 2's context on its own" + (why.empty() ? "" : ": " + why));
+			check(tc.make(device, IW, IH, OW, OH, false, why), "FSR 2's context on its own" + (why.empty() ? "" : ": " + why));
 			D3D12_RESOURCE_DESC md = {};
 			md.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 			md.Width = IW;

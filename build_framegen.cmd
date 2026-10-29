@@ -36,6 +36,7 @@ cl /nologo /c /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DNOMINMAX /DNDEBUG /DUNICODE 
   %FFX%\src\backends\dx12\FrameInterpolationSwapchain\FrameInterpolationSwapchainDX12_Helpers.cpp ^
   %FFX%\src\backends\dx12\FrameInterpolationSwapchain\FrameInterpolationSwapchainDX12_UiComposition.cpp ^
   %FFX%\src\shared\ffx_assert.cpp %FFX%\src\shared\ffx_breadcrumbs_list.cpp %FFX%\src\shared\ffx_message.cpp %FFX%\src\shared\ffx_object_management.cpp ^
+  %FFX%\src\components\fsr3upscaler\ffx_fsr3upscaler.cpp src\upscale\fsr3.cpp ^
   src\framegen\ffx_shader_blobs.cpp src\framegen\framegen.cpp /Fo"%OUT%\obj\\" || goto failed
 lib /nologo /OUT:"%OUT%\ffx_fg.lib" "%OUT%\obj\*.obj" || goto failed
 rem Its swap chain in dgVoodoo's place, offline on WARP: build\framegen_test.exe

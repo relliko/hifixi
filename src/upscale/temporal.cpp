@@ -162,6 +162,8 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			delete static_cast<FfxFsr2Context *>(_fsr);
 			_fsr = nullptr;
 		}
+		fsr3::destroy(_fsr3);
+		_fsr3 = nullptr;
 		std::free(_scratch);
 		_scratch = nullptr;
 		drop(_motion);
@@ -176,7 +178,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 		_device = nullptr;
 	}
 
-	bool context::make(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, std::string &why)
+	bool context::make(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, bool v3, std::string &why)
 	{
 		release();
 		_device = device;
@@ -267,7 +269,19 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			release();
 			return false;
 		}
-		// FSR 2's context (its shaders compiled here: fsr2_shaders.cpp)
+		// FSR 3.1's upscaler (its shaders built in: tools/ffx_sc), or FSR 2's context (its shaders compiled here: fsr2_shaders.cpp)
+		if (v3)
+		{
+			_fsr3 = fsr3::make(device, render_w, render_h, display_w, display_h, why);
+			if (_fsr3 == nullptr)
+			{
+				release();
+				return false;
+			}
+			_made = true;
+			_frames = 0;
+			return true;
+		}
 		const size_t scratch = ffxFsr2GetScratchMemorySizeDX12();
 		_scratch = std::calloc(1, scratch);
 		FfxFsr2ContextDescription desc = {};
@@ -412,36 +426,58 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 		// FSR 2: its inputs where it expects them (compute-read), its output an unordered-access target
 		transition(list, color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, color_state, read);
 		transition(list, _output, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		FfxFsr2Context *const fsr = static_cast<FfxFsr2Context *>(_fsr);
-		FfxFsr2DispatchDescription d = {};
-		d.commandList = ffxGetCommandListDX12(list);
-		d.color = ffxGetResourceDX12(fsr, color, L"hifixi: the world", FFX_RESOURCE_STATE_COMPUTE_READ);
-		d.depth = ffxGetResourceDX12(fsr, _depth, L"hifixi: FSR 2's depth", FFX_RESOURCE_STATE_COMPUTE_READ);
-		d.motionVectors = ffxGetResourceDX12(fsr, _mv, L"hifixi: FSR 2's motion", FFX_RESOURCE_STATE_COMPUTE_READ);
-		d.exposure = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no exposure");
-		d.reactive = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no reactive mask");
-		d.transparencyAndComposition = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no transparency mask");
-		d.output = ffxGetResourceDX12(fsr, _output, L"hifixi: FSR 2's picture", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
-		d.jitterOffset = { cam.jitter[0], cam.jitter[1] };
-		d.motionVectorScale = { float(_rw), float(_rh) };
-		d.renderSize = { _rw, _rh };
-		d.enableSharpening = sharpen > 0.0f;
-		d.sharpness = std::clamp(sharpen, 0.0f, 1.0f);
-		d.frameTimeDelta = std::clamp(dt_ms, 1.0f, 100.0f);
-		d.preExposure = 1.0f;
-		d.reset = reset || _frames == 0;
-		d.cameraNear = 0.1f;
-		d.cameraFar = 65535.0f;
-		d.cameraFovAngleVertical = 2.0f * std::atan(1.0f / float(proj[5]));
-		d.viewSpaceToMetersFactor = 1.0f;
-		const FfxErrorCode e = ffxFsr2ContextDispatch(fsr, &d);
+		FfxErrorCode e = FFX_OK;
+		std::string fsr3_why;
+		if (_fsr3 != nullptr)
+		{
+			fsr3::frame f;
+			f.list = list;
+			f.color = color;
+			f.depth = _depth;
+			f.motion = _mv;
+			f.output = _output;
+			f.jitter[0] = cam.jitter[0];
+			f.jitter[1] = cam.jitter[1];
+			f.sharpen = sharpen;
+			f.dt_ms = dt_ms;
+			f.fov = 2.0f * std::atan(1.0f / float(proj[5]));
+			f.reset = reset || _frames == 0;
+			if (!fsr3::dispatch(_fsr3, f, fsr3_why))
+				e = FFX_ERROR_BACKEND_API_ERROR;
+		}
+		else
+		{
+			FfxFsr2Context *const fsr = static_cast<FfxFsr2Context *>(_fsr);
+			FfxFsr2DispatchDescription d = {};
+			d.commandList = ffxGetCommandListDX12(list);
+			d.color = ffxGetResourceDX12(fsr, color, L"hifixi: the world", FFX_RESOURCE_STATE_COMPUTE_READ);
+			d.depth = ffxGetResourceDX12(fsr, _depth, L"hifixi: FSR 2's depth", FFX_RESOURCE_STATE_COMPUTE_READ);
+			d.motionVectors = ffxGetResourceDX12(fsr, _mv, L"hifixi: FSR 2's motion", FFX_RESOURCE_STATE_COMPUTE_READ);
+			d.exposure = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no exposure");
+			d.reactive = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no reactive mask");
+			d.transparencyAndComposition = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no transparency mask");
+			d.output = ffxGetResourceDX12(fsr, _output, L"hifixi: FSR 2's picture", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+			d.jitterOffset = { cam.jitter[0], cam.jitter[1] };
+			d.motionVectorScale = { float(_rw), float(_rh) };
+			d.renderSize = { _rw, _rh };
+			d.enableSharpening = sharpen > 0.0f;
+			d.sharpness = std::clamp(sharpen, 0.0f, 1.0f);
+			d.frameTimeDelta = std::clamp(dt_ms, 1.0f, 100.0f);
+			d.preExposure = 1.0f;
+			d.reset = reset || _frames == 0;
+			d.cameraNear = 0.1f;
+			d.cameraFar = 65535.0f;
+			d.cameraFovAngleVertical = 2.0f * std::atan(1.0f / float(proj[5]));
+			d.viewSpaceToMetersFactor = 1.0f;
+			e = ffxFsr2ContextDispatch(fsr, &d);
+		}
 		// (where FSR 2 left them: its inputs compute-read, its output unordered access)
 		transition(list, color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, read, color_state);
 		transition(list, _output, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		_output_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		if (e != FFX_OK)
 		{
-			why = "FSR 2's dispatch failed (error " + std::to_string(int(e)) + ")";
+			why = !fsr3_why.empty() ? fsr3_why : "FSR 2's dispatch failed (error " + std::to_string(int(e)) + ")";
 			return false;
 		}
 		_frames++;

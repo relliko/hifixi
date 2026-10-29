@@ -117,6 +117,8 @@ namespace hifi::upscale
 			LARGE_INTEGER last_qpc = {};
 			uint64_t fsr2_drawn = 0, fsr2_skipped = 0;
 			std::string fsr2_why, fsr2_failed;
+			std::string fsr3_refused; // (why FSR 3.1's upscaler couldn't be made: FSR 2's since)
+			std::atomic<bool> fsr3{ true };
 			std::atomic<ULONGLONG> fsr2_at{ 0 };   // (when FSR 2 last drew: the jitter follows it)
 			std::atomic<uint32_t> phases{ 8 };
 			std::vector<std::pair<ID3D12Resource *, uint64_t>> old; // (textures let go, and the use they were let go at)
@@ -331,7 +333,7 @@ namespace hifi::upscale
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES planes[2] = {};
 			const char *why = m.root == nullptr ? "the passes aren't made" : l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
-				g.fsr2 == nullptr || !g.fsr2->fits(UINT(in.Width), in.Height, out_w, out_h) ? "waiting for FSR 2's context" :
+				g.fsr2 == nullptr || !g.fsr2->fits(UINT(in.Width), in.Height, out_w, out_h, g.fsr2->v3()) ? "waiting for FSR 2's context" :
 				copy == m.copy.end() ? "waiting for the screen's pipeline" :
 				!zone::inject::last_camera(c) || GetTickCount64() - c.at > 250 ? "no camera from the native zone's frame" :
 				!zone::inject::world_depth(depth, planes) ? "the world's depth isn't known" : nullptr;
@@ -516,8 +518,9 @@ namespace hifi::upscale
 		}
 	}
 
-	void set_options(bool fsr, bool temporal, float sharpen)
+	void set_options(bool fsr, bool temporal, float sharpen, bool fsr3)
 	{
+		g.fsr3.store(fsr3, std::memory_order_relaxed);
 		g.fsr.store(fsr, std::memory_order_relaxed);
 		g.temporal.store(temporal, std::memory_order_relaxed);
 		g.sharpen.store(sharpen, std::memory_order_relaxed);
@@ -539,6 +542,7 @@ namespace hifi::upscale
 		if (device == nullptr)
 			return false;
 		UINT want_w = 0, want_h = 0, want_rw = 0, want_rh = 0;
+		bool want_v3 = false;
 		std::vector<DXGI_FORMAT> want_formats;
 		bool fresh = false;
 		{
@@ -554,8 +558,9 @@ namespace hifi::upscale
 			want_formats = g.want_formats;
 			// (FSR 2's context: made for A's size and the screen's once dgVoodoo's thread has seen them)
 			if (g.temporal.load() && !fresh && g.fsr2_failed.empty() && g.want_rw != 0 && want_w != 0 &&
-				(g.fsr2 == nullptr || !g.fsr2->fits(g.want_rw, g.want_rh, want_w, want_h)))
+				(g.fsr2 == nullptr || !g.fsr2->fits(g.want_rw, g.want_rh, want_w, want_h, g.fsr3.load() && g.fsr3_refused.empty())))
 			{
+				want_v3 = g.fsr3.load() && g.fsr3_refused.empty();
 				want_rw = g.want_rw;
 				want_rh = g.want_rh;
 			}
@@ -563,11 +568,19 @@ namespace hifi::upscale
 				return true;
 		}
 		std::unique_ptr<temporal::context> fsr2;
-		std::string fsr2_why;
+		std::string fsr2_why, v3_refused;
 		if (want_rw != 0)
 		{
 			fsr2 = std::make_unique<temporal::context>();
-			if (!fsr2->make(device, want_rw, want_rh, want_w, want_h, fsr2_why))
+			// (FSR 3.1's upscaler, unless off or refused before: then FSR 2's, as when it can't be made)
+			bool v3 = want_v3;
+			if (v3 && !fsr2->make(device, want_rw, want_rh, want_w, want_h, true, fsr2_why))
+			{
+				v3_refused = fsr2_why;
+				fsr2_why.clear();
+				v3 = false;
+			}
+			if (!v3 && !fsr2->make(device, want_rw, want_rh, want_w, want_h, false, fsr2_why))
 			{
 				fsr2.reset();
 				const std::string shader = fsr2_shaders::last_error();
@@ -624,6 +637,8 @@ namespace hifi::upscale
 			for (auto &p : copies)
 				g.made.copy.push_back(p);
 			g.want_formats.clear();
+			if (!v3_refused.empty())
+				g.fsr3_refused = v3_refused;
 			if (fsr2 != nullptr)
 			{
 				if (g.fsr2 != nullptr)
@@ -704,11 +719,14 @@ namespace hifi::upscale
 			uint32_t shaders = 0;
 			double ms = 0.0;
 			fsr2_shaders::stats(shaders, ms);
-			std::snprintf(line, sizeof(line), "upscale: FSR 2 %s; %llu frames drawn (%u with the grass's own motion), %llu skipped%s%s%s; %u jitter phases; %u shaders compiled in %.0f ms",
+			std::snprintf(line, sizeof(line), "upscale: %s %s; %llu frames drawn (%u with the grass's own motion), %llu skipped%s%s%s; %u jitter phases; FSR 2's %u shaders compiled in %.0f ms",
+				g.fsr2 != nullptr ? g.fsr2->name() : g.fsr3.load() && g.fsr3_refused.empty() ? "FSR 3.1" : "FSR 2",
 				!g.fsr2_failed.empty() ? ("not made (" + g.fsr2_failed + ")").c_str() : g.fsr2 != nullptr ? "made" : "not made yet",
 				static_cast<unsigned long long>(g.fsr2_drawn), g.fsr2 != nullptr ? g.fsr2->blade_frames() : 0u, static_cast<unsigned long long>(g.fsr2_skipped),
 				g.fsr2_why.empty() ? "" : " (the last: ", g.fsr2_why.c_str(), g.fsr2_why.empty() ? "" : ")", g.phases.load(), shaders, ms);
 			lines.push_back(line);
+			if (!g.fsr3_refused.empty())
+				lines.push_back("upscale: FSR 3.1's upscaler couldn't be made, FSR 2's instead: " + g.fsr3_refused);
 		}
 		return lines;
 	}

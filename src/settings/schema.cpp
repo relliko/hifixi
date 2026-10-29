@@ -261,6 +261,11 @@ namespace hifi::settings
 				"the screen's size, for far less work. Set the background resolution to the screen's (or lower, for more frames) "
 				"in the launcher. Off: FSR 1 when the background is smaller. (/hifi upscale)", nullptr, "upscale.fsr", false,
 				{ 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+			{ "upscale.fsr3", tab::upscaling, "AMD FSR", "FSR 3.1 (the newer upscaler)",
+				"AMD FidelityFX Super Resolution 3.1's upscaler in FSR 2's place: the same frames in, less ghosting behind moving "
+				"things, less shimmer, thin things (fences, hair, grass tips) kept better. Off: FSR 2. If it can't be made on "
+				"your graphics card, FSR 2 is used and the Upscaling tab says why.", nullptr, "upscale.temporal", false,
+				{ _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 			{ "upscale.sharpen", tab::upscaling, "AMD FSR", "Sharpening",
 				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most.", "%.2f", "upscale.fsr", false,
 				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.8f },

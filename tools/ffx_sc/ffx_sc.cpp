@@ -1,6 +1,7 @@
 /*
- * HiFi XI's shader tool for AMD's frame generation (src/framegen): every pass and permutation of the FidelityFX SDK's
- * frame interpolation and optical flow compiled with Microsoft's DXC (the Windows SDK's dxcompiler.dll, signed; its
+ * HiFi XI's shader tool for AMD's frame generation and upscaler (src/framegen): every pass and permutation of the
+ * FidelityFX SDK's frame interpolation, optical flow and FSR 3.1 upscaler (only the permutations HiFi XI can ask for:
+ * its context's flags fixed) compiled with Microsoft's DXC (the Windows SDK's dxcompiler.dll, signed; its
  * dxil.dll beside it signs the output), as AMD's own tool (FidelityFX_SC, unsigned: never run) would: cs_6_2, entry CS,
  * FFX_GPU, FFX_HLSL, FFX_HLSL_SM 62, each component's base defines, every combination of its permutation options, wave32,
  * no 16-bit types. Each one's bindings (constant buffers, SRV and UAV textures and buffers, samplers: names, registers,
@@ -26,6 +27,7 @@ namespace
 		const wchar_t *component; // (its folder under include/FidelityFX/gpu and src/backends/dx12/shaders)
 		std::vector<const wchar_t *> base;   // its base defines
 		std::vector<std::pair<const wchar_t *, uint32_t>> options; // its permutation defines and their option bits
+		uint32_t fixed = 0; // option bits always set for it (defines in base)
 	};
 
 	const std::vector<const wchar_t *> kFiBase = { L"FFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0",
@@ -36,6 +38,16 @@ namespace
 		{ L"FFX_FRAMEINTERPOLATION_OPTION_JITTER_MOTION_VECTORS", 2u }, { L"FFX_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH", 4u } };
 	// (OPTICALFLOW_HDR_COLOR_INPUT 4)
 	const std::vector<std::pair<const wchar_t *, uint32_t>> kOfOptions = { { L"FFX_OPTICALFLOW_OPTION_HDR_COLOR_INPUT", 4u } };
+	// The FSR 3.1 upscaler as HiFi XI's context is made (src/upscale/fsr3.cpp): no HDR, motion vectors at the render size
+	// (FSR3UPSCALER_SHADER_PERMUTATION_LOW_RES_MOTION_VECTORS 4, always set), without the jitter, depth not inverted; the
+	// Lanczos lookup table (1, on AMD's GPUs) and sharpening (32) either way
+	const std::vector<const wchar_t *> kUpBase = { L"FFX_FSR3UPSCALER_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0",
+		L"FFX_FSR3UPSCALER_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0", L"FFX_FSR3UPSCALER_OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1",
+		L"FFX_FSR3UPSCALER_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0", L"FFX_FSR3UPSCALER_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2",
+		L"FFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=0", L"FFX_FSR3UPSCALER_OPTION_LOW_RESOLUTION_MOTION_VECTORS=1",
+		L"FFX_FSR3UPSCALER_OPTION_JITTERED_MOTION_VECTORS=0", L"FFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=0" };
+	const std::vector<std::pair<const wchar_t *, uint32_t>> kUpOptions = { { L"FFX_FSR3UPSCALER_OPTION_REPROJECT_USE_LANCZOS_TYPE", 1u },
+		{ L"FFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING", 32u } };
 
 	std::vector<job> jobs()
 	{
@@ -60,6 +72,18 @@ namespace
 		of("FFX_OPTICALFLOW_PASS_COMPUTE_OPTICAL_FLOW_ADVANCED_V5", "ffx_opticalflow_compute_optical_flow_advanced_pass_v5.hlsl");
 		of("FFX_OPTICALFLOW_PASS_FILTER_OPTICAL_FLOW_V5", "ffx_opticalflow_filter_optical_flow_pass_v5.hlsl");
 		of("FFX_OPTICALFLOW_PASS_SCALE_OPTICAL_FLOW_ADVANCED_V5", "ffx_opticalflow_scale_optical_flow_advanced_pass_v5.hlsl");
+		auto up = [&](const char *pass, const char *file) { j.push_back({ "FFX_EFFECT_FSR3UPSCALER", pass, file, L"fsr3upscaler", kUpBase, kUpOptions, 4u }); };
+		up("FFX_FSR3UPSCALER_PASS_PREPARE_INPUTS", "ffx_fsr3upscaler_prepare_inputs_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_LUMA_PYRAMID", "ffx_fsr3upscaler_luma_pyramid_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_SHADING_CHANGE_PYRAMID", "ffx_fsr3upscaler_shading_change_pyramid_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_SHADING_CHANGE", "ffx_fsr3upscaler_shading_change_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_PREPARE_REACTIVITY", "ffx_fsr3upscaler_prepare_reactivity_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_LUMA_INSTABILITY", "ffx_fsr3upscaler_luma_instability_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_ACCUMULATE", "ffx_fsr3upscaler_accumulate_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_ACCUMULATE_SHARPEN", "ffx_fsr3upscaler_accumulate_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_RCAS", "ffx_fsr3upscaler_rcas_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_DEBUG_VIEW", "ffx_fsr3upscaler_debug_view_pass.hlsl");
+		up("FFX_FSR3UPSCALER_PASS_GENERATE_REACTIVE", "ffx_fsr3upscaler_autogen_reactive_pass.hlsl");
 		return j;
 	}
 
@@ -155,7 +179,7 @@ int wmain(int argc, wchar_t **argv)
 		const uint32_t combos = 1u << jb.options.size();
 		for (uint32_t c = 0; c < combos; ++c)
 		{
-			uint32_t options = 0;
+			uint32_t options = jb.fixed;
 			std::vector<std::wstring> defs = { L"FFX_GPU=1", L"FFX_HLSL=1", L"FFX_HLSL_SM=62" };
 			for (const wchar_t *d : jb.base)
 				defs.push_back(d);

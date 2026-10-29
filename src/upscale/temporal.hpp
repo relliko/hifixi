@@ -17,6 +17,7 @@
 // The context (FSR 2's own resources and pipelines: its shaders compiled then, fsr2_shaders.cpp) is made off
 // dgVoodoo's thread by make(), for one size of A and of the screen.
 #include <d3d12.h>
+#include "fsr3.hpp"
 #include <cstdint>
 #include <string>
 
@@ -38,14 +39,17 @@ namespace hifi::upscale::temporal
 		context(const context &) = delete;
 		context &operator=(const context &) = delete;
 		~context();
-		// Made for A's size and the screen's (not on dgVoodoo's thread); false with why
-		bool make(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, std::string &why);
+		// Made for A's size and the screen's (not on dgVoodoo's thread), with FSR 3.1's upscaler (v3: fsr3.hpp) or FSR 2's;
+		// false with why
+		bool make(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, bool v3, std::string &why);
 		void release();
 		bool ready() const { return _made; }
-		bool fits(uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h) const
+		bool fits(uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, bool v3) const
 		{
-			return _made && render_w == _rw && render_h == _rh && display_w == _dw && display_h == _dh;
+			return _made && render_w == _rw && render_h == _rh && display_w == _dw && display_h == _dh && v3 == (_fsr3 != nullptr);
 		}
+		bool v3() const { return _fsr3 != nullptr; }
+		const char *name() const { return _fsr3 != nullptr ? "FSR 3.1" : "FSR 2"; }
 		// The frame (dgVoodoo's thread): A (color) in color_state, its depth (plane 0 in depth_state); its output left in
 		// PIXEL_SHADER_RESOURCE (output()). Sets its own heaps, root signatures and pipelines: the caller puts dgVoodoo's
 		// back. False with why when nothing was drawn.
@@ -65,6 +69,7 @@ namespace hifi::upscale::temporal
 		ID3D12Device *_device = nullptr;
 		void *_scratch = nullptr;
 		void *_fsr = nullptr; // (FfxFsr2Context, allocated: its header stays in temporal.cpp)
+		fsr3::upscaler *_fsr3 = nullptr; // (or FSR 3.1's)
 		ID3D12RootSignature *_root = nullptr;
 		ID3D12PipelineState *_motion = nullptr;
 		ID3D12DescriptorHeap *_heap = nullptr;
