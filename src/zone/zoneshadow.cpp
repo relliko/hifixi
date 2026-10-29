@@ -73,6 +73,7 @@ void ps(v2p i)
 )";
 
 		constexpr uint32_t kRingSlots = 16;
+		constexpr uint32_t kOldRecords = 256; // (records after which a zone's placements left behind are let go)
 		constexpr uint32_t kMaxVisible = 65536;
 		constexpr uint32_t kMaxMovers = 4096;   // (a frame's: the plants and door parts within the casters' map)
 		constexpr uint32_t kPlaceFloats = 16;
@@ -243,7 +244,7 @@ void ps(v2p i)
 		_door_model.assign(d.models.size(), 0);
 		_doors.clear();
 		_mover_generation++;
-		// (the old placements' buffer may still be read by the GPU: let go kRingSlots records on, as the ring's slots)
+		// (the old placements' buffer may still be read by the GPU: let go kOldRecords records on)
 		if (_places != nullptr)
 			_old.push_back({ _places, _slot });
 		_places = nullptr;
@@ -345,48 +346,68 @@ void ps(v2p i)
 		// The placements in the cascade: their boxes' corners through world_to_clip within x, y of -1..1 (a box all to
 		// one side of it is out); depth isn't cut (anything along the rays shades)
 		for (size_t i = 0; i < _old.size();)
-			if (_slot - _old[i].second > kRingSlots)
+			if (_slot - _old[i].second > kOldRecords)
 			{
 				drop(_old[i].first);
 				_old.erase(_old.begin() + ptrdiff_t(i));
 			}
 			else
 				++i;
-		const uint32_t slot = _slot++ % kRingSlots;
-		uint32_t *out = _mapped + size_t(slot) * kMaxVisible;
+		_slot++;
+		// (the list from the ring's next free place, back at its start when a whole kMaxVisible wouldn't fit: a record
+		// takes only what it lists, so a frame's cascades and lamp faces together come nowhere near going round)
+		if (_ring_at + kMaxVisible > kRingSlots * kMaxVisible)
+			_ring_at = 0;
+		const uint32_t first = _ring_at;
+		uint32_t *out = _mapped + first;
 		std::vector<group> groups;
 		uint32_t listed = 0;
 		const float *M = world_to_clip;
+		// (a cascade looks along parallel rays, w 1 everywhere; a lamp's face from a point, w the depth along its middle:
+		// then what's behind it or past its far plane is out as well)
+		const bool ortho = M[3] == 0.0f && M[7] == 0.0f && M[11] == 0.0f;
 		// (the hole the moving layer fills: only in a near cascade, its first column's length being 1 / its reach)
 		const float reach = 1.0f / std::max(std::sqrt(M[0] * M[0] + M[4] * M[4] + M[8] * M[8]), 1e-6f);
-		const float cut = hole && reach <= kHoleReach ? kHole / reach : 0.0f;
+		const float cut = hole && ortho && reach <= kHoleReach ? kHole / reach : 0.0f;
+		// (each test on a box exactly as on its 8 corners, from its middle and half sizes: a linear function's least and
+		// greatest over a box are its value at the middle less and plus its weights' sizes times the half sizes. A box is
+		// out when it's wholly past one plane: x > w, x < -w, y > w, y < -w; and for a lamp's face z > w, z < 0)
+		auto spread = [](const float *col, const float h[3]) { return std::fabs(col[0]) * h[0] + std::fabs(col[4]) * h[1] + std::fabs(col[8]) * h[2]; };
+		const float planes[6][4] = { // (each a column (x, y, z rows' weights, then the constant) of the function past it: > 0)
+			{ M[0] - M[3], M[4] - M[7], M[8] - M[11], M[12] - M[15] }, { -M[0] - M[3], -M[4] - M[7], -M[8] - M[11], -M[12] - M[15] },
+			{ M[1] - M[3], M[5] - M[7], M[9] - M[11], M[13] - M[15] }, { -M[1] - M[3], -M[5] - M[7], -M[9] - M[11], -M[13] - M[15] },
+			{ M[2] - M[3], M[6] - M[7], M[10] - M[11], M[14] - M[15] }, { -M[2], -M[6], -M[10], -M[14] } };
 		for (uint32_t i : _by_model)
 		{
 			const float *b = &_boxes[size_t(i) * 6];
-			float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
-			for (int c = 0; c < 8; ++c)
+			const float c[3] = { 0.5f * (b[0] + b[3]), 0.5f * (b[1] + b[4]), 0.5f * (b[2] + b[5]) };
+			const float h[3] = { 0.5f * (b[3] - b[0]), 0.5f * (b[4] - b[1]), 0.5f * (b[5] - b[2]) };
+			bool culled = listed >= kMaxVisible;
+			for (int k = 0; k < (ortho ? 4 : 6) && !culled; ++k)
 			{
-				const float q[3] = { (c & 1) ? b[3] : b[0], (c & 2) ? b[4] : b[1], (c & 4) ? b[5] : b[2] };
-				const float x = q[0] * M[0] + q[1] * M[4] + q[2] * M[8] + M[12], y = q[0] * M[1] + q[1] * M[5] + q[2] * M[9] + M[13];
-				x0 = std::min(x0, x);
-				x1 = std::max(x1, x);
-				y0 = std::min(y0, y);
-				y1 = std::max(y1, y);
+				const float *f = planes[k];
+				culled = c[0] * f[0] + c[1] * f[1] + c[2] * f[2] + f[3] - (std::fabs(f[0]) * h[0] + std::fabs(f[1]) * h[1] + std::fabs(f[2]) * h[2]) > 0.0f;
 			}
-			if (x1 < -1.0f || x0 > 1.0f || y1 < -1.0f || y0 > 1.0f || listed >= kMaxVisible)
+			if (culled)
 				continue;
 			const zm::placement &p = d.placements[i];
-			if (cut > 0.0f && x0 >= -cut && x1 <= cut && y0 >= -cut && y1 <= cut && is_mover(p.model))
-				continue;
+			if (cut > 0.0f && is_mover(p.model))
+			{
+				const float x = c[0] * M[0] + c[1] * M[4] + c[2] * M[8] + M[12], y = c[0] * M[1] + c[1] * M[5] + c[2] * M[9] + M[13];
+				const float sx = spread(M, h), sy = spread(M + 1, h);
+				if (x - sx >= -cut && x + sx <= cut && y - sy >= -cut && y + sy <= cut)
+					continue;
+			}
 			const uint32_t tested = (p.flags & zm::kAlphaTested) != 0 ? 1u : 0u;
 			if (groups.empty() || groups.back().model != p.model || groups.back().tested != tested)
 				groups.push_back({ p.model, tested, listed, 0 });
 			out[listed++] = i;
 			groups.back().count++;
 		}
+		_ring_at = first + ((listed + 63u) & ~63u);
 		if (groups.empty())
 			return 0;
-		return draw_groups(list, z, world_to_clip, dsv, size, _places->GetGPUVirtualAddress(), _ring->GetGPUVirtualAddress() + UINT64(slot) * kMaxVisible * 4,
+		return draw_groups(list, z, world_to_clip, dsv, size, _places->GetGPUVirtualAddress(), _ring->GetGPUVirtualAddress() + UINT64(first) * 4,
 			uint32_t(d.placements.size()), groups);
 	}
 

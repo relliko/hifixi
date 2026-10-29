@@ -691,7 +691,7 @@ int main(int argc, char **argv)
 		};
 
 		constexpr UINT kSmall = 512;
-		ID3D12Resource *cmap = nullptr, *backs[4] = {};
+		ID3D12Resource *cmap = nullptr, *backs[5] = {};
 		ID3D12DescriptorHeap *small_heap = nullptr;
 		{
 			D3D12_RESOURCE_DESC cd = {};
@@ -772,6 +772,13 @@ int main(int argc, char **argv)
 		// The near and far cascades, the layer drawn just now
 		map_out(2, [&] { near_triangles = inj::record_zone_casters(list, m_near, small_dsv, kSmall); });
 		map_out(3, [&] { inj::record_zone_casters(list, m_far, small_dsv, kSmall); });
+		// A lamp's cube face (World FX's draw_lamp_maps: a perspective from the light, here 4 yalms over the card looking
+		// down at it, from 1 yalm to 8; its middle 0.95 of it a quarter turn)
+		const float lamp_at[3] = { 0.0f, -14.0f, 0.0f }, l_near = 1.0f, l_far = 8.0f, l_scale = 0.95f;
+		const float l_a = l_far / (l_far - l_near), l_b = -l_near * l_far / (l_far - l_near);
+		const float m_lamp[16] = { l_scale, 0, 0, 0, 0, 0, l_a, 1, 0, l_scale, 0, 0, -l_scale * lamp_at[0], -l_scale * lamp_at[2], -l_a * lamp_at[1] + l_b, -lamp_at[1] };
+		uint32_t lamp_triangles = 0;
+		map_out(4, [&] { lamp_triangles = inj::record_zone_casters(list, m_lamp, small_dsv, kSmall); });
 		list->Close();
 		direct->ExecuteCommandLists(1, lists);
 		direct->Signal(fence, 2);
@@ -829,6 +836,21 @@ int main(int argc, char **argv)
 		check(f_middle.n >= 4 && f_card.n >= f_middle.n + 4 && f_door.n >= 4 && std::fabs(f_door.row - 256.0) < 2.0, line);
 		std::snprintf(line, sizeof(line), "the bounds take in the second map (y %.0f..%.0f, z %.0f..%.0f); the cascades' number changes as the layer comes in", blo[1], bhi[1], blo[2], bhi[2]);
 		check(bounds_now && blo[1] <= -20.0f && bhi[2] >= 11.0f && gen_before != gen_after, line);
+		{
+			// (the card 4 yalms down the face's middle: z = f / (f - n) x (1 - n / 4); a yalm each way of it 0.95 / 4 of the
+			// face's half)
+			float *zz = nullptr;
+			backs[4]->Map(0, nullptr, reinterpret_cast<void **>(&zz));
+			const float centre = zz[size_t(256) * kSmall + 256], expected = l_a * (1.0f - l_near / 4.0f);
+			uint32_t covered = 0;
+			for (size_t i = 0; i < size_t(kSmall) * kSmall; ++i)
+				covered += zz[i] < 1.0f;
+			backs[4]->Unmap(0, nullptr);
+			const double side = 0.95 / 4.0 * kSmall;
+			std::snprintf(line, sizeof(line), "a lamp's cube face: the card under it at depth %.4f (%.4f), %u texels (%.0f), %u triangles (only the card in its frustum: the rest beside, behind or past its reach)",
+				centre, expected, covered, side * side, lamp_triangles);
+			check(std::fabs(centre - expected) < 1e-3f && std::fabs(double(covered) - side * side) < 0.05 * side * side && lamp_triangles == 2, line);
+		}
 		const std::vector<std::string> st2 = inj::status();
 		check(st2.size() > 2 && st2[2].find("2 frames") != std::string::npos, "counted: " + (st2.size() > 2 ? st2[2] : std::string()));
 		for (ID3D12Resource *back : backs)

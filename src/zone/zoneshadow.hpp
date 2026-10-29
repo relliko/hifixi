@@ -44,8 +44,10 @@ namespace hifi::zone
 		void release();
 		// The box around everything the zone places (world), for the map's depth; false when nothing's placed
 		bool bounds(gpu_zone &z, float lo[3], float hi[3]);
-		// The placements seen through world_to_clip into dsv (D32, size texels square, cleared); triangles drawn. With
-		// hole, a near cascade (kHoleReach yalms each way or less) leaves out the movers wholly within kHole of its middle.
+		// The placements seen through world_to_clip into dsv (D32, size texels square, cleared); triangles drawn.
+		// world_to_clip is a cascade's (parallel rays: depth not cut) or a lamp's cube face's (a perspective: what's behind
+		// it or past its far plane cut too). With hole, a near cascade (kHoleReach yalms each way or less) leaves out the
+		// movers wholly within kHole of its middle.
 		uint32_t record(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, bool hole = false);
 
 		// The moving layer. note_pass: the objects of the last pass drawn that are this map's (zone_index: 0 the zone, 1
@@ -76,10 +78,11 @@ namespace hifi::zone
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
 		ID3D12PipelineState *_pso = nullptr;
-		// The visible lists: kRingSlots slots of kMaxVisible uints (upload heap, mapped), one slot a record
+		// The visible lists: a ring of kRingSlots x kMaxVisible uints (upload heap, mapped), each record's list from the next
+		// free place; the records made
 		ID3D12Resource *_ring = nullptr;
 		uint32_t *_mapped = nullptr;
-		uint32_t _slot = 0;
+		uint32_t _ring_at = 0, _slot = 0;
 		// The movers' ring: kRingSlots slots of kMaxMovers places (16 floats) then as many uints, one slot a record_movers
 		ID3D12Resource *_mover_ring = nullptr;
 		uint8_t *_mover_mapped = nullptr;
