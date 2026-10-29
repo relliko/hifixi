@@ -2349,6 +2349,9 @@ static std::string crash_context()
 	std::snprintf(line, sizeof(line), "  light split (the native zone's and characters' facing and sun share): %s\n",
 		g.light == nullptr ? "no host" : g.last.light_split ? "read in the last drawing" : "not in the last drawing");
 	out += line;
+	std::snprintf(line, sizeof(line), "  lamp shadow maps (cubes from the native zone, in place of the march): %s; %u ready in the last drawing, %u faces (%u triangles) drawn in it\n",
+		g.zone_bounds == nullptr ? "no host" : "on with lamp shadows", g.last.lamp_maps, g.last.lamp_map_faces, g.last.lamp_map_triangles);
+	out += line;
 	std::snprintf(line, sizeof(line), "  sea: %s (%s), to %.0f yalms, %u corners last drawn\n", g.look.sea ? "on" : "off", g.sea_status.c_str(), g.look.sea_distance,
 		g.last.sea_corners);
 	out += line;

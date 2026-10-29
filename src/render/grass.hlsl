@@ -664,6 +664,69 @@ float lamp_march(float3 from, float3 path, float last, float3 L, float3 f0, floa
 	return blocked;
 }
 
+// The lamps' shadow maps (grass_render.cpp draw_lamp_maps; t2 after the blades' motion's, kMotion's 9): [kLampMap ..
+// + 2] the view's rows (a view-space direction's world x, y and z), [kLampMap + 3] how many maps, where they start in the
+// depth copy (bytes, as bits: zbuf, past the depth and the light split), the near plane and the faces' scale; [kLampMap
+// + 4 + k] map k's lamp (view space) and its far plane (0: no map in that place). Each map a cube of kLampMapSize texels
+// a face (kLampFaces: each face's middle, right and up, world axes), depth as a perspective from the light, drawn from
+// the host's zone (HiFi XI's native zone data): it hides a lamp whether the thing between is on screen or not.
+static const uint kLampMap = kMotion + 9;
+static const uint kLampMapSize = 256;
+static const float3 kLampFaces[18] = {
+	float3(1, 0, 0), float3(0, 0, 1), float3(0, 1, 0),
+	float3(-1, 0, 0), float3(0, 0, -1), float3(0, 1, 0),
+	float3(0, 1, 0), float3(1, 0, 0), float3(0, 0, 1),
+	float3(0, -1, 0), float3(1, 0, 0), float3(0, 0, -1),
+	float3(0, 0, 1), float3(-1, 0, 0), float3(0, 1, 0),
+	float3(0, 0, -1), float3(1, 0, 0), float3(0, 1, 0) };
+
+// How much the lamp at L (view space) is hidden from P (n its facing) by what its map holds; false when L has no map
+// (marched then). The point moved off the surface by a texel and a half and the depth compared a few centimetres and
+// two texels short (each texel a little wider the further from the light); a 3 x 3 of texels around it, each hidden or
+// not, gives the share. A texel nothing was drawn in (the reach and beyond) hides nothing.
+bool lamp_from_map(float3 P, float3 n, float3 L, out float blocked)
+{
+	blocked = 0.0;
+	const float4 head = actors[kLampMap + 3];
+	int k = -1;
+	float far_plane = 0.0;
+	[unroll] for (int i = 0; i < 4; ++i)
+	{
+		const float4 a = actors[kLampMap + 4 + i];
+		const float3 d = a.xyz - L;
+		const bool here = k < 0 && a.w > 0.0 && dot(d, d) < 1e-4;
+		k = here ? i : k;
+		far_plane = here ? a.w : far_plane;
+	}
+	[branch] if (head.x < 0.5 || k < 0)
+		return false;
+	const float near_plane = head.z, scale = head.w;
+	const float3x3 to_world = float3x3(actors[kLampMap].xyz, actors[kLampMap + 1].xyz, actors[kLampMap + 2].xyz);
+	float3 d = mul(to_world, P - L);
+	const float reach = max(abs(d.x), max(abs(d.y), abs(d.z)));
+	const float texel = 2.0 * reach / (scale * kLampMapSize);
+	d = mul(to_world, P + n * (1.5 * texel) - L);
+	const float3 ad = abs(d);
+	const uint face = ad.x >= ad.y && ad.x >= ad.z ? (d.x > 0.0 ? 0 : 1) : ad.y >= ad.z ? (d.y > 0.0 ? 2 : 3) : (d.z > 0.0 ? 4 : 5);
+	const float3 middle = kLampFaces[face * 3], right = kLampFaces[face * 3 + 1], up = kLampFaces[face * 3 + 2];
+	const float w = max(dot(d, middle), 1e-3);
+	const float2 c = float2(scale * dot(d, right) / w * 0.5 + 0.5, 0.5 - scale * dot(d, up) / w * 0.5) * kLampMapSize;
+	const float compared = w - (0.04 + 2.0 * texel);
+	const uint base = asuint(head.y) + uint(k * 6 + face) * kLampMapSize * kLampMapSize * 4;
+	float hidden = 0.0;
+	[unroll] for (int y = -1; y <= 1; ++y)
+		[unroll] for (int x = -1; x <= 1; ++x)
+		{
+			const int2 q = clamp(int2(c) + int2(x, y), int2(0, 0), int2(kLampMapSize - 1, kLampMapSize - 1));
+			const float z = asfloat(zbuf.Load(base + uint(q.y * kLampMapSize + q.x) * 4));
+			// (the depth back to the distance along the face's middle: z = f / (f - n) x (1 - n / w))
+			const float drawn = near_plane * far_plane / max(far_plane - z * (far_plane - near_plane), 1e-4);
+			hidden += z < 1.0 && drawn < compared ? 1.0 : 0.0;
+		}
+	blocked = hidden / 9.0;
+	return true;
+}
+
 // How much a lamp at L (view space) is hidden from the surface at P (n its facing). Only the world hides a lamp here:
 // - Its own lantern, bowl or bracket is around the light: the march stops kLampFixture short of it, and a surface
 //   within kLampNear of the light isn't shaded by it at all, fading in over the next yalm. (Marching to 85% of the way,
@@ -685,6 +748,10 @@ float lamp_blocked(float3 P, float3 n, float3 L)
 	float blocked = 0.0;
 	[branch] if (last > 0.15 && away > 0.0)
 	{
+		// (the lamp's shadow map, when it has one: what's off screen hides it too, and no march)
+		float mapped = 0.0;
+		[branch] if (lamp_from_map(from, n, L, mapped))
+			return mapped * away;
 		blocked = lamp_march(from, path, last, L, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
 		uint count = min(crowd.x & 0xFFFF, 32u);
 		[branch] if (blocked > 0.0 && count > 0)

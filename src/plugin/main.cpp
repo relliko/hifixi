@@ -576,7 +576,7 @@ class hifixi final : public IPlugin
 		// (their sun shadows from their meshes: World FX calls for them in its shading pass, once its renderer is up)
 		if (!m_casters_set && hifi::chars::inject::ready())
 		{
-			worldfx::set_casters(hifi::chars::inject::caster_hook(), nullptr);
+			worldfx::set_casters(all_casters, nullptr);
 			m_casters_set = true;
 		}
 		const bool flowing = m_char_flow.update(hifi::game::charslot::get_counts().sent[3], hifi::chars::marks::get_counts().end);
@@ -597,6 +597,12 @@ class hifixi final : public IPlugin
 			// (and the light split the zone and characters draw: World FX takes it in its shading pass)
 			worldfx::set_light_source([](void *) { return hifi::light::take(); }, nullptr);
 			m_zone_casters_set = true;
+			// (and the zone's moving layer, with the characters, into World FX's casters' map each frame)
+			if (!m_casters_set)
+			{
+				worldfx::set_casters(all_casters, nullptr);
+				m_casters_set = true;
+			}
 		}
 		ID3D12Device *const device = worldfx::attached();
 		if (!hifi::game::zonedraw::in() && !m_native_refused && device != nullptr && hifi::game::zoneslot::in())
@@ -610,6 +616,14 @@ class hifixi final : public IPlugin
 				hifi::backend::log(0, "HiFi XI: the native zone draw in (17CBA8 through our stub; the renderer made)");
 		}
 		hifi::zone::inject::set_options(hifi::game::option_on("zone", "perpixel", hifi::zone::options::kPerPixelByDefault));
+	}
+	// World FX's casters each frame (worldfx::set_casters): the characters and monsters from their meshes, then the zone's
+	// moving layer (its swaying plants, doors and elevators) into the same map. Whether either drew.
+	static bool all_casters(void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
+	{
+		const bool chars = hifi::chars::inject::record_casters(list, world_to_clip, dsv, size);
+		const bool zone = hifi::zone::inject::record_zone_movers(list, world_to_clip, dsv, size);
+		return chars || zone;
 	}
 	// The camera of the frame dgVoodoo is finishing, for World FX: the zone pass's (its frame record, with the jitter it
 	// was drawn with) when one was recorded in the last quarter second

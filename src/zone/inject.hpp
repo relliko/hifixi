@@ -73,10 +73,17 @@ namespace hifi::zone::inject
 	// World FX's sun shadow cascades from the zone this draws (zoneshadow.hpp; grass::renderer::set_zone_casters): the
 	// zone drawn here in the last kZoneFreshMs (only then: a zone left is let go 240 presents on), the box around what it
 	// places and a number that changes with its data; and its placements, depth only, into a cascade (the game's
-	// descriptor heaps put back after; nothing drawn when they aren't known). Triangles drawn.
+	// descriptor heaps put back after; nothing drawn when they aren't known). Triangles drawn. The second map (an
+	// interior) the pass drew is cast as well. While the moving layer is drawn, the near cascade leaves out its movers.
 	bool zone_bounds(float lo[3], float hi[3], uint64_t &generation);
 	uint32_t record_zone_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
-	// Both as World FX takes them
+	// The moving layer (zoneshadow.hpp): the swaying plants and the last pass's doors and elevators, both maps', depth
+	// only into World FX's casters' map (grass::renderer::set_casters: drawn each frame around the camera, beside the
+	// characters); the game's heaps put back after. Whether anything was drawn.
+	bool record_zone_movers(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
+	// All as World FX takes them (the movers alone; the plugin hands World FX one caster function for them and the
+	// characters together)
 	grass::renderer::zone_bounds_fn zone_bounds_hook();
 	grass::renderer::zone_draw_fn zone_draw_hook();
+	grass::renderer::caster_fn movers_hook();
 }

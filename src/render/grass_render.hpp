@@ -546,6 +546,8 @@ namespace grass
 		uint32_t sea_corners = 0;   // of the sea's sheets drawn
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
 		uint32_t lamps = 0;         // lamps whose glow the shading pass added
+		uint32_t lamp_maps = 0;     // ... with a shadow map ready (draw_lamp_maps): their shadows from it, the rest marched
+		uint32_t lamp_map_faces = 0, lamp_map_triangles = 0; // cube faces drawn into them this frame, and their triangles
 		bool wet = false;           // the wet look on path and stone in the shading pass
 		bool snow_cover = false;    // settled snow in the shading pass
 		bool snow_layer = false;    // ... with depth, its layer drawn
@@ -789,6 +791,8 @@ namespace grass
 		void sun_map_params(const camera &cam, double clock, float out[32], float prev[32]) const;
 		bool draw_casters(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3]);
 		void caster_params(const camera &cam, float out[16]) const;
+		bool lamp_maps_for(std::string &error);
+		void draw_lamp_maps(ID3D12GraphicsCommandList *list, const camera &cam, const look &l, const float eye[3], float out[32], draw_stats &stats);
 		ID3D12PipelineState *vis_pipeline(std::string &error);
 		bool vis_buffers(std::string &error);
 		uint32_t draw_vis(ID3D12GraphicsCommandList *list, const float *constants, std::string &error);
@@ -926,6 +930,23 @@ namespace grass
 		bool _map_host = false;
 		ID3D12Resource *_caster_map = nullptr;
 		float _caster_world_to_clip[16] = {};
+		// The lamps' shadow maps (draw_lamp_maps): a D32 array of kLampMaps x 6 faces (DEPTH_WRITE between draws; a view
+		// each in a heap of their own), each six for one lamp: where it is, how far it reaches, the host's zone data they
+		// were drawn from, whether they're drawn, and the depth copy and place they were last copied to; the bytes copy_out
+		// keeps free at the depth copy's end for them (0 until they're first wanted)
+		struct lamp_cube
+		{
+			float pos[3] = {}, range = 0.0f;
+			uint64_t source = 0;
+			uint32_t faces = 0; // (drawn so far: one a frame)
+			bool used = false, drawn = false;
+			ID3D12Resource *copied_to = nullptr;
+			UINT64 copied_at = 0;
+		};
+		lamp_cube _lamp_cubes[4];
+		ID3D12Resource *_lamp_map = nullptr;
+		ID3D12DescriptorHeap *_lamp_map_heap = nullptr;
+		UINT64 _lamp_tail = 0;
 
 		ID3D12Resource *_buffer = nullptr;
 		ID3D12Resource *_memory = nullptr; // the ground colour each blade point remembers (12 bytes a point)

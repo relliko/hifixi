@@ -3791,6 +3791,7 @@ lamps:
 		std::vector<std::pair<D3D12_RECT, float>> cards; // (more things standing in the depth buffer, drawn in order)
 		const float *who = nullptr;                      // (characters and monsters, as the Ashita addon sends them)
 		uint32_t who_count = 0;
+		draw_stats lamp_st;                              // (the last frame's)
 		auto frame = [&](const float *lamps, uint32_t count, float shadows) {
 			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			g.list->ClearRenderTargetView(world_rtv, night_ground, 0, nullptr);
@@ -3819,6 +3820,7 @@ lamps:
 			l2.actors = who;
 			l2.actor_count = who_count;
 			const draw_stats st = r.draw(g.list, t, cam, l2, error);
+			lamp_st = st;
 			check(st.shaded == (count != 0) && st.lamps == count, "the shading pass ran for the lamps (and only with some)");
 			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			return g.read(world, 4);
@@ -3915,6 +3917,81 @@ lamps:
 		check(beside_open.luma > front_unlit.luma + 0.5 && std::fabs(beside_hidden.luma - beside_open.luma) < 0.5, "ground whose way to the lamp is clear keeps its glow");
 		check(std::fabs(front_someone.luma - front_open.luma) < 0.5, "a character or monster casts no lamp shadow (the game casts their own; the march laid a row of copies)");
 		check(std::fabs(front_glow.luma - front_open.luma) < 0.5, "a glow (a Home Point's, an effect's) casts no lamp shadow: the wall leaves its light (its crystal laid a row of shadows)");
+
+		// The lamp's shadow map from the host's zone (set_zone_casters: HiFi XI's native zone data; draw_lamp_maps): the same
+		// low lamp, the wall not in the depth buffer at all (off screen, as far as the march can tell) but drawn by a
+		// stand-in into the lamp's cube faces, as a plate 0.6 of the way from the light to the ground in front of the wall
+		// (a yalm square across the face looking at it). The first frame only asks for room at the depth copy's end; then
+		// one face a frame, the cube copied there with the sixth: the ground in front darker, as with the wall on screen, the
+		// ground beside keeping its glow; a frame later nothing drawn again (kept); the host gone, marched again (nothing on
+		// screen hides it: lit).
+		{
+			struct lamp_host
+			{
+				vec3 q;
+				uint32_t faces = 0, hits = 0;
+			} lh;
+			const vec3 light = { low_lamp[0], low_lamp[1], low_lamp[2] };
+			lh.q = { light.x + 0.6f * (front.x - light.x), light.y + 0.6f * (front.y - light.y), light.z + 0.6f * (front.z - light.z) };
+			r.set_zone_casters(
+				[](void *, float lo[3], float hi[3], uint64_t *generation) {
+					for (int a = 0; a < 3; ++a)
+					{
+						lo[a] = -1000.0f;
+						hi[a] = 1000.0f;
+					}
+					*generation = 7;
+					return true;
+				},
+				[](void *context, ID3D12GraphicsCommandList *list, const float m[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) -> uint32_t {
+					lamp_host &h = *static_cast<lamp_host *>(context);
+					h.faces++;
+					const vec3 &q = h.q;
+					const float x = q.x * m[0] + q.y * m[4] + q.z * m[8] + m[12], y = q.x * m[1] + q.y * m[5] + q.z * m[9] + m[13];
+					const float z = q.x * m[2] + q.y * m[6] + q.z * m[10] + m[14], w = q.x * m[3] + q.y * m[7] + q.z * m[11] + m[15];
+					if (!(w > 0.05f) || std::fabs(x) > w || std::fabs(y) > w)
+						return 0;
+					h.hits++;
+					const float per_yalm = 0.5f * float(size) * std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]) / w;
+					const float cx = (x / w * 0.5f + 0.5f) * float(size), cy = (0.5f - y / w * 0.5f) * float(size);
+					const D3D12_RECT rc = { std::max(LONG(cx - 0.5f * per_yalm), 0L), std::max(LONG(cy - 0.5f * per_yalm), 0L),
+						std::min(LONG(cx + 0.5f * per_yalm) + 1, LONG(size)), std::min(LONG(cy + 0.5f * per_yalm) + 1, LONG(size)) };
+					list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, std::clamp(z / w, 0.0f, 1.0f), 0, 1, &rc);
+					return 2;
+				},
+				&lh);
+			frame(low_lamp, 1, 1.0f);
+			const draw_stats asked = lamp_st;
+			std::vector<uint8_t> mapped;
+			uint32_t faces = 0, most_faces = 0, frames = 0;
+			while (frames < 10 && (frames == 0 || lamp_st.lamp_maps == 0))
+			{
+				mapped = frame(low_lamp, 1, 1.0f);
+				faces += lamp_st.lamp_map_faces;
+				most_faces = std::max(most_faces, lamp_st.lamp_map_faces);
+				frames++;
+			}
+			const draw_stats drawn = lamp_st;
+			const uint32_t hits = lh.hits;
+			const std::vector<uint8_t> kept = frame(low_lamp, 1, 1.0f);
+			const draw_stats kept_st = lamp_st;
+			r.set_zone_casters(nullptr, nullptr, nullptr);
+			const std::vector<uint8_t> marched = frame(low_lamp, 1, 1.0f);
+			const draw_stats marched_st = lamp_st;
+			const colour front_mapped = around(mapped, in_front), front_kept = around(kept, in_front), beside_mapped = around(mapped, beside);
+			const colour front_marched = around(marched, in_front);
+			std::printf("  the lamp's shadow map (the wall only in it, a plate the host draws): ground in front %.1f, kept %.1f, beside %.1f; marched without it %.1f (lit %.1f, unlit %.1f); maps %u/%u/%u/%u; faces %u over %u frames (at most %u a frame), then %u (the plate in %u)\n",
+				front_mapped.luma, front_kept.luma, beside_mapped.luma, front_marched.luma, front_open.luma, front_unlit.luma, asked.lamp_maps, drawn.lamp_maps,
+				kept_st.lamp_maps, marched_st.lamp_maps, faces, frames, most_faces, kept_st.lamp_map_faces, hits);
+			check(asked.lamp_maps == 0 && asked.lamp_map_faces == 0 && drawn.lamp_maps == 1 && faces == 6 && frames == 6 && most_faces == 1 && hits >= 1 &&
+				kept_st.lamp_maps == 1 && kept_st.lamp_map_faces == 0 && marched_st.lamp_maps == 0,
+				"the lamp's cube drawn a face a frame once it's asked for (six frames), then kept; none without the host");
+			check(front_mapped.luma < front_open.luma - 0.6 * (front_open.luma - front_unlit.luma) && std::fabs(front_kept.luma - front_mapped.luma) < 0.5,
+				"with its shadow map, what isn't on screen hides the lamp from the ground in front");
+			check(std::fabs(beside_mapped.luma - beside_open.luma) < 0.5, "ground whose way to the lamp is clear keeps its glow (the map)");
+			check(std::fabs(front_marched.luma - front_open.luma) < 0.5, "without the host's zone the march again (nothing on screen between: lit)");
+			check(g.report_messages() == 0, "no debug-layer errors (the lamp's shadow map)");
+		}
 
 		// A lantern hanging 0.6 yalms in front of a wall facing the camera, the light inside it: the wall (as deep as a point
 		// a yalm past the looked-at one) over the middle of the picture, and the lantern's front a quarter yalm in front of

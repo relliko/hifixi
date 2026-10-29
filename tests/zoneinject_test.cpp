@@ -15,7 +15,10 @@
  *     under the character dgVoodoo drew afterwards, its depth not the depth buffer's (World FX leaves those words);
  *   - a lamp in the frame that no object names (the game's per-object lamps): per pixel it lights the street near it all
  *     the same (draw.cpp near_lamps), per vertex it lights nothing (the game's own way); named by every object, per
- *     vertex it lights them.
+ *     vertex it lights them;
+ *   - the sun's shadows from a made-up zone: the moving layer (a swaying card's shadow moves with its sway, an open door's
+ *     is where the pass drew it), the near cascade leaving those to it while the far one keeps them at rest, and the
+ *     second map's (an interior's) placements cast with the zone's.
  *
  *   build\zoneinject_test.exe [out.bmp]       (ZONE_PERPIXEL=1: drawn with the per-pixel option)
  */
@@ -29,6 +32,7 @@
 #include "../src/zone/inject.hpp"
 #include "../src/zone/light_split.hpp"
 #include "../src/zone/zone_gpu.hpp"
+#include "../src/zone/zoneshadow.hpp"
 #include "game_dump.hpp"
 #include <algorithm>
 #include <cmath>
@@ -789,6 +793,265 @@ int main(int argc, char **argv)
 			}
 			fclose(f);
 		}
+	}
+	// The moving layer and the second map (zoneshadow.hpp; notes-mesh-shadows.md M3), on a made-up zone: a swaying card
+	// (kind 2, its sway vector 4 yalms along x) placed twice, a door (its part drawn 4 yalms along z from its placement),
+	// a wall, each a 2 x 2 yalm card lying flat at its own height; and a second map with a roof. Drawn looking straight
+	// down (depth by height: the card 0.5, the door 0.45, the wall 0.55, the roof 0.25), 512 texels square.
+	{
+		auto card = [](zm::zone &z, const char *name, uint32_t kind, float y, float sway_x) {
+			zm::model m;
+			std::memcpy(m.name, name, std::strlen(name));
+			m.kind = kind;
+			m.first_piece = uint32_t(z.pieces.size());
+			m.pieces = 1;
+			m.first_vertex = uint32_t(z.vertices.size());
+			m.vertices = 4;
+			const float corners[4][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } };
+			for (const auto &c : corners)
+			{
+				zm::vertex v = {};
+				v.pos[0] = c[0];
+				v.pos[1] = y;
+				v.pos[2] = c[1];
+				v.normal[1] = -1.0f;
+				v.colour = 0x80FFFFFFu;
+				v.sway[0] = sway_x;
+				z.vertices.push_back(v);
+			}
+			zm::piece pc;
+			pc.first_index = uint32_t(z.indices.size());
+			pc.triangles = 2;
+			for (const uint32_t i : { 0u, 1u, 2u, 2u, 1u, 3u })
+				z.indices.push_back(m.first_vertex + i);
+			z.pieces.push_back(pc);
+			m.lo[0] = -1.0f;
+			m.hi[0] = 1.0f + sway_x;
+			m.lo[1] = m.hi[1] = y;
+			m.lo[2] = -1.0f;
+			m.hi[2] = 1.0f;
+			z.models.push_back(m);
+			return uint32_t(z.models.size() - 1);
+		};
+		auto place = [](zm::zone &z, uint32_t model, float x, float y, float zz) {
+			zm::placement p;
+			p.model = model;
+			p.m[0] = p.m[4] = p.m[8] = 1.0f;
+			p.t[0] = x;
+			p.t[1] = y;
+			p.t[2] = zz;
+			z.placements.push_back(p);
+		};
+		zm::zone za, zb;
+		za.map = 9001;
+		zb.map = 9002;
+		const uint32_t palm = card(za, "palm", 2, 0.0f, 4.0f), door = card(za, "door", 1, 0.0f, 0.0f), wall = card(za, "wall", 1, 0.0f, 0.0f);
+		place(za, palm, 0.0f, -10.0f, 0.0f);   // (in the near cascade's hole)
+		place(za, palm, -24.0f, -10.0f, 0.0f); // (outside it; never in a pass: its model's sway)
+		place(za, door, 10.0f, -12.0f, 0.0f);
+		place(za, wall, -10.0f, -8.0f, 0.0f);
+		const uint32_t roof = card(zb, "roof", 1, 0.0f, 0.0f);
+		place(zb, roof, 0.0f, -20.0f, 10.0f);
+		hifi::zone::gpu_zone ga, gb;
+		check(ga.upload(device, copy, std::move(za), why) && gb.upload(device, copy, std::move(zb), why) && ga.wait(10000) && gb.wait(10000), "the made-up zone and second map on the GPU" + why);
+
+		auto pass = [&](uint32_t seq, float sway) {
+			hifi::zone::frame &f = hifi::zone::frame_slot(seq);
+			f.native = true;
+			f.zone = &ga;
+			f.second = &gb;
+			f.map = 9001;
+			std::memcpy(f.view_proj, vp.m, 64);
+			std::memcpy(f.camera, eye, 12);
+			f.env_count = 1;
+			f.count = 0;
+			f.lamp_count = 0;
+			auto object = [&](uint32_t model, float x, float y, float z, uint32_t flags, float s, uint32_t zone) {
+				hifi::zone::frame_object &o = f.objects[f.count++];
+				o = hifi::zone::frame_object();
+				o.world[0] = o.world[5] = o.world[10] = 1.0f;
+				o.world[3] = x;
+				o.world[7] = y;
+				o.world[11] = z;
+				o.model = model;
+				o.flags = flags;
+				o.sway = s;
+				o.zone = zone;
+			};
+			object(palm, 0.0f, -10.0f, 0.0f, 0, sway, 0);
+			object(door, 10.0f, -12.0f, 4.0f, hifi::zone::kDoor, 0.0f, 0); // (open: 4 yalms from where it's placed)
+			object(wall, -10.0f, -8.0f, 0.0f, 0, 0.0f, 0);
+			object(roof, 0.0f, -20.0f, 10.0f, 0, 0.0f, 1);
+			hifi::zone::publish(f, seq);
+		};
+
+		constexpr UINT kSmall = 512;
+		ID3D12Resource *cmap = nullptr, *backs[5] = {};
+		ID3D12DescriptorHeap *small_heap = nullptr;
+		{
+			D3D12_RESOURCE_DESC cd = {};
+			cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			cd.Width = kSmall;
+			cd.Height = kSmall;
+			cd.DepthOrArraySize = 1;
+			cd.MipLevels = 1;
+			cd.Format = DXGI_FORMAT_D32_FLOAT;
+			cd.SampleDesc.Count = 1;
+			cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+			D3D12_CLEAR_VALUE cv = {};
+			cv.Format = DXGI_FORMAT_D32_FLOAT;
+			cv.DepthStencil.Depth = 1.0f;
+			D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT }, rh = { D3D12_HEAP_TYPE_READBACK };
+			device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&cmap));
+			D3D12_DESCRIPTOR_HEAP_DESC sd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+			device->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&small_heap));
+			device->CreateDepthStencilView(cmap, nullptr, small_heap->GetCPUDescriptorHandleForHeapStart());
+			D3D12_RESOURCE_DESC b = {};
+			b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			b.Width = UINT64(kSmall) * kSmall * 4;
+			b.Height = 1;
+			b.DepthOrArraySize = 1;
+			b.MipLevels = 1;
+			b.SampleDesc.Count = 1;
+			b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			for (ID3D12Resource *&back : backs)
+				device->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&back));
+		}
+		const D3D12_CPU_DESCRIPTOR_HANDLE small_dsv = small_heap->GetCPUDescriptorHandleForHeapStart();
+		// (looking straight down, centred on the origin, reach yalms each way: x across, z up the map, depth by height
+		// from 30 yalms up over 40)
+		auto down = [](float reach, float out[16]) {
+			const float m[16] = { 1.0f / reach, 0, 0, 0, 0, 0, 1.0f / 40.0f, 0, 0, -1.0f / reach, 0, 0, 0, 0, 30.0f / 40.0f, 1 };
+			std::memcpy(out, m, sizeof(m));
+		};
+
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		inj::on_reset(list);
+		list->SetDescriptorHeaps(1, &srvh);
+		inj::on_heaps(list, 1, &srvh);
+		// (the world back from its copies: dgVoodoo's planes as for the marker before)
+		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		uint64_t gen_before = 0, gen_after = 0;
+		float blo[3], bhi[3];
+		auto map_out = [&](int k, auto &&draw) {
+			list->ClearDepthStencilView(small_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+			draw();
+			bound.restore(list);
+			barrier(list, cmap, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION sdst = {}, ssrc = {};
+			sdst.pResource = backs[k];
+			sdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			sdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_TYPELESS, kSmall, kSmall, 1, kSmall * 4 };
+			ssrc.pResource = cmap;
+			ssrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			list->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
+			barrier(list, cmap, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		};
+		float m_movers[16], m_near[16], m_far[16];
+		down(32.0f, m_movers);
+		down(40.0f, m_near);
+		down(160.0f, m_far);
+		bool movers_drew[2] = {};
+		uint32_t near_triangles = 0;
+		// The pass with the card at rest, then swayed all the way: the moving layer after each
+		pass(9, 0.0f);
+		inj::on_zone_end(list, bound, w, 9);
+		const bool bounds_now = inj::zone_bounds(blo, bhi, gen_before);
+		map_out(0, [&] { movers_drew[0] = inj::record_zone_movers(list, m_movers, small_dsv, kSmall); });
+		pass(10, 1.0f);
+		inj::on_zone_end(list, bound, w, 10);
+		map_out(1, [&] { movers_drew[1] = inj::record_zone_movers(list, m_movers, small_dsv, kSmall); });
+		inj::zone_bounds(blo, bhi, gen_after);
+		// The near and far cascades, the layer drawn just now
+		map_out(2, [&] { near_triangles = inj::record_zone_casters(list, m_near, small_dsv, kSmall); });
+		map_out(3, [&] { inj::record_zone_casters(list, m_far, small_dsv, kSmall); });
+		// A lamp's cube face (World FX's draw_lamp_maps: a perspective from the light, here 4 yalms over the card looking
+		// down at it, from 1 yalm to 8; its middle 0.95 of it a quarter turn)
+		const float lamp_at[3] = { 0.0f, -14.0f, 0.0f }, l_near = 1.0f, l_far = 8.0f, l_scale = 0.95f;
+		const float l_a = l_far / (l_far - l_near), l_b = -l_near * l_far / (l_far - l_near);
+		const float m_lamp[16] = { l_scale, 0, 0, 0, 0, 0, l_a, 1, 0, l_scale, 0, 0, -l_scale * lamp_at[0], -l_scale * lamp_at[2], -l_a * lamp_at[1] + l_b, -lamp_at[1] };
+		uint32_t lamp_triangles = 0;
+		map_out(4, [&] { lamp_triangles = inj::record_zone_casters(list, m_lamp, small_dsv, kSmall); });
+		list->Close();
+		direct->ExecuteCommandLists(1, lists);
+		direct->Signal(fence, 2);
+		fence->SetEventOnCompletion(2, e);
+		WaitForSingleObject(e, 60000);
+		check(device->GetDeviceRemovedReason() == S_OK, "the device still there after the moving layer");
+		const uint32_t later = debug_messages(info, first);
+		check(later == 0, "the debug layer: nothing (" + std::to_string(later) + (later != 0 ? ": " + first : std::string()) + ")");
+
+		// Each thing by its depth: texels and their middle (column, row)
+		struct band
+		{
+			uint32_t n = 0;
+			double col = 0.0, row = 0.0;
+		};
+		auto measure = [&](int k, float depth, float x_from = -1.0f) {
+			float *zz = nullptr;
+			backs[k]->Map(0, nullptr, reinterpret_cast<void **>(&zz));
+			band b;
+			for (UINT y = 0; y < kSmall; ++y)
+				for (UINT x = 0; x < kSmall; ++x)
+					if (std::fabs(zz[size_t(y) * kSmall + x] - depth) < 0.01f && float(x) >= x_from)
+					{
+						b.n++;
+						b.col += x;
+						b.row += y;
+					}
+			backs[k]->Unmap(0, nullptr);
+			if (b.n != 0)
+			{
+				b.col /= b.n;
+				b.row /= b.n;
+			}
+			return b;
+		};
+		const float d_card = 0.5f, d_door = 0.45f, d_wall = 0.55f, d_roof = 0.25f;
+		// (in the movers' map, 32 yalms each way: 8 texels a yalm, the origin at 256)
+		const band rest = measure(0, d_card, 128.0f), swayed = measure(1, d_card, 128.0f), far_rest = measure(0, d_card), far_swayed = measure(1, d_card);
+		const band open = measure(1, d_door), wall_m = measure(1, d_wall), roof_m = measure(1, d_roof);
+		std::snprintf(line, sizeof(line), "the moving layer: drawn (%d %d); the card at rest at column %.1f (%u texels), swayed 4 yalms at %.1f (%u): its shadow moves with it",
+			movers_drew[0], movers_drew[1], rest.col, rest.n, swayed.col, swayed.n);
+		check(movers_drew[0] && movers_drew[1] && rest.n > 200 && swayed.n > 200 && std::fabs(rest.col - 256.0) < 2.0 && std::fabs(swayed.col - 288.0) < 2.0, line);
+		std::snprintf(line, sizeof(line), "the card the pass didn't draw sways with its model's (its texels' middle %.1f -> %.1f over both cards)", far_rest.col, far_swayed.col);
+		check(far_rest.n > rest.n && std::fabs((far_swayed.col - far_rest.col) - 32.0) < 2.0, line);
+		std::snprintf(line, sizeof(line), "the open door where the pass drew it (row %.1f, column %.1f, %u texels); nothing static in the layer (wall %u, roof %u)",
+			open.row, open.col, open.n, wall_m.n, roof_m.n);
+		check(open.n > 200 && std::fabs(open.row - 288.0) < 2.0 && std::fabs(open.col - 336.0) < 2.0 && wall_m.n == 0 && roof_m.n == 0, line);
+		// (the near cascade, 40 yalms each way: 6.4 texels a yalm; the far one 160: 1.6)
+		const band n_card = measure(2, d_card), n_door = measure(2, d_door), n_wall = measure(2, d_wall), n_roof = measure(2, d_roof);
+		std::snprintf(line, sizeof(line), "the near cascade leaves the movers in its middle %.0f yalms to the layer: cards %u texels (column %.1f: the far one's), door %u; keeps the wall (%u) and the interior's roof (%u); %u triangles",
+			hifi::zone::zone_shadow::kHole, n_card.n, n_card.col, n_door.n, n_wall.n, n_roof.n, near_triangles);
+		check(n_card.n > 100 && std::fabs(n_card.col - (256.0 - 24.0 * 6.4)) < 2.0 && n_door.n == 0 && n_wall.n > 100 && n_roof.n > 100, line);
+		const band f_card = measure(3, d_card), f_middle = measure(3, d_card, 240.0f), f_door = measure(3, d_door);
+		std::snprintf(line, sizeof(line), "the far cascade keeps them all at rest: cards %u texels (%u the middle one's), the door %u at its placement (row %.1f)", f_card.n, f_middle.n, f_door.n, f_door.row);
+		check(f_middle.n >= 4 && f_card.n >= f_middle.n + 4 && f_door.n >= 4 && std::fabs(f_door.row - 256.0) < 2.0, line);
+		std::snprintf(line, sizeof(line), "the bounds take in the second map (y %.0f..%.0f, z %.0f..%.0f); the cascades' number changes as the layer comes in", blo[1], bhi[1], blo[2], bhi[2]);
+		check(bounds_now && blo[1] <= -20.0f && bhi[2] >= 11.0f && gen_before != gen_after, line);
+		{
+			// (the card 4 yalms down the face's middle: z = f / (f - n) x (1 - n / 4); a yalm each way of it 0.95 / 4 of the
+			// face's half)
+			float *zz = nullptr;
+			backs[4]->Map(0, nullptr, reinterpret_cast<void **>(&zz));
+			const float centre = zz[size_t(256) * kSmall + 256], expected = l_a * (1.0f - l_near / 4.0f);
+			uint32_t covered = 0;
+			for (size_t i = 0; i < size_t(kSmall) * kSmall; ++i)
+				covered += zz[i] < 1.0f;
+			backs[4]->Unmap(0, nullptr);
+			const double side = 0.95 / 4.0 * kSmall;
+			std::snprintf(line, sizeof(line), "a lamp's cube face: the card under it at depth %.4f (%.4f), %u texels (%.0f), %u triangles (only the card in its frustum: the rest beside, behind or past its reach)",
+				centre, expected, covered, side * side, lamp_triangles);
+			check(std::fabs(centre - expected) < 1e-3f && std::fabs(double(covered) - side * side) < 0.05 * side * side && lamp_triangles == 2, line);
+		}
+		const std::vector<std::string> st2 = inj::status();
+		check(st2.size() > 2 && st2[2].find("2 frames") != std::string::npos, "counted: " + (st2.size() > 2 ? st2[2] : std::string()));
+		for (ID3D12Resource *back : backs)
+			back->Release();
+		cmap->Release();
+		small_heap->Release();
 	}
 	dump::unmap(base);
 	if (failures == 0)

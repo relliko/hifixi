@@ -38,14 +38,21 @@ namespace hifi::zone::inject
 			std::mutex mutex;
 			ID3D12Device *device = nullptr;
 			std::unique_ptr<zone_renderer> renderer; // (made and let go outside the mutex: see prepare)
-			// The zone last drawn, and when (GetTickCount64): what the shadow cascades are drawn from while fresh
-			gpu_zone *last_zone = nullptr;
+			// The zone last drawn, and when (GetTickCount64): what the shadow cascades are drawn from while fresh; the
+			// second map that pass drew (nullptr: none)
+			gpu_zone *last_zone = nullptr, *last_second = nullptr;
 			ULONGLONG last_zone_at = 0;
+			// The movers of the pass last drawn (its door parts and swaying plants, both maps'), for the moving layer
+			std::vector<frame_object> movers;
 			// The shadow pass under a mutex of its own, never taken in the hooks: it makes resources (a zone's placements)
 			// on dgVoodoo's thread, and with the debug layer a device call under the hooks' mutex deadlocks
 			std::mutex shadow_mutex;
 			std::unique_ptr<zone_shadow> shadow; // (made and let go outside both)
+			std::unique_ptr<zone_shadow> second_shadow; // (the second map's: its own placements, its own movers)
 			std::atomic<uint64_t> shadow_frames { 0 }, shadow_triangles { 0 };
+			// The moving layer: frames it was drawn in, its triangles and instances in all, when it was last asked for
+			std::atomic<uint64_t> mover_frames { 0 }, mover_triangles { 0 }, mover_instances { 0 };
+			std::atomic<ULONGLONG> movers_at { 0 };
 			std::atomic<bool> shadow_up { false };
 			std::atomic<bool> per_pixel { false };
 			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
@@ -142,7 +149,7 @@ namespace hifi::zone::inject
 				return true;
 		}
 		std::unique_ptr<zone_renderer> made;
-		std::unique_ptr<zone_shadow> made_shadow;
+		std::unique_ptr<zone_shadow> made_shadow, made_second;
 		if (device != nullptr)
 		{
 			made = std::make_unique<zone_renderer>();
@@ -155,15 +162,19 @@ namespace hifi::zone::inject
 			made_shadow = std::make_unique<zone_shadow>();
 			if (!made_shadow->init(device, shadow_why))
 				made_shadow.reset(); // (the zone still draws: its shadows come from the bake then)
+			made_second = std::make_unique<zone_shadow>();
+			if (made_shadow == nullptr || !made_second->init(device, shadow_why))
+				made_second.reset(); // (interiors then cast nothing)
 		}
 		std::unique_ptr<zone_renderer> old;
-		std::unique_ptr<zone_shadow> old_shadow;
+		std::unique_ptr<zone_shadow> old_shadow, old_second;
 		ID3D12DescriptorHeap *old_rtv = nullptr, *old_dsv = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			old = std::move(g.renderer);
 			g.renderer = std::move(made);
-			g.last_zone = nullptr;
+			g.last_zone = g.last_second = nullptr;
+			g.movers.clear();
 			old_rtv = g.rtv_heap;
 			old_dsv = g.dsv_heap;
 			g.rtv_heap = g.dsv_heap = nullptr;
@@ -173,7 +184,9 @@ namespace hifi::zone::inject
 		{
 			std::lock_guard<std::mutex> lock(g.shadow_mutex);
 			old_shadow = std::move(g.shadow);
+			old_second = std::move(g.second_shadow);
 			g.shadow = std::move(made_shadow);
+			g.second_shadow = std::move(made_second);
 			g.shadow_up = g.shadow != nullptr;
 		}
 		if (old != nullptr)
@@ -188,12 +201,13 @@ namespace hifi::zone::inject
 	{
 		light::release(); // (both passes' target: let go with either)
 		std::unique_ptr<zone_renderer> old;
-		std::unique_ptr<zone_shadow> old_shadow;
+		std::unique_ptr<zone_shadow> old_shadow, old_second;
 		ID3D12DescriptorHeap *old_rtv = nullptr, *old_dsv = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			old = std::move(g.renderer);
-			g.last_zone = nullptr;
+			g.last_zone = g.last_second = nullptr;
+			g.movers.clear();
 			old_rtv = g.rtv_heap;
 			old_dsv = g.dsv_heap;
 			g.rtv_heap = g.dsv_heap = nullptr;
@@ -206,6 +220,7 @@ namespace hifi::zone::inject
 		{
 			std::lock_guard<std::mutex> lock(g.shadow_mutex);
 			old_shadow = std::move(g.shadow);
+			old_second = std::move(g.second_shadow);
 			g.shadow_up = false;
 		}
 		if (old != nullptr)
@@ -237,6 +252,10 @@ namespace hifi::zone::inject
 		lines.push_back(line);
 		std::snprintf(line, sizeof(line), "native zone renderer: sun shadow cascades from its data: %s; %llu drawn, %llu triangles in all",
 			g.shadow_up ? "up" : "not made", static_cast<unsigned long long>(g.shadow_frames.load()), static_cast<unsigned long long>(g.shadow_triangles.load()));
+		lines.push_back(line);
+		const uint64_t mf = g.mover_frames.load();
+		std::snprintf(line, sizeof(line), "native zone renderer: moving layer (swaying plants, doors) in the casters' map: %llu frames, %.0f instances and %.0f triangles a frame",
+			static_cast<unsigned long long>(mf), mf != 0 ? double(g.mover_instances.load()) / double(mf) : 0.0, mf != 0 ? double(g.mover_triangles.load()) / double(mf) : 0.0);
 		lines.push_back(line);
 		return lines;
 	}
@@ -394,15 +413,32 @@ namespace hifi::zone::inject
 		bound.restore(list);
 		g.drawn++;
 		g.last_zone = f->zone;
+		g.last_second = f->second;
 		g.last_zone_at = GetTickCount64();
+		// (the movers it drew, for the moving layer: World FX asks for that later in this frame, in its shading pass)
+		g.movers.clear();
+		const gpu_zone *const zones[2] = { f->zone, f->second };
+		for (uint32_t i = 0; i < std::min(f->count, kMaxObjects); ++i)
+		{
+			const frame_object &ob = f->objects[i];
+			const gpu_zone *const z = ob.zone < 2 ? zones[ob.zone] : nullptr;
+			if (z == nullptr || ob.model >= z->data().models.size())
+				continue;
+			if ((ob.flags & kDoor) != 0 || z->data().models[ob.model].kind == 2)
+				g.movers.push_back(ob);
+		}
 	}
 
 	namespace
 	{
 		constexpr ULONGLONG kZoneFreshMs = 250;
+		// (the moving layer counts as drawn this long after it was last asked for: the near cascade's hole comes and goes
+		// with it, not with a frame it missed)
+		constexpr ULONGLONG kMoversFreshMs = 2000;
 
-		// The zone drawn lately, else nullptr; and the list's heaps (count 0: not known)
-		gpu_zone *fresh_zone(ID3D12GraphicsCommandList *list, heaps &h)
+		// The zone drawn lately, else nullptr; the second map that pass drew (nullptr: none); and the list's heaps
+		// (count 0: not known)
+		gpu_zone *fresh_zone(ID3D12GraphicsCommandList *list, heaps &h, gpu_zone **second = nullptr)
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			if (list != nullptr)
@@ -410,36 +446,95 @@ namespace hifi::zone::inject
 					h = known->second;
 			if (g.last_zone == nullptr || GetTickCount64() - g.last_zone_at > kZoneFreshMs)
 				return nullptr;
+			if (second != nullptr)
+				*second = g.last_second;
 			return g.last_zone;
+		}
+
+		bool movers_drawn()
+		{
+			const ULONGLONG at = g.movers_at.load(std::memory_order_relaxed);
+			return at != 0 && GetTickCount64() - at <= kMoversFreshMs;
 		}
 	}
 
+	// (the second map's placements as well, when the pass drew one: an interior's walls and roof shade its floor where
+	// the sun reaches in; the box around both)
 	bool zone_bounds(float lo[3], float hi[3], uint64_t &generation)
 	{
 		heaps h;
-		gpu_zone *const z = fresh_zone(nullptr, h);
+		gpu_zone *second = nullptr;
+		gpu_zone *const z = fresh_zone(nullptr, h, &second);
 		std::lock_guard<std::mutex> lock(g.shadow_mutex);
 		if (z == nullptr || g.shadow == nullptr || !g.shadow->bounds(*z, lo, hi))
 			return false;
 		generation = (uint64_t(reinterpret_cast<uintptr_t>(z)) << 16) ^ z->data().map;
+		float slo[3], shi[3];
+		if (second != nullptr && g.second_shadow != nullptr && g.second_shadow->bounds(*second, slo, shi))
+		{
+			for (int a = 0; a < 3; ++a)
+			{
+				lo[a] = std::min(lo[a], slo[a]);
+				hi[a] = std::max(hi[a], shi[a]);
+			}
+			generation ^= (uint64_t(second->data().map) << 40) ^ (uint64_t(g.second_shadow->mover_generation()) << 52);
+		}
+		// (the cascades drawn again when the moving layer comes or goes, or what they leave out changes)
+		generation ^= (movers_drawn() ? uint64_t(1) << 62 : 0) ^ (uint64_t(g.shadow->mover_generation()) << 32);
 		return true;
 	}
 
 	uint32_t record_zone_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
 	{
 		heaps h;
-		gpu_zone *const z = fresh_zone(list, h);
+		gpu_zone *second = nullptr;
+		gpu_zone *const z = fresh_zone(list, h, &second);
 		if (z == nullptr || h.count == 0)
 			return 0;
 		std::lock_guard<std::mutex> lock(g.shadow_mutex);
 		if (g.shadow == nullptr)
 			return 0;
-		const uint32_t triangles = g.shadow->record(list, *z, world_to_clip, dsv, size);
+		const bool hole = movers_drawn();
+		uint32_t triangles = g.shadow->record(list, *z, world_to_clip, dsv, size, hole);
+		if (second != nullptr && g.second_shadow != nullptr)
+			triangles += g.second_shadow->record(list, *second, world_to_clip, dsv, size, hole);
 		// (the game's heaps back: World FX binds none of its own)
 		list->SetDescriptorHeaps(h.count, h.h);
 		g.shadow_frames++;
 		g.shadow_triangles += triangles;
 		return triangles;
+	}
+
+	bool record_zone_movers(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
+	{
+		heaps h;
+		gpu_zone *second = nullptr;
+		gpu_zone *const z = fresh_zone(list, h, &second);
+		if (z == nullptr || h.count == 0)
+			return false;
+		std::vector<frame_object> movers;
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			movers = g.movers;
+		}
+		std::lock_guard<std::mutex> lock(g.shadow_mutex);
+		if (g.shadow == nullptr)
+			return false;
+		g.movers_at.store(GetTickCount64(), std::memory_order_relaxed);
+		g.shadow->note_pass(*z, movers.data(), uint32_t(movers.size()), 0);
+		uint32_t triangles = g.shadow->record_movers(list, *z, world_to_clip, dsv, size);
+		uint32_t instances = g.shadow->last_movers();
+		if (second != nullptr && g.second_shadow != nullptr)
+		{
+			g.second_shadow->note_pass(*second, movers.data(), uint32_t(movers.size()), 1);
+			triangles += g.second_shadow->record_movers(list, *second, world_to_clip, dsv, size);
+			instances += g.second_shadow->last_movers();
+		}
+		list->SetDescriptorHeaps(h.count, h.h);
+		g.mover_frames++;
+		g.mover_triangles += triangles;
+		g.mover_instances += instances;
+		return triangles != 0;
 	}
 
 	grass::renderer::zone_bounds_fn zone_bounds_hook()
@@ -451,6 +546,13 @@ namespace hifi::zone::inject
 	{
 		return [](void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
 			return record_zone_casters(list, world_to_clip, dsv, size);
+		};
+	}
+
+	grass::renderer::caster_fn movers_hook()
+	{
+		return [](void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
+			return record_zone_movers(list, world_to_clip, dsv, size);
 		};
 	}
 }

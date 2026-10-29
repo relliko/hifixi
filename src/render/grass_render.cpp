@@ -102,13 +102,33 @@ namespace grass
 		// VIEW x PROJECTION and this frame's (both without the jitter), the last frame's seconds
 		constexpr UINT kMotionParams = 36;
 		constexpr UINT kMotionOffset = kVolOffset + kVolParams;
-		constexpr UINT kActorBytes = (kMotionOffset + kMotionParams) * 4;
+		// ... and after the blades' motion's the lamps' shadow maps' (grass.hlsl kLampMap; draw_lamp_maps): the view's three
+		// rows, how many maps, where they start in the depth copy, the near plane and the faces' scale, then each map's lamp
+		constexpr UINT kLampMapParams = 32;
+		constexpr UINT kLampMapOffset = kMotionOffset + kMotionParams;
+		constexpr UINT kActorBytes = (kLampMapOffset + kLampMapParams) * 4;
 		constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 		constexpr D3D12_RESOURCE_STATES kMotionRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		// (how far its march reaches, yalms; past that the game's own fog is the air; how high the air thins to 1/e)
 		constexpr float kVolReach = 80.0f, kVolThinning = 9.0f;
 		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
 		constexpr float kCasterReach = 32.0f;
+		// The lamps' shadow maps (draw_lamp_maps): cubes for this many lamps, kLampMapSize texels a face, from kLampMapNear
+		// yalms off the light (its own lantern, bowl or bracket inside that: grass.hlsl kLampBody) out to its glow's reach;
+		// each face a little wider than a quarter turn (its middle kLampMapScale of it the quarter turn) so a lookup's
+		// neighbours stay on its face. The faces (grass.hlsl kLampFaces): each one's middle, right and up, world axes.
+		constexpr UINT kLampMaps = 4;
+		constexpr UINT kLampMapSize = 256;
+		constexpr float kLampMapNear = 1.0f;
+		constexpr float kLampMapScale = 0.95f;
+		constexpr float kLampFaces[6][3][3] = {
+			{ { 1, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 } },
+			{ { -1, 0, 0 }, { 0, 0, -1 }, { 0, 1, 0 } },
+			{ { 0, 1, 0 }, { 1, 0, 0 }, { 0, 0, 1 } },
+			{ { 0, -1, 0 }, { 1, 0, 0 }, { 0, 0, -1 } },
+			{ { 0, 0, 1 }, { -1, 0, 0 }, { 0, 1, 0 } },
+			{ { 0, 0, -1 }, { 1, 0, 0 }, { 0, 1, 0 } },
+		};
 		// The clouds' steps along a view ray and toward the light at each quality (look::weather_fx::cloud_quality)
 		constexpr UINT kCloudSteps[3][2] = { { 16, 3 }, { 24, 4 }, { 32, 6 } };
 		// Each point's memory (grass.hlsl kMemoryStride): its ground colour (12 bytes), then when its trampling wears off
@@ -1875,6 +1895,11 @@ namespace grass
 		release(_caster_map);
 		release(_sun_map_heap);
 		release(_sun_map_copy);
+		release(_lamp_map);
+		release(_lamp_map_heap);
+		for (lamp_cube &c : _lamp_cubes)
+			c = lamp_cube();
+		_lamp_tail = 0;
 		release(_shadow_pso);
 		release(_queries);
 		release(_times);
@@ -4383,6 +4408,243 @@ namespace grass
 		out[15] = 0.0f;
 	}
 
+	// The lamps' shadow maps' depth array (kLampMaps x 6 faces of kLampMapSize, D32) and its views, made once
+	bool renderer::lamp_maps_for(std::string &error)
+	{
+		if (_lamp_map != nullptr && _lamp_map_heap != nullptr)
+			return true;
+		release(_lamp_map);
+		release(_lamp_map_heap);
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+		hd.NumDescriptors = kLampMaps * 6;
+		HRESULT hr = _device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_lamp_map_heap));
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC desc = {};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		desc.Width = kLampMapSize;
+		desc.Height = kLampMapSize;
+		desc.DepthOrArraySize = UINT16(kLampMaps * 6);
+		desc.MipLevels = 1;
+		desc.Format = DXGI_FORMAT_D32_FLOAT;
+		desc.SampleDesc.Count = 1;
+		desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		D3D12_CLEAR_VALUE clear = {};
+		clear.Format = DXGI_FORMAT_D32_FLOAT;
+		clear.DepthStencil.Depth = 1.0f;
+		if (SUCCEEDED(hr))
+			hr = _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&_lamp_map));
+		if (FAILED(hr))
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "lamp shadow maps failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			release(_lamp_map);
+			release(_lamp_map_heap);
+			return false;
+		}
+		_lamp_map->SetName(L"worldfx: lamps' shadow maps");
+		const UINT step = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+		for (UINT k = 0; k < kLampMaps * 6; ++k)
+		{
+			D3D12_DEPTH_STENCIL_VIEW_DESC vd = {};
+			vd.Format = DXGI_FORMAT_D32_FLOAT;
+			vd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+			vd.Texture2DArray.FirstArraySlice = k;
+			vd.Texture2DArray.ArraySize = 1;
+			D3D12_CPU_DESCRIPTOR_HANDLE h = _lamp_map_heap->GetCPUDescriptorHandleForHeapStart();
+			h.ptr += SIZE_T(k) * step;
+			_device->CreateDepthStencilView(_lamp_map, &vd, h);
+		}
+		for (lamp_cube &c : _lamp_cubes)
+			c = lamp_cube();
+		return true;
+	}
+
+	// The lamps' shadow maps, from the host's zone (set_zone_casters: its casters through each cube face, as into a
+	// cascade; nothing without it, and the lamps are marched as before). The kLampMaps lamps nearest the camera that cast
+	// lamp shadows each keep a cube while they stay among them and the zone's data is the same; a lamp coming in has its
+	// six faces drawn one a frame from the frame it's first seen, one lamp at a time (marched until all six are). So a
+	// frame draws at most one face, and none while the lamps around stay as they are: what's drawn into them is the zone
+	// at rest, which doesn't move (doors and swaying plants at rest; characters don't hide a lamp here, as in the march).
+	// Copied to the depth copy's end (its last _lamp_tail bytes, which copy_out keeps free: kept there across frames),
+	// again whenever that buffer is made again. Their parameters for lamp_blocked (kLampMapParams floats): the view's
+	// three rows (a view-space direction's world x, y and z), how many maps, where they start in the depth copy (bytes, as
+	// bits), the near plane and the faces' scale; then each map's lamp in view space and its far plane (0: none there).
+	void renderer::draw_lamp_maps(ID3D12GraphicsCommandList *list, const camera &cam, const look &l, const float eye[3], float out[32], draw_stats &stats)
+	{
+		std::memset(out, 0, 32 * sizeof(float));
+		float lo[3], hi[3];
+		uint64_t source = 0;
+		std::string error;
+		if (_zone_bounds == nullptr || _zone_draw == nullptr || l.lamps == nullptr || !_zone_bounds(_zone_casters_context, lo, hi, &source) || !lamp_maps_for(error))
+			return;
+		const UINT64 face_bytes = UINT64(kLampMapSize) * kLampMapSize * 4;
+		if (_lamp_tail == 0)
+		{
+			// (kept free from the next depth copy on)
+			_lamp_tail = face_bytes * 6 * kLampMaps + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+			return;
+		}
+		if (_depth.buffer == nullptr || _depth.size < _lamp_tail)
+			return;
+		const UINT64 at = (_depth.size - _lamp_tail + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+
+		// The lamps wanted: the zone's lit ones (their glow reaching past the near plane), nearest the camera first
+		const uint32_t count = std::min<uint32_t>(l.lamp_count, kMaxLamps);
+		uint32_t wanted[kLampMaps];
+		float wanted_d[kLampMaps];
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			const float *s = l.lamps + size_t(i) * 8;
+			bool ok = s[7] > 0.5f && s[3] > kLampMapNear + 0.5f && (s[4] > 0.0f || s[5] > 0.0f || s[6] > 0.0f);
+			for (int k = 0; k < 7; ++k)
+				ok = ok && std::isfinite(s[k]);
+			if (!ok)
+				continue;
+			const float d = (s[0] - eye[0]) * (s[0] - eye[0]) + (s[1] - eye[1]) * (s[1] - eye[1]) + (s[2] - eye[2]) * (s[2] - eye[2]);
+			uint32_t j = n < kLampMaps ? n++ : kLampMaps;
+			if (j == kLampMaps)
+			{
+				if (d >= wanted_d[kLampMaps - 1])
+					continue;
+				j = kLampMaps - 1;
+			}
+			for (; j > 0 && wanted_d[j - 1] > d; --j)
+			{
+				wanted[j] = wanted[j - 1];
+				wanted_d[j] = wanted_d[j - 1];
+			}
+			wanted[j] = i;
+			wanted_d[j] = d;
+		}
+		// Each cube kept for a lamp still wanted (the same place and reach, the same data), the others let go; the lamps
+		// without one given the free ones
+		bool taken[kLampMaps] = {};
+		for (lamp_cube &c : _lamp_cubes)
+		{
+			bool keep = false;
+			for (uint32_t k = 0; k < n && c.used && !keep; ++k)
+			{
+				const float *s = l.lamps + size_t(wanted[k]) * 8;
+				if (!taken[k] && std::fabs(s[0] - c.pos[0]) < 0.01f && std::fabs(s[1] - c.pos[1]) < 0.01f && std::fabs(s[2] - c.pos[2]) < 0.01f &&
+					std::fabs(s[3] - c.range) < 0.01f && (c.faces == 0 || c.source == source))
+					keep = taken[k] = true;
+			}
+			if (!keep)
+				c = lamp_cube();
+		}
+		for (uint32_t k = 0; k < n; ++k)
+			for (lamp_cube &c : _lamp_cubes)
+				if (!taken[k] && !c.used)
+				{
+					const float *s = l.lamps + size_t(wanted[k]) * 8;
+					c.used = true;
+					std::memcpy(c.pos, s, 12);
+					c.range = s[3];
+					taken[k] = true;
+				}
+
+		// One face of one lamp's cube this frame: a perspective from the light through the face (row vectors: x and y the
+		// face's right and up times kLampMapScale, w the depth along its middle, depth from kLampMapNear to the reach)
+		const UINT step = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+		for (uint32_t slot = 0; slot < kLampMaps; ++slot)
+		{
+			lamp_cube &c = _lamp_cubes[slot];
+			if (!c.used || c.drawn)
+				continue;
+			section(list, L"worldfx: a lamp's shadow map");
+			const float nr = kLampMapNear, fr = c.range, A = fr / (fr - nr), B = -nr * fr / (fr - nr), s = kLampMapScale;
+			{
+				const uint32_t f = c.faces;
+				const float *fw = kLampFaces[f][0], *rt = kLampFaces[f][1], *up = kLampFaces[f][2];
+				auto dot = [](const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+				float m[16];
+				for (int i = 0; i < 3; ++i)
+				{
+					m[i * 4 + 0] = s * rt[i];
+					m[i * 4 + 1] = s * up[i];
+					m[i * 4 + 2] = A * fw[i];
+					m[i * 4 + 3] = fw[i];
+				}
+				m[12] = -s * dot(c.pos, rt);
+				m[13] = -s * dot(c.pos, up);
+				m[14] = -A * dot(c.pos, fw) + B;
+				m[15] = -dot(c.pos, fw);
+				D3D12_CPU_DESCRIPTOR_HANDLE dsv = _lamp_map_heap->GetCPUDescriptorHandleForHeapStart();
+				dsv.ptr += SIZE_T(slot * 6 + f) * step;
+				list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+				stats.lamp_map_triangles += _zone_draw(_zone_casters_context, list, m, dsv, kLampMapSize);
+				stats.lamp_map_faces++;
+			}
+			if (c.faces++ == 0)
+				c.source = source;
+			c.drawn = c.faces == 6;
+			c.copied_to = nullptr;
+			break;
+		}
+
+		// Into the depth copy's end, where they aren't yet
+		const D3D12_RESOURCE_DESC desc = _lamp_map->GetDesc();
+		bool copying = false;
+		for (uint32_t slot = 0; slot < kLampMaps; ++slot)
+		{
+			lamp_cube &c = _lamp_cubes[slot];
+			if (!c.drawn || (c.copied_to == _depth.buffer && c.copied_at == at))
+				continue;
+			if (!copying)
+			{
+				transition(list, _lamp_map, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				transition(list, _depth.buffer, _depth.state, D3D12_RESOURCE_STATE_COPY_DEST);
+				copying = true;
+			}
+			for (uint32_t f = 0; f < 6; ++f)
+			{
+				const UINT sub = slot * 6 + f;
+				D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+				dst.pResource = _depth.buffer;
+				dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				_device->GetCopyableFootprints(&desc, sub, 1, at + UINT64(sub) * face_bytes, &dst.PlacedFootprint, nullptr, nullptr, nullptr);
+				src.pResource = _lamp_map;
+				src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				src.SubresourceIndex = sub;
+				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			}
+			c.copied_to = _depth.buffer;
+			c.copied_at = at;
+		}
+		if (copying)
+		{
+			transition(list, _lamp_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			transition(list, _depth.buffer, D3D12_RESOURCE_STATE_COPY_DEST, _depth.state);
+		}
+
+		// The parameters
+		for (int i = 0; i < 3; ++i)
+			for (int k = 0; k < 3; ++k)
+				out[i * 4 + k] = cam.view[i * 4 + k];
+		uint32_t mapped = 0;
+		for (uint32_t slot = 0; slot < kLampMaps; ++slot)
+		{
+			const lamp_cube &c = _lamp_cubes[slot];
+			if (!c.drawn || c.copied_to != _depth.buffer)
+				continue;
+			float *q = out + 16 + slot * 4;
+			for (int k = 0; k < 3; ++k)
+				q[k] = c.pos[0] * cam.view[0 * 4 + k] + c.pos[1] * cam.view[1 * 4 + k] + c.pos[2] * cam.view[2 * 4 + k] + cam.view[3 * 4 + k];
+			q[3] = c.range;
+			mapped++;
+		}
+		const uint32_t start = uint32_t(at);
+		out[12] = float(mapped);
+		std::memcpy(&out[13], &start, 4);
+		out[14] = kLampMapNear;
+		out[15] = kLampMapScale;
+		stats.lamp_maps = mapped;
+	}
+
 	bool renderer::upload(const blade_file &file, std::string &error)
 	{
 		unload();
@@ -4555,7 +4817,8 @@ namespace grass
 				size = at + extra_size;
 		}
 		std::string ignored; // without the copy, grass goes on without what it gives rather than not at all
-		if (size == 0 || size == UINT64(-1) || !copy_buffer(c, size, ignored))
+		// (the depth copy with room at its end for the lamps' shadow maps, once they're wanted: draw_lamp_maps)
+		if (size == 0 || size == UINT64(-1) || !copy_buffer(c, size + (&c == &_depth ? _lamp_tail : 0), ignored))
 			return 0;
 		transition(list, res, state, D3D12_RESOURCE_STATE_COPY_SOURCE, 0);
 		transition(list, c.buffer, c.state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -5001,6 +5264,7 @@ namespace grass
 			o[0] = float(lamp_count);
 			o[1] = std::clamp(l.lamp_shadows, 0.0f, 1.0f);
 			o[2] = o[3] = 0.0f;
+			actor_data[kLampMapOffset + 12] = 0.0f; // (no shadow maps unless draw_lamp_maps has them)
 			for (uint32_t i = 0; i < kMaxLamps; ++i)
 			{
 				float *q = o + 4 + i * 8;
@@ -5397,6 +5661,10 @@ namespace grass
 					stats.sun_map = true;
 				}
 			}
+			// The lamps' shadow maps (drawn when a lamp comes near, read by lamp_blocked in place of its march), when lamp
+			// shadows are on
+			if (lamps_written != 0 && l.lamp_shadows > 0.0f && actor_data != nullptr)
+				draw_lamp_maps(list, cam, l, eye, actor_data + kLampMapOffset, stats);
 			list->SetGraphicsRootSignature(_root);
 			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 			list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
