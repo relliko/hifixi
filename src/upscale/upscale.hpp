@@ -22,6 +22,10 @@ namespace hifi::upscale
 	// FSR on (else the game's stretch), FSR 2 first (temporal: with the world at most the screen's size; FSR 1 for a
 	// smaller one when FSR 2 can't draw), and the sharpening (0 none .. 1 the most)
 	void set_options(bool fsr, bool temporal, float sharpen, bool fsr3 = true);
+	// Where the characters' own motion comes from (the plugin: chars::inject::motion; none in the tests): the texture
+	// and how many frames it's been drawn in
+	using chars_motion_fn = bool (*)(ID3D12Resource *&texture, uint64_t &frames);
+	void set_chars_motion_source(chars_motion_fn fn);
 	// Whether FSR 2 drew in the last quarter second (the world's jitter goes with it: game/jitter), and the length of its
 	// jitter sequence for A's size and the screen's
 	bool temporal_running();

@@ -862,6 +862,73 @@ int main(int argc, char **argv)
 					c->Release();
 				rtvs->Release();
 			}
+
+			// The characters' own motion (chars::inject's texture: xyz a character's move since the last frame in the world,
+			// w its view depth): the left third a character nearer than what's seen there (5 yalms: something drawn over it),
+			// the middle third one seen (20 yalms) that moved half a yalm along the view's x, the right third none. Its
+			// motion where it's seen: back half a yalm, through the camera; the camera's (none: it's still) elsewhere.
+			{
+				ID3D12Resource *chars = nullptr, *cub = nullptr;
+				device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&chars));
+				device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &ud, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&cub));
+				// (half a yalm along the view's x, in the world: VIEW's first column)
+				const float move[3] = { 0.5f * view[0], 0.5f * view[4], 0.5f * view[8] };
+				uint8_t *cm = nullptr;
+				cub->Map(0, nullptr, reinterpret_cast<void **>(&cm));
+				for (UINT y = 0; y < IH; ++y)
+					for (UINT x = 0; x < IW; ++x)
+					{
+						const UINT band = x * 3 / IW;
+						const float v[4] = { band == 2 ? 0.0f : move[0], band == 2 ? 0.0f : move[1], band == 2 ? 0.0f : move[2], band == 0 ? 5.0f : band == 1 ? 20.0f : 0.0f };
+						uint16_t *q = reinterpret_cast<uint16_t *>(cm + fp.Offset + size_t(y) * fp.Footprint.RowPitch + size_t(x) * 8);
+						for (int k = 0; k < 4; ++k)
+							q[k] = XMConvertFloatToHalf(v[k]);
+					}
+				cub->Unmap(0, nullptr);
+				D3D12_TEXTURE_COPY_LOCATION csrc = { cub, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, cdst = { chars, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+				csrc.PlacedFootprint = fp;
+				list->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
+				barrier(list, chars, D3D12_RESOURCE_STATE_COPY_DEST, read);
+				std::string cfail;
+				const bool crecorded = tc.record(list, A, D3D12_RESOURCE_STATE_RENDER_TARGET, Az, D3D12_RESOURCE_STATE_DEPTH_READ, nullptr, cam, 0.5f, 16.0f, true, cfail,
+					nullptr, chars);
+				ID3D12Resource *cmv = tc.motion();
+				barrier(list, cmv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				ID3D12Resource *crb = nullptr;
+				D3D12_RESOURCE_DESC crd = ud;
+				crd.Width = vtotal;
+				device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &crd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&crb));
+				D3D12_TEXTURE_COPY_LOCATION cr_dst = { crb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, cr_src = { cmv, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+				cr_dst.PlacedFootprint = vfp;
+				list->CopyTextureRegion(&cr_dst, 0, 0, 0, &cr_src, nullptr);
+				barrier(list, cmv, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+				g.run();
+				uint8_t *cr = nullptr;
+				crb->Map(0, nullptr, reinterpret_cast<void **>(&cr));
+				const float want_x = -0.25f * proj[0] / 20.0f; // (back half a yalm at 20 yalms: UV units)
+				uint32_t moved = 0, still_left = 0, still_right = 0, n_band[3] = {};
+				for (UINT y = 0; y < IH; ++y)
+					for (UINT x = 0; x < IW; ++x)
+					{
+						const uint16_t *q = reinterpret_cast<const uint16_t *>(cr + size_t(y) * vfp.Footprint.RowPitch + size_t(x) * 4);
+						const float mx = XMConvertHalfToFloat(q[0]), my = XMConvertHalfToFloat(q[1]);
+						const UINT band = x * 3 / IW;
+						n_band[band]++;
+						const bool none = std::fabs(mx) < 1e-4f && std::fabs(my) < 1e-4f;
+						moved += band == 1 && std::fabs(mx - want_x) < 0.02f * std::fabs(want_x) + 2e-4f && std::fabs(my) < 2e-4f ? 1 : 0;
+						still_left += band == 0 && none ? 1 : 0;
+						still_right += band == 2 && none ? 1 : 0;
+					}
+				crb->Unmap(0, nullptr);
+				std::printf("  the characters' motion: %u of %u seen characters' pixels moved back %.4f (UV), %u of %u covered and %u of %u without a character the camera's\n",
+					moved, n_band[1], want_x, still_left, n_band[0], still_right, n_band[2]);
+				check(crecorded && moved == n_band[1] && still_left == n_band[0] && still_right == n_band[2],
+					"a character's own motion where it's seen; the camera's where something was drawn over it, and where there's none" + (cfail.empty() ? "" : " (" + cfail + ")"));
+				check(tc.char_frames() == 1, "  counted as a frame with the characters' own motion");
+				crb->Release();
+				cub->Release();
+				chars->Release();
+			}
 			ub->Release();
 			blades->Release();
 			tc.release();

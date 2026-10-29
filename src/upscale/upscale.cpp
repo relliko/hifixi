@@ -119,6 +119,8 @@ namespace hifi::upscale
 			uint64_t fsr2_drawn = 0, fsr2_skipped = 0;
 			std::string fsr2_why, fsr2_failed;
 			std::string fsr3_refused; // (why FSR 3.1's upscaler couldn't be made: FSR 2's since)
+			std::atomic<upscale::chars_motion_fn> chars_motion{ nullptr };
+			uint64_t char_frames = 0;
 			std::atomic<bool> fsr3{ true };
 			std::atomic<ULONGLONG> fsr2_at{ 0 };   // (when FSR 2 last drew: the jitter follows it)
 			std::atomic<uint32_t> phases{ 8 };
@@ -367,8 +369,15 @@ namespace hifi::upscale
 			std::string fail;
 			// (this frame's copies of the world for FSR's masks: masks.hpp)
 			const masks::taken copies = masks::take();
+			// (the characters' own motion, when they were drawn with it this frame)
+			ID3D12Resource *chars = nullptr;
+			uint64_t char_frames = 0;
+			if (const upscale::chars_motion_fn source = g.chars_motion.load(std::memory_order_relaxed))
+				if (source(chars, char_frames) && char_frames == g.char_frames)
+					chars = nullptr;
+			g.char_frames = char_frames;
 			const bool drawn = g.fsr2->record(list, l.world, l.world_state, depth, planes[0], blades, cam, std::clamp(g.sharpen.load(), 0.0f, 1.0f), dt, reset, fail,
-				masks::on() ? &copies : nullptr);
+				masks::on() ? &copies : nullptr, chars);
 			if (drawn)
 			{
 				// Its picture onto the back buffer
@@ -520,6 +529,11 @@ namespace hifi::upscale
 			g.out_w = out_w;
 			g.out_h = out_h;
 		}
+	}
+
+	void set_chars_motion_source(chars_motion_fn fn)
+	{
+		g.chars_motion.store(fn, std::memory_order_relaxed);
 	}
 
 	void set_options(bool fsr, bool temporal, float sharpen, bool fsr3)
@@ -723,10 +737,11 @@ namespace hifi::upscale
 			uint32_t shaders = 0;
 			double ms = 0.0;
 			fsr2_shaders::stats(shaders, ms);
-			std::snprintf(line, sizeof(line), "upscale: %s %s; %llu frames drawn (%u with the grass's own motion), %llu skipped%s%s%s; %u jitter phases; FSR 2's %u shaders compiled in %.0f ms",
+			std::snprintf(line, sizeof(line), "upscale: %s %s; %llu frames drawn (%u with the grass's own motion, %u the characters'), %llu skipped%s%s%s; %u jitter phases; FSR 2's %u shaders compiled in %.0f ms",
 				g.fsr2 != nullptr ? g.fsr2->name() : g.fsr3.load() && g.fsr3_refused.empty() ? "FSR 3.1" : "FSR 2",
 				!g.fsr2_failed.empty() ? ("not made (" + g.fsr2_failed + ")").c_str() : g.fsr2 != nullptr ? "made" : "not made yet",
-				static_cast<unsigned long long>(g.fsr2_drawn), g.fsr2 != nullptr ? g.fsr2->blade_frames() : 0u, static_cast<unsigned long long>(g.fsr2_skipped),
+				static_cast<unsigned long long>(g.fsr2_drawn), g.fsr2 != nullptr ? g.fsr2->blade_frames() : 0u, g.fsr2 != nullptr ? g.fsr2->char_frames() : 0u,
+				static_cast<unsigned long long>(g.fsr2_skipped),
 				g.fsr2_why.empty() ? "" : " (the last: ", g.fsr2_why.c_str(), g.fsr2_why.empty() ? "" : ")", g.phases.load(), shaders, ms);
 			lines.push_back(line);
 			if (!g.fsr3_refused.empty())

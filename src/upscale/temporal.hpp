@@ -57,7 +57,7 @@ namespace hifi::upscale::temporal
 		// blades: World FX's blades' motion this frame (A's size, shader-readable), or nullptr.
 		bool record(ID3D12GraphicsCommandList *list, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state, ID3D12Resource *depth,
 			D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why,
-			const masks::taken *m = nullptr);
+			const masks::taken *m = nullptr, ID3D12Resource *chars = nullptr);
 		ID3D12Resource *output() const { return _output; }
 		ID3D12Resource *motion() const { return _mv; } // (the motion FSR 2 was given: NON_PIXEL_SHADER_RESOURCE after record)
 		ID3D12Resource *depth() const { return _depth; } // (FSR 2's depth: NON_PIXEL_SHADER_RESOURCE after record)
@@ -65,6 +65,7 @@ namespace hifi::upscale::temporal
 		uint32_t frames() const { return _frames; }
 		uint32_t blade_frames() const { return _blade_frames; } // (of them, with the blades' own motion)
 		uint32_t mask_frames() const { return _mask_frames; }   // (of them, with the reactive or transparency mask)
+		uint32_t char_frames() const { return _char_frames; }   // (of them, with the characters' own motion)
 		ID3D12Resource *reactive() const { return _reactive; } // (the last masks: NON_PIXEL_SHADER_RESOURCE after record)
 		ID3D12Resource *composition() const { return _tc; }
 
@@ -88,7 +89,7 @@ namespace hifi::upscale::temporal
 		uint32_t _slot = 0;
 		bool _have_last = false;
 		float _last_view_proj[16] = {}; // (the last frame's VIEW x PROJECTION without the jitter)
-		uint32_t _frames = 0, _blade_frames = 0, _mask_frames = 0;
+		uint32_t _frames = 0, _blade_frames = 0, _mask_frames = 0, _char_frames = 0;
 		// The masks' pass (masks.hpp): its root signature, pipeline, descriptors (six a frame) and the two masks (R8_UNORM)
 		ID3D12RootSignature *_mask_root = nullptr;
 		ID3D12PipelineState *_mask = nullptr;

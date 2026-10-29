@@ -25,6 +25,12 @@ namespace hifi::chars::inject
 	void set_clock(double seconds);
 	// Whether models can be handed over: the renderer is up and nothing failed in the last two seconds
 	bool ready();
+	// The opaque characters' motion for FSR (chardraw.hpp "Motion"): wanted while FSR draws (the plugin follows it each
+	// present); the texture (the world's size, R16G16B16A16_FLOAT: xyz the move since the last frame in the world, w
+	// the view depth, 0 where no character is; NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE between frames) and how
+	// many frames it's been drawn in. False when there's none.
+	void set_motion_wanted(bool wanted);
+	bool motion(ID3D12Resource *&texture, uint64_t &frames);
 	std::vector<std::string> status();
 
 	void on_reset(ID3D12GraphicsCommandList *list);

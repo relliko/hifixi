@@ -40,6 +40,7 @@ cbuffer draw_constants : register(b1)
 	uint composite;      // the actor colour (0xAARRGGBB) for the composite
 	uint first_corner;   // the group's first corner (SV_VertexID starts at 0 for each draw, whatever its start)
 	uint corner_count;   // the mesh's corners (every read clamped below it)
+	uint has_last;       // 1: last_palette is this instance's in the last frame (its motion); 0: it moved nowhere of its own
 };
 struct vertex_t { float3 p0; float w0; float3 p1; float w1; float3 n0; float3 n1; uint bones; uint mirror_bones; uint axes; };
 struct corner_t { uint vertex; float2 uv; };
@@ -60,6 +61,7 @@ StructuredBuffer<corner_t> corners : register(t1);
 Texture2D colour_map : register(t2);
 StructuredBuffer<bone_t> palette : register(t3);
 StructuredBuffer<model_t> models : register(t4);
+StructuredBuffer<bone_t> last_palette : register(t5);
 SamplerState clamp_linear : register(s0);
 
 static const float kMaterialDiffuse = 0.5;
@@ -67,6 +69,11 @@ static const float kMaterialDiffuse = 0.5;
 float3 bone_point(uint b, float4 p)
 {
 	const bone_t m = palette[min(b, bone_count - 1)];
+	return p.x * float3(m.a.x, m.a.y, m.a.z) + p.y * float3(m.a.w, m.b.x, m.b.y) + p.z * float3(m.b.z, m.b.w, m.c.x) + p.w * float3(m.c.y, m.c.z, m.c.w);
+}
+float3 last_bone_point(uint b, float4 p)
+{
+	const bone_t m = last_palette[min(b, bone_count - 1)];
 	return p.x * float3(m.a.x, m.a.y, m.a.z) + p.y * float3(m.a.w, m.b.x, m.b.y) + p.z * float3(m.b.z, m.b.w, m.c.x) + p.w * float3(m.c.y, m.c.z, m.c.w);
 }
 float3 bone_dir(uint b, float3 n)
@@ -99,6 +106,7 @@ struct v2p
 	float2 uv : TEXCOORD0;
 	float fog : TEXCOORD1;
 	float3 normal : TEXCOORD2;
+	float4 motion : TEXCOORD3; // xyz the move since the last frame (world), w the view depth
 };
 
 v2p vs(uint vid : SV_VertexID)
@@ -115,6 +123,8 @@ v2p vs(uint vid : SV_VertexID)
 	const float3 nn = l2 > 0 ? n * rsqrt(l2) : float3(0, -1, 0);
 	v2p r;
 	r.pos = mul(float4(world, 1), view_proj);
+	const float3 before = has_last != 0 ? last_bone_point(b0, float4(v.p0 * f0, v.w0)) + last_bone_point(b1, float4(v.p1 * f1, v.w1)) : world;
+	r.motion = float4(world - before, r.pos.w);
 	const model_t mo = models[min(model_index, (uint)options.y - 1)];
 	const float4 f = mo.fog.w >= 0 ? mo.fog : fog;
 	const float e = mo.fog.w >= 0 ? mo.fog_end.x : fog_end.x;
@@ -125,7 +135,7 @@ v2p vs(uint vid : SV_VertexID)
 	return r;
 }
 
-float4 ps(v2p i) : SV_Target
+float4 shade(v2p i)
 {
 	const model_t m = models[min(model_index, (uint)options.y - 1)];
 	const float4 t = colour_map.Sample(clamp_linear, i.uv);
@@ -149,6 +159,23 @@ float4 ps(v2p i) : SV_Target
 			discard; // (ALPHAFUNC GREATER, ALPHAREF 0x45)
 	}
 	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb, i.fog), a);
+}
+float4 ps(v2p i) : SV_Target
+{
+	return shade(i);
+}
+// (with the motion target as well: the motion of what's drawn there)
+struct motion_out
+{
+	float4 colour : SV_Target0;
+	float4 motion : SV_Target1;
+};
+motion_out ps_motion(v2p i)
+{
+	motion_out o;
+	o.colour = shade(i);
+	o.motion = i.motion;
+	return o;
 }
 
 // Depth only into a sun shadow map (record_casters): the model draw's alpha test, nothing written but depth
@@ -1005,6 +1032,7 @@ float4 pps(p2p i) : SV_Target
 			kComposite = 1,
 			kEnShell = 2,
 			kEnSprites = 3,
+			kModelMotion = 4, // (the model with the motion target)
 		};
 
 		struct en_constants
@@ -1039,7 +1067,7 @@ float4 pps(p2p i) : SV_Target
 		drop(_ring);
 		drop(_root);
 		drop(_en_root);
-		for (void **b : { &_vs, &_ps, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps })
+		for (void **b : { &_vs, &_ps, &_ps_motion, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps })
 		{
 			if (*b != nullptr)
 				static_cast<ID3DBlob *>(*b)->Release();
@@ -1065,7 +1093,7 @@ float4 pps(p2p i) : SV_Target
 			const char *name, *target;
 			void **out;
 		};
-		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps },
+		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "ps_motion", "ps_5_0", &_ps_motion }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps },
 			{ "svs", "vs_5_0", &_en_svs }, { "sps", "ps_5_0", &_en_sps }, { "pvs", "vs_5_0", &_en_pvs }, { "pps", "ps_5_0", &_en_pps } };
 		for (const entry &e : entries)
 		{
@@ -1086,12 +1114,12 @@ float4 pps(p2p i) : SV_Target
 		}
 
 		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2 } };
-		D3D12_ROOT_PARAMETER p[6] = {};
+		D3D12_ROOT_PARAMETER p[7] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 		p[0].Descriptor.ShaderRegister = 0;
 		p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		p[1].Constants.ShaderRegister = 1;
-		p[1].Constants.Num32BitValues = 8;
+		p[1].Constants.Num32BitValues = 9;
 		p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
 		p[2].Descriptor.ShaderRegister = 3;
 		p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -1102,12 +1130,14 @@ float4 pps(p2p i) : SV_Target
 			p[4 + i].DescriptorTable.NumDescriptorRanges = 1;
 			p[4 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
 		}
+		p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // (the last frame's palette rows for the instance: t5)
+		p[6].Descriptor.ShaderRegister = 5;
 		D3D12_STATIC_SAMPLER_DESC s = {};
 		s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 		s.MaxLOD = D3D12_FLOAT32_MAX;
 		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 6, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 7, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -1197,20 +1227,24 @@ float4 pps(p2p i) : SV_Target
 
 	ID3D12PipelineState *char_renderer::pipeline(const char_target &t, int k)
 	{
-		const uint64_t key = uint64_t(t.rtv_format) | uint64_t(t.dsv_format) << 8 | uint64_t(t.samples) << 16 | uint64_t(k) << 24;
+		const uint64_t key = uint64_t(t.rtv_format) | uint64_t(t.dsv_format) << 8 | uint64_t(t.samples) << 16 | uint64_t(k) << 24 |
+			(k == kModelMotion ? uint64_t(t.motion_format) << 32 : 0);
 		const auto known = _pipelines.find(key);
 		if (known != _pipelines.end())
 			return known->second;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 		const bool en = k == kEnShell || k == kEnSprites;
 		d.pRootSignature = en ? _en_root : _root;
-		ID3DBlob *const vs = static_cast<ID3DBlob *>(k == kModel ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
-		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps : t.samples > 1 ? _cps_ms : _cps);
+		ID3DBlob *const vs = static_cast<ID3DBlob *>(k == kModel || k == kModelMotion ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
+		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : k == kModelMotion ? _ps_motion : k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps :
+			t.samples > 1 ? _cps_ms : _cps);
 		d.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
 		d.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
 		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-		d.NumRenderTargets = 1;
+		d.NumRenderTargets = k == kModelMotion ? 2 : 1;
 		d.RTVFormats[0] = t.rtv_format;
+		if (k == kModelMotion)
+			d.RTVFormats[1] = t.motion_format;
 		d.SampleDesc.Count = t.samples;
 		d.SampleMask = UINT_MAX;
 		d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1219,8 +1253,9 @@ float4 pps(p2p i) : SV_Target
 		d.RasterizerState.MultisampleEnable = t.samples > 1;
 		D3D12_RENDER_TARGET_BLEND_DESC &b = d.BlendState.RenderTarget[0];
 		b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-		if (k == kModel)
+		if (k == kModel || k == kModelMotion)
 		{
+			d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 			d.DSVFormat = t.dsv_format;
 			d.DepthStencilState.DepthEnable = TRUE;
 			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -1281,13 +1316,15 @@ float4 pps(p2p i) : SV_Target
 	bool char_renderer::begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o)
 	{
 		ID3D12DescriptorHeap *const heap = cache::heap();
-		ID3D12PipelineState *const pso = pipeline(t, kModel);
+		const bool motion = t.motion_rtv.ptr != 0 && t.samples == 1;
+		ID3D12PipelineState *const pso = pipeline(t, motion ? kModelMotion : kModel);
 		if (_root == nullptr || heap == nullptr || pso == nullptr || !f.camera || f.models == 0)
 			return false;
 		// The frame's constants (rewritten for each draw of the frame: the same values) and its models'
 		const D3D12_GPU_VIRTUAL_ADDRESS base = write_frame(f, o, f.view_proj, 0);
 
-		list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { t.rtv, t.motion_rtv };
+		list->OMSetRenderTargets(motion ? 2 : 1, rtvs, FALSE, &t.dsv);
 		const D3D12_VIEWPORT vp = { t.offset, t.offset, t.width, t.height, 0.0f, 1.0f };
 		const D3D12_RECT sc = { 0, 0, LONG(t.width), LONG(t.height) };
 		list->RSSetViewports(1, &vp);
@@ -1301,19 +1338,43 @@ float4 pps(p2p i) : SV_Target
 		return true;
 	}
 
-	void char_renderer::draw_model(ID3D12GraphicsCommandList *list, const char_target &, const frame &f, uint32_t mi, char_stats &st)
+	void char_renderer::draw_model(ID3D12GraphicsCommandList *list, const char_target &, const frame &f, uint32_t mi, char_stats &st, const frame *last)
 	{
 		const model_entry &m = f.model[mi];
 		const D3D12_GPU_VIRTUAL_ADDRESS palettes = cache::palettes(f.seq.load(std::memory_order_relaxed));
 		if (palettes == 0)
 			return;
 		st.models++;
+		// (the same actor's same model in the last frame, its skeleton as now: its palette rows, still in the ring, give
+		// each point's place then)
+		const model_entry *was = nullptr;
+		D3D12_GPU_VIRTUAL_ADDRESS last_palettes = 0;
+		if (last != nullptr)
+		{
+			const uint32_t n = std::min(last->opaque.load(std::memory_order_acquire), kMaxModels);
+			for (uint32_t i = 0; i < n && was == nullptr; ++i)
+				if (last->model[i].actor == m.actor && last->model[i].model == m.model && last->model[i].instances == m.instances)
+					was = &last->model[i];
+			last_palettes = was != nullptr ? cache::palettes(last->seq.load(std::memory_order_relaxed)) : 0;
+		}
 		for (uint32_t ii = 0; ii < m.instances && m.first_instance + ii < kMaxInstances; ++ii)
 		{
 			const instance_entry &ie = f.instance[m.first_instance + ii];
 			if (ie.bones == 0)
 				continue;
 			list->SetGraphicsRootShaderResourceView(2, palettes + UINT64(ie.first_bone) * sizeof(bone));
+			uint32_t has_last = 0;
+			D3D12_GPU_VIRTUAL_ADDRESS last_rows = palettes + UINT64(ie.first_bone) * sizeof(bone);
+			if (was != nullptr && last_palettes != 0 && was->first_instance + ii < kMaxInstances)
+			{
+				const instance_entry &le = last->instance[was->first_instance + ii];
+				if (le.bones == ie.bones && le.first_bone + le.bones <= kMaxBones)
+				{
+					last_rows = last_palettes + UINT64(le.first_bone) * sizeof(bone);
+					has_last = 1;
+				}
+			}
+			list->SetGraphicsRootShaderResourceView(6, last_rows);
 			for (uint32_t k = 0; k < ie.meshes && ie.first_mesh + k < kMaxMeshes; ++k)
 			{
 				cache::mesh_view mv;
@@ -1359,9 +1420,9 @@ float4 pps(p2p i) : SV_Target
 					float env;
 					std::memcpy(&env, &gr.material[10], 4);
 					const uint32_t shine = gr.has_material && env != 0.0f ? 1u : 0u;
-					uint32_t dc[8] = { mi, 0, shine, mv.vertices, ie.bones, 0, gr.first, mv.corners };
+					uint32_t dc[9] = { mi, 0, shine, mv.vertices, ie.bones, 0, gr.first, mv.corners, has_last };
 					std::memcpy(&dc[1], &scale, 4);
-					list->SetGraphicsRoot32BitConstants(1, 8, dc, 0);
+					list->SetGraphicsRoot32BitConstants(1, 9, dc, 0);
 					list->DrawInstanced(gr.count, 1, 0, 0);
 					st.draws++;
 					st.triangles += gr.count / 3;
@@ -1379,9 +1440,18 @@ float4 pps(p2p i) : SV_Target
 			any = (f.model[i].flags & kNative) != 0 && (f.model[i].colour >> 24) != 0;
 		if (!any || !begin(list, t, f, o))
 			return st;
+		// (the last frame's record, for each model's motion: only with the motion target, and only the walk just before)
+		const frame *last = nullptr;
+		if (t.motion_rtv.ptr != 0)
+		{
+			const uint32_t seq = f.seq.load(std::memory_order_relaxed);
+			last = published((seq - 1) & 15u);
+			if (last != nullptr && last->seq.load(std::memory_order_acquire) != seq - 1)
+				last = nullptr;
+		}
 		for (uint32_t i = 0; i < opaque; ++i)
 			if ((f.model[i].flags & kNative) != 0 && (f.model[i].colour >> 24) != 0)
-				draw_model(list, t, f, i, st);
+				draw_model(list, t, f, i, st, last);
 		return st;
 	}
 
@@ -1440,8 +1510,8 @@ float4 pps(p2p i) : SV_Target
 		list->SetGraphicsRootSignature(_root);
 		list->SetPipelineState(pso);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		const uint32_t dc[8] = { 0, 0, 0, 0, 0, colour, 0, 0 };
-		list->SetGraphicsRoot32BitConstants(1, 8, dc, 0);
+		const uint32_t dc[9] = { 0, 0, 0, 0, 0, colour, 0, 0, 0 };
+		list->SetGraphicsRoot32BitConstants(1, 9, dc, 0);
 		list->SetGraphicsRootDescriptorTable(5, srv);
 		list->DrawInstanced(3, 1, 0, 0);
 	}

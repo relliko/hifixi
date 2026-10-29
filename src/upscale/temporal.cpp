@@ -1,11 +1,13 @@
 /*
  * AMD FSR 2 over the world (temporal.hpp). The motion pass's root signature:
- *   0  24 constants b0  A's width, height, the depth copy's row pitch (words), whether the blades' motion is there; the
+ *   0  40 constants b0  A's width, height, the depth copy's row pitch (words), whether the blades' motion is there; the
  *                       jitter (NDC); PROJECTION's _11 and _22 (without the jitter); the reprojection: this frame's view
- *                       space to the last frame's clip (inverse VIEW x last VIEW x last PROJECTION, row vectors)
- *   1  table            t0 the depth copy (raw), t1 the blades' motion (World FX's; a null view when there's none),
- *                       u0 the depth (R32_FLOAT), u1 the motion (R16G16_FLOAT)
- * Its descriptors: kSlots fours in a shader-visible heap of its own, four a frame.
+ *                       space to the last frame's clip (inverse VIEW x last VIEW x last PROJECTION, row vectors); VIEW's
+ *                       first three rows (a world direction into view space); whether the characters' motion is there
+ *   1  table            t0 the depth copy (raw), t1 the blades' motion (World FX's; a null view when there's none), t2
+ *                       the characters' motion (chars::inject::motion; or a null view), u0 the depth (R32_FLOAT), u1 the
+ *                       motion (R16G16_FLOAT)
+ * Its descriptors: kSlots fives in a shader-visible heap of its own, five a frame.
  *
  * The masks' pass (masks.hpp) before FSR's: 4 constants b0 (A's width, height, which masks: 1 reactive, 2 transparency),
  * then a table: t0-t3 the world's copies (opaque, pre_fx, shaded, pre_air), u0 the reactive mask, u1 the transparency
@@ -35,9 +37,12 @@ cbuffer motion_constants : register(b0)
 	float2 jitter_ndc;
 	float p11, p22;
 	row_major float4x4 reproject;
+	float4 view_x, view_y, view_z; // (VIEW's rows: a world direction into view space)
+	uint use_chars, pad0, pad1, pad2;
 };
 ByteAddressBuffer depth_in : register(t0);
 Texture2D<float4> blades_in : register(t1);
+Texture2D<float4> chars_in : register(t2); // xyz a character's move since the last frame (world), w its view depth
 RWTexture2D<float> depth_out : register(u0);
 RWTexture2D<float2> motion_out : register(u1);
 
@@ -62,6 +67,19 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 		const float4 b = blades_in[id.xy];
 		if (b.w > 0.5 && abs(b.z - d) <= 0.004 * b.z + 0.02)
 			motion = b.xy;
+	}
+	// (a character still what's seen there: the point it was at, its own move back from where it is now, through the
+	// last frame's camera)
+	if (use_chars != 0)
+	{
+		const float4 c = chars_in[id.xy];
+		if (c.w > 0.0 && abs(c.w - d) <= 0.01 * c.w + 0.05)
+		{
+			const float3 move = c.x * view_x.xyz + c.y * view_y.xyz + c.z * view_z.xyz;
+			const float4 was = mul(float4(float3(ndc.x * d / p11, ndc.y * d / p22, -d) - move, 1.0), reproject);
+			if (was.w > 1e-4)
+				motion = (was.xy / was.w - ndc) * float2(0.5, -0.5);
+		}
 	}
 	motion_out[id.xy] = motion;
 }
@@ -102,7 +120,8 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 )";
 
 		constexpr UINT kSlots = 16;
-		constexpr UINT kConstants = 24;
+		constexpr UINT kConstants = 40;
+		constexpr UINT kMotionViews = 5; // (a frame's: the depth copy, the blades', the characters', the depth, the motion)
 		constexpr UINT kMaskConstants = 4;
 
 		// (a copy's typeless format as its views read it)
@@ -260,7 +279,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			return false;
 		}
 		drop(errors);
-		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 2 } };
+		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 3 } };
 		D3D12_ROOT_PARAMETER p[2] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		p[0].Constants.Num32BitValues = kConstants;
@@ -285,7 +304,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		drop(cs);
 		if (ok)
 		{
-			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * kMotionViews, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
 			ok = SUCCEEDED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap)));
 			_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		}
@@ -407,7 +426,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 
 	bool context::record(ID3D12GraphicsCommandList *list, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state, ID3D12Resource *depth,
 		D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why,
-		const masks::taken *m)
+		const masks::taken *m, ID3D12Resource *chars)
 	{
 		if (!_made)
 		{
@@ -463,12 +482,18 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 
 		// The motion pass: the depth as floats and the camera's motion
 		const UINT slot = _slot++ % kSlots;
-		const D3D12_CPU_DESCRIPTOR_HANDLE cpu = { _heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(slot * 4) * _step };
+		const D3D12_CPU_DESCRIPTOR_HANDLE cpu = { _heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(slot * kMotionViews) * _step };
 		if (blades != nullptr)
 		{
 			const D3D12_RESOURCE_DESC bd = blades->GetDesc();
 			if (bd.Width != _rw || bd.Height != _rh)
 				blades = nullptr; // (another size: drawn for another world)
+		}
+		if (chars != nullptr)
+		{
+			const D3D12_RESOURCE_DESC ch = chars->GetDesc();
+			if (ch.Width != _rw || ch.Height != _rh)
+				chars = nullptr;
 		}
 		{
 			D3D12_SHADER_RESOURCE_VIEW_DESC s = {};
@@ -485,12 +510,13 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			b.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			b.Texture2D.MipLevels = 1;
 			_device->CreateShaderResourceView(blades, &b, { cpu.ptr + _step });
+			_device->CreateShaderResourceView(chars, &b, { cpu.ptr + 2 * _step }); // (the same format: the characters' motion, or a null view)
 			D3D12_UNORDERED_ACCESS_VIEW_DESC u = {};
 			u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 			u.Format = DXGI_FORMAT_R32_FLOAT;
-			_device->CreateUnorderedAccessView(_depth, nullptr, &u, { cpu.ptr + 2 * _step });
+			_device->CreateUnorderedAccessView(_depth, nullptr, &u, { cpu.ptr + 3 * _step });
 			u.Format = DXGI_FORMAT_R16G16_FLOAT;
-			_device->CreateUnorderedAccessView(_mv, nullptr, &u, { cpu.ptr + 3 * _step });
+			_device->CreateUnorderedAccessView(_mv, nullptr, &u, { cpu.ptr + 4 * _step });
 		}
 		transition(list, _depth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _depth_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		transition(list, _mv, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _mv_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -507,11 +533,19 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 				const float v = float(reproject[i]);
 				std::memcpy(&c[8 + i], &v, 4);
 			}
+			// (VIEW's first three rows, x y z of each: a world direction into view space)
+			for (int r = 0; r < 3; ++r)
+				for (int k = 0; k < 4; ++k)
+				{
+					const float v = k < 3 ? float(view[r * 4 + k]) : 0.0f;
+					std::memcpy(&c[24 + r * 4 + k], &v, 4);
+				}
+			c[36] = chars != nullptr ? 1u : 0u;
 			list->SetDescriptorHeaps(1, &_heap);
 			list->SetComputeRootSignature(_root);
 			list->SetPipelineState(_motion);
 			list->SetComputeRoot32BitConstants(0, kConstants, c, 0);
-			list->SetComputeRootDescriptorTable(1, { _heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 4) * _step });
+			list->SetComputeRootDescriptorTable(1, { _heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * kMotionViews) * _step });
 			list->Dispatch((_rw + 7) / 8, (_rh + 7) / 8, 1);
 		}
 
@@ -630,6 +664,8 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		_frames++;
 		if (blades != nullptr)
 			_blade_frames++;
+		if (chars != nullptr)
+			_char_frames++;
 		return true;
 	}
 }

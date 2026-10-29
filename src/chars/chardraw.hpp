@@ -20,6 +20,12 @@
 //
 // Option: per-pixel lighting (the same lights at each pixel, the normal interpolated).
 //
+// Motion (for FSR, src/upscale): with a motion target (char_target::motion_rtv, R16G16B16A16_FLOAT) the opaque models
+// also write, at each pixel, how far that point moved in the world since the last frame (this frame's skinning less
+// the last frame's: the same model and instance in the last frame's record, its palette still in the cache's ring)
+// and its view depth: xyz the move (yalms), w the depth. A model not in the last frame (or its skeleton changed) moved
+// nowhere of its own.
+//
 // En-spells (record_enspells, after the opaque models): HiFi XI's own effect on a model's blades (cache::mesh_view's
 // os2::blade) while it has one (model_entry::enspell, one of the eight elements); not the game's. The blade's mesh
 // drawn again a little swollen with the element's surface on it (fire climbing, frost, wind streaks, glowing cracks,
@@ -48,6 +54,8 @@ namespace hifi::chars
 		UINT samples = 1;
 		float width = 0.0f, height = 0.0f;
 		float offset = 0.5f; // (dgVoodoo's half-pixel for Direct3D 8's pixel centres)
+		D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = {}; // (the opaque models' motion target, or none)
+		DXGI_FORMAT motion_format = DXGI_FORMAT_UNKNOWN;
 	};
 
 	struct char_options
@@ -92,12 +100,13 @@ namespace hifi::chars
 	private:
 		bool begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o);
 		D3D12_GPU_VIRTUAL_ADDRESS write_frame(const frame &f, const char_options &o, const float view_proj[16], uint32_t part);
-		void draw_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, char_stats &st);
+		void draw_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, char_stats &st, const frame *last = nullptr);
 		ID3D12PipelineState *pipeline(const char_target &t, int kind);
 
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
 		void *_vs = nullptr, *_ps = nullptr, *_cvs = nullptr, *_cps = nullptr, *_cps_ms = nullptr, *_sps = nullptr; // (ID3DBlob)
+		void *_ps_motion = nullptr; // (ID3DBlob: the model's pixel shader with its motion as well)
 		ID3D12RootSignature *_en_root = nullptr; // (the en-spells': 32 constants, the palette, the mesh)
 		void *_en_svs = nullptr, *_en_sps = nullptr, *_en_pvs = nullptr, *_en_pps = nullptr; // (ID3DBlob: shell, sprites)
 		ID3D12PipelineState *_shadow_pso = nullptr; // (depth only, D32: made in init, not under the injection's mutex)

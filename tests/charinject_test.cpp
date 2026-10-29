@@ -20,6 +20,7 @@
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include <DirectXPackedVector.h>
 #include "../src/chars/cache.hpp"
 #include "../src/chars/charframe.hpp"
 #include "../src/chars/charinject.hpp"
@@ -724,6 +725,7 @@ int main(int argc, char **argv)
 	// The characters' end marker: the planes as dgVoodoo leaves them (depth read, stencil written for the clear)
 	barrier(list, Az, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+	inj::set_motion_wanted(samples == 1); // (the characters' motion for FSR, as while it draws: chardraw.hpp "Motion")
 	inj::on_chars_end(list, bound, w, seq & 15);
 	const D3D12_RECT end_pixel = { 48 + 5, 0, 48 + 6, 1 };
 	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &end_pixel);
@@ -821,6 +823,24 @@ int main(int argc, char **argv)
 		src.SubresourceIndex = 0;
 		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 	}
+	// (the characters' motion, read back: R16G16B16A16_FLOAT)
+	ID3D12Resource *motion_tex = nullptr, *motion_back = nullptr;
+	uint64_t motion_frames = 0;
+	const bool have_motion = inj::motion(motion_tex, motion_frames);
+	if (have_motion)
+	{
+		bd.Width = UINT64(W) * 8 * H;
+		device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&motion_back));
+		barrier(list, motion_tex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		dst.pResource = motion_back;
+		dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R16G16B16A16_FLOAT, W, H, 1, W * 8 };
+		src.pResource = motion_tex;
+		src.SubresourceIndex = 0;
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		barrier(list, motion_tex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	}
 	list->Close();
 	ID3D12CommandList *lists[] = { list };
 	direct->ExecuteCommandLists(1, lists);
@@ -890,6 +910,33 @@ int main(int argc, char **argv)
 	std::snprintf(line, sizeof(line), "the middle Mithra drawn at the end marker: %u pixels (%.0f%% of its box), its depth %u, nothing outside the boxes (%u)", in_middle,
 		100.0 * in_middle / box, depth_middle, outside);
 	check(in_middle > box * 0.15 && depth_middle >= in_middle * 9 / 10 && outside == 0, line);
+	// Its motion (for FSR): on each of its pixels its view depth and no move of its own (no last frame: this is the first);
+	// nothing elsewhere but the other opaque one HiFi XI draws
+	if (samples == 1)
+	{
+		uint32_t on_middle = 0, still_middle = 0, sane_depth = 0, stray = 0;
+		const uint16_t *mo = nullptr;
+		if (motion_back != nullptr)
+			motion_back->Map(0, nullptr, reinterpret_cast<void **>(const_cast<uint16_t **>(&mo)));
+		for (UINT y = 0; y < H && mo != nullptr; ++y)
+			for (UINT x = 0; x < W; ++x)
+			{
+				const uint16_t *q = mo + (size_t(y) * W + x) * 4;
+				const float mx = DirectX::PackedVector::XMConvertHalfToFloat(q[0]), my = DirectX::PackedVector::XMConvertHalfToFloat(q[1]),
+					mz = DirectX::PackedVector::XMConvertHalfToFloat(q[2]), mw = DirectX::PackedVector::XMConvertHalfToFloat(q[3]);
+				const float cx = float(x) + 0.5f, cy = float(y) + 0.5f;
+				if (middle.inside(cx, cy, 2) && !is_sky(px + (size_t(y) * W + x) * 4) && mw > 0.0f)
+				{
+					on_middle++;
+					still_middle += mx == 0.0f && my == 0.0f && mz == 0.0f ? 1 : 0;
+					sane_depth += mw > 0.05f && mw < 100.0f ? 1 : 0;
+				}
+				stray += !middle.inside(cx, cy, 2) && !fogged.inside(cx, cy, 2) && mw != 0.0f ? 1 : 0;
+			}
+		check(have_motion && motion_frames == 1 && on_middle >= in_middle * 9 / 10 && still_middle == on_middle && sane_depth == on_middle && stray == 0,
+			"its motion for FSR: " + std::to_string(on_middle) + " of its " + std::to_string(in_middle) + " pixels with its depth (" + std::to_string(sane_depth) +
+			" sane), none moved on a first frame (" + std::to_string(still_middle) + "), nothing outside HiFi XI's opaque ones (" + std::to_string(stray) + ")");
+	}
 	const double mean_middle = in_middle ? off_sky_middle / in_middle : 0, mean_right = in_right ? off_sky_right / in_right : 0;
 	std::snprintf(line, sizeof(line), "the see-through one at its marker: %u pixels, %.0f%% as far from the sky as the opaque one's (about half: alpha 0x40), its depth written %u",
 		in_right, mean_middle > 0 ? 100.0 * mean_right / mean_middle : 0.0, depth_right);

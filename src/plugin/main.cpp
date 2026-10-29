@@ -619,6 +619,8 @@ class hifixi final : public IPlugin
 		hifi::framegen::set_automatic(hifi::game::option_on("upscale", "framegen_auto", true));
 		// (FSR's masks: the world copied at World FX's passes as well as at the characters' end)
 		hifi::upscale::masks::set_on(hifi::game::option_on("upscale", "masks", true));
+		// (the characters' own motion for FSR: drawn while it runs)
+		hifi::upscale::set_chars_motion_source(&hifi::chars::inject::motion);
 		ID3D12Device *const device = worldfx::attached();
 		std::string why;
 		if (fsr && !m_upscale_refused && device != nullptr && !hifi::upscale::prepare(device, why))
@@ -947,6 +949,7 @@ public:
 		hifi::game::drawcull::frame(now);
 		// (the next frame's offset, before the camera tick builds its projection: only while FSR 2 draws to take it back out)
 		hifi::game::jitter::set_on(hifi::upscale::temporal_running());
+		hifi::chars::inject::set_motion_wanted(hifi::upscale::temporal_running()); // (the characters' own motion for FSR)
 		worldfx::set_blade_motion(hifi::upscale::temporal_running()); // (the grass's own motion for FSR 2)
 		hifi::game::jitter::set_phases(hifi::upscale::jitter_phases());
 		hifi::game::jitter::next_frame();

@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 
 
@@ -63,8 +64,17 @@ namespace hifi::chars::inject
 			D3D12_PLACED_SUBRESOURCE_FOOTPRINT snapshot_spot = {};
 			DXGI_FORMAT snapshot_format = DXGI_FORMAT_UNKNOWN;
 			bool snapshot_taken = false;
+			// The opaque characters' motion (set_motion_wanted, motion): the world's size, its own RTV heap
+			std::atomic<bool> motion_wanted { false };
+			ID3D12Resource *motion = nullptr;
+			ID3D12DescriptorHeap *motion_heap = nullptr;
+			D3D12_RESOURCE_STATES motion_state = D3D12_RESOURCE_STATE_COMMON;
+			uint64_t motion_frames = 0;
+			std::vector<std::pair<ID3D12Resource *, uint64_t>> motion_old; // (let go 16 frames on: past the GPU)
 		};
 		state g;
+		constexpr D3D12_RESOURCE_STATES kMotionRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 		// The en-spells' time in seconds: set_clock's, else the performance counter's
 		double effect_time()
@@ -212,6 +222,49 @@ namespace hifi::chars::inject
 			return true;
 		}
 
+		// (under the lock) The motion texture the world's target's size, made (again) when it isn't
+		bool motion_target(const world &w)
+		{
+			const D3D12_RESOURCE_DESC rd = w.rt->GetDesc();
+			if (g.motion != nullptr)
+			{
+				const D3D12_RESOURCE_DESC md = g.motion->GetDesc();
+				if (md.Width == rd.Width && md.Height == rd.Height)
+					return true;
+				g.motion_old.push_back({ g.motion, g.motion_frames });
+				g.motion = nullptr;
+			}
+			if (g.device == nullptr)
+				return false;
+			if (g.motion_heap == nullptr)
+			{
+				const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+				if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.motion_heap))))
+					return false;
+			}
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = rd.Width;
+			d.Height = rd.Height;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = kMotionFormat;
+			d.SampleDesc.Count = 1;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+			D3D12_CLEAR_VALUE cv = {};
+			cv.Format = kMotionFormat;
+			if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, &cv, IID_PPV_ARGS(&g.motion))))
+			{
+				g.motion = nullptr;
+				return false;
+			}
+			g.motion->SetName(L"hifixi: the characters' motion");
+			g.motion_state = D3D12_RESOURCE_STATE_COMMON;
+			g.device->CreateRenderTargetView(g.motion, nullptr, g.motion_heap->GetCPUDescriptorHandleForHeapStart());
+			return true;
+		}
+
 		char_target target_of(const world &w, D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv)
 		{
 			const D3D12_RESOURCE_DESC rd = w.rt->GetDesc();
@@ -314,6 +367,12 @@ namespace hifi::chars::inject
 		ID3D12Resource *t = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
+			drop(g.motion);
+			drop(g.motion_heap);
+			for (auto &o : g.motion_old)
+				o.first->Release();
+			g.motion_old.clear();
+			g.motion_state = D3D12_RESOURCE_STATE_COMMON;
 			old = std::move(g.renderer);
 			rtv = g.rtv_heap;
 			dsv = g.dsv_heap;
@@ -441,7 +500,33 @@ namespace hifi::chars::inject
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		g.last = g.renderer->record_opaque(list, target_of(w, rtv, dsv), *f, o);
+		char_target target = target_of(w, rtv, dsv);
+		// (their motion for FSR, while it draws: the texture the world's size, cleared, as the second target)
+		const bool moving = g.motion_wanted.load(std::memory_order_relaxed) && target.samples == 1 && motion_target(w);
+		if (moving)
+		{
+			barrier(list, g.motion, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, g.motion_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const D3D12_CPU_DESCRIPTOR_HANDLE mrtv = g.motion_heap->GetCPUDescriptorHandleForHeapStart();
+			const float none[4] = {};
+			list->ClearRenderTargetView(mrtv, none, 0, nullptr);
+			target.motion_rtv = mrtv;
+			target.motion_format = kMotionFormat;
+		}
+		g.last = g.renderer->record_opaque(list, target, *f, o);
+		if (moving)
+		{
+			barrier(list, g.motion, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, kMotionRead);
+			g.motion_state = kMotionRead;
+			g.motion_frames++;
+			for (auto it = g.motion_old.begin(); it != g.motion_old.end();)
+				if (g.motion_frames - it->second > 16)
+				{
+					it->first->Release();
+					it = g.motion_old.erase(it);
+				}
+				else
+					++it;
+		}
 		{
 			const char_stats en = g.renderer->record_enspells(list, target_of(w, rtv, dsv), *f, effect_time());
 			g.n.enspell_models += en.models;
@@ -454,6 +539,19 @@ namespace hifi::chars::inject
 		put_back(list, bound);
 		g.n.frames++;
 		g.n.models += g.last.models;
+	}
+
+	void set_motion_wanted(bool wanted)
+	{
+		g.motion_wanted = wanted;
+	}
+
+	bool motion(ID3D12Resource *&texture, uint64_t &frames)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		texture = g.motion_state == kMotionRead ? g.motion : nullptr;
+		frames = g.motion_frames;
+		return texture != nullptr;
 	}
 
 	bool record_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
