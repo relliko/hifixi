@@ -4542,8 +4542,10 @@ namespace grass
 		_device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &size);
 		if (extra != nullptr)
 		{
+			// (after whole rows of it, the last one's padding too, as the shaders find it: grass.hlsl light_at)
 			const D3D12_RESOURCE_DESC ed = extra->GetDesc();
-			const UINT64 at = (size + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+			const UINT64 rows = UINT64(footprint.Footprint.RowPitch) * footprint.Footprint.Height;
+			const UINT64 at = (rows + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
 			if (size != 0 && size != UINT64(-1) && ed.Width == desc.Width && ed.Height == desc.Height && ed.SampleDesc.Count == 1 &&
 				ed.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
 				_device->GetCopyableFootprints(&ed, 0, 1, at, &extra_footprint, nullptr, nullptr, &extra_size);

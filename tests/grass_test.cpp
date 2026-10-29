@@ -1793,6 +1793,7 @@ int main(int argc, char **argv)
 		bool characters_cast = false;
 		float weather_share = 1.0f;    // (the share of the sun's shadows the weather leaves)
 		float haze_end = 0.0f;         // (the game's fog, in the ground's own colour, from 0 to this many yalms: none while 0)
+		bool light_read = false;       // (the last frame read the host's light split: set_light_source)
 		auto frame = [&](bool with_box, float shadows) {
 			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
@@ -1836,6 +1837,7 @@ int main(int argc, char **argv)
 			l2.haze_start = 0.0f;
 			l2.haze_end = haze_end;
 			const draw_stats st = r.draw(g.list, t, cam, l2, error);
+			light_read = st.light_split;
 			check(st.sun == (shadows * weather_share > 0.0f), "the sun's half-size pass ran when its shadows are on (and the weather leaves some)");
 			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			return g.read(world, 4);
@@ -1871,6 +1873,84 @@ int main(int argc, char **argv)
 		const double behind_shadowed = mean(side_shadowed, LONG(px) - 110, LONG(py) - 70, LONG(px) - 66, LONG(py) - 30);
 		std::printf("  sun to the right: ground left of the box and behind it %.1f lit, %.1f with shadows\n", behind_lit, behind_shadowed);
 		check(std::fabs(behind_shadowed - behind_lit) < 1.0, "ground beside something and well behind it isn't shadowed by it");
+
+		// The light split (set_light_source: HiFi XI's native zone and characters say each pixel's facing and how much of its
+		// light is the sun's, src/zone/light_split.hpp): the ground facing up, its words made from the depth as drawn (the box
+		// left unknown), the sun toward the camera and up again. A shadow takes the sun's share of the light as the word says,
+		// scaled as sun_share's (1.39: the game's daylight share of a surface square to the sun, 0.72, takes all the slider's
+		// strength): none from ground the word says the sun doesn't light (a surface lit by the ambient and lamps alone), half as
+		// much at half the share; and where the word's depth isn't what's drawn (the box), the old way stands.
+		{
+			to_sun = normalize({ (eye.x - at.x) / 5.385f, (eye.y - at.y) / 5.385f - 1.0f, (eye.z - at.z) / 5.385f });
+			frame(true, 0.0f);
+			barrier(g.list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			const std::vector<uint8_t> zb = g.read(depth, 4);
+			barrier(g.list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+			const D3D12_RESOURCE_DESC sd = split->GetDesc();
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT sfp = {};
+			UINT64 stotal = 0;
+			g.device->GetCopyableFootprints(&sd, 0, 1, 0, &sfp, nullptr, nullptr, &stotal);
+			ID3D12Resource *sup = g.buffer(D3D12_HEAP_TYPE_UPLOAD, stotal, D3D12_RESOURCE_STATE_GENERIC_READ);
+			struct source
+			{
+				ID3D12Resource *texture;
+			} src_ctx = { nullptr };
+			r.set_light_source([](void *c) { return static_cast<source *>(c)->texture; }, &src_ctx);
+			const float lx = cam.proj[11] != 0.0f ? cam.proj[10] / cam.proj[11] : cam.proj[10], ly = cam.proj[14];
+			// (facing up, y down: octahedral (0, -1, 0) is (0, -1), each side 0..127)
+			const uint32_t up_bits = uint32_t(std::lround(0.5 * 127.0)) << 11 | uint32_t(std::lround(0.0)) << 18;
+			auto words = [&](float share) {
+				uint32_t *w = nullptr;
+				sup->Map(0, nullptr, reinterpret_cast<void **>(&w));
+				for (UINT y = 0; y < H; ++y)
+					for (UINT x = 0; x < W; ++x)
+					{
+						uint32_t v = 0;
+						const uint32_t d24 = (zb[(size_t(y) * W + x) * 4] | zb[(size_t(y) * W + x) * 4 + 1] << 8 | zb[(size_t(y) * W + x) * 4 + 2] << 16);
+						const bool in_box = LONG(x) >= box.left && LONG(x) < box.right && LONG(y) >= box.top && LONG(y) < box.bottom;
+						if (d24 < 0xFFFFFF && !in_box)
+						{
+							const double vd = ly / (d24 / 16777215.0 - lx);
+							const uint32_t code = uint32_t(std::clamp(std::lround((std::log2(std::max(vd, 1e-3)) + 3.0) * 128.0), 1L, 2047L));
+							v = code | up_bits | uint32_t(std::lround(std::clamp(share, 0.0f, 1.0f) * 127.0f)) << 25;
+						}
+						w[size_t(y) * (sfp.Footprint.RowPitch / 4) + x] = v;
+					}
+				sup->Unmap(0, nullptr);
+				if (src_ctx.texture != nullptr)
+					barrier(g.list, split, kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+				D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, from = { sup, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+				from.PlacedFootprint = sfp;
+				g.list->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+				src_ctx.texture = split;
+			};
+			words(0.0f);
+			const std::vector<uint8_t> none_lit = frame(true, 0.0f), none_shadowed = frame(true, 0.6f);
+			const bool read_none = light_read;
+			words(0.36f);
+			const std::vector<uint8_t> half_shadowed = frame(true, 0.6f);
+			words(0.72f);
+			const std::vector<uint8_t> full_lit = frame(true, 0.0f), full_shadowed = frame(true, 0.6f);
+			const bool read_full = light_read;
+			r.set_light_source(nullptr, nullptr);
+			const std::vector<uint8_t> after = frame(true, 0.6f);
+			const bool read_after = light_read;
+			auto near_of = [&](const std::vector<uint8_t> &img) { return mean(img, LONG(px) - 40, LONG(py) - 10, LONG(px) + 40, LONG(py) + 4); };
+			const double n_lit = near_of(none_lit), n0 = near_of(none_shadowed), n36 = near_of(half_shadowed), n72 = near_of(full_shadowed), f_lit = near_of(full_lit);
+			const double box_split = mean(full_shadowed, box.left + 10, box.top + 10, box.right - 10, box.bottom - 10), box_old = mean(shadowed, box.left + 10, box.top + 10, box.right - 10, box.bottom - 10);
+			std::printf("  the light split: read %d %d (after it's gone %d); in front of the box lit %.1f / %.1f, with shadows at a share of 0 %.1f, 0.36 %.1f, 0.72 %.1f "
+				"(without the split %.1f); the box %.1f (without %.1f)\n", read_none, read_full, read_after, n_lit, f_lit, n0, n36, n72, near_shadowed, box_split, box_old);
+			check(read_none && read_full && !read_after, "the shading pass read the light split while the host had one, and not after");
+			check(std::fabs(n_lit - near_lit) < 1.0 && std::fabs(f_lit - near_lit) < 1.0, "lit ground is as it was, the split or not");
+			check(std::fabs(n0 - n_lit) < 1.0, "no shadow on ground the sun doesn't light (its share 0)");
+			check(n72 < n_lit * 0.9 && n36 < n_lit - 0.35 * (n_lit - n72) && n36 > n_lit - 0.65 * (n_lit - n72), "a shadow takes the sun's share: about half at half of it");
+			check(std::fabs(box_split - box_old) < 1.0, "where the word isn't what's drawn (the box), as without the split");
+			release(sup);
+			release(split);
+		}
 
 		// A tall pole (a yalm wide, like a trunk) 20 yalms further off; the sun to the right, low (19 degrees up) and a little away
 		// from the camera: the ground 10 to 13 yalms left of its foot is in its shadow (out of reach of the

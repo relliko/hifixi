@@ -9,7 +9,10 @@
  *   - the character is drawn as dgVoodoo meant: its texture through its heap and table, its vertices through its
  *     buffer, its pipeline (each would be wrong had our state been left bound);
  *   - the debug layer says nothing (the planes' states, the heaps, the views);
- *   - a pass not HiFi XI's, an old seq, a depth not yet followed: nothing drawn (and said why when it should have been).
+ *   - a pass not HiFi XI's, an old seq, a depth not yet followed: nothing drawn (and said why when it should have been);
+ *   - the light split (src/zone/light_split.hpp) drawn with it once World FX has asked: a word on most of the zone's
+ *     pixels, its depth the depth buffer's, the ground facing up, lit mostly by the sun, the walls turned from it not;
+ *     under the character dgVoodoo drew afterwards, its depth not the depth buffer's (World FX leaves those words).
  *
  *   build\zoneinject_test.exe [out.bmp]
  */
@@ -21,6 +24,7 @@
 #include "../src/bake/zonemesh.hpp"
 #include "../src/zone/frame.hpp"
 #include "../src/zone/inject.hpp"
+#include "../src/zone/light_split.hpp"
 #include "../src/zone/zone_gpu.hpp"
 #include "game_dump.hpp"
 #include <algorithm>
@@ -417,6 +421,7 @@ int main(int argc, char **argv)
 	float zlo[3] = {}, zhi[3] = {};
 	uint64_t zgen = 0;
 	const bool bounds_before = inj::zone_bounds(zlo, zhi, zgen);
+	hifi::light::take(); // (World FX asking for the light split: from now on the native passes draw it)
 	inj::on_zone_end(list, bound, w, 5);
 	const D3D12_RECT pixel = { 16, 0, 17, 1 };
 	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &pixel); // (the marker itself)
@@ -474,6 +479,22 @@ int main(int argc, char **argv)
 		ssrc.pResource = sun_map;
 		ssrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 		list->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
+	}
+	// The light split drawn with the pass, as World FX takes it, out to be read
+	ID3D12Resource *const light = hifi::light::take(), *light_back = nullptr;
+	if (light != nullptr)
+	{
+		bd.Width = UINT64(W) * 4 * H;
+		device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&light_back));
+		barrier(list, light, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, hifi::light::kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION ldst = {}, lsrc = {};
+		ldst.pResource = light_back;
+		ldst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		ldst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
+		lsrc.pResource = light;
+		lsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		list->CopyTextureRegion(&ldst, 0, 0, 0, &lsrc, nullptr);
+		barrier(list, light, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, hifi::light::kRead);
 	}
 	// dgVoodoo's next draw, nothing bound again (the planes moved on as it moves them)
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
@@ -536,6 +557,54 @@ int main(int argc, char **argv)
 	check(c[0] == 0xE0 && c[1] == 0x80 && c[2] == 0x20, line);
 	const std::vector<std::string> st = inj::status();
 	check(!st.empty() && st[0].find("1 passes drawn, 0 couldn't be") != std::string::npos, "one pass drawn, the repeat and the game's left alone: " + st[0]);
+	// The light split: a word where the zone was drawn (the sky and the blended-only pixels none), its depth code the
+	// depth buffer's (the camera's projection: view depth = _43 / (d + _33)) but under the character drawn after it (its
+	// quad, above), the ground (facing up: y is down) mostly lit by the sun overhead (0.36, -0.83, 0.42: about 1.04 of
+	// sun to 0.48 of ambient, a share of 0.68), some walls turned from it barely
+	check(light != nullptr && light_back != nullptr, "the light split drawn and taken");
+	if (light_back != nullptr)
+	{
+		uint32_t *lw = nullptr;
+		light_back->Map(0, nullptr, reinterpret_cast<void **>(&lw));
+		const float zn = 0.5f, zf = 2000.0f, p33 = zf / (zn - zf), p43 = zn * zf / (zn - zf);
+		uint32_t coded = 0, drawn = 0, agree = 0, up = 0, dark = 0, under = 0, under_agree = 0;
+		double up_share = 0.0;
+		for (UINT y = 0; y < H; ++y)
+			for (UINT x = 0; x < W; ++x)
+			{
+				const uint32_t v = lw[size_t(y) * W + x], dd = dz[size_t(y) * W + x] & 0xFFFFFF;
+				drawn += dd < 0xFFFFFF;
+				const uint32_t code = v & 0x7FF;
+				if (code == 0)
+					continue;
+				coded++;
+				const double depth = p43 / (dd / 16777215.0 + p33);
+				const bool same = std::abs((std::log2(std::max(depth, 1e-3)) + 3.0) * 128.0 - code) <= 2.5;
+				const bool character = x >= 602 && x < 758 && y >= 339 && y < 425;
+				under += character;
+				under_agree += character && same;
+				agree += !character && same;
+				float o[2] = { float((v >> 11) & 127) / 127.0f * 2 - 1, float((v >> 18) & 127) / 127.0f * 2 - 1 };
+				float n[3] = { o[0], o[1], 1.0f - std::abs(o[0]) - std::abs(o[1]) };
+				const float t = std::clamp(-n[2], 0.0f, 1.0f);
+				n[0] += n[0] >= 0 ? -t : t;
+				n[1] += n[1] >= 0 ? -t : t;
+				const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+				const float share = float(v >> 25) / 127.0f;
+				if (n[1] / l < -0.9f)
+				{
+					up++;
+					up_share += share;
+				}
+				dark += share < 0.1f;
+			}
+		up_share = up != 0 ? up_share / up : 0.0;
+		std::snprintf(line, sizeof(line), "the light split: a word on %.0f%% of the zone's pixels, %.2f%% of them at the depth's own, %u of %u under the "
+			"character; %u facing up, the sun's share there %.2f; %u with under a tenth", drawn != 0 ? 100.0 * coded / drawn : 0.0,
+			coded > under ? 100.0 * agree / (coded - under) : 0.0, under_agree, under, up, up_share, dark);
+		check(coded > drawn / 2 && agree > (coded - under) * 0.995 && under > 10000 && under_agree < under / 50 && up > 1000 && up_share > 0.55 &&
+			up_share < 0.8 && dark > 100, line);
+	}
 	// The sun's cascade from the zone's data: nothing before a zone was drawn; then the town seen from above: its streets,
 	// plazas and gate (18% of the box: walls seen from straight above are edge on, and the box holds the whole layout),
 	// its depths over the box's height
