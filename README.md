@@ -14,9 +14,10 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - culling at the camera's own height of view;
   - square pixels.
 - **Smooth edges and upscaling with AMD FidelityFX Super Resolution:**
-  - **FSR 2** builds each frame from the last ones, the world drawn a fraction of a pixel apart every frame: edges as smooth as a background resolution twice the screen's, for far less work. Swaying grass carries its own motion, so it stays sharp;
+  - **FSR 3.1** builds each frame from the last ones, the world drawn a fraction of a pixel apart every frame: edges as smooth as a background resolution twice the screen's, for far less work. Swaying grass and moving characters carry their own motion, and spells, particles, water and weather are marked so FSR doesn't smear them;
   - with the background resolution at the screen's size it smooths edges; below it, it also upscales, for more frames;
-  - **FSR 1** (edge-aware upscaling and sharpening) when FSR 2 is off;
+  - **FSR 2** in its place if you prefer it, or where FSR 3.1 can't run; **FSR 1** (edge-aware upscaling and sharpening) when both are off;
+  - **Frame generation (AMD FSR 3):** a frame made between each two the game draws, for motion as smooth as twice the frames, the menus and text kept sharp. By default only while the game runs below half your screen's refresh rate;
   - the menus and text are always drawn at the screen's own size.
 - **The zone and the characters drawn by HiFi XI itself**, from your own game files, in the game's own look:
   - **Per-pixel light** with every texture's normal map, on the zone and on characters and monsters;
@@ -33,7 +34,7 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn.
 - **En-spell effects:** while Enfire, Enblizzard, Enaero, Enstone, Enthunder, Enwater, Enlight or Endark is on you (the IIs too), your weapons carry its element: flames, frost and ice shards, wind, circling stones, arcs of lightning, flowing water, rays of light or dark smoke. On every melee weapon of every race: along a blade, on an axe's, scythe's, staff's or spear's head, all over hand-to-hand weapons.
 
-Everything is in one menu (`/hifi`), with presets (Off, Balanced, High, Ultra) and a tooltip on every setting.
+Everything is in one menu (`/hifi`): presets in a dropdown (Off, Balanced, High, Ultra, and your own, saved by name), a search box, a tooltip on every setting and a right-click reset.
 
 ## Requirements
 
@@ -59,11 +60,17 @@ Your settings from hifps and drawcull are taken over the first time HiFi XI star
 
 FSR works with the game's **background resolution** (the size the world is drawn at, set in your launcher or the game's config) at or below your screen's:
 
-- the same as your screen (say 2560x1440 on a 2560x1440 screen): FSR 2 smooths every edge, about as well as a background twice the screen's size;
-- lower (1920x1080, or 1707x960 for the most frames): FSR 2 also upscales to the screen;
+- the same as your screen (say 2560x1440 on a 2560x1440 screen): FSR smooths every edge, about as well as a background twice the screen's size;
+- lower (1920x1080, or 1707x960 for the most frames): FSR also upscales to the screen;
 - above the screen's size, HiFi XI leaves the game's own scaling alone.
 
-In the menu: **Game -> Upscaling**: FSR on or off, FSR 2 or FSR 1, and how much it sharpens.
+In the menu's **Upscaling** tab: FSR on or off, FSR 3.1 or FSR 2 (or FSR 1), how much it sharpens, and whether effects, water and weather are kept crisp. What it's doing is shown under them.
+
+### Frame generation
+
+With **Frame generation** on, AMD FSR 3 makes a frame between each two the game draws while FSR 3.1 or FSR 2 draws the world. Your screen shows twice the frames; the game itself then runs at up to half your screen's refresh rate (122 at 244 Hz) and answers a little later. It pays most where the game runs below that: with **Only while the game runs below half the refresh rate** on (the default), it switches itself off whenever the game can run faster alone, and back on when it can't.
+
+Turning it on takes effect the next time the game starts (it replaces the game's swap chain as the game starts); turning it off is immediate. Frame counters in the game count the game's own frames; the menu's **Performance** tab shows both. With a G-Sync or FreeSync screen, a frame cap a little under half your refresh rate (116 at 244 Hz) keeps the pacing even.
 
 ## Zone data
 
@@ -98,4 +105,4 @@ If the GPU hangs (`DXGI_ERROR_DEVICE_HUNG`):
 
 ## Licences
 
-HiFi XI includes AMD FidelityFX Super Resolution 1 and 2 (Copyright (c) 2021-2023 Advanced Micro Devices, Inc., MIT licence). Their licence texts are in `docs\hifixi\`.
+HiFi XI includes AMD FidelityFX Super Resolution 1 and 2 (Copyright (c) 2021-2023 Advanced Micro Devices, Inc., MIT licence) and, from the AMD FidelityFX SDK v1.1.4, FSR 3.1's upscaler and frame generation (Copyright (C) 2024 Advanced Micro Devices, Inc., MIT licence). Their licence texts are in `docs\hifixi\`.
