@@ -58,6 +58,7 @@ namespace hifi::zone::inject
 	{
 		float view[16], proj[16];
 		float jitter[2];
+		float sun_dir[3];  // toward the zone's sun (world)
 		uint32_t seq = 0;
 		uint64_t at = 0;
 	};

@@ -10,6 +10,7 @@
 #include "cache.hpp"
 #include "chardraw.hpp"
 #include "charframe.hpp"
+#include "../zone/light_split.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -40,6 +41,10 @@ namespace hifi::chars::inject
 			ID3D12Device *device = nullptr;
 			std::unique_ptr<char_renderer> renderer; // (made and let go outside the mutex: see prepare)
 			std::atomic<bool> per_pixel { false };
+			// Toward the zone's sun (set_sun: the plugin's, from the zone pass), for the light split's share
+			std::mutex sun_mutex;
+			bool sun_known = false;
+			float sun[3] = {};
 			std::atomic<double> clock { -1.0 }; // (the en-spells' time: below 0, the real one)
 			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
 			ID3D12Resource *depth = nullptr;
@@ -362,6 +367,7 @@ namespace hifi::chars::inject
 
 	void release()
 	{
+		light::release(); // (both passes' target: let go with either)
 		std::unique_ptr<char_renderer> old;
 		ID3D12DescriptorHeap *rtv = nullptr, *dsv = nullptr;
 		ID3D12Resource *t = nullptr;
@@ -496,6 +502,11 @@ namespace hifi::chars::inject
 			return;
 		char_options o;
 		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
+		{
+			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
+			o.sun_known = g.sun_known;
+			std::memcpy(o.sun, g.sun, sizeof(o.sun));
+		}
 		const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -512,7 +523,11 @@ namespace hifi::chars::inject
 			target.motion_rtv = mrtv;
 			target.motion_format = kMotionFormat;
 		}
+		// (the light split as well, while World FX reads it: light_split.hpp)
+		const bool lit = light::begin(list, g.device, w.rt, target.light_rtv);
 		g.last = g.renderer->record_opaque(list, target, *f, o);
+		if (lit)
+			light::end(list);
 		if (moving)
 		{
 			barrier(list, g.motion, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, kMotionRead);
@@ -539,6 +554,14 @@ namespace hifi::chars::inject
 		put_back(list, bound);
 		g.n.frames++;
 		g.n.models += g.last.models;
+	}
+
+	void set_sun(const float *toward)
+	{
+		std::lock_guard<std::mutex> lock(g.sun_mutex);
+		g.sun_known = toward != nullptr;
+		for (int i = 0; i < 3; ++i)
+			g.sun[i] = toward != nullptr ? toward[i] : 0.0f;
 	}
 
 	void set_motion_wanted(bool wanted)
@@ -614,6 +637,11 @@ namespace hifi::chars::inject
 			return fail("the see-through target couldn't be made");
 		char_options o;
 		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
+		{
+			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
+			o.sun_known = g.sun_known;
+			std::memcpy(o.sun, g.sun, sizeof(o.sun));
+		}
 		const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);

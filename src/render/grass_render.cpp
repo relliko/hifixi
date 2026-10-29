@@ -4529,12 +4529,29 @@ namespace grass
 	// Copies subresource 0 (plane 0 of a depth buffer) of res, in state, into c; that subresource alone is
 	// left in COPY_SOURCE (a depth buffer's stencil plane isn't touched). The row pitch in 4-byte units, or 0
 	// when it couldn't be copied.
-	uint32_t renderer::copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state)
+	// (extra: a texture of the same size and a 4-byte format, copied after it, at the next 512 bytes, with the same rows:
+	// the host's light split after the depth; extra_copied says whether it was)
+	uint32_t renderer::copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state, ID3D12Resource *extra,
+		bool *extra_copied)
 	{
+		if (extra_copied != nullptr)
+			*extra_copied = false;
 		const D3D12_RESOURCE_DESC desc = res->GetDesc();
-		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-		UINT64 size = 0;
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {}, extra_footprint = {};
+		UINT64 size = 0, extra_size = 0;
 		_device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &size);
+		if (extra != nullptr)
+		{
+			const D3D12_RESOURCE_DESC ed = extra->GetDesc();
+			const UINT64 at = (size + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+			if (size != 0 && size != UINT64(-1) && ed.Width == desc.Width && ed.Height == desc.Height && ed.SampleDesc.Count == 1 &&
+				ed.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+				_device->GetCopyableFootprints(&ed, 0, 1, at, &extra_footprint, nullptr, nullptr, &extra_size);
+			if (extra_size == 0 || extra_size == UINT64(-1) || extra_footprint.Footprint.RowPitch != footprint.Footprint.RowPitch)
+				extra = nullptr;
+			else
+				size = at + extra_size;
+		}
 		std::string ignored; // without the copy, grass goes on without what it gives rather than not at all
 		if (size == 0 || size == UINT64(-1) || !copy_buffer(c, size, ignored))
 			return 0;
@@ -4549,6 +4566,16 @@ namespace grass
 		src.SubresourceIndex = 0;
 		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 		const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		if (extra != nullptr)
+		{
+			transition(list, extra, readable, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			dst.PlacedFootprint = extra_footprint;
+			src.pResource = extra;
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			transition(list, extra, D3D12_RESOURCE_STATE_COPY_SOURCE, readable);
+			if (extra_copied != nullptr)
+				*extra_copied = true;
+		}
 		transition(list, c.buffer, D3D12_RESOURCE_STATE_COPY_DEST, readable);
 		c.state = readable;
 		return footprint.Footprint.RowPitch / 4;
@@ -4872,13 +4899,17 @@ namespace grass
 		// touches the game's depth buffer
 		const D3D12_RESOURCE_DESC ds_desc = t.ds->GetDesc();
 		uint32_t depth_kind = 0, depth_pitch = 0;
+		// (and the host's light split after it, when this pass shades: grass.hlsl light_at; zinfo.w bit 16)
+		ID3D12Resource *const light = shading && !only_blades && _light != nullptr ? _light(_light_context) : nullptr;
+		bool light_copied = false;
 		const DXGI_FORMAT df = ds_desc.Format;
 		const bool d24 = df == DXGI_FORMAT_D24_UNORM_S8_UINT || df == DXGI_FORMAT_R24G8_TYPELESS;
 		const bool d32 = df == DXGI_FORMAT_D32_FLOAT || df == DXGI_FORMAT_R32_TYPELESS || df == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || df == DXGI_FORMAT_R32G8X24_TYPELESS;
 		if ((d24 || d32) && ds_desc.SampleDesc.Count == 1 && ds_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
-			if ((depth_pitch = copy_out(list, _depth, t.ds, t.ds_state)) != 0)
+			if ((depth_pitch = copy_out(list, _depth, t.ds, t.ds_state, light, &light_copied)) != 0)
 			{
-				depth_kind = d24 ? 1 : 2;
+				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u);
+				stats.light_split = light_copied;
 				transition(list, t.ds, D3D12_RESOURCE_STATE_COPY_SOURCE, t.ds_state, 0);
 			}
 

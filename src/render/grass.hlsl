@@ -90,14 +90,50 @@ bool name_at(int2 p)
 // How far from the camera what's drawn at a pixel is (view depth), or a long way when depth isn't known
 float drawn_depth(int2 p)
 {
-	if (zinfo.w == 0)
+	if ((zinfo.w & 15) == 0)
 		return 1e9;
 	if (any(zinfo.yz != ground.yz)) // (as a rule the same size: no divides then, at every step of a march)
 		p = p * int2(zinfo.yz) / int2(ground.yz);
 	p = clamp(p, int2(0, 0), int2(zinfo.yz) - 1);
 	uint v = zbuf.Load((p.y * zinfo.x + p.x) * 4);
-	float d = zinfo.w == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
+	float d = (zinfo.w & 15) == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
 	return d >= 1.0 ? 1e9 : lin.y / (d - lin.x); // (the game's: 0.1 / (1 - d))
+}
+
+// The light split (zinfo.w bit 16: the host drew it, HiFi XI's src/zone/light_split.hpp, and it was copied after the
+// depth, at the next 512 bytes, in the same rows): what the native zone and characters know of a pixel's light. A uint
+// a pixel: bits 0-10 its view depth, round((log2(depth) + 3) x 128), 0 for none; 11-24 its facing (world, octahedral, 7
+// bits a side); 25-31 the sun's share of the light drawn there (how much of it a full shadow takes away), 0..127.
+// light_at: the facing (view space, toward the camera) and the share at p, where the word is this frame's and still
+// what's drawn there (its depth the depth's own within 2.5 codes, about 1.4%: what the game drew over it later, an
+// effect's mesh, a model left to the game, a blade, isn't it); false elsewhere, and the old ways stand.
+static const float kShareScale = 1.39; // (sun_share's: the game's daylight share of a surface square to the sun is 0.72)
+bool light_split() { return (zinfo.w & 16) != 0; }
+float3 view_dir(float3 d)
+{
+	float4 c = mul(float4(d, 0.0), view_proj);
+	return float3(c.x / lin.z, c.y / lin.w, c.w / up_row.w); // (the projection's _11, _22 and _34 undone, as body_in_view)
+}
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share)
+{
+	n = float3(0.0, 0.0, 1.0);
+	share = 0.0;
+	if (!light_split() || any(zinfo.yz != ground.yz) || z > 1e8)
+		return false;
+	p = clamp(p, int2(0, 0), int2(zinfo.yz) - 1);
+	uint at = (zinfo.x * zinfo.z * 4 + 511) & ~511u;
+	uint v = zbuf.Load(at + (p.y * zinfo.x + p.x) * 4);
+	uint code = v & 0x7FF;
+	if (code == 0 || abs((log2(max(z, 1e-3)) + 3.0) * 128.0 - float(code)) > 2.5)
+		return false;
+	float2 o = float2((v >> 11) & 127, (v >> 18) & 127) / 127.0 * 2.0 - 1.0;
+	float3 w = float3(o, 1.0 - abs(o.x) - abs(o.y));
+	float t = saturate(-w.z);
+	w.xy += float2(w.x >= 0.0 ? -t : t, w.y >= 0.0 ? -t : t);
+	n = normalize(view_dir(normalize(w)));
+	n = dot(n, -P) < 0.0 ? -n : n;
+	share = float(v >> 25) / 127.0;
+	return true;
 }
 
 // The ground's colour under p on screen: the zone's own texture, lighting, fog and time of day, from
@@ -1746,12 +1782,16 @@ float3 shimmered(int2 p, float3 P, float z, float3 col)
 // under trees stayed bright, and came and went with the camera's angle), and a character's (sun_ps), both taken
 // as they are.
 // The clouds' shadows too, with cloud_shade. (The shading pass's, and the snow layer's: snow_layer_ps.)
-float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade)
+// known: the sun's share of the light drawn here as the light split has it (light_at; below 0: not known, sun_share by
+// the facing, as the game lights by day). in_sun: how much of the light drawn here is the sun's and still reaches it
+// (its share, scaled as sun_share's, less the shadows): what the ambient occlusion spares (shade_ps).
+float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float known, out float in_sun)
 {
 	float sunlit = 1.0;
+	const float share = known >= 0.0 ? min(known * kShareScale, 1.0) : sun_share(dot(n, sun_in_view()));
+	in_sun = share;
 	if (shade.w > 0.0)
 	{
-		float share = sun_share(dot(n, sun_in_view()));
 		int2 size = sun_mask_size();
 		int2 first = (p - 3) >> 1;
 		float2 sum = 0.0, nearest_shadow = 0.0;
@@ -1773,11 +1813,16 @@ float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade)
 		// which left every other row there unshaded)
 		float2 s = weight > 0.0 ? sum / weight : nearest_shadow;
 		sunlit = 1.0 - shade.w * max(s.x * share, s.y);
+		in_sun *= 1.0 - max(s.x, s.y);
 	}
 	// The clouds' shadows (cloud_shadow_at): what they keep off the sun's share of this surface's light, as strong as
 	// [kCloud + 9].y says
 	[branch] if (cloud_shade)
-		sunlit *= 1.0 - actors[kCloud + 9].y * sun_share(dot(n, sun_in_view())) * (1.0 - cloud_shadow_at(P));
+	{
+		const float cloud = actors[kCloud + 9].y * (1.0 - cloud_shadow_at(P));
+		sunlit *= 1.0 - cloud * share;
+		in_sun *= 1.0 - cloud;
+	}
 	return sunlit;
 }
 
@@ -1802,8 +1847,20 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	bool wetting = wet();
 	bool cloud_shade = cloud_shadows();
 	bool snowing = snowy();
-	if (shade.x > 0.0 || shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)
+	// (what the native zone and characters drew here, when the light split has it: their own facing for the sun, the lamps,
+	// the wet and the snow, and the sun's share of the light as they lit it; the ambient occlusion keeps the depth's facing,
+	// what it was made for)
+	float3 n_known;
+	float known_share;
+	const bool known = light_at(p, z, P, n_known, known_share);
+	if (shade.x > 0.0 || (!known && (shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)))
 		n = surface_normal(p, P, steep);
+	const float3 n_depth = n;
+	if (known)
+	{
+		n = n_known;
+		steep = 1.0;
+	}
 	float noise = frac(52.9829189 * frac(dot(pos.xy, float2(0.06711056, 0.00583715))));
 
 	// Ambient occlusion: twelve points within the radius, turned per pixel; each one above the surface and
@@ -1820,7 +1877,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 			float rr = radius_px * sqrt((i + 0.5) / 12.0);
 			float3 v = view_at(p + int2(float2(cos(a), sin(a)) * rr)) - P;
 			float d2 = dot(v, v);
-			occ += saturate(dot(n, v) * rsqrt(d2 + 1e-6) - 0.15) * saturate(1.0 - d2 / (shade.y * shade.y));
+			occ += saturate(dot(n_depth, v) * rsqrt(d2 + 1e-6) - 0.15) * saturate(1.0 - d2 / (shade.y * shade.y));
 		}
 		ao = saturate(1.0 - shade.x * occ / 12.0);
 	}
@@ -1852,7 +1909,14 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 			relief = 1.0 + shade.z * clamp(0.6 * detail + 0.2 * lit, -0.45, 0.45) * saturate((rr - 1.5) / 3.0);
 		}
 	}
-	float sunlit = sun_lit_at(p, z, n, P, cloud_shade);
+	float in_sun;
+	float sunlit = sun_lit_at(p, z, n, P, cloud_shade, known ? known_share : -1.0, in_sun);
+	// The ambient occlusion darkens the light from all round, not the sun's straight in: where the light split says how much
+	// of a pixel's light is the sun's still reaching it, that much is spared kAoSunSpared of it (a crease in full sun stays
+	// half as dark as in the shade; under a shadow, all of it)
+	static const float kAoSunSpared = 0.5;
+	if (known)
+		ao = lerp(ao, 1.0, kAoSunSpared * saturate(in_sun));
 	// Settled snow (snow_open, the cover [kSnow].w): on what faces up under open sky, in patches across the world that join
 	// up as it deepens (a whole layer at 1), lit as the scene around it is (its brightness on this surface read as a
 	// mid-grey ground's light: sun, shade, night and the game's own lamps carry over), in the game's fog as the rest; the
@@ -2275,8 +2339,13 @@ void sun_ps(float4 pos : SV_Position)
 	float shadow = 0.0, whole = 0.0;
 	float3 to_sun = sun_in_view();
 	float3 P = view_at(p);
-	float steep;
-	float3 n = surface_normal(p, P, steep);
+	// (the native zone's and characters' own facing where the light split has it: never too edge on to tell)
+	float steep = 1.0;
+	float3 n;
+	float known_share;
+	const bool known = light_at(p, z, P, n, known_share);
+	if (!known)
+		n = surface_normal(p, P, steep);
 	// A character or monster here (inside one of their capsules, t2): its shadow is worked out once, from its
 	// chest, as if facing the sun, and taken whole at kActorShare of its light (below, and shade_ps). The facing
 	// built from the depth is a facet's on the game's low-poly models: under a canopy it split every face, limb
@@ -2414,7 +2483,9 @@ void sun_ps(float4 pos : SV_Position)
 	}
 	if (on_actor)
 	{
-		whole = saturate(shadow) * kActorShare; // (taken whole: not by the facet's facing)
+		// (taken whole: not by the facet's facing; by the sun's share of their light where the light split has it, so the
+		// side turned from the sun, lit by the rest already, isn't darkened again)
+		whole = saturate(shadow) * (known ? min(known_share * kShareScale, 1.0) : kActorShare);
 		shadow = 0.0;
 	}
 	sun_mask.Store((h.y * size.x + h.x) * 4, uint(saturate(shadow) * 255.0 + 0.5) | (uint(saturate(whole) * 255.0 + 0.5) << 8) |
@@ -2837,8 +2908,8 @@ float4 ps_main(v2p i) : SV_Target
 {
 	int2 p = clamp(int2(i.pos.xy) * int2(zinfo.yz) / int2(ground.yz), int2(0, 0), int2(zinfo.yz) - 1);
 	uint v = zbuf.Load((p.y * zinfo.x + p.x) * 4);
-	float d = zinfo.w == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
-	if (i.pos.z > d + (zinfo.w == 1 ? 1.0 / 16777215.0 : 0.0))
+	float d = (zinfo.w & 15) == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
+	if (i.pos.z > d + ((zinfo.w & 15) == 1 ? 1.0 / 16777215.0 : 0.0))
 		discard;
 	return float4(i.col, 1.0);
 }
@@ -3039,8 +3110,8 @@ float4 firefly_ps(firefly_v2p i) : SV_Target
 	// Behind what the game drew there: hidden
 	int2 q = clamp(int2(i.pos.xy) * int2(zinfo.yz) / int2(ground.yz), int2(0, 0), int2(zinfo.yz) - 1);
 	uint v = zbuf.Load((q.y * zinfo.x + q.x) * 4);
-	float d = zinfo.w == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
-	if (i.pos.z > d + (zinfo.w == 1 ? 1.0 / 16777215.0 : 0.0))
+	float d = (zinfo.w & 15) == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
+	if (i.pos.z > d + ((zinfo.w & 15) == 1 ? 1.0 / 16777215.0 : 0.0))
 		discard;
 	// A small hot core in a soft yellow-green glow, nothing at the sprite's edge
 	float r2 = dot(i.uv, i.uv);
@@ -3158,8 +3229,8 @@ bool behind_drawn(float4 pos)
 {
 	int2 q = clamp(int2(pos.xy) * int2(zinfo.yz) / int2(ground.yz), int2(0, 0), int2(zinfo.yz) - 1);
 	uint v = zbuf.Load((q.y * zinfo.x + q.x) * 4);
-	float d = zinfo.w == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
-	return pos.z > d + (zinfo.w == 1 ? 1.0 / 16777215.0 : 0.0);
+	float d = (zinfo.w & 15) == 1 ? (v & 0xFFFFFF) / 16777215.0 : asfloat(v);
+	return pos.z > d + ((zinfo.w & 15) == 1 ? 1.0 / 16777215.0 : 0.0);
 }
 
 struct rain_v2p
@@ -3603,7 +3674,8 @@ float4 snow_layer_ps(layer_v2p i) : SV_Target
 	float facing = (0.49 + 1.25 * saturate(dot(n, L))) / (0.49 + 1.25 * saturate(dot(world_up, L)));
 	snow = lerp(texel(p), min(snow * clamp(facing, 0.6, 1.35), 1.0), 0.98 * (1.0 - 0.3 * saturate(trodden)));
 	// World FX's shadows and lamps on it, in the game's fog, as the shading pass's on the rest
-	float sunlit = sun_lit_at(p, z, n, i.P, cloud_shadows());
+	float in_sun;
+	float sunlit = sun_lit_at(p, z, n, i.P, cloud_shadows(), -1.0, in_sun);
 	float3 glow = 0.0;
 	[branch] if (((crowd.x >> 16) & 16) != 0)
 		glow = lamp_light(i.P, n, 1.0, snow);
@@ -3949,7 +4021,7 @@ void vis_ps(float4 pos : SV_Position)
 	int2 slo = max(lo, int2(0, 0)), shi = min(hi, size);              // (and within the screen)
 	int2 cell = int2(k % 8, k / 8) * 2;
 	uint passed = 0;
-	if (zinfo.w != 0 && all(shi > slo) && all(phi > plo))
+	if ((zinfo.w & 15) != 0 && all(shi > slo) && all(phi > plo))
 	{
 		int2 share = (16 * (shi - slo)) / (phi - plo);
 		if (all(cell < share))
@@ -3958,7 +4030,7 @@ void vis_ps(float4 pos : SV_Position)
 			int2 p = clamp(int2(at), int2(0, 0), size - 1);
 			int2 q = any(int2(zinfo.yz) != size) ? clamp(p * int2(zinfo.yz) / size, int2(0, 0), int2(zinfo.yz) - 1) : p;
 			uint v = zbuf.Load((q.y * zinfo.x + q.x) * 4);
-			if (zinfo.w == 1)
+			if ((zinfo.w & 15) == 1)
 				passed = uint(saturate(m.x) * 16777215.0 + 0.5) <= (v & 0xFFFFFF) ? 1u : 0u;
 			else
 				passed = m.x <= asfloat(v) ? 1u : 0u;

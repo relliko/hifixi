@@ -30,6 +30,8 @@ namespace hifi::chars::inject
 	// the view depth, 0 where no character is; NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE between frames) and how
 	// many frames it's been drawn in. False when there's none.
 	void set_motion_wanted(bool wanted);
+	// Toward the zone's sun (world; nullptr: not known), for the light split's share of the sun (light_split.hpp)
+	void set_sun(const float *toward);
 	bool motion(ID3D12Resource *&texture, uint64_t &frames);
 	std::vector<std::string> status();
 

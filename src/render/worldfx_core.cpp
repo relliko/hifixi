@@ -117,6 +117,8 @@ namespace
 		grass::renderer::zone_bounds_fn zone_bounds = nullptr;
 		grass::renderer::zone_draw_fn zone_draw = nullptr;
 		void *zone_casters_context = nullptr;
+		grass::renderer::light_fn light = nullptr;
+		void *light_context = nullptr;
 		// The camera of the frame being finished, from the host (set_camera_source), else the game's camera read now
 		worldfx::camera_source_fn camera_source = nullptr;
 		void *camera_source_context = nullptr;
@@ -2344,6 +2346,9 @@ static std::string crash_context()
 	out += line;
 	std::snprintf(line, sizeof(line), "  sun shadow map: %s (%s), drawn again %u times\n", g.look.sun_map ? "on" : "off", g.shadow_status.c_str(), g.sun_map_redraws);
 	out += line;
+	std::snprintf(line, sizeof(line), "  light split (the native zone's and characters' facing and sun share): %s\n",
+		g.light == nullptr ? "no host" : g.last.light_split ? "read in the last drawing" : "not in the last drawing");
+	out += line;
 	std::snprintf(line, sizeof(line), "  sea: %s (%s), to %.0f yalms, %u corners last drawn\n", g.look.sea ? "on" : "off", g.sea_status.c_str(), g.look.sea_distance,
 		g.last.sea_corners);
 	out += line;
@@ -2546,6 +2551,15 @@ namespace worldfx
 			g.renderer->set_zone_casters(bounds, draw, context);
 	}
 
+	void set_light_source(grass::renderer::light_fn fn, void *context)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.light = fn;
+		g.light_context = context;
+		if (g.renderer != nullptr)
+			g.renderer->set_light_source(fn, context);
+	}
+
 	void attach(ID3D12Device *device)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
@@ -2556,6 +2570,7 @@ namespace worldfx
 		g.renderer = std::make_unique<grass::renderer>();
 		g.renderer->set_casters(g.casters, g.casters_context);
 		g.renderer->set_zone_casters(g.zone_bounds, g.zone_draw, g.zone_casters_context);
+		g.renderer->set_light_source(g.light, g.light_context);
 		g.shader_stamp = 0; // (a new renderer starts from the built-in shaders: worldfx.hlsl is loaded again)
 		g.shader_status = "built in";
 		g.error.clear();
@@ -3668,6 +3683,7 @@ static void status_lines(const worldfx::ui &u)
 		text(u, "The game's light: %s; from the hour: %s", game, hour);
 	}
 	text(u, "Shadow map: %s; %s, drawn again %u times", g.shadow_status.c_str(), g.last.sun_map ? "in use" : "not in use", g.sun_map_redraws);
+	text(u, "Light from the native zone and characters: %s", g.light == nullptr ? "none" : g.last.light_split ? "in use" : "not in use");
 	if (weather_fresh())
 		text_wrapped(u, "Weather: %s", weather_text().c_str());
 	else

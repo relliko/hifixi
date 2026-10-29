@@ -56,11 +56,14 @@ namespace hifi::chars
 		float offset = 0.5f; // (dgVoodoo's half-pixel for Direct3D 8's pixel centres)
 		D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = {}; // (the opaque models' motion target, or none)
 		DXGI_FORMAT motion_format = DXGI_FORMAT_UNKNOWN;
+		D3D12_CPU_DESCRIPTOR_HANDLE light_rtv = {};  // (the opaque models' light split: light_split.hpp; or none)
 	};
 
 	struct char_options
 	{
 		bool per_pixel = false;
+		bool sun_known = false; // sun: toward the zone's sun (world), for the light split's share
+		float sun[3] = {};
 	};
 
 	struct char_stats
@@ -107,6 +110,7 @@ namespace hifi::chars
 		ID3D12RootSignature *_root = nullptr;
 		void *_vs = nullptr, *_ps = nullptr, *_cvs = nullptr, *_cps = nullptr, *_cps_ms = nullptr, *_sps = nullptr; // (ID3DBlob)
 		void *_ps_motion = nullptr; // (ID3DBlob: the model's pixel shader with its motion as well)
+		void *_ps_light = nullptr, *_ps_light_motion = nullptr; // (... with the light split; with both)
 		ID3D12RootSignature *_en_root = nullptr; // (the en-spells': 32 constants, the palette, the mesh)
 		void *_en_svs = nullptr, *_en_sps = nullptr, *_en_pvs = nullptr, *_en_pps = nullptr; // (ID3DBlob: shell, sprites)
 		ID3D12PipelineState *_shadow_pso = nullptr; // (depth only, D32: made in init, not under the injection's mutex)

@@ -541,6 +541,7 @@ namespace grass
 		uint32_t sun_map_triangles = 0; // triangles drawn into them
 		bool casters = false;           // the host's casters drew into their map, read with it (set_casters)
 		bool sun_map_host = false;      // the cascades are the host's zone casters' (set_zone_casters), not the uploaded meshes'
+		bool light_split = false;       // the host's light split was copied after the depth, read by the passes (set_light_source)
 		uint32_t water_corners = 0; // of the water drawn (the water, or the debug view)
 		uint32_t sea_corners = 0;   // of the sea's sheets drawn
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
@@ -715,6 +716,17 @@ namespace grass
 			_zone_draw = draw;
 			_zone_casters_context = context;
 		}
+		// The light split the host draws (HiFi XI: src/zone/light_split.hpp): each pixel's view depth, facing and the sun's
+		// share of its light, a uint each (R32_UINT, the world's size, one sample), from what it drew itself. Called once a
+		// frame, by the pass that shades (not the blades' at the zone's end), before the depth is copied: the texture written
+		// since the last call, in NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE (left so), or nullptr. It's copied after
+		// the depth (grass.hlsl light_at). nullptr: none.
+		using light_fn = ID3D12Resource *(*)(void *context);
+		void set_light_source(light_fn fn, void *context)
+		{
+			_light = fn;
+			_light_context = context;
+		}
 		// Forgets the clouds' last picture: the next frame marches every pixel of it again (as after a weather jump)
 		void forget_clouds() { _cloud_known = false; }
 		// Forgets the ground colours seen so far (each blade point remembers its own, see the shader)
@@ -766,7 +778,8 @@ namespace grass
 		enum class fall { rain, splash, snow, leaf };
 		ID3D12PipelineState *rain_pipeline_for(const target &t, fall kind, std::string &error);
 		bool rain_window_for(const float eye[3], bool &moved, std::string &error);
-		uint32_t copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state);
+		uint32_t copy_out(ID3D12GraphicsCommandList *list, copy &c, ID3D12Resource *res, D3D12_RESOURCE_STATES state, ID3D12Resource *extra = nullptr,
+			bool *extra_copied = nullptr);
 		bool blade_depth_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
 		bool world_rtv_for(const target &t, D3D12_CPU_DESCRIPTOR_HANDLE &rtv, std::string &error);
 		bool world_dsv_for(const target &t, D3D12_CPU_DESCRIPTOR_HANDLE &dsv, std::string &error);
@@ -904,6 +917,9 @@ namespace grass
 		zone_bounds_fn _zone_bounds = nullptr;
 		zone_draw_fn _zone_draw = nullptr;
 		void *_zone_casters_context = nullptr;
+		// The host's light split (set_light_source)
+		light_fn _light = nullptr;
+		void *_light_context = nullptr;
 		uint64_t _map_source = 0;
 		float _map_lo[3] = {}, _map_hi[3] = {};
 		bool _map_bounds = false;

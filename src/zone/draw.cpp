@@ -6,15 +6,18 @@
  *   4  SRV t2      the frame's objects (80 bytes)        5  SRV t3  its lamps (32 bytes)
  *   6  table t4    the piece's texture                   7  table t5  its normal map
  *   s0             linear, wrapping (the zone pass draws without mips: MIPFILTER NONE)
- * Pipelines are made as targets of new formats or sample counts come, one for each (blended, cull, door) set.
+ * Pipelines are made as targets of new formats or sample counts come, one for each (blended, cull, door) set, and with
+ * the light split as a second target when it's given (light_split.hpp; blended pieces leave it as it is).
  */
 
 #include <windows.h>
 #include <d3dcompiler.h>
 #include "draw.hpp"
+#include "light_split.hpp"
 #include "zone_gpu.hpp"
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 namespace hifi::zone
 {
@@ -117,6 +120,8 @@ struct v2p
 	float fog : TEXCOORD3;
 	float3 world : TEXCOORD4;
 	float3 normal : TEXCOORD5;
+	float depth : TEXCOORD6;     // the view depth (the light split's)
+	float share : TEXCOORD7;     // fixed-function: the sun's share of lit (light_share)
 };
 
 v2p vs(uint vid : SV_VertexID)
@@ -137,10 +142,12 @@ v2p vs(uint vid : SV_VertexID)
 	r.uv = v.uv;
 	r.world = world;
 	r.normal = n;
+	r.depth = r.pos.w;
 	r.vcol = unpack(v.colour);
 	const float3 lamp_rgb = lamp_light(o, world, n);
 	r.lamps = r.vcol.rgb * lamp_rgb;
 	r.light_ts = 0;
+	r.share = 0;
 	if ((piece & kBump) != 0)
 	{
 		// 170B30: per triangle, D = (p2 - p1)(u0 - u1) - (p0 - p1)(u2 - u1), the direction u is constant along, the
@@ -155,11 +162,16 @@ v2p vs(uint vid : SV_VertexID)
 		r.lit = r.vcol;
 	}
 	else
-		r.lit = float4(saturate(r.vcol.rgb * (e.sun.rgb * max(0, dot(n, e.sun_dir.xyz)) + e.ambient.rgb) + r.lamps), r.vcol.a);
+	{
+		const float3 rest = r.vcol.rgb * e.ambient.rgb + r.lamps;
+		r.lit = float4(saturate(r.vcol.rgb * e.sun.rgb * max(0, dot(n, e.sun_dir.xyz)) + rest), r.vcol.a);
+		r.share = light_share(r.lit.rgb, saturate(rest));
+	}
 	return r;
 }
 
-float4 ps(v2p i) : SV_Target
+// The piece's colour; share: the sun's share of its light (light_share)
+float4 shade(v2p i, out float share)
 {
 	const float4 t = colour_map.Sample(wrap, i.uv);
 	const float a = saturate(4 * t.a * i.vcol.a);
@@ -188,7 +200,9 @@ float4 ps(v2p i) : SV_Target
 		}
 		n *= scale;
 		const float3 s_rgb = bump ? e.sun_bump.rgb : e.sun.rgb, a_rgb = bump ? e.ambient_bump.rgb : e.ambient.rgb;
-		lit = saturate(i.vcol.rgb * (s_rgb * saturate(dot(n, e.sun_dir.xyz)) + a_rgb) + i.vcol.rgb * lamp_light(objects[object_index], i.world, n));
+		const float3 rest = i.vcol.rgb * a_rgb + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
+		lit = saturate(i.vcol.rgb * s_rgb * saturate(dot(n, e.sun_dir.xyz)) + rest);
+		share = light_share(lit, saturate(rest));
 	}
 	else if (bump)
 	{
@@ -196,14 +210,38 @@ float4 ps(v2p i) : SV_Target
 		// (ps.1.1: texcoord t2 and t3, the sun and the ambient plus lamps each times the vertex colour, clamp to 0..1)
 		const float3 t2 = saturate(i.vcol.rgb * e.sun_bump.rgb), t3 = saturate(i.vcol.rgb * e.ambient_bump.rgb + i.lamps);
 		lit = saturate(t2 * saturate(dot(m, i.light_ts)) + t3);
+		share = light_share(lit, t3);
 	}
 	else
+	{
 		lit = i.lit.rgb;
+		share = i.share;
+	}
 	// (the world's alpha 1 of 255 marks a name facelift drew, left unshaded by World FX (grass.hlsl name_at): a solid
 	// piece writes at least 2 instead, so the band where a ground layer's vertex alpha fades out doesn't come out 1 (Valkurm's
 	// sand outlined in lines, 2026-10-27); a blended one keeps its own (it's also its colour's share), and blended over 2 or
 	// more its result stays over 1.99)
 	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
+}
+float4 ps(v2p i) : SV_Target
+{
+	float share;
+	return shade(i, share);
+}
+// (with the light split as well: light_split.hpp; the mesh's own facing, turned toward the camera)
+struct light_out
+{
+	float4 colour : SV_Target0;
+	uint light : SV_Target1;
+};
+light_out ps_light(v2p i)
+{
+	light_out o;
+	float share;
+	o.colour = shade(i, share);
+	const float3 n = i.normal;
+	o.light = light_word(i.depth, dot(n, options.yzw - i.world) < 0 ? -n : n, share);
+	return o;
 }
 )";
 
@@ -275,7 +313,9 @@ float4 ps(v2p i) : SV_Target
 			static_cast<ID3DBlob *>(_vs)->Release();
 		if (_ps != nullptr)
 			static_cast<ID3DBlob *>(_ps)->Release();
-		_vs = _ps = nullptr;
+		if (_ps_light != nullptr)
+			static_cast<ID3DBlob *>(_ps_light)->Release();
+		_vs = _ps = _ps_light = nullptr;
 		_device = nullptr;
 	}
 
@@ -291,10 +331,11 @@ float4 ps(v2p i) : SV_Target
 			why = "d3dcompiler_47.dll isn't there";
 			return false;
 		}
-		for (int k = 0; k < 2; ++k)
+		const std::string source = std::string(light::kHlsl) + kShader;
+		for (int k = 0; k < 3; ++k)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
-			if (FAILED(compile(kShader, std::strlen(kShader), "hifixi_zone", nullptr, nullptr, k == 0 ? "vs" : "ps", k == 0 ? "vs_5_0" : "ps_5_0",
+			if (FAILED(compile(source.data(), source.size(), "hifixi_zone", nullptr, nullptr, k == 0 ? "vs" : k == 1 ? "ps" : "ps_light", k == 0 ? "vs_5_0" : "ps_5_0",
 					D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the zone shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
@@ -305,7 +346,7 @@ float4 ps(v2p i) : SV_Target
 			}
 			if (errors != nullptr)
 				errors->Release();
-			(k == 0 ? _vs : _ps) = code;
+			(k == 0 ? _vs : k == 1 ? _ps : _ps_light) = code;
 		}
 
 		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5 } };
@@ -371,18 +412,27 @@ float4 ps(v2p i) : SV_Target
 
 	ID3D12PipelineState *zone_renderer::pipeline(const draw_target &t, bool blended, int cull, bool door)
 	{
+		const bool light = t.light_rtv.ptr != 0;
 		const uint64_t key = uint64_t(t.rtv_format) | uint64_t(t.dsv_format) << 8 | uint64_t(t.samples) << 16 | uint64_t(blended) << 24 | uint64_t(cull) << 25 |
-			uint64_t(door) << 27;
+			uint64_t(door) << 27 | uint64_t(light) << 28;
 		const auto known = _pipelines.find(key);
 		if (known != _pipelines.end())
 			return known->second;
+		ID3DBlob *const ps = static_cast<ID3DBlob *>(light ? _ps_light : _ps);
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 		d.pRootSignature = _root;
 		d.VS = { static_cast<ID3DBlob *>(_vs)->GetBufferPointer(), static_cast<ID3DBlob *>(_vs)->GetBufferSize() };
-		d.PS = { static_cast<ID3DBlob *>(_ps)->GetBufferPointer(), static_cast<ID3DBlob *>(_ps)->GetBufferSize() };
+		d.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
 		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-		d.NumRenderTargets = 1;
+		d.NumRenderTargets = light ? 2 : 1;
 		d.RTVFormats[0] = t.rtv_format;
+		if (light)
+		{
+			d.RTVFormats[1] = light::kFormat;
+			d.BlendState.IndependentBlendEnable = TRUE;
+			// (a blended piece's colour goes over what's there; the light split keeps the surface under it)
+			d.BlendState.RenderTarget[1].RenderTargetWriteMask = blended ? 0 : D3D12_COLOR_WRITE_ENABLE_ALL;
+		}
 		d.DSVFormat = t.dsv_format;
 		d.SampleDesc.Count = t.samples;
 		d.SampleMask = UINT_MAX;
@@ -470,7 +520,8 @@ float4 ps(v2p i) : SV_Target
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
 
 		// Targets, heaps, root
-		list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { t.rtv, t.light_rtv };
+		list->OMSetRenderTargets(t.light_rtv.ptr != 0 ? 2 : 1, rtvs, FALSE, &t.dsv);
 		const D3D12_VIEWPORT vp = { t.offset, t.offset, t.width, t.height, 0.0f, 1.0f };
 		const D3D12_RECT sc = { 0, 0, LONG(t.width), LONG(t.height) };
 		list->RSSetViewports(1, &vp);

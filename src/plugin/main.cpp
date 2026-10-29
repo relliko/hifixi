@@ -72,6 +72,7 @@
 #include "../chars/charoptions.hpp"   // (native characters)
 #include "../zone/zoneoptions.hpp"
 #include "../zone/inject.hpp"
+#include "../zone/light_split.hpp"
 #include "../zone/native.hpp"
 #include "../upscale/upscale.hpp"
 #include "../upscale/masks.hpp"
@@ -560,6 +561,12 @@ class hifixi final : public IPlugin
 			}
 		}
 		hifi::chars::inject::set_options(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault));
+		// (the zone's sun, for the light split's share of their light: the zone pass's of the last quarter second)
+		{
+			hifi::zone::inject::frame_camera c;
+			const bool known = hifi::zone::inject::last_camera(c) && GetTickCount64() - c.at <= 250;
+			hifi::chars::inject::set_sun(known ? c.sun_dir : nullptr);
+		}
 		// (their sun shadows from their meshes: World FX calls for them in its shading pass, once its renderer is up)
 		if (!m_casters_set && hifi::chars::inject::ready())
 		{
@@ -581,6 +588,8 @@ class hifixi final : public IPlugin
 		{
 			worldfx::set_zone_casters(hifi::zone::inject::zone_bounds_hook(), hifi::zone::inject::zone_draw_hook(), nullptr);
 			worldfx::set_camera_source(frame_camera, nullptr);
+			// (and the light split the zone and characters draw: World FX takes it in its shading pass)
+			worldfx::set_light_source([](void *) { return hifi::light::take(); }, nullptr);
 			m_zone_casters_set = true;
 		}
 		ID3D12Device *const device = worldfx::attached();

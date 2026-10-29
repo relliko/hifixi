@@ -35,6 +35,7 @@ namespace hifi::zone
 		UINT samples = 1;
 		float width = 0.0f, height = 0.0f;
 		float offset = 0.5f; // (the viewport's corner: dgVoodoo's half-pixel for Direct3D 8's pixel centres)
+		D3D12_CPU_DESCRIPTOR_HANDLE light_rtv = {}; // the light split's (light_split.hpp), as the second target; 0: none
 	};
 
 	struct draw_options
@@ -69,7 +70,7 @@ namespace hifi::zone
 
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
-		void *_vs = nullptr, *_ps = nullptr; // (ID3DBlob)
+		void *_vs = nullptr, *_ps = nullptr, *_ps_light = nullptr; // (ID3DBlob)
 		ID3D12Resource *_ring = nullptr;     // upload: kFrames slots of constants, objects, lamps
 		uint8_t *_mapped = nullptr;
 		std::unordered_map<uint64_t, ID3D12PipelineState *> _pipelines;

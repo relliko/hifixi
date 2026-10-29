@@ -9,6 +9,7 @@
 #include "inject.hpp"
 #include "draw.hpp"
 #include "frame.hpp"
+#include "light_split.hpp"
 #include "zone_gpu.hpp"
 #include "zoneshadow.hpp"
 #include <algorithm>
@@ -183,6 +184,7 @@ namespace hifi::zone::inject
 
 	void release()
 	{
+		light::release(); // (both passes' target: let go with either)
 		std::unique_ptr<zone_renderer> old;
 		std::unique_ptr<zone_shadow> old_shadow;
 		ID3D12DescriptorHeap *old_rtv = nullptr, *old_dsv = nullptr;
@@ -323,6 +325,7 @@ namespace hifi::zone::inject
 			std::memcpy(g.camera.proj, f->proj, sizeof(g.camera.proj));
 			g.camera.jitter[0] = f->jitter[0];
 			g.camera.jitter[1] = f->jitter[1];
+			std::memcpy(g.camera.sun_dir, f->sun_dir, sizeof(g.camera.sun_dir));
 			g.camera.seq = f->seq.load(std::memory_order_acquire);
 			g.camera.at = GetTickCount64();
 			g.have_camera = true;
@@ -363,7 +366,11 @@ namespace hifi::zone::inject
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		// (the light split as well, while World FX reads it: light_split.hpp)
+		const bool lit = light::begin(list, g.device, w.rt, t.light_rtv);
 		g.last = g.renderer->record(list, t, *f, o, ++g.frame_number);
+		if (lit)
+			light::end(list);
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
 		barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
 		barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);

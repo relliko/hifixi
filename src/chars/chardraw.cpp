@@ -13,9 +13,11 @@
 #include <d3dcompiler.h>
 #include "chardraw.hpp"
 #include "cache.hpp"
+#include "../zone/light_split.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 
 
 namespace hifi::chars
@@ -29,6 +31,7 @@ cbuffer frame_constants : register(b0)
 	float4 fog;          // rgb; w: 1 / (end - start), 0 for none
 	float4 fog_end;      // x: end
 	float4 options;      // x: per-pixel lighting; y: the frame's models
+	float4 sun_dir;      // toward the zone's sun (world), w: 1 when it's known (the light split's share: which light is it)
 };
 cbuffer draw_constants : register(b1)
 {
@@ -86,16 +89,21 @@ float3 flip(uint axis)
 	return float3(axis == 1 ? -1 : 1, axis == 2 ? -1 : 1, axis == 3 ? -1 : 1);
 }
 
-// Direct3D 8's fixed-function colour for a normal (the game's states: directional lights, no specular, no emissive)
-float4 lit(model_t m, float3 n)
+// Direct3D 8's fixed-function colour for a normal (the game's states: directional lights, no specular, no emissive); share:
+// the sun's share of it (light_share), the sun being the light that comes from the zone's sun (the game eases an actor's
+// sun toward it: within about 10 degrees; a lamp is turned into a light from the lamp)
+float4 lit(model_t m, float3 n, out float share)
 {
-	float3 diffuse = 0, light_ambient = 0;
+	float3 diffuse = 0, light_ambient = 0, sun = 0;
 	[unroll] for (int k = 0; k < 4; ++k)
 	{
-		diffuse += m.light_dir[k].w * m.light_diffuse[k].rgb * light_scale * max(0, dot(n, m.light_dir[k].xyz));
+		const float3 d = m.light_dir[k].w * m.light_diffuse[k].rgb * light_scale * max(0, dot(n, m.light_dir[k].xyz));
+		diffuse += d;
+		sun += sun_dir.w > 0 && dot(m.light_dir[k].xyz, sun_dir.xyz) > 0.985 ? d : 0;
 		light_ambient += m.light_dir[k].w * m.light_ambient[k].rgb;
 	}
 	const float3 c = m.material_ambient.rgb * (m.ambient.rgb * light_scale + light_ambient) + kMaterialDiffuse * diffuse;
+	share = light_share(saturate(c), saturate(c - kMaterialDiffuse * sun));
 	return float4(saturate(c), kMaterialDiffuse);
 }
 
@@ -106,6 +114,7 @@ struct v2p
 	float2 uv : TEXCOORD0;
 	float fog : TEXCOORD1;
 	float3 normal : TEXCOORD2;
+	float share : TEXCOORD4;    // the sun's share of colour (lit)
 	float4 motion : TEXCOORD3; // xyz the move since the last frame (world), w the view depth
 };
 
@@ -131,15 +140,16 @@ v2p vs(uint vid : SV_VertexID)
 	r.fog = f.w > 0 ? saturate((e - r.pos.w) * f.w) : 1;
 	r.uv = c.uv;
 	r.normal = nn;
-	r.colour = lit(models[min(model_index, (uint)options.y - 1)], nn);
+	r.colour = lit(models[min(model_index, (uint)options.y - 1)], nn, r.share);
 	return r;
 }
 
-float4 shade(v2p i)
+float4 shade(v2p i, out float share)
 {
 	const model_t m = models[min(model_index, (uint)options.y - 1)];
 	const float4 t = colour_map.Sample(clamp_linear, i.uv);
-	const float4 colour = options.x > 0 ? lit(m, normalize(i.normal)) : i.colour;
+	share = i.share;
+	const float4 colour = options.x > 0 ? lit(m, normalize(i.normal), share) : i.colour;
 	const float3 s0 = saturate(2 * t.rgb * colour.rgb);
 	const float a0 = saturate(2 * t.a * m.tfactor.a);
 	float3 rgb;
@@ -162,7 +172,8 @@ float4 shade(v2p i)
 }
 float4 ps(v2p i) : SV_Target
 {
-	return shade(i);
+	float share;
+	return shade(i, share);
 }
 // (with the motion target as well: the motion of what's drawn there)
 struct motion_out
@@ -173,7 +184,37 @@ struct motion_out
 motion_out ps_motion(v2p i)
 {
 	motion_out o;
-	o.colour = shade(i);
+	float share;
+	o.colour = shade(i, share);
+	o.motion = i.motion;
+	return o;
+}
+// (with the light split as well (light_split.hpp), and the motion after it)
+struct light_out
+{
+	float4 colour : SV_Target0;
+	uint light : SV_Target1;
+};
+light_out ps_light(v2p i)
+{
+	light_out o;
+	float share;
+	o.colour = shade(i, share);
+	o.light = light_word(i.motion.w, i.normal, share);
+	return o;
+}
+struct light_motion_out
+{
+	float4 colour : SV_Target0;
+	uint light : SV_Target1;
+	float4 motion : SV_Target2;
+};
+light_motion_out ps_light_motion(v2p i)
+{
+	light_motion_out o;
+	float share;
+	o.colour = shade(i, share);
+	o.light = light_word(i.motion.w, i.normal, share);
 	o.motion = i.motion;
 	return o;
 }
@@ -962,6 +1003,7 @@ float4 pps(p2p i) : SV_Target
 			float fog[4];
 			float fog_end[4];
 			float options[4];
+			float sun_dir[4];
 		};
 		static_assert(sizeof(gpu_constants) <= kConstantsBytes);
 		// (a slot: the frame's draw's constants and models, then its shadow's: record_casters may come while the GPU has yet
@@ -1033,6 +1075,8 @@ float4 pps(p2p i) : SV_Target
 			kEnShell = 2,
 			kEnSprites = 3,
 			kModelMotion = 4, // (the model with the motion target)
+			kModelLight = 5,  // (... with the light split's: light_split.hpp)
+			kModelLightMotion = 6, // (... with both: the light split second, the motion third)
 		};
 
 		struct en_constants
@@ -1067,7 +1111,7 @@ float4 pps(p2p i) : SV_Target
 		drop(_ring);
 		drop(_root);
 		drop(_en_root);
-		for (void **b : { &_vs, &_ps, &_ps_motion, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps })
+		for (void **b : { &_vs, &_ps, &_ps_motion, &_ps_light, &_ps_light_motion, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps })
 		{
 			if (*b != nullptr)
 				static_cast<ID3DBlob *>(*b)->Release();
@@ -1093,14 +1137,14 @@ float4 pps(p2p i) : SV_Target
 			const char *name, *target;
 			void **out;
 		};
-		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "ps_motion", "ps_5_0", &_ps_motion }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps },
+		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "ps_motion", "ps_5_0", &_ps_motion }, { "ps_light", "ps_5_0", &_ps_light }, { "ps_light_motion", "ps_5_0", &_ps_light_motion }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps },
 			{ "svs", "vs_5_0", &_en_svs }, { "sps", "ps_5_0", &_en_sps }, { "pvs", "vs_5_0", &_en_pvs }, { "pps", "ps_5_0", &_en_pps } };
 		for (const entry &e : entries)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
 			const bool en = e.out == &_en_svs || e.out == &_en_sps || e.out == &_en_pvs || e.out == &_en_pps;
-			const char *const src = en ? kEnShader : kShader;
-			if (FAILED(compile(src, std::strlen(src), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+			const std::string src = en ? std::string(kEnShader) : std::string(light::kHlsl) + kShader;
+			if (FAILED(compile(src.data(), src.size(), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the character shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)
@@ -1227,24 +1271,28 @@ float4 pps(p2p i) : SV_Target
 
 	ID3D12PipelineState *char_renderer::pipeline(const char_target &t, int k)
 	{
+		const bool model = k == kModel || k == kModelMotion || k == kModelLight || k == kModelLightMotion;
+		const bool motion = k == kModelMotion || k == kModelLightMotion, light = k == kModelLight || k == kModelLightMotion;
 		const uint64_t key = uint64_t(t.rtv_format) | uint64_t(t.dsv_format) << 8 | uint64_t(t.samples) << 16 | uint64_t(k) << 24 |
-			(k == kModelMotion ? uint64_t(t.motion_format) << 32 : 0);
+			(motion ? uint64_t(t.motion_format) << 32 : 0);
 		const auto known = _pipelines.find(key);
 		if (known != _pipelines.end())
 			return known->second;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 		const bool en = k == kEnShell || k == kEnSprites;
 		d.pRootSignature = en ? _en_root : _root;
-		ID3DBlob *const vs = static_cast<ID3DBlob *>(k == kModel || k == kModelMotion ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
-		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : k == kModelMotion ? _ps_motion : k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps :
-			t.samples > 1 ? _cps_ms : _cps);
+		ID3DBlob *const vs = static_cast<ID3DBlob *>(model ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
+		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : k == kModelMotion ? _ps_motion : k == kModelLight ? _ps_light : k == kModelLightMotion ? _ps_light_motion :
+			k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps : t.samples > 1 ? _cps_ms : _cps);
 		d.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
 		d.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
 		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-		d.NumRenderTargets = k == kModelMotion ? 2 : 1;
+		d.NumRenderTargets = 1 + (light ? 1 : 0) + (motion ? 1 : 0);
 		d.RTVFormats[0] = t.rtv_format;
-		if (k == kModelMotion)
-			d.RTVFormats[1] = t.motion_format;
+		if (light)
+			d.RTVFormats[1] = light::kFormat;
+		if (motion)
+			d.RTVFormats[light ? 2 : 1] = t.motion_format;
 		d.SampleDesc.Count = t.samples;
 		d.SampleMask = UINT_MAX;
 		d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1253,9 +1301,10 @@ float4 pps(p2p i) : SV_Target
 		d.RasterizerState.MultisampleEnable = t.samples > 1;
 		D3D12_RENDER_TARGET_BLEND_DESC &b = d.BlendState.RenderTarget[0];
 		b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-		if (k == kModel || k == kModelMotion)
+		if (model)
 		{
 			d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			d.BlendState.RenderTarget[2].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 			d.DSVFormat = t.dsv_format;
 			d.DepthStencilState.DepthEnable = TRUE;
 			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -1306,6 +1355,11 @@ float4 pps(p2p i) : SV_Target
 		c.fog_end[0] = f.fog_end;
 		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
 		c.options[1] = float(std::min(f.models, kMaxModels));
+		if (o.sun_known)
+		{
+			std::memcpy(c.sun_dir, o.sun, 12);
+			c.sun_dir[3] = 1.0f;
+		}
 		std::memcpy(_mapped + slot, &c, sizeof(c));
 		gpu_model *gm = reinterpret_cast<gpu_model *>(_mapped + slot + kModelsAt);
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
@@ -1316,15 +1370,15 @@ float4 pps(p2p i) : SV_Target
 	bool char_renderer::begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o)
 	{
 		ID3D12DescriptorHeap *const heap = cache::heap();
-		const bool motion = t.motion_rtv.ptr != 0 && t.samples == 1;
-		ID3D12PipelineState *const pso = pipeline(t, motion ? kModelMotion : kModel);
+		const bool motion = t.motion_rtv.ptr != 0 && t.samples == 1, light = t.light_rtv.ptr != 0 && t.samples == 1;
+		ID3D12PipelineState *const pso = pipeline(t, light ? (motion ? kModelLightMotion : kModelLight) : motion ? kModelMotion : kModel);
 		if (_root == nullptr || heap == nullptr || pso == nullptr || !f.camera || f.models == 0)
 			return false;
 		// The frame's constants (rewritten for each draw of the frame: the same values) and its models'
 		const D3D12_GPU_VIRTUAL_ADDRESS base = write_frame(f, o, f.view_proj, 0);
 
-		const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { t.rtv, t.motion_rtv };
-		list->OMSetRenderTargets(motion ? 2 : 1, rtvs, FALSE, &t.dsv);
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3] = { t.rtv, light ? t.light_rtv : t.motion_rtv, t.motion_rtv };
+		list->OMSetRenderTargets(1 + (light ? 1 : 0) + (motion ? 1 : 0), rtvs, FALSE, &t.dsv);
 		const D3D12_VIEWPORT vp = { t.offset, t.offset, t.width, t.height, 0.0f, 1.0f };
 		const D3D12_RECT sc = { 0, 0, LONG(t.width), LONG(t.height) };
 		list->RSSetViewports(1, &vp);
