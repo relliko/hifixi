@@ -512,7 +512,16 @@ namespace hifi::framegen
 		}
 		// (outside every lock: turning it on or off waits for the presents in flight, whose DXGI work goes through
 		// HiFi XI's hooks and generate())
+		const ULONGLONG asked = GetTickCount64();
 		const FfxErrorCode e = ffxSetFrameGenerationConfigToSwapchainDX12(&c);
+		// (in HiFi XI's log each time, with how long the game's thread waited on it: a hang to find)
+		if (g.log != nullptr)
+		{
+			char text[160];
+			std::snprintf(text, sizeof(text), "HiFi XI: frame generation turned %s%s (the game's thread waited %llu ms)", c.frameGenerationEnabled ? "on" : "off",
+				c.frameGenerationEnabled ? "" : " (no FSR 2 frames for a second, or the setting off)", GetTickCount64() - asked);
+			g.log(GetTickCount64() - asked > 250 ? 1 : 0, text);
+		}
 		if (e != FFX_OK)
 		{
 			std::lock_guard<std::mutex> lock(gen.mutex);
