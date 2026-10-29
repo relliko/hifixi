@@ -1,6 +1,6 @@
 /*
  * Frame generation's swap chain (src/framegen), offline on WARP with the debug layer, as dgVoodoo would ask for its own:
- *   - with HIFIXI_FRAMEGEN unset, nothing is changed: a swap chain is DXGI's;
+ *   - with the setting off at the start, nothing is changed: a swap chain is DXGI's;
  *   - with it set, a window's 1280x720 FLIP_DISCARD swap chain made on a Direct3D 12 queue comes back as AMD's frame
  *     interpolation swap chain (and a 1x1 one, dgVoodoo's probe, as DXGI's);
  *   - through it, as dgVoodoo draws: each back buffer cleared to its own colour and presented, 60 times; resized to
@@ -78,9 +78,9 @@ int main()
 	const auto create_factory1 = reinterpret_cast<create_factory_fn>(GetProcAddress(LoadLibraryW(L"dxgi.dll"), "CreateDXGIFactory1"));
 
 	// Not wanted: nothing changed
-	SetEnvironmentVariableA("HIFIXI_FRAMEGEN", nullptr);
+	hifi::framegen::set_wanted(false);
 	std::string why;
-	check(!hifi::framegen::wanted() && hifi::framegen::install(reinterpret_cast<void *>(create_factory1), why), "HIFIXI_FRAMEGEN unset: nothing put in");
+	check(!hifi::framegen::wanted() && hifi::framegen::install(reinterpret_cast<void *>(create_factory1), why), "the setting off: nothing put in");
 
 	ID3D12Debug *debug = nullptr;
 	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
@@ -126,14 +126,14 @@ int main()
 	{
 		IDXGISwapChain1 *plain = nullptr;
 		factory->CreateSwapChainForHwnd(queue, hwnd, &sd, nullptr, nullptr, &plain);
-		check(plain != nullptr && hifi::framegen::status()[0].find("not in") != std::string::npos, "unset: the swap chain is DXGI's");
+		check(plain != nullptr && hifi::framegen::status()[0].find("off (Game tab") != std::string::npos, "the setting off: the swap chain is DXGI's");
 		if (plain != nullptr)
 			plain->Release();
 	}
 
 	// Wanted: the factory's calls through ours
-	SetEnvironmentVariableA("HIFIXI_FRAMEGEN", "1");
-	check(hifi::framegen::wanted() && hifi::framegen::install(reinterpret_cast<void *>(create_factory1), why), "HIFIXI_FRAMEGEN=1: the factory's swap chain calls through ours" + (why.empty() ? "" : ": " + why));
+	hifi::framegen::set_wanted(true);
+	check(hifi::framegen::wanted() && hifi::framegen::install(reinterpret_cast<void *>(create_factory1), why), "the setting on: the factory's swap chain calls through ours" + (why.empty() ? "" : ": " + why));
 	{
 		HWND tiny = make_window(64, 64);
 		DXGI_SWAP_CHAIN_DESC1 td = sd;
@@ -416,6 +416,22 @@ int main()
 		run(20, 1280, 720, false, prepared, presented);
 		const counts back = counted();
 		check(back.switches == 3 && back.made - c.made >= 18 && back.failed == 0, "FSR 2 back: generation on again (" + std::to_string(back.made - c.made) + " made between)");
+	}
+	// The setting turned off while it runs, then on again: off at once (each frame shown once, nothing prepared), on
+	// again at once
+	{
+		hifi::framegen::set_on(false);
+		const counts before = counted();
+		const UINT shown_before = real_presents();
+		run(20, 1280, 720, false, prepared, presented);
+		const counts off = counted();
+		const UINT shown = real_presents() - shown_before;
+		check(prepared == 0 && off.made == before.made && off.switches == before.switches + 1 && shown >= 19 && shown <= 21 &&
+			off.line.find("turned off") != std::string::npos, "the setting off: at once, each frame shown once (" + std::to_string(shown) + " for 20)");
+		hifi::framegen::set_on(true);
+		run(20, 1280, 720, false, prepared, presented);
+		const counts on = counted();
+		check(prepared == 20 && on.made - off.made >= 18 && on.switches == off.switches + 1, "the setting on again: at once (" + std::to_string(on.made - off.made) + " made between)");
 	}
 
 	const uint32_t errors = debug_messages(info, why);

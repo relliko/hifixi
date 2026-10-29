@@ -264,6 +264,12 @@ namespace hifi::settings
 			{ "upscale.sharpen", tab::game, "Upscaling", "Sharpening",
 				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most.", "%.2f", "upscale.fsr", false,
 				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.8f },
+			{ "upscale.framegen", tab::game, "Upscaling", "Frame generation (AMD FSR 3)",
+				"While FSR 2 draws the world, a frame is made between each two the game draws: motion as smooth as twice the "
+				"frames, the menus and text kept sharp. The game itself then runs at up to half the screen's refresh rate (122 at "
+				"244 Hz) and answers a little later, so it pays most where the game runs below that. Turning it on takes effect "
+				"the next time the game starts; off right away. (/hifi upscale framegen)", nullptr, "upscale.temporal", false,
+				{ 0.0f, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 
 			// Advanced
 			{ "GrassHue", tab::advanced, "Grass colour", "Grass colour where the ground hasn't been seen",

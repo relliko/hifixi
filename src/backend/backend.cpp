@@ -797,11 +797,15 @@ namespace hifi::backend
 		g_early = true;
 		g_started = true;
 		write_log(0, "HiFi XI: Direct3D 12 hooks in, before the game's device: its lists and views followed from their making");
-		// (frame generation: dgVoodoo's swap chain made as AMD's, when wanted)
+		// (frame generation: dgVoodoo's swap chain made as AMD's, when the setting's on as the game starts)
+		{
+			std::string on;
+			framegen::set_wanted(option("upscale", "framegen", on) && on != "0" && _stricmp(on.c_str(), "false") != 0);
+		}
 		if (framegen::wanted())
 		{
 			if (framegen::install(create_factory1, why, [](int level, const char *text) { write_log(level, text); }))
-				write_log(0, "HiFi XI: frame generation's swap chain in (HIFIXI_FRAMEGEN=1): the game window's swap chain will be AMD's");
+				write_log(0, "HiFi XI: frame generation's swap chain in (upscale.framegen on): the game window's swap chain will be AMD's");
 			else
 				write_log(2, ("HiFi XI: frame generation's swap chain not in: " + why).c_str());
 		}

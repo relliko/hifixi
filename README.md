@@ -78,7 +78,7 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 - `/hifi glows`: the glows lighting the scene now, and the glowing effects met lately.
 - `/hifi gpu`: the GPU time each part of the richer world takes, the costliest first (also in the menu's **Performance** tab).
 - `/hifi nativezone`, `/hifi nativechars`: what HiFi XI's own drawing of the zone, or the characters, is doing; `perpixel on|off` after either for its per-pixel light.
-- `/hifi upscale [on|off] [sharpen <0..1>]`: FSR on or off, its sharpening, and whether it's drawing now.
+- `/hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]`: FSR on or off, its sharpening, frame generation (on from the next start, off at once), and whether they're drawing now.
 - `/hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]`: the en-spell effect on your weapons. `auto` (the default) follows the en-spell on you; an element shows that one now, to see it. The same buttons are in the menu's Game tab.
 - `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.

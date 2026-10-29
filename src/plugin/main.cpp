@@ -40,7 +40,7 @@
  *                  (Enfire .. Endark, the IIs too); off; or one element always (to look at it)
  *   /hifi nativechars [perpixel [on|off]]   HiFi XI drawing the characters in the game's place (src/chars; [chars]
  *                  perpixel its per-pixel lighting); the game draws any model whose data isn't up yet
- *   /hifi upscale [on|off] [sharpen <0..1>]   the world upscaled to the screen with AMD FSR 1 when the background
+ *   /hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]   the world upscaled to the screen with AMD FSR 1 when the background
  *                  resolution is below the screen's (src/upscale; [upscale] fsr, sharpen)
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
  *                  mist, dryw, heat, rain, squl, dust, sand, wind, stom, snow, bliz, thdr, bolt, aura, ligt, fogd, dark),
@@ -605,6 +605,7 @@ class hifixi final : public IPlugin
 	{
 		const bool fsr = hifi::game::option_on("upscale", "fsr", true);
 		hifi::upscale::set_options(fsr && !m_upscale_refused, hifi::game::option_on("upscale", "temporal", true), hifi::game::option_number("upscale", "sharpen", 0.8f));
+		hifi::framegen::set_on(fsr && hifi::game::option_on("upscale", "framegen", false));
 		ID3D12Device *const device = worldfx::attached();
 		std::string why;
 		if (fsr && !m_upscale_refused && device != nullptr && !hifi::upscale::prepare(device, why))
@@ -870,10 +871,14 @@ public:
 				hifi::game::set_option_on("upscale", "fsr", how == "on");
 			else if (how.rfind("sharpen ", 0) == 0)
 				hifixi_set_option("upscale", "sharpen", how.substr(8).c_str());
+			else if (how == "framegen on" || how == "framegen off")
+				hifi::game::set_option_on("upscale", "framegen", how == "framegen on");
 			else if (!how.empty())
-				say("/hifi upscale [on|off] [sharpen <0..1>]: the world upscaled to the screen with AMD FSR 1 when the background resolution is below the screen's");
+				say("/hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]: the world upscaled to the screen with AMD FSR; frame generation (on from the next start)");
 			follow_upscale();
 			for (const std::string &line : hifi::upscale::status())
+				say(line);
+			for (const std::string &line : hifi::framegen::status())
 				say(line);
 		}
 		else if (arg == "weather" || arg.rfind("weather ", 0) == 0)
@@ -932,7 +937,7 @@ public:
 		worldfx::set_blade_motion(hifi::upscale::temporal_running()); // (the grass's own motion for FSR 2)
 		hifi::game::jitter::set_phases(hifi::upscale::jitter_phases());
 		hifi::game::jitter::next_frame();
-		hifi::framegen::present(); // (frame generation on or off as FSR 2 runs, when HIFIXI_FRAMEGEN=1)
+		hifi::framegen::present(); // (frame generation on or off as FSR 2 runs and the setting says)
 		if (now >= m_next_update)
 		{
 			m_next_update = now + 0.5;

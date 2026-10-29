@@ -3,9 +3,10 @@
 // with HiFi XI). Spike, step 1: dgVoodoo's swap chain for the game's window made as AMD's frame interpolation swap chain
 // (its own present queue and pacing threads around a real FLIP_DISCARD swap chain), frame generation off: the game drawn
 // and presented through it as before. DXGI's factory's CreateSwapChain and CreateSwapChainForHwnd go through ours from
-// HiFi XI's early start (before dgVoodoo makes its device and swap chain); only with HIFIXI_FRAMEGEN=1 for now.
+// HiFi XI's early start (before dgVoodoo makes its device and swap chain), when the setting (upscale.framegen) is on
+// then: turning it on takes effect the next time the game starts.
 //
-// Step 2, generation on (HIFIXI_FRAMEGEN=1 and FSR 2 drawing the world): each frame, from FSR 2's pass on dgVoodoo's
+// Step 2, generation on (the setting on and FSR 2 drawing the world; turned off at once): each frame, from FSR 2's pass on dgVoodoo's
 // list, prepare() hands AMD's frame interpolation FSR 2's depth and motion (made into its dilated depth and motion
 // there) and keeps FSR 2's picture as the frame without the UI. At dgVoodoo's Present AMD's swap chain asks for the
 // frame between the last one and this one: optical flow over the pictures without the UI, then frame interpolation,
@@ -44,6 +45,10 @@ namespace hifi::framegen
 	// ours, when wanted. False with why when they couldn't be; true (nothing done) when not wanted.
 	// log: HiFi XI's log (level 0 info, 1 warning, 2 error), told of each swap chain made through ours.
 	bool install(void *create_factory1, std::string &why, void (*log)(int level, const char *text) = nullptr);
+	// The setting at the start (before install(): AMD's swap chain put in only then), and as it is now (generation
+	// only while on: off at once, on again at once when the swap chain is AMD's)
+	void set_wanted(bool on);
 	bool wanted();
+	void set_on(bool on);
 	std::vector<std::string> status();
 }

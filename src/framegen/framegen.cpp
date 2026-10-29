@@ -47,6 +47,8 @@ namespace hifi::framegen
 			UINT buffers = 0, flags = 0;
 			DXGI_SWAP_EFFECT effect = DXGI_SWAP_EFFECT_DISCARD;
 			void (*log)(int, const char *) = nullptr;
+			std::atomic<bool> wanted{ false }; // (the setting at the start)
+			std::atomic<bool> on{ false };     // (and now)
 		};
 		state g;
 		thread_local int t_inside = 0; // (AMD's code making the real swap chain: straight to DXGI)
@@ -419,6 +421,11 @@ namespace hifi::framegen
 			why = !g.installed ? "not wanted" : "no AMD swap chain";
 			return false;
 		}
+		if (!g.on.load())
+		{
+			why = "turned off";
+			return false;
+		}
 		if (list == nullptr || in.depth == nullptr || in.motion == nullptr || in.picture == nullptr)
 		{
 			why = "FSR 2's depth, motion or picture missing";
@@ -490,8 +497,9 @@ namespace hifi::framegen
 			std::lock_guard<std::mutex> lock(gen.mutex);
 			if (!g.installed || gen.swapchain == nullptr)
 				return;
-			// (on while FSR 2 hands its frames over; off a second after the last, else each frame is shown twice)
-			const bool want = gen.now != nullptr && GetTickCount64() - gen.prepared_at < 1000;
+			// (on while FSR 2 hands its frames over and the setting's on; off a second after the last, else each frame is
+			// shown twice)
+			const bool want = g.on.load() && gen.now != nullptr && GetTickCount64() - gen.prepared_at < 1000;
 			if (want == gen.enabled)
 				return;
 			gen.enabled = want;
@@ -520,10 +528,20 @@ namespace hifi::framegen
 		return gen.last_output;
 	}
 
+	void set_wanted(bool on)
+	{
+		g.wanted = on;
+		g.on = on;
+	}
+
 	bool wanted()
 	{
-		char v[8] = {};
-		return GetEnvironmentVariableA("HIFIXI_FRAMEGEN", v, sizeof(v)) != 0 && v[0] == '1';
+		return g.wanted.load();
+	}
+
+	void set_on(bool on)
+	{
+		g.on = on;
 	}
 
 	bool install(void *create_factory1, std::string &why, void (*log)(int, const char *))
@@ -559,7 +577,8 @@ namespace hifi::framegen
 		std::lock_guard<std::mutex> lock(g.mutex);
 		char line[320];
 		if (!g.installed)
-			std::snprintf(line, sizeof(line), "frame generation: not in (HIFIXI_FRAMEGEN=1 before the game starts)");
+			std::snprintf(line, sizeof(line), g.on.load() ? "frame generation: on from the next start (AMD's swap chain is put in only as the game starts)" :
+				"frame generation: off (Game tab, Upscaling)");
 		else
 			std::snprintf(line, sizeof(line), "frame generation: swap chains %u AMD's, %u DXGI's, %u refused; the last: %s %ux%u format %u, %u buffers, effect %u, flags 0x%X",
 				g.wrapped.load(), g.passed.load(), g.failed.load(), g.last.empty() ? "none" : g.last.c_str(), g.width, g.height, unsigned(g.format),
@@ -569,7 +588,7 @@ namespace hifi::framegen
 		{
 			std::lock_guard<std::mutex> glock(gen.mutex);
 			std::snprintf(line, sizeof(line), "frame generation: %s; %u frames prepared, %u made between, %u shown twice, %u failed, turned on/off %u times%s%s",
-				gen.now == nullptr ? "contexts not made" : !gen.enabled ? "off (no FSR 2 frames)" : gen.apart ? "on, the UI kept apart" : "on, the UI moved with the world (FSR 2's picture isn't the screen's size)",
+				!g.on.load() ? "off (turned off: on again at once from the menu)" : gen.now == nullptr ? "contexts not made" : !gen.enabled ? "off (no FSR 2 frames)" : gen.apart ? "on, the UI kept apart" : "on, the UI moved with the world (FSR 2's picture isn't the screen's size)",
 				gen.prepares, gen.generated, gen.repeated, gen.failed, gen.switches, gen.why.empty() ? "" : ": ", gen.why.c_str());
 			lines.push_back(line);
 		}
