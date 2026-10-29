@@ -186,7 +186,11 @@ namespace
 			x.end_disabled = [] { g_gui->EndDisabled(); };
 			x.text = [](const char *s) { g_gui->TextUnformatted(s); };
 			x.text_colored = [](const float rgba[4], const char *s) { g_gui->TextColored(ImVec4(rgba[0], rgba[1], rgba[2], rgba[3]), "%s", s); };
-			x.text_disabled = [](const char *s) { g_gui->TextDisabled("%s", s); };
+			x.text_disabled = [](const char *s) {
+				g_gui->PushTextWrapPos(0.0f);
+				g_gui->TextDisabled("%s", s);
+				g_gui->PopTextWrapPos();
+			};
 			x.text_wrapped = [](const char *s) { g_gui->TextWrapped("%s", s); };
 			x.selectable = [](const char *label, bool selected) { return g_gui->Selectable(label, selected); };
 			x.button = [](const char *label) { return g_gui->Button(label); };
@@ -211,6 +215,8 @@ namespace
 			x.input_text = [](const char *id, const char *hint, char *buffer, size_t size) { return g_gui->InputTextWithHint(id, hint, buffer, size); };
 			x.begin_combo = [](const char *id, const char *preview) { return g_gui->BeginCombo(id, preview, 0); };
 			x.end_combo = [] { g_gui->EndCombo(); };
+			x.begin_context = [](const char *id) { return g_gui->BeginPopupContextItem(id, ImGuiPopupFlags_MouseButtonRight); };
+			x.end_popup = [] { g_gui->EndPopup(); };
 			x.tooltip = [](const char *text) {
 				if (!g_gui->IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
 					return;

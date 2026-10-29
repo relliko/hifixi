@@ -126,7 +126,7 @@ int main()
 	{
 		IDXGISwapChain1 *plain = nullptr;
 		factory->CreateSwapChainForHwnd(queue, hwnd, &sd, nullptr, nullptr, &plain);
-		check(plain != nullptr && hifi::framegen::status()[0].find("off (Game tab") != std::string::npos, "the setting off: the swap chain is DXGI's");
+		check(plain != nullptr && hifi::framegen::status()[0].find("off (the Upscaling tab") != std::string::npos, "the setting off: the swap chain is DXGI's");
 		if (plain != nullptr)
 			plain->Release();
 	}

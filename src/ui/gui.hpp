@@ -28,7 +28,7 @@ namespace hifi::ui
 		// Text
 		void (*text)(const char *text) = nullptr;
 		void (*text_colored)(const float rgba[4], const char *text) = nullptr;
-		void (*text_disabled)(const char *text) = nullptr;
+		void (*text_disabled)(const char *text) = nullptr; // (wrapped at the window's edge)
 		void (*text_wrapped)(const char *text) = nullptr;
 		// Widgets
 		bool (*selectable)(const char *label, bool selected) = nullptr;
@@ -43,6 +43,10 @@ namespace hifi::ui
 		// A dropdown showing preview; true while open (its items drawn with selectable, then end_combo)
 		bool (*begin_combo)(const char *id, const char *preview) = nullptr;
 		void (*end_combo)() = nullptr;
+		// A menu for the item just drawn, opened by right-clicking it; true while open (its items drawn with selectable,
+		// then end_popup)
+		bool (*begin_context)(const char *id) = nullptr;
+		void (*end_popup)() = nullptr;
 		// The tooltip for the item just drawn, while the mouse is over it
 		void (*tooltip)(const char *text) = nullptr;
 		// An Ashita command, as typed (/hifps)

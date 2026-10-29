@@ -522,6 +522,12 @@ namespace hifi::framegen
 		}
 	}
 
+	uint64_t made_between()
+	{
+		std::lock_guard<std::mutex> lock(gen.mutex);
+		return gen.generated;
+	}
+
 	ID3D12Resource *last_made()
 	{
 		std::lock_guard<std::mutex> lock(gen.mutex);
@@ -578,7 +584,7 @@ namespace hifi::framegen
 		char line[320];
 		if (!g.installed)
 			std::snprintf(line, sizeof(line), g.on.load() ? "frame generation: on from the next start (AMD's swap chain is put in only as the game starts)" :
-				"frame generation: off (Game tab, Upscaling)");
+				"frame generation: off (the Upscaling tab)");
 		else
 			std::snprintf(line, sizeof(line), "frame generation: swap chains %u AMD's, %u DXGI's, %u refused; the last: %s %ux%u format %u, %u buffers, effect %u, flags 0x%X",
 				g.wrapped.load(), g.passed.load(), g.failed.load(), g.last.empty() ? "none" : g.last.c_str(), g.width, g.height, unsigned(g.format),

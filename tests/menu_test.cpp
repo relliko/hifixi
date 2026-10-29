@@ -8,7 +8,10 @@
  *   - a preset picked: its values saved and it shown picked; the frame rate's options on in every preset;
  *   - a slider moved: saved, and the preset Custom; the search finding settings by name and description;
  *   - your own presets: saved by name from the dropdown's row (a file in presets\), in the dropdown, picked back,
- *     updated under the same name, deleted; names that can't be one refused.
+ *     updated under the same name, deleted; names that can't be one refused;
+ *   - the Upscaling tab with what FSR and frame generation are doing; a line under each section's heading; the
+ *     weather debug on Advanced; settings waiting for the next start said under the presets; right-click "Reset to
+ *     default"; Custom saying the preset it was changed from, what's changed, and "Back to" it.
  *
  *   build\menu_test.exe     (from this folder: it works in build\test\menu)
  */
@@ -44,11 +47,15 @@ namespace
 		float slide_to = 0.0f;
 		int windows = 0, children = 0, ids = 0, disabled = 0, greyed_depth = 0, combos = 0;
 		std::string type_into, type_text; // (an input box, by its hint, given this text once)
+		std::string last_label, open_context; // (the last widget drawn; the one whose right-click menu opens once)
+		int popups = 0;
+		std::vector<std::string> tips; // (the tooltips given, apart: they aren't drawn until hovered)
 		bool unbalanced = false;
 		std::vector<std::string> commands;
 
 		void widget(const char *label, bool selected = false)
 		{
+			last_label = label;
 			drawn.push_back(std::string(greyed_depth > 0 ? "~" : "[") + label + (greyed_depth > 0 ? "" : "]") + (selected ? "*" : ""));
 		}
 		bool clicked(const char *label)
@@ -64,6 +71,7 @@ namespace
 		{
 			drawn.clear();
 			commands.clear();
+			tips.clear();
 		}
 		bool has(const char *text)
 		{
@@ -124,7 +132,15 @@ namespace
 		};
 		g.begin_combo = [](const char *, const char *preview) { fake::combos++; fake::drawn.push_back(std::string("combo ") + preview); return true; };
 		g.end_combo = [] { fake::unbalanced |= --fake::combos < 0; };
-		g.tooltip = [](const char *) {};
+		g.tooltip = [](const char *text) { fake::tips.push_back(text); };
+		g.begin_context = [](const char *) {
+			if (fake::open_context.empty() || fake::open_context != fake::last_label)
+				return false;
+			fake::open_context.clear();
+			fake::popups++;
+			return true;
+		};
+		g.end_popup = [] { fake::unbalanced |= --fake::popups < 0; };
 		g.command = [](const char *text) { fake::commands.push_back(text); };
 		return g;
 	}
@@ -244,7 +260,7 @@ int main()
 	auto draw = [&] {
 		fake::reset();
 		hifi::ui::draw_menu(g, &open);
-		return !fake::unbalanced && fake::windows == 0 && fake::children == 0 && fake::ids == 0 && fake::disabled == 0 && fake::combos == 0;
+		return !fake::unbalanced && fake::windows == 0 && fake::children == 0 && fake::ids == 0 && fake::disabled == 0 && fake::combos == 0 && fake::popups == 0;
 	};
 
 	// 2. Every tab, balanced, with its own settings on it
@@ -252,7 +268,8 @@ int main()
 	const tab_check tabs[] = {
 		{ hifi::settings::tab::overview, "At a glance" }, { hifi::settings::tab::frame_rate, "[Answer glow, lamp, lens flare and door tests without waiting]" },
 		{ hifi::settings::tab::distance, "[Characters and monsters]" }, { hifi::settings::tab::lighting, "[Sun shadows]" },
-		{ hifi::settings::tab::world, "[Rings from moving]" }, { hifi::settings::tab::performance, "World FX" },
+		{ hifi::settings::tab::world, "[Rings from moving]" }, { hifi::settings::tab::upscaling, "[Upscale the world with AMD FSR]" },
+		{ hifi::settings::tab::performance, "World FX" },
 		{ hifi::settings::tab::advanced, "[Direct3D 12 debug layer]" },
 	};
 	bool all_balanced = true, all_found = true;
@@ -355,9 +372,12 @@ int main()
 		grass::weather w;
 		worldfx::weather_look_now(real, &w);
 		hifi::ui::show_tab(hifi::settings::tab::world);
+		draw();
+		check(!fake::has("Weather (debug)"), "the World tab without the weather debug (on Advanced now)");
+		hifi::ui::show_tab(hifi::settings::tab::advanced);
 		const bool balanced = draw();
 		check(balanced && fake::has("Weather (debug)") && fake::has("[Off: the real weather]*") && fake::has("[Thunderstorm]") && fake::has("[Flash lightning now]") &&
-			fake::has("light and fog still follow the real weather"), "the World tab: Weather (debug), Off picked, a button each, the lightning, light and fog said to stay real");
+			fake::has("light and fog still follow the real weather"), "the Advanced tab: Weather (debug), Off picked, a button each, the lightning, light and fog said to stay real");
 		fake::click = "Thunderstorm";
 		draw();
 		draw();
@@ -450,6 +470,93 @@ int main()
 			"Delete: its file gone, the settings left as they were, Custom");
 		const bool balanced = draw();
 		check(balanced, "the menu's begins, pushes and dropdowns matched throughout");
+	}
+
+	// 11. The menu's helps: the Upscaling tab, section lines, restart notices, reset, Custom's base
+	{
+		hifi::ui::show_tab(hifi::settings::tab::upscaling);
+		bool balanced = draw();
+		check(balanced && fake::has("[Upscale the world with AMD FSR]") && fake::has("[Frame generation (AMD FSR 3)]") && fake::has("What it's doing") &&
+			fake::has("upscale") && fake::has("frame generation: off"), "the Upscaling tab: FSR's and frame generation's settings, then what they're doing");
+		check(fake::has("AMD FidelityFX Super Resolution: sharper"), "a line under each section's heading (AMD FSR's)");
+		hifi::ui::show_tab(hifi::settings::tab::game);
+		draw();
+		check(!fake::has("[Upscale the world with AMD FSR]"), "and FSR no longer on the Game tab");
+
+		// (waiting for the next start: the debug layer changed, frame generation turned on without AMD's swap chain)
+		hifi::ui::show_tab(hifi::settings::tab::advanced);
+		draw();
+		check(!fake::has("Waiting for the game's next start"), "nothing waiting for the next start at first");
+		fake::click = "Direct3D 12 debug layer";
+		draw();
+		draw();
+		check(fake::has("Waiting for the game's next start: Direct3D 12 debug layer."), "the debug layer changed: said to wait for the next start");
+		fake::click = "Direct3D 12 debug layer";
+		draw();
+		draw();
+		check(!fake::has("Waiting for the game's next start"), "changed back: nothing waiting");
+		hifi::ui::show_tab(hifi::settings::tab::upscaling);
+		fake::click = "Frame generation (AMD FSR 3)";
+		draw();
+		draw();
+		check(fake::has("Waiting for the game's next start: Frame generation (AMD FSR 3).") && hifi::game::option_on("upscale", "framegen", false),
+			"frame generation turned on: saved, and said to wait for the next start (AMD's swap chain isn't in)");
+		fake::click = "Frame generation (AMD FSR 3)";
+		draw();
+		bool tip = false;
+		hifi::ui::show_tab(hifi::settings::tab::advanced);
+		draw();
+		for (const std::string &t : fake::tips)
+			tip |= t.find("GPU crash reports") == std::string::npos && t.find("Takes effect the next time the game starts.") != std::string::npos;
+		check(tip, "a next-start setting's tooltip says so");
+
+		// (right-click: back to its default)
+		hifi::ui::show_tab(hifi::settings::tab::world);
+		fake::slide = "Distance";
+		fake::slide_to = 50.0f;
+		draw();
+		draw();
+		const float default_distance = worldfx::find_setting("GrassDistance")->fallback[0];
+		fake::open_context = "Distance";
+		fake::click = "Reset to default";
+		balanced = draw();
+		draw();
+		check(balanced && value("GrassDistance") == default_distance && default_distance != 50.0f && hifi::backend::preset() == "custom",
+			"right-click Reset to default: the grass's distance back to its default, Custom");
+		check(fake::has("HiFi XI's own grass over the ground"), "the Grass section's line under its heading");
+
+		// (Custom from Ultra: said, what's changed in its tooltip, Back to Ultra)
+		fake::click = "Ultra";
+		draw();
+		fake::slide = "Distance";
+		fake::slide_to = 33.0f;
+		draw();
+		draw();
+		bool changed = false;
+		for (const std::string &t : fake::tips)
+			changed |= t.find("Changed from Ultra: ") != std::string::npos && t.find("Distance") != std::string::npos;
+		check(fake::has("combo Custom (from Ultra)") && fake::has("[Back to Ultra]") && changed,
+			"a setting changed after Ultra: Custom (from Ultra), the change named, Back to Ultra in the dropdown");
+		fake::click = "Back to Ultra";
+		draw();
+		draw();
+		check(value("GrassDistance") == 140.0f && hifi::backend::preset() == "ultra" && fake::has("combo Ultra"), "Back to Ultra: its values again, Ultra picked");
+		fake::type_into = "Name to save as";
+		fake::type_text = "Mine too";
+		draw();
+		fake::click = "Save";
+		draw();
+		fake::slide = "Distance";
+		fake::slide_to = 77.0f;
+		draw();
+		draw();
+		check(fake::has("combo Custom (from Mine too)") && fake::has("[Back to Mine too]"), "and from one of yours: Custom (from Mine too)");
+		fake::click = "Back to Mine too";
+		draw();
+		draw();
+		check(value("GrassDistance") == 140.0f && hifi::backend::preset() == "saved:Mine too", "Back to Mine too: its values again");
+		std::string why;
+		hifi::ui::delete_preset("Mine too", why);
 	}
 
 	check(read_all(reshade_ini) == old_ini, "ReShade.ini as it was, at the end");

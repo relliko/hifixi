@@ -1,7 +1,9 @@
 #pragma once
 
-// HiFi XI's menu (/hifi): the presets in a dropdown (the built-in ones and your own, saved by name), a search box, the tabs down the left (settings/schema), each
-// setting with its tooltip, saved as it's changed. Drawn each frame it's open, through a gui (gui.hpp).
+// HiFi XI's menu (/hifi): the presets in a dropdown (the built-in ones and your own, saved by name; Custom says which
+// one it was changed from and goes back to it), a search box, what's waiting for the next start, the tabs down the
+// left (settings/schema), each setting with its tooltip and a right-click reset, saved as it's changed. Drawn each
+// frame it's open, through a gui (gui.hpp).
 
 #include "gui.hpp"
 #include "../settings/schema.hpp"
@@ -18,6 +20,9 @@ namespace hifi::ui
 	void set_search(const char *text);
 	// A preset's values applied (mine: the old setup's), and the preset kept as the one picked
 	void apply_preset(settings::preset p);
+	// The preset Custom was changed from, kept as the settings file keeps a preset ("ultra", "saved:<name>"; nullptr:
+	// none): set as one is picked or saved
+	void set_base_preset(const char *key);
 
 	// Your own presets: every setting as it is now saved under a name (presets\<name>.ini beside the settings file; the
 	// same name again: updated), listed by name, put back (kept as the one picked: "saved:<name>"), deleted. A name is

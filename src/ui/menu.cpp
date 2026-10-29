@@ -2,12 +2,14 @@
 #include "menu.hpp"
 #include "../backend/backend.hpp"
 #include "../bake/runner.hpp"
+#include "../framegen/framegen.hpp"
 #include "../game/drawcull.hpp"
 #include "../game/feed.hpp"
 #include "../game/hifps/exp.hpp"
 #include "../game/hifps/step.hpp"
 #include "../host/hooks.hpp"
 #include "../render/worldfx_core.hpp"
+#include "../upscale/upscale.hpp"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -17,10 +19,11 @@
 #include <cstring>
 #include <string>
 
-// How it looks: one window, the presets across the top beside a search box, the tabs down the left, the page on the
-// right. A page is sections, each a heading in the accent colour over its settings; every setting has a tooltip, and
+// How it looks: one window, the presets' dropdown across the top beside a search box (under them what's waiting for
+// the next start), the tabs down the left, the page on the right. A page is sections, each a heading in the accent
+// colour over a line about it and its settings; every setting has a tooltip and a right-click "Reset to default", and
 // one that only matters with another on (the grass's distance with the grass) is greyed out while that's off. A
-// change is saved at once and makes the preset Custom.
+// change is saved at once and makes the preset Custom, which remembers the preset it was changed from.
 
 namespace hifi::ui
 {
@@ -43,6 +46,8 @@ namespace hifi::ui
 			float fps = 0.0f, ms = 0.0f;
 			host::stats last = {};
 			double lists = 0.0, calls = 0.0, draws = 0.0;
+			uint64_t made = 0;      // (frame generation's frames made between, so far)
+			float made_rate = 0.0f; // (and a second, over the same second)
 			bool known = false;
 		};
 		meter g_meter;
@@ -58,6 +63,9 @@ namespace hifi::ui
 			const double frames = double(g_meter.frames);
 			g_meter.fps = float(frames / secs);
 			g_meter.ms = float(secs * 1000.0 / frames);
+			const uint64_t made = framegen::made_between();
+			g_meter.made_rate = g_meter.known ? float(double(made - std::min(made, g_meter.made)) / secs) : 0.0f;
+			g_meter.made = made;
 			if (g_meter.known)
 			{
 				uint64_t calls = 0, draws = 0;
@@ -154,6 +162,37 @@ namespace hifi::ui
 			backend::set_option(section, name, option_text(e, v).c_str());
 		}
 
+		// (below, with the presets of yours: a setting's value as a preset file keeps it; the preset Custom was changed
+		// from, as kept, its name as shown, the settings now different from it; the settings waiting for the next start)
+		std::string entry_text(const settings::entry &e);
+		std::string base_preset();
+		std::string base_label(const std::string &base);
+		std::vector<std::string> changed_from(const std::string &base);
+		std::vector<std::string> waiting_for_restart();
+
+		// A setting back to its default (one of HiFi XI's own: the schema's; World FX's: the core's), the preset Custom
+		void reset_to_default(const settings::entry &e)
+		{
+			if (settings::is_option(e))
+				set_option_value(e, e.fallback);
+			else if (const worldfx::setting *s = worldfx::find_setting(e.key))
+			{
+				float v[3] = { s->fallback[0], s->fallback[1], s->fallback[2] };
+				worldfx::set_setting(e.key, v);
+			}
+			backend::set_preset(settings::preset_key(settings::preset::custom));
+		}
+
+		// The right-click menu on the setting just drawn
+		void draw_reset(const gui &g, const settings::entry &e)
+		{
+			if (!g.begin_context("reset"))
+				return;
+			if (g.selectable("Reset to default", false))
+				reset_to_default(e);
+			g.end_popup();
+		}
+
 		bool on(const char *key)
 		{
 			if (std::strchr(key, '.') != nullptr)
@@ -205,10 +244,13 @@ namespace hifi::ui
 			}
 			{
 				std::string help = e.help;
+				if (e.next_start)
+					help += " Takes effect the next time the game starts.";
 				if (greyed)
 					help += std::string(" (Only with \"") + (settings::find(e.needs) != nullptr ? settings::find(e.needs)->label : e.needs) + "\" on.)";
 				g.tooltip(help.c_str());
 			}
+			draw_reset(g, e);
 			if (greyed)
 				g.end_disabled();
 			g.pop_id();
@@ -277,6 +319,7 @@ namespace hifi::ui
 					help += std::string(" (Only with \"") + (settings::find(e.needs) != nullptr ? settings::find(e.needs)->label : e.needs) + "\" on.)";
 				g.tooltip(help.c_str());
 			}
+			draw_reset(g, e);
 			if (greyed)
 				g.end_disabled();
 			g.pop_id();
@@ -301,6 +344,8 @@ namespace hifi::ui
 				{
 					section = all[i].section;
 					heading(g, section);
+					if (const char *about = settings::section_help(section); about[0] != 0)
+						g.text_disabled(about);
 				}
 				draw_entry(g, all[i]);
 			}
@@ -444,7 +489,6 @@ namespace hifi::ui
 		void draw_world(const gui &g)
 		{
 			draw_tab_settings(g, settings::tab::world);
-			draw_weather_debug(g);
 			heading(g, "Zone files");
 			g.text_wrapped("Grass, water, rain, wet ground and the lamps come from each zone's own files in "
 				"your game, made the first time you enter a zone (a few seconds, in the background). Or make them all now:");
@@ -462,10 +506,27 @@ namespace hifi::ui
 				g.text_wrapped(line.c_str());
 		}
 
+		// FSR and frame generation's settings, then what they're doing
+		void draw_upscaling(const gui &g)
+		{
+			draw_tab_settings(g, settings::tab::upscaling);
+			std::vector<std::string> lines = upscale::status();
+			for (const std::string &line : framegen::status())
+				lines.push_back(line);
+			draw_lines(g, "What it's doing", lines);
+		}
+
 		void draw_performance(const gui &g)
 		{
 			heading(g, "Frames");
-			if (g_meter.fps > 0.0f)
+			if (g_meter.fps > 0.0f && g_meter.made_rate >= 1.0f)
+			{
+				// (with frame generation the game's own frames and those on the screen differ: both, so neither looks lost)
+				textf(g, "%.0f fps from the game (%.1f ms a frame), %.0f shown: frame generation makes %.0f a second between them",
+					g_meter.fps, g_meter.ms, g_meter.fps + g_meter.made_rate, g_meter.made_rate);
+				g.text_disabled("The game itself runs at up to half the screen's refresh rate while frame generation is on.");
+			}
+			else if (g_meter.fps > 0.0f)
 				textf(g, "%.0f fps (%.1f ms a frame)", g_meter.fps, g_meter.ms);
 			else
 				g.text_disabled("Measuring...");
@@ -540,6 +601,7 @@ namespace hifi::ui
 			if (g.button("Forget the grass colours learned"))
 				worldfx::forget_colours();
 			g.tooltip("Grass learns its colour from the ground again, from what's in view now.");
+			draw_weather_debug(g);
 			heading(g, "Files");
 			textf(g, "Settings: %s", narrow(backend::settings_file()).c_str());
 			textf(g, "Log: %shifixi.log", narrow(backend::folder()).c_str());
@@ -564,11 +626,31 @@ namespace hifi::ui
 			const bool yours = key.rfind("saved:", 0) == 0;
 			const std::string your_name = yours ? key.substr(6) : std::string();
 			const settings::preset now = yours ? settings::preset::custom : settings::preset_from(key.c_str());
+			// (Custom: the preset it was changed from, when known)
+			const std::string base = !yours && now == settings::preset::custom ? base_preset() : std::string();
+			const std::string from = base.empty() ? std::string() : base_label(base);
+			const std::string preview = yours ? your_name : !from.empty() ? "Custom (from " + from + ")" : std::string(settings::preset_label(now));
 			g.text("Preset");
 			g.same_line();
-			g.set_next_item_width(180.0f);
-			if (g.begin_combo("##preset", yours ? your_name.c_str() : settings::preset_label(now)))
+			g.set_next_item_width(220.0f);
+			if (g.begin_combo("##preset", preview.c_str()))
 			{
+				if (!from.empty())
+				{
+					if (g.selectable(("Back to " + from).c_str(), false))
+					{
+						std::string why;
+						if (base.rfind("saved:", 0) == 0)
+							note(load_preset(from.c_str(), why), why.empty() ? "Back to " + from + "." : why);
+						else
+						{
+							apply_preset(settings::preset_from(base.c_str()));
+							note(true, "Back to " + from + ".");
+						}
+					}
+					g.tooltip(("Every setting as " + from + " has it again: your changes since undone.").c_str());
+					g.separator();
+				}
 				for (int i = 0; i < settings::kFixedPresets; ++i)
 				{
 					const settings::preset p = settings::preset(i);
@@ -597,7 +679,21 @@ namespace hifi::ui
 				}
 				g.end_combo();
 			}
-			g.tooltip(yours ? "One of yours: every setting as it was when you saved it." : settings::preset_help(now));
+			if (!from.empty())
+			{
+				// (what's been changed since, at most a dozen named)
+				const std::vector<std::string> changed = changed_from(base);
+				std::string tip = changed.empty() ? "Nothing differs from " + from + " any more." : "Changed from " + from + ": ";
+				for (size_t i = 0; i < changed.size() && i < 12; ++i)
+					tip += (i == 0 ? "" : ", ") + changed[i];
+				if (changed.size() > 12)
+					tip += " and " + std::to_string(changed.size() - 12) + " more";
+				if (!changed.empty())
+					tip += ". \"Back to " + from + "\" in the dropdown undoes them.";
+				g.tooltip(tip.c_str());
+			}
+			else
+				g.tooltip(yours ? "One of yours: every setting as it was when you saved it." : settings::preset_help(now));
 			g.same_line();
 			g.set_next_item_width(150.0f);
 			g.input_text("##save-name", "Name to save as", g_save_name, sizeof(g_save_name));
@@ -629,6 +725,14 @@ namespace hifi::ui
 					g.text_colored(kWarn, g_preset_note.c_str());
 				else
 					g.text_disabled(g_preset_note.c_str());
+			}
+			const std::vector<std::string> waiting = waiting_for_restart();
+			if (!waiting.empty())
+			{
+				std::string line = "Waiting for the game's next start: ";
+				for (size_t i = 0; i < waiting.size(); ++i)
+					line += (i == 0 ? "" : ", ") + waiting[i];
+				g.text_colored(kWarn, (line + ".").c_str());
 			}
 		}
 	}
@@ -673,6 +777,7 @@ namespace hifi::ui
 			worldfx::set_setting(e.key, v);
 		}
 		backend::set_preset(settings::preset_key(p));
+		set_base_preset(settings::preset_key(p));
 	}
 
 	namespace
@@ -751,10 +856,9 @@ namespace hifi::ui
 			return number_text(v[0], s->kind != worldfx::setting::number);
 		}
 
-		// And put back from that (false when the text isn't a number)
-		bool set_entry_text(const settings::entry &e, const std::string &text)
+		// That text's numbers (up to three: a colour's), how many; 0 when it isn't numbers
+		int values_of(const std::string &text, float v[3])
 		{
-			float v[3] = {};
 			int count = 0;
 			const char *at = text.c_str();
 			while (count < 3 && *at != 0)
@@ -762,10 +866,18 @@ namespace hifi::ui
 				char *end = nullptr;
 				const float x = std::strtof(at, &end);
 				if (end == at || !std::isfinite(x))
-					return false;
+					return 0;
 				v[count++] = x;
 				at = *end == ',' ? end + 1 : end;
 			}
+			return count;
+		}
+
+		// And put back from that (false when the text isn't a number)
+		bool set_entry_text(const settings::entry &e, const std::string &text)
+		{
+			float v[3] = {};
+			const int count = values_of(text, v);
 			if (count == 0)
 				return false;
 			if (settings::is_option(e))
@@ -784,6 +896,127 @@ namespace hifi::ui
 			worldfx::set_setting(e.key, v);
 			return true;
 		}
+
+		// A setting's value(s) now, as numbers: how many (a colour's three)
+		int values_now(const settings::entry &e, float v[3])
+		{
+			if (settings::is_option(e))
+			{
+				v[0] = option_value(e);
+				return 1;
+			}
+			const worldfx::setting *s = worldfx::find_setting(e.key);
+			if (s == nullptr || !worldfx::get_setting(e.key, v))
+				return 0;
+			return s->kind == worldfx::setting::colour ? 3 : 1;
+		}
+
+		bool differs(float a, float b)
+		{
+			return std::fabs(a - b) > std::max(1e-4f, 1e-4f * std::fabs(b));
+		}
+
+		// The settings that differ from the preset Custom was changed from, by label (looked at again at most once a second)
+		struct changed_cache
+		{
+			std::string base;
+			std::chrono::steady_clock::time_point at;
+			std::vector<std::string> labels;
+			bool known = false;
+		};
+		changed_cache g_changed;
+	}
+
+	namespace
+	{
+		std::string base_preset()
+		{
+			std::string base;
+			return backend::option("hifixi", "preset_base", base) ? base : std::string();
+		}
+
+		std::string base_label(const std::string &base)
+		{
+			if (base.rfind("saved:", 0) == 0)
+				return base.substr(6);
+			const settings::preset p = settings::preset_from(base.c_str());
+			return p == settings::preset::custom ? std::string() : std::string(settings::preset_label(p));
+		}
+
+		std::vector<std::string> changed_from(const std::string &base)
+		{
+			const auto now = std::chrono::steady_clock::now();
+			if (g_changed.known && g_changed.base == base && now - g_changed.at < std::chrono::seconds(1))
+				return g_changed.labels;
+			std::vector<std::string> labels;
+			size_t n = 0;
+			const settings::entry *all = settings::entries(n);
+			const bool yours = base.rfind("saved:", 0) == 0;
+			const std::wstring path = yours ? preset_path(base.substr(6)) : std::wstring();
+			const settings::preset p = settings::preset_from(base.c_str());
+			for (size_t i = 0; i < n; ++i)
+			{
+				const settings::entry &e = all[i];
+				float was[3] = {}, is[3] = {};
+				int count = 0;
+				if (yours)
+				{
+					wchar_t text[128] = L"";
+					GetPrivateProfileStringW(L"settings", wide(e.key).c_str(), L"", text, DWORD(std::size(text)), path.c_str());
+					std::string value;
+					for (const wchar_t *c = text; *c != 0; ++c)
+						value += *c < 128 ? char(*c) : '?';
+					count = values_of(value, was);
+				}
+				else if (int(p) < settings::kFixedPresets && !std::isnan(e.presets[int(p)]))
+				{
+					was[0] = e.presets[int(p)];
+					count = 1;
+				}
+				if (count == 0)
+					continue;
+				count = std::min(count, values_now(e, is));
+				for (int k = 0; k < count; ++k)
+					if (differs(is[k], was[k]))
+					{
+						labels.push_back(e.label);
+						break;
+					}
+			}
+			g_changed = { base, now, labels, true };
+			return labels;
+		}
+
+		// The settings that take effect at the next start, as they were the first time the menu was drawn; and frame
+		// generation, on but without AMD's swap chain this time (it's made only as the game starts)
+		std::vector<std::pair<const settings::entry *, std::string>> g_at_start;
+		bool g_start_known = false;
+
+		std::vector<std::string> waiting_for_restart()
+		{
+			if (!g_start_known)
+			{
+				size_t n = 0;
+				const settings::entry *all = settings::entries(n);
+				for (size_t i = 0; i < n; ++i)
+					if (all[i].next_start)
+						g_at_start.emplace_back(&all[i], entry_text(all[i]));
+				g_start_known = true;
+			}
+			std::vector<std::string> labels;
+			for (const auto &[e, text] : g_at_start)
+				if (entry_text(*e) != text)
+					labels.push_back(e->label);
+			if (const settings::entry *fg = settings::find("upscale.framegen"); fg != nullptr && option_value(*fg) >= 0.5f && !framegen::wanted())
+				labels.push_back(fg->label);
+			return labels;
+		}
+	}
+
+	void set_base_preset(const char *key)
+	{
+		backend::set_option("hifixi", "preset_base", key);
+		g_changed.known = false;
 	}
 
 	std::vector<std::string> saved_presets()
@@ -845,6 +1078,7 @@ namespace hifi::ui
 			return false;
 		}
 		backend::set_preset(("saved:" + name).c_str());
+		set_base_preset(("saved:" + name).c_str());
 		std::snprintf(g_save_name, sizeof(g_save_name), "%s", name.c_str());
 		return true;
 	}
@@ -874,6 +1108,7 @@ namespace hifi::ui
 				set_entry_text(all[i], value);
 		}
 		backend::set_preset(("saved:" + name).c_str());
+		set_base_preset(("saved:" + name).c_str());
 		std::snprintf(g_save_name, sizeof(g_save_name), "%s", name.c_str());
 		return true;
 	}
@@ -890,6 +1125,8 @@ namespace hifi::ui
 		}
 		if (backend::preset() == "saved:" + name)
 			backend::set_preset(settings::preset_key(settings::preset::custom));
+		if (base_preset() == "saved:" + name)
+			set_base_preset(nullptr);
 		if (_stricmp(g_save_name, name.c_str()) == 0)
 			g_save_name[0] = 0;
 		return true;
@@ -929,6 +1166,7 @@ namespace hifi::ui
 				case settings::tab::world: draw_world(g); break;
 				case settings::tab::performance: draw_performance(g); break;
 				case settings::tab::game: draw_game(g); break;
+				case settings::tab::upscaling: draw_upscaling(g); break;
 				case settings::tab::advanced: draw_advanced(g); break;
 				default: draw_tab_settings(g, g_tab); break;
 				}

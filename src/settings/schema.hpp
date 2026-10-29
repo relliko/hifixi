@@ -10,8 +10,10 @@
 
 namespace hifi::settings
 {
-	enum class tab : uint8_t { overview, frame_rate, distance, lighting, world, game, performance, advanced, count };
+	enum class tab : uint8_t { overview, frame_rate, distance, lighting, world, game, upscaling, performance, advanced, count };
 	const char *tab_name(tab t);
+	// A section's one line under its heading ("Sun and moon": what its settings are about); "" for none
+	const char *section_help(const char *section);
 
 	// The presets, in the order the menu shows them; custom: changed by hand since one was picked
 	enum class preset : uint8_t { off, balanced, high, ultra, custom };

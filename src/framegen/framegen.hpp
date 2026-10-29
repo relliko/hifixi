@@ -51,4 +51,6 @@ namespace hifi::framegen
 	bool wanted();
 	void set_on(bool on);
 	std::vector<std::string> status();
+	// Frames made between since the start (the menu's frames shown)
+	uint64_t made_between();
 }

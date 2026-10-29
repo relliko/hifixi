@@ -250,21 +250,21 @@ namespace hifi::settings
 				{ _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _ },
 				flag, 0.0f, 1.0f, chars::options::kPerPixelByDefault ? 1.0f : 0.0f },
 			// (the upscale: src/upscale)
-			{ "upscale.fsr", tab::game, "Upscaling", "Upscale the world with AMD FSR",
+			{ "upscale.fsr", tab::upscaling, "AMD FSR", "Upscale the world with AMD FSR",
 				"When the game's background resolution is below the screen's, the world is stretched to the screen with AMD "
 				"FidelityFX Super Resolution 1 (sharp along edges) instead of the game's blur. The menus and text stay at the "
 				"screen's own size. Set a lower background resolution in the launcher for more frames. (/hifi upscale)", nullptr,
 				nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
-			{ "upscale.temporal", tab::game, "Upscaling", "FSR 2: smooth edges over the frames",
+			{ "upscale.temporal", tab::upscaling, "AMD FSR", "FSR 2: smooth edges over the frames",
 				"With the background resolution at or below the screen's, AMD FidelityFX Super Resolution 2 builds each frame "
 				"from the last ones (the world drawn a fraction of a pixel apart each frame): edges as smooth as a background twice "
 				"the screen's size, for far less work. Set the background resolution to the screen's (or lower, for more frames) "
 				"in the launcher. Off: FSR 1 when the background is smaller. (/hifi upscale)", nullptr, "upscale.fsr", false,
 				{ 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
-			{ "upscale.sharpen", tab::game, "Upscaling", "Sharpening",
+			{ "upscale.sharpen", tab::upscaling, "AMD FSR", "Sharpening",
 				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most.", "%.2f", "upscale.fsr", false,
 				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.8f },
-			{ "upscale.framegen", tab::game, "Upscaling", "Frame generation (AMD FSR 3)",
+			{ "upscale.framegen", tab::upscaling, "Frame generation", "Frame generation (AMD FSR 3)",
 				"While FSR 2 draws the world, a frame is made between each two the game draws: motion as smooth as twice the "
 				"frames, the menus and text kept sharp. The game itself then runs at up to half the screen's refresh rate (122 at "
 				"244 Hz) and answers a little later, so it pays most where the game runs below that. Turning it on takes effect "
@@ -307,10 +307,42 @@ namespace hifi::settings
 		case tab::lighting: return "Light and shadow";
 		case tab::world: return "Grass, water, weather";
 		case tab::game: return "The game's own";
+		case tab::upscaling: return "Upscaling";
 		case tab::performance: return "Performance";
 		case tab::advanced: return "Advanced";
 		default: return "?";
 		}
+	}
+
+	const char *section_help(const char *section)
+	{
+		static const char *const kHelp[][2] = {
+			{ "Above 60 fps", "The game drawn past its own 60 a second, up to a cap of your choosing." },
+			{ "Waiting on the GPU", "Answers the game would stop and wait for from the graphics card, worked out without waiting." },
+			{ "Less work a frame", "Work the game and Ashita repeat each frame, done once or skipped: the same picture for less time." },
+			{ "Sun and moon", "Shadows cast by the sun and the moon, from the scenery and the characters." },
+			{ "Light on surfaces", "Shade in corners and creases, and relief on flat textures." },
+			{ "Lamps and glows", "Light from the zone's lamps, glowing objects and spells, at night and indoors." },
+			{ "Tone and colour", "How the finished picture's brightness and colour are shaped." },
+			{ "Light in the air", "Light you see in the air itself: shafts of sunlight and low-lying fog." },
+			{ "Grass", "HiFi XI's own grass over the ground the zone's files say is grassy." },
+			{ "Water", "HiFi XI's own water: reflections, ripples, depth and the open sea." },
+			{ "Weather", "HiFi XI's own rain, snow, clouds, storms and the rest, following the zone's weather." },
+			{ "Sky", "The sky behind everything: its colours, sun, moon and stars." },
+			{ "View distance", "How far the world, characters and detail are drawn." },
+			{ "Display", "How the picture fits your screen." },
+			{ "Left out", "The game's own versions of what HiFi XI draws better itself." },
+			{ "Drawn by HiFi XI", "How HiFi XI lights the scenery and characters it draws in the game's place." },
+			{ "AMD FSR", "The world brought to your screen's size with AMD FidelityFX Super Resolution: sharper and smoother than the game's stretch." },
+			{ "Frame generation", "A frame made between each two the game draws, for motion twice as smooth." },
+			{ "Grass colour", "Where the grass gets its colour from." },
+			{ "Fine-tuning", "Small adjustments to how things look." },
+			{ "Diagnostics", "For finding out what went wrong: leave these off unless asked." },
+		};
+		for (const auto &h : kHelp)
+			if (section != nullptr && std::strcmp(section, h[0]) == 0)
+				return h[1];
+		return "";
 	}
 
 	const char *preset_key(preset p)
