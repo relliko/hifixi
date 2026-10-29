@@ -13,6 +13,11 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - the zone's visibility lists ignored, so far terrain doesn't pop in;
   - culling at the camera's own height of view;
   - square pixels.
+- **Smooth edges and upscaling with AMD FidelityFX Super Resolution:**
+  - **FSR 2** builds each frame from the last ones, the world drawn a fraction of a pixel apart every frame: edges as smooth as a background resolution twice the screen's, for far less work. Swaying grass carries its own motion, so it stays sharp;
+  - with the background resolution at the screen's size it smooths edges; below it, it also upscales, for more frames;
+  - **FSR 1** (edge-aware upscaling and sharpening) when FSR 2 is off;
+  - the menus and text are always drawn at the screen's own size.
 - **The zone and the characters drawn by HiFi XI itself**, from your own game files, in the game's own look:
   - **Per-pixel light** with every texture's normal map, on the zone and on characters and monsters;
   - **Tone mapping, bloom and a colour grade** over the world;
@@ -50,6 +55,16 @@ Check your server's rules on client modifications before using it.
 
 Your settings from hifps and drawcull are taken over the first time HiFi XI starts.
 
+## Upscaling (FSR)
+
+FSR works with the game's **background resolution** (the size the world is drawn at, set in your launcher or the game's config) at or below your screen's:
+
+- the same as your screen (say 2560x1440 on a 2560x1440 screen): FSR 2 smooths every edge, about as well as a background twice the screen's size;
+- lower (1920x1080, or 1707x960 for the most frames): FSR 2 also upscales to the screen;
+- above the screen's size, HiFi XI leaves the game's own scaling alone.
+
+In the menu: **Game -> Upscaling**: FSR on or off, FSR 2 or FSR 1, and how much it sharpens.
+
 ## Zone data
 
 Grass, water, the sea past the zone's edge, rain, wet ground and the lamps come from each zone's own files in your game. HiFi XI makes them on your PC, in the background, the first time you enter a zone; nothing from the game's data ships with HiFi XI. To make every zone's at once: **Grass, water, weather -> Make every zone's files now**.
@@ -63,6 +78,7 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 - `/hifi glows`: the glows lighting the scene now, and the glowing effects met lately.
 - `/hifi gpu`: the GPU time each part of the richer world takes, the costliest first (also in the menu's **Performance** tab).
 - `/hifi nativezone`, `/hifi nativechars`: what HiFi XI's own drawing of the zone, or the characters, is doing; `perpixel on|off` after either for its per-pixel light.
+- `/hifi upscale [on|off] [sharpen <0..1>]`: FSR on or off, its sharpening, and whether it's drawing now.
 - `/hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]`: the en-spell effect on your weapons. `auto` (the default) follows the en-spell on you; an element shows that one now, to see it. The same buttons are in the menu's Game tab.
 - `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
@@ -79,3 +95,7 @@ If the GPU hangs (`DXGI_ERROR_DEVICE_HUNG`):
 - Set the game's profile in your graphics driver back to its defaults (NVIDIA Control Panel or AMD Software), with anisotropic filtering, antialiasing and texture filtering left to the application. For sharper textures at an angle, use dgVoodoo's own `Filtering` setting (an anisotropy level, 1 to 16) instead.
 - Run your GPU at its stock clocks and voltage.
 - Send the crash report and the log when you ask for help.
+
+## Licences
+
+HiFi XI includes AMD FidelityFX Super Resolution 1 and 2 (Copyright (c) 2021-2023 Advanced Micro Devices, Inc., MIT licence). Their licence texts are in `docs\hifixi\`.

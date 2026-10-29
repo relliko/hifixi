@@ -5,6 +5,7 @@ HiFi XI's release zip, laid out as Ashita's folder (unzipped there as it is):
     bootloader/dxgi.dll             its starter (build/starter/dxgi.dll)
     bootloader/worldfx-sunlit.txt   which zones have open sky (data/)
     bootloader/worldfx-clearsky.txt each zone's clear-sky light by the hour (data/)
+    docs/hifixi/AMD-FidelityFX-FSR1-LICENSE.txt, AMD-FidelityFX-FSR2-LICENSE.txt   the MIT licences of AMD's code built in
     README.md
 
     python tools/package.py <version> [--out <folder>] [--plugin <dll>] [--starter <dll>]   (default build/release)
@@ -30,6 +31,8 @@ FILES = [
     ('build/starter/dxgi.dll', 'bootloader/dxgi.dll'),
     ('data/worldfx-sunlit.txt', 'bootloader/worldfx-sunlit.txt'),
     ('data/worldfx-clearsky.txt', 'bootloader/worldfx-clearsky.txt'),
+    ('src/upscale/fsr1/LICENSE.txt', 'docs/hifixi/AMD-FidelityFX-FSR1-LICENSE.txt'),
+    ('src/upscale/fsr2/LICENSE.txt', 'docs/hifixi/AMD-FidelityFX-FSR2-LICENSE.txt'),
     ('README.md', 'README.md'),
 ]
 
