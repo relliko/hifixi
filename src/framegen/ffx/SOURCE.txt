@@ -1,0 +1,4 @@
+AMD FidelityFX SDK v1.1.4 (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, c6efa6b, MIT: LICENSE.txt): the frame interpolation and
+optical flow components, the DX12 backend with its frame interpolation swap chain, the shared helpers, and the host and
+GPU headers they need, as they are. ffx_shader_blobs.cpp is HiFi XI's own (src/framegen: the shaders compiled with DXC
+when HiFi XI is built, tools/ffx_sc).

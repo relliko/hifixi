@@ -10,6 +10,7 @@
 #include "../zone/native.hpp"
 #include "../zone/zone_gpu.hpp"
 #include "../upscale/upscale.hpp"
+#include "../framegen/framegen.hpp"
 #include "../host/events.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
@@ -796,6 +797,14 @@ namespace hifi::backend
 		g_early = true;
 		g_started = true;
 		write_log(0, "HiFi XI: Direct3D 12 hooks in, before the game's device: its lists and views followed from their making");
+		// (frame generation: dgVoodoo's swap chain made as AMD's, when wanted)
+		if (framegen::wanted())
+		{
+			if (framegen::install(create_factory1, why))
+				write_log(0, "HiFi XI: frame generation's swap chain in (HIFIXI_FRAMEGEN=1): the game window's swap chain will be AMD's");
+			else
+				write_log(2, ("HiFi XI: frame generation's swap chain not in: " + why).c_str());
+		}
 		return true;
 	}
 

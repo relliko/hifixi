@@ -37,6 +37,8 @@ if not exist build\test mkdir build\test
 
 rem The render engine (src\render), as the World FX add-on builds it
 call "%~dp0build_engine.cmd" build\engine || exit /b 1
+rem Frame generation (src\framegen: AMD's FidelityFX SDK, its shaders compiled with the Windows SDK's DXC)
+call "%~dp0build_framegen.cmd" build\framegen || exit /b 1
 
 rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hifps and drawcull did
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
@@ -65,8 +67,8 @@ set "UPSCALE=src\upscale\upscale.cpp src\upscale\temporal.cpp src\upscale\fsr2_s
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib ^
-  /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib || exit /b 1
+  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
+  /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib dxgi.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
 echo Built build\hifixi.dll
 
@@ -119,7 +121,7 @@ echo Built build\shade_bench.exe
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib || exit /b 1
+  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib dxgi.lib || exit /b 1
 echo Built build\menu_test.exe
 
 rem The game side's feed on both FFXiMain dumps, World FX's functions stubbed: build\feed_test.exe

@@ -74,6 +74,7 @@
 #include "../zone/inject.hpp"
 #include "../zone/native.hpp"
 #include "../upscale/upscale.hpp"
+#include "../framegen/framegen.hpp"
 #include "../host/hooks.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../ui/menu.hpp"
@@ -322,6 +323,8 @@ class hifixi final : public IPlugin
 		for (const std::string &line : hifi::upscale::status())
 			say(line);
 		say(hifi::game::jitter::status());
+		for (const std::string &line : hifi::framegen::status())
+			say(line);
 		if (!hifi::host::installed())
 		{
 			say("The hooks aren't in (/hifi on).", true);
