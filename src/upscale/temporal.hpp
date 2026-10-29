@@ -54,6 +54,7 @@ namespace hifi::upscale::temporal
 			D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why);
 		ID3D12Resource *output() const { return _output; }
 		ID3D12Resource *motion() const { return _mv; } // (the motion FSR 2 was given: NON_PIXEL_SHADER_RESOURCE after record)
+		ID3D12Resource *depth() const { return _depth; } // (FSR 2's depth: NON_PIXEL_SHADER_RESOURCE after record)
 		DXGI_FORMAT output_format() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
 		uint32_t frames() const { return _frames; }
 		uint32_t blade_frames() const { return _blade_frames; } // (of them, with the blades' own motion)

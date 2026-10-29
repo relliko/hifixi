@@ -5,6 +5,8 @@
  *     interpolation swap chain (and a 1x1 one, dgVoodoo's probe, as DXGI's);
  *   - through it, as dgVoodoo draws: each back buffer cleared to its own colour and presented, 60 times; resized to
  *     1600x900 and presented 30 more (frame generation off: the game's frames as they are);
+ *   - generation on: each frame FSR 2's depth, motion and picture (stand-ins) handed to prepare() before Present, a UI
+ *     box drawn over the back buffer: a frame made between each two, the real swap chain shown twice as many;
  *   - the debug layer says nothing.
  *
  *   build\framegen_test.exe
@@ -202,6 +204,170 @@ int main()
 	}
 	check(frames(30, 0.75f) == 30, "30 more frames at the new size");
 	wait();
+	{
+		std::string not_yet;
+		const hifi::framegen::frame none;
+		const bool refused = !hifi::framegen::prepare(list, none, not_yet);
+		check(refused && !not_yet.empty(), "prepare() without FSR 2's frame: refused (" + not_yet + ")");
+	}
+
+	// Generation on: FSR 2's frame as upscale's pass hands it over (A 800x450: depth, motion; its picture 1600x900), the
+	// back buffer that picture with a UI box over it; each frame prepared, then presented
+	auto texture = [&](UINT w, UINT h, DXGI_FORMAT format, D3D12_RESOURCE_STATES state) {
+		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_RESOURCE_DESC rd = {};
+		rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		rd.Width = w;
+		rd.Height = h;
+		rd.DepthOrArraySize = 1;
+		rd.MipLevels = 1;
+		rd.Format = format;
+		rd.SampleDesc.Count = 1;
+		rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		ID3D12Resource *t = nullptr;
+		device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&t));
+		return t;
+	};
+	ID3D12Resource *depth = texture(800, 450, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	ID3D12Resource *motion = texture(800, 450, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	ID3D12Resource *picture = texture(1600, 900, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	check(depth != nullptr && motion != nullptr && picture != nullptr, "FSR 2's depth, motion and picture stand-ins");
+	ID3D12DescriptorHeap *rtvs = nullptr;
+	const D3D12_DESCRIPTOR_HEAP_DESC rh4 = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4 };
+	device->CreateDescriptorHeap(&rh4, IID_PPV_ARGS(&rtvs));
+	const UINT rtv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	auto rtv = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{ rtvs->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(i) * rtv_step }; };
+	device->CreateRenderTargetView(depth, nullptr, rtv(0));
+	device->CreateRenderTargetView(motion, nullptr, rtv(1));
+	device->CreateRenderTargetView(picture, nullptr, rtv(2));
+	auto barrier = [&](ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Transition = { r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to };
+		list->ResourceBarrier(1, &b);
+	};
+	UINT presents_before = 0, presents_after = 0;
+	chain->GetLastPresentCount(&presents_before);
+	uint32_t prepared = 0, presented = 0;
+	std::string prepare_why;
+	for (UINT f = 0; f < 60; ++f)
+	{
+		const UINT index = chain->GetCurrentBackBufferIndex();
+		ID3D12Resource *buffer = nullptr;
+		if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer))))
+			continue;
+		device->CreateRenderTargetView(buffer, nullptr, rtv(3));
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		// (the world: grey, a bright bar 64 wide moving 16 pixels right each frame; its motion, in A's pixels, back to where it was)
+		const float world[4] = { 0.2f, 0.2f, 0.2f, 1.0f }, bright[4] = { 0.8f, 0.8f, 0.8f, 1.0f }, far_depth[4] = { 0.5f }, still[4] = {};
+		const float moved[4] = { -16.0f / 1600.0f, 0.0f, 0.0f, 0.0f };
+		const LONG bar_x = LONG(400 + 16 * f);
+		const D3D12_RECT bar = { bar_x, 0, bar_x + 64, 900 }, bar_in_a = { bar_x / 2, 0, (bar_x + 64) / 2, 450 };
+		// (FSR 2's pass: its depth and motion written, its picture drawn, then onto the back buffer; the UI over that)
+		barrier(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		barrier(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		barrier(picture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		list->ClearRenderTargetView(rtv(0), far_depth, 0, nullptr);
+		list->ClearRenderTargetView(rtv(1), still, 0, nullptr);
+		list->ClearRenderTargetView(rtv(1), moved, 1, &bar_in_a);
+		list->ClearRenderTargetView(rtv(2), world, 0, nullptr);
+		list->ClearRenderTargetView(rtv(2), bright, 1, &bar);
+		barrier(depth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		barrier(motion, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		barrier(picture, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		barrier(buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		list->ClearRenderTargetView(rtv(3), world, 0, nullptr);
+		list->ClearRenderTargetView(rtv(3), bright, 1, &bar);
+		const float ui[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		const D3D12_RECT box = { 40, 40, 400, 120 };
+		list->ClearRenderTargetView(rtv(3), ui, 1, &box);
+		barrier(buffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+		hifi::framegen::frame in;
+		in.depth = depth;
+		in.motion = motion;
+		in.picture = picture;
+		in.jitter[0] = (f % 2) ? 0.25f : -0.25f;
+		in.fov = 0.8f;
+		in.dt_ms = 16.7f;
+		in.reset = f == 0;
+		if (hifi::framegen::prepare(list, in, prepare_why))
+			prepared++;
+		list->Close();
+		ID3D12CommandList *l = list;
+		queue->ExecuteCommandLists(1, &l);
+		presented += SUCCEEDED(chain->Present(0, 0)) ? 1 : 0;
+		wait();
+		buffer->Release();
+	}
+	wait();
+	Sleep(200); // (AMD's presenting thread: its last frames out)
+	chain->GetLastPresentCount(&presents_after);
+	const std::vector<std::string> st = hifi::framegen::status();
+	for (const std::string &s : st)
+		std::printf("  %s\n", s.c_str());
+	const std::string gen_line = st.size() > 1 ? st[1] : std::string();
+	check(prepared == 60 && presented == 60, "60 frames prepared and presented with generation on (" + std::to_string(prepared) + ", " + std::to_string(presented) +
+		(prepare_why.empty() ? std::string(")") : "; " + prepare_why + ")"));
+	unsigned made_between = 0, failed_gen = 99;
+	const size_t at_made = gen_line.find(" frames prepared, ");
+	if (at_made != std::string::npos)
+		sscanf_s(gen_line.c_str() + at_made, " frames prepared, %u made between, %*u shown twice, %u failed", &made_between, &failed_gen);
+	check(made_between >= 58 && failed_gen == 0, "a frame made between each two (" + std::to_string(made_between) + " made, " + std::to_string(failed_gen) + " failed)");
+	const UINT real_presents = presents_after - presents_before;
+	check(real_presents >= 116, "the real swap chain shown twice as many frames as the game presented (" + std::to_string(real_presents) + " for 60)");
+	wait();
+
+	// The last frame made between (frames 58 and 59: the bar from x 1328, then 1344): the bar halfway, the UI box as drawn
+	if (ID3D12Resource *between = hifi::framegen::last_made())
+	{
+		const D3D12_RESOURCE_DESC md = between->GetDesc();
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+		UINT64 bytes = 0;
+		device->GetCopyableFootprints(&md, 0, 1, 0, &fp, nullptr, nullptr, &bytes);
+		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK };
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = bytes;
+		bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		ID3D12Resource *readback = nullptr;
+		device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		barrier(between, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+		src.pResource = between;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst.pResource = readback;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint = fp;
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		barrier(between, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		list->Close();
+		ID3D12CommandList *l = list;
+		queue->ExecuteCommandLists(1, &l);
+		wait();
+		const uint8_t *px = nullptr;
+		readback->Map(0, nullptr, reinterpret_cast<void **>(const_cast<uint8_t **>(&px)));
+		auto at = [&](UINT x, UINT y) { return px + fp.Offset + SIZE_T(y) * fp.Footprint.RowPitch + SIZE_T(x) * 4; };
+		const uint8_t *ui_px = at(200, 80);
+		int left = -1, right = -1;
+		for (UINT x = 0; x < 1600; ++x)
+			if (at(x, 450)[0] > 128)
+			{
+				if (left < 0)
+					left = int(x);
+				right = int(x);
+			}
+		std::printf("  the frame made between: the bar from x %d to %d, the UI box %u %u %u (format %u)\n", left, right, ui_px[0], ui_px[1], ui_px[2], unsigned(md.Format));
+		check(left >= 1333 && left <= 1339 && right >= 1396 && right <= 1402, "  the bar in it halfway: from x 1336 (the frames' 1328 and 1344)");
+		check(ui_px[0] >= 250 && ui_px[1] >= 250 && ui_px[2] >= 250, "  the UI box in it white, as drawn");
+		readback->Unmap(0, nullptr);
+		readback->Release();
+	}
+	else
+		check(false, "the last frame made between: none");
 
 	const uint32_t errors = debug_messages(info, why);
 	check(errors == 0, "no debug-layer errors" + (errors != 0 ? " (" + std::to_string(errors) + ", the first: " + why + ")" : std::string()));

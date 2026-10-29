@@ -16,6 +16,7 @@
 #include "../render/worldfx_core.hpp"
 #include "temporal.hpp"
 #include "fsr2_shaders.hpp"
+#include "../framegen/framegen.hpp"
 #include "fsr2/ffx_fsr2.h"
 #include <algorithm>
 #include <atomic>
@@ -388,6 +389,19 @@ namespace hifi::upscale
 				list->SetGraphicsRootDescriptorTable(1, { m.srv_heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 2) * m.srv_step });
 				list->DrawInstanced(3, 1, 0, 0);
 				transition(list, l.target, D3D12_RESOURCE_STATE_RENDER_TARGET, l.target_state);
+				// The frame to frame generation, when on (framegen: AMD's swap chain in dgVoodoo's), FSR 2's picture the
+				// world without the UI
+				framegen::frame f;
+				f.depth = g.fsr2->depth();
+				f.motion = g.fsr2->motion();
+				f.picture = g.fsr2->output();
+				f.jitter[0] = c.jitter[0];
+				f.jitter[1] = c.jitter[1];
+				f.fov = 2.0f * std::atan(1.0f / c.proj[5]);
+				f.dt_ms = dt;
+				f.reset = reset;
+				std::string unused;
+				framegen::prepare(list, f, unused);
 			}
 			// (FSR 2 set its own heaps, root signatures and pipelines, drawn or not)
 			list->SetDescriptorHeaps(l.heap_count, l.heaps);

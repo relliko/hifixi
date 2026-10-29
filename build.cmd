@@ -192,7 +192,7 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
 echo Built build\zoneinject_test.exe
 rem The world upscaled to the screen on a list recorded as dgVoodoo records its own (src\upscale): build\upscale_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
-  tests\upscale_test.cpp %UPSCALE% %GAME% %ZONE% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\upscale_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  tests\upscale_test.cpp %UPSCALE% %GAME% %ZONE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\upscale_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\upscale_test.exe
 rem The visibility tests' answers (src\render\vistest.cpp): build\vistest_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
