@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace hifi::framegen
@@ -41,6 +42,7 @@ namespace hifi::framegen
 			DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 			UINT buffers = 0, flags = 0;
 			DXGI_SWAP_EFFECT effect = DXGI_SWAP_EFFECT_DISCARD;
+			void (*log)(int, const char *) = nullptr;
 		};
 		state g;
 		thread_local int t_inside = 0; // (AMD's code making the real swap chain: straight to DXGI)
@@ -59,6 +61,13 @@ namespace hifi::framegen
 		void note(const char *what, UINT w, UINT h, DXGI_FORMAT f, UINT buffers, UINT flags, DXGI_SWAP_EFFECT effect)
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
+			if (g.log != nullptr)
+			{
+				char text[200];
+				std::snprintf(text, sizeof(text), "HiFi XI: frame generation: a swap chain %s, %ux%u format %u, %u buffers, effect %u, flags 0x%X", what, w, h,
+					unsigned(f), buffers, unsigned(effect), flags);
+				g.log(std::strncmp(what, "wrapped", 7) == 0 ? 0 : 1, text);
+			}
 			g.last = what;
 			g.width = w;
 			g.height = h;
@@ -141,8 +150,9 @@ namespace hifi::framegen
 		return GetEnvironmentVariableA("HIFIXI_FRAMEGEN", v, sizeof(v)) != 0 && v[0] == '1';
 	}
 
-	bool install(void *create_factory1, std::string &why)
+	bool install(void *create_factory1, std::string &why, void (*log)(int, const char *))
 	{
+		g.log = log;
 		if (!wanted() || g.installed)
 			return true;
 		using create_factory_fn = HRESULT(WINAPI *)(REFIID, void **);

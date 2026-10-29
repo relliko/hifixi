@@ -12,7 +12,8 @@ namespace hifi::framegen
 {
 	// At HiFi XI's early start, with DXGI's own CreateDXGIFactory1 (the starter's): the factory's swap chain calls through
 	// ours, when wanted. False with why when they couldn't be; true (nothing done) when not wanted.
-	bool install(void *create_factory1, std::string &why);
+	// log: HiFi XI's log (level 0 info, 1 warning, 2 error), told of each swap chain made through ours.
+	bool install(void *create_factory1, std::string &why, void (*log)(int level, const char *text) = nullptr);
 	bool wanted();
 	std::vector<std::string> status();
 }

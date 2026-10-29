@@ -800,7 +800,7 @@ namespace hifi::backend
 		// (frame generation: dgVoodoo's swap chain made as AMD's, when wanted)
 		if (framegen::wanted())
 		{
-			if (framegen::install(create_factory1, why))
+			if (framegen::install(create_factory1, why, [](int level, const char *text) { write_log(level, text); }))
 				write_log(0, "HiFi XI: frame generation's swap chain in (HIFIXI_FRAMEGEN=1): the game window's swap chain will be AMD's");
 			else
 				write_log(2, ("HiFi XI: frame generation's swap chain not in: " + why).c_str());
