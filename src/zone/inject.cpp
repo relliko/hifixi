@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -54,6 +55,9 @@ namespace hifi::zone::inject
 			ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
 			ID3D12Resource *view_rt = nullptr, *view_ds = nullptr;
 			DXGI_FORMAT view_rt_format = DXGI_FORMAT_UNKNOWN, view_ds_format = DXGI_FORMAT_UNKNOWN;
+			// The camera of the last zone pass whose end was recorded (last_camera)
+			frame_camera camera;
+			bool have_camera = false;
 			// What's been drawn
 			uint32_t last_seq = 0;
 			uint64_t frame_number = 0, drawn = 0, failed = 0;
@@ -287,10 +291,43 @@ namespace hifi::zone::inject
 		return true;
 	}
 
+	bool world_depth(ID3D12Resource *&depth, D3D12_RESOURCE_STATES planes[2])
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (g.depth == nullptr || g.plane[0] == kUnknown || g.plane[1] == kUnknown)
+			return false;
+		depth = g.depth;
+		planes[0] = g.plane[0];
+		planes[1] = g.plane[1];
+		return true;
+	}
+
+	bool last_camera(frame_camera &out)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (!g.have_camera)
+			return false;
+		out = g.camera;
+		return true;
+	}
+
 	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
 	{
 		const frame *f = published(seq_low4);
-		if (f == nullptr || !f->native)
+		if (f == nullptr)
+			return;
+		{
+			// (the pass's camera, drawn natively or not: World FX and FSR 2 take this frame's from here)
+			std::lock_guard<std::mutex> lock(g.mutex);
+			std::memcpy(g.camera.view, f->view, sizeof(g.camera.view));
+			std::memcpy(g.camera.proj, f->proj, sizeof(g.camera.proj));
+			g.camera.jitter[0] = f->jitter[0];
+			g.camera.jitter[1] = f->jitter[1];
+			g.camera.seq = f->seq.load(std::memory_order_acquire);
+			g.camera.at = GetTickCount64();
+			g.have_camera = true;
+		}
+		if (!f->native)
 			return;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		const uint32_t seq = f->seq.load(std::memory_order_acquire);

@@ -117,6 +117,9 @@ namespace
 		grass::renderer::zone_bounds_fn zone_bounds = nullptr;
 		grass::renderer::zone_draw_fn zone_draw = nullptr;
 		void *zone_casters_context = nullptr;
+		// The camera of the frame being finished, from the host (set_camera_source), else the game's camera read now
+		worldfx::camera_source_fn camera_source = nullptr;
+		void *camera_source_context = nullptr;
 
 		// Settings ([FFXI_WORLDFX] in ReShade.ini, through the host)
 		bool enabled = true;
@@ -600,6 +603,16 @@ namespace
 		// without the world are skipped anyway, since nothing passes the world target's vertex count then.)
 		if (!safe_copy(cam.view, game + 0x94, 64) || !safe_copy(cam.proj, game + 0x154, 64))
 			return "the camera couldn't be read";
+		// (this frame's own, when the host has it: the game's thread may be a frame on by now, with another jitter)
+		if (g.camera_source != nullptr)
+		{
+			float view[16], proj[16];
+			if (g.camera_source(g.camera_source_context, view, proj))
+			{
+				std::memcpy(cam.view, view, 64);
+				std::memcpy(cam.proj, proj, 64);
+			}
+		}
 		for (int i = 0; i < 16; ++i)
 			if (!std::isfinite(cam.view[i]) || !std::isfinite(cam.proj[i]))
 				return "the camera isn't set";
@@ -1938,6 +1951,13 @@ namespace
 		// How deep into the night (fireflies): from sunset, full a little before 19:00, gone again by sunrise; only
 		// under open sky
 		g.look.night = g.zone_sunlit ? float(std::clamp(-up / 0.2, 0.0, 1.0)) : 0.0f;
+		// The fireflies' hours: the evening, as fireflies keep them, all of them till 22:00 and fewer until none by 00:30;
+		// none after midnight till the next dusk (they flew all night: 2026-10-29)
+		{
+			const double h = vanadiel_hour();
+			const double since_noon = h >= 12.0 ? h : h + 24.0;
+			g.look.firefly_hours = float(std::clamp((24.5 - since_noon) / 2.5, 0.0, 1.0));
+		}
 		// For the water: the sky it reflects when none is on screen (blue by day, warm at sunrise and sunset,
 		// dark at night; a dim grey without open sky), and the sun's glints, warmer low down
 		auto mix = [](const float *a, const float *b, double k, float *out) {
@@ -2495,6 +2515,13 @@ namespace worldfx
 			g.renderer->set_casters(fn, context);
 	}
 
+	void set_camera_source(camera_source_fn source, void *context)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.camera_source = source;
+		g.camera_source_context = context;
+	}
+
 	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
@@ -2693,6 +2720,7 @@ namespace worldfx
 				const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 				if ((d.world_rt_state & read) != 0 && (was & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)
 				{
+					d.world_ended = resources[i];
 					if (g.logging_moves && g.moves.size() < 1500)
 						g.moves += " rt-read";
 					if (!d.grass_done && g.world_rtv != 0 && g.world_dsv != 0)

@@ -103,7 +103,7 @@ namespace grass
 		constexpr UINT kSegments = 4;                              // per blade, the last one a triangle
 		constexpr UINT kVerticesPerBlade = (kSegments - 1) * 6 + 3;
 		// A firefly's home every this many grass points at the usual amount (3 points a square yalm: one in 20)
-		constexpr float kFireflyStride = 60.0f;
+		constexpr float kFireflyStride = 120.0f; // (was 60: too many, 2026-10-29)
 		// Rain: the rain map's window around the camera (squares a side: 128 yalms at 0.5), moved in steps of
 		// kRainWindowStep squares, with the camera kept at least kRainWindowMargin squares from its edges. Drops fall
 		// in columns kRainSpacing yalms apart (two drops a column, kRainLayers), drawn within kRainRadius yalms of the
@@ -4610,7 +4610,13 @@ namespace grass
 		const bool water = !only_blades && (l.water || l.water_debug) && (_water != nullptr || sea);
 		const float sea_reach = std::isfinite(l.sea_distance) ? std::clamp(l.sea_distance, 0.0f, 20000.0f) : 0.0f;
 		const float water_reach = sea ? std::max(l.water_distance, sea_reach) : l.water_distance;
-		const bool fireflies = !only_blades && l.fireflies > 0.0f && l.night > 0.0f && _buffer != nullptr;
+		// Fireflies: as many as the setting and their hours say, fewer in weather they don't fly in (none in rain, snow,
+		// a dust or sand storm, gloom, or a wind much over a breeze)
+		const auto share = [](float v) { return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f; };
+		const float firefly_weather = (1.0f - share(l.rain)) * (1.0f - share(l.snow)) * (1.0f - share(l.wx.dust)) * (1.0f - share(l.wx.gloom)) *
+			(1.0f - share((l.wx.wind_strength - 0.5f) / 0.5f));
+		const float firefly_amount = (std::isfinite(l.fireflies) ? l.fireflies : 0.0f) * share(l.firefly_hours) * firefly_weather;
+		const bool fireflies = !only_blades && firefly_amount > 0.02f && l.night > 0.0f && _buffer != nullptr;
 		// Rain, with the zone's rain map: how hard (the share of the columns with drops in them)
 		const float rain_amount = std::isfinite(l.rain) ? std::clamp(l.rain, 0.0f, 2.0f) : 0.0f;
 		const bool rain = !only_blades && rain_amount > 0.0f && !_rain.q.empty();
@@ -4702,7 +4708,7 @@ namespace grass
 		// The fireflies' cells: every kFireflyStride-th point (fewer with a lower amount) within their distance
 		cell_run firefly_runs[256];
 		uint32_t firefly_run_count = 0;
-		const UINT firefly_stride = fireflies ? static_cast<UINT>(std::clamp(kFireflyStride / l.fireflies, 20.0f, 100000.0f)) : 0;
+		const UINT firefly_stride = fireflies ? static_cast<UINT>(std::clamp(kFireflyStride / firefly_amount, 20.0f, 100000.0f)) : 0;
 		const float firefly_reach2 = l.firefly_distance * l.firefly_distance;
 		for (const blade_file::cell &c : _cells)
 		{
@@ -5078,10 +5084,13 @@ namespace grass
 			c[30] = c[31] = 0.0f;
 			// Their shadows' map round the camera (its texels on a grid fixed in the world, so the map doesn't crawl as the
 			// camera moves), as strong as the sun's shadows are, less the more the sky is covered (an overcast's light is the
-			// game's dim light already); none with the sun's shadows off or the light down
+			// game's dim light already); none with the sun's shadows off or the light down, and none by the moon (gone as the
+			// night deepens: clouds unseen against the night sky left only their shadows, dark patches on the ground at random;
+			// a dust storm's by moonlight in Batallia, 2026-10-29)
 			const float texel = 2.0f * kCloudShadowReach / kCloudShadowSize;
 			const float corner[2] = { std::floor(eye[0] / texel) * texel - kCloudShadowReach, std::floor(eye[2] / texel) * texel - kCloudShadowReach };
-			const float shadow_strength = std::clamp(sun_shadow, 0.0f, 1.0f) * (1.0f - cover * cover);
+			const float night = std::isfinite(l.night) ? std::clamp(l.night, 0.0f, 1.0f) : 0.0f;
+			const float shadow_strength = std::clamp(sun_shadow, 0.0f, 1.0f) * (1.0f - cover * cover) * (1.0f - night);
 			cloud_shade = light_ok && shadow_strength > 0.001f && std::isfinite(corner[0]) && std::isfinite(corner[1]);
 			const uint32_t map_at = uint32_t(mask_bytes + 2 * cloud_bytes), map_size = kCloudShadowSize;
 			c[32] = corner[0];

@@ -1,0 +1,1 @@
+AMD FidelityFX Super Resolution 2 (GPUOpen-Effects/FidelityFX-FSR2 1680d1e, MIT; LICENSE.txt). The core, the DX12 backend and the HLSL shaders as they are; dx12/shaders/ffx_fsr2_shaders_dx12.cpp is HiFi XI's own (src/upscale/fsr2_shaders.cpp: the shaders compiled at run time with D3DCompile and reflected, no 16-bit or wave64 permutations).

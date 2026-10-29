@@ -40,6 +40,8 @@
  *                  (Enfire .. Endark, the IIs too); off; or one element always (to look at it)
  *   /hifi nativechars [perpixel [on|off]]   HiFi XI drawing the characters in the game's place (src/chars; [chars]
  *                  perpixel its per-pixel lighting); the game draws any model whose data isn't up yet
+ *   /hifi upscale [on|off] [sharpen <0..1>]   the world upscaled to the screen with AMD FSR 1 when the background
+ *                  resolution is below the screen's (src/upscale; [upscale] fsr, sharpen)
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
  *                  mist, dryw, heat, rain, squl, dust, sand, wind, stom, snow, bliz, thdr, bolt, aura, ligt, fogd, dark),
  *                  cross-faded; off: back to the real one; flash: lightning now. Debug, not saved (off at every start);
@@ -60,6 +62,7 @@
 #include "../game/hifps/step.hpp"
 #include "../game/zonedraw.hpp"
 #include "../game/zoneslot.hpp"
+#include "../game/jitter.hpp"
 #include "../game/charslot.hpp" // (native characters)
 #include "../chars/marks.hpp"    // (native characters)
 #include "../game/charmodel.hpp"  // (native characters)
@@ -70,16 +73,18 @@
 #include "../zone/zoneoptions.hpp"
 #include "../zone/inject.hpp"
 #include "../zone/native.hpp"
+#include "../upscale/upscale.hpp"
 #include "../host/hooks.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../ui/menu.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace
 {
-	constexpr double kVersion = 0.48;
+	constexpr double kVersion = 0.51;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -236,6 +241,8 @@ class hifixi final : public IPlugin
 	uint32_t m_zone = 0;         // (the zone the zone files were last asked for)
 	bool m_zoneslot_refused = false; // (the zone slot couldn't be marked: not tried again until its option goes off and on)
 	bool m_native_refused = false;   // (likewise the native zone draw)
+	bool m_upscale_refused = false;  // (likewise the upscale: the game's stretch stays)
+	bool m_jitter_refused = false;   // (likewise the projection calls for FSR 2's jitter)
 	// Whether the end markers sent are coming through to Direct3D 12 (the native draws are left to HiFi XI only then): over
 	// the last kWindow presents, at least one ever seen and no more than 8 fewer seen than sent. (The totals since the start
 	// were compared before: 97 markers lost once, at a zone change or a stall, left native drawing off for the rest of
@@ -312,6 +319,9 @@ class hifixi final : public IPlugin
 		say(hifi::game::zonedraw::status());
 		for (const std::string &line : hifi::zone::inject::status())
 			say(line);
+		for (const std::string &line : hifi::upscale::status())
+			say(line);
+		say(hifi::game::jitter::status());
 		if (!hifi::host::installed())
 		{
 			say("The hooks aren't in (/hifi on).", true);
@@ -558,6 +568,7 @@ class hifixi final : public IPlugin
 		if (!m_zone_casters_set)
 		{
 			worldfx::set_zone_casters(hifi::zone::inject::zone_bounds_hook(), hifi::zone::inject::zone_draw_hook(), nullptr);
+			worldfx::set_camera_source(frame_camera, nullptr);
 			m_zone_casters_set = true;
 		}
 		ID3D12Device *const device = worldfx::attached();
@@ -573,6 +584,50 @@ class hifixi final : public IPlugin
 		}
 		hifi::zone::inject::set_options(hifi::game::option_on("zone", "perpixel", hifi::zone::options::kPerPixelByDefault));
 	}
+	// The camera of the frame dgVoodoo is finishing, for World FX: the zone pass's (its frame record, with the jitter it
+	// was drawn with) when one was recorded in the last quarter second
+	static bool frame_camera(void *, float view[16], float proj[16])
+	{
+		hifi::zone::inject::frame_camera c;
+		if (!hifi::zone::inject::last_camera(c) || GetTickCount64() - c.at > 250)
+			return false;
+		std::memcpy(view, c.view, 64);
+		std::memcpy(proj, c.proj, 64);
+		return true;
+	}
+
+	// The world upscaled to the screen (src/upscale): its options, and its passes made for the game's device (with what
+	// dgVoodoo's thread has asked for since: the screen-size texture, a pipeline for the back buffer's format)
+	void follow_upscale()
+	{
+		const bool fsr = hifi::game::option_on("upscale", "fsr", true);
+		hifi::upscale::set_options(fsr && !m_upscale_refused, hifi::game::option_on("upscale", "temporal", true), hifi::game::option_number("upscale", "sharpen", 0.8f));
+		ID3D12Device *const device = worldfx::attached();
+		std::string why;
+		if (fsr && !m_upscale_refused && device != nullptr && !hifi::upscale::prepare(device, why))
+		{
+			m_upscale_refused = true; // (not tried again: the game's stretch stays)
+			hifi::backend::log(1, ("HiFi XI: the upscale passes not made: " + why).c_str());
+		}
+	}
+
+	// The four projection calls through ours for FSR 2's jitter (src/game/jitter), once FFXiMain is there; offsets only
+	// while FSR 2 draws (Direct3DPresent)
+	void follow_jitter()
+	{
+		std::string why;
+		if (!hifi::game::jitter::in() && !m_jitter_refused && hifi::game::image_known())
+		{
+			if (hifi::game::jitter::start(why))
+				hifi::backend::log(0, "HiFi XI: the projection calls through ours (FSR 2's jitter)");
+			else
+			{
+				m_jitter_refused = true;
+				hifi::backend::log(1, ("HiFi XI: the projection calls not taken (no jitter for FSR 2): " + why).c_str());
+			}
+		}
+	}
+
 	void native_gate()
 	{
 		const bool want = hifi::game::zonedraw::in();
@@ -677,6 +732,8 @@ public:
 		hifi::game::zoneslot::set_listener(nullptr);
 		// (the zone's data stays: the renderer may still be drawing with it on dgVoodoo's lists)
 		hifi::game::zoneslot::set_wanted(false);
+		if (!hifi::game::jitter::stop(why))
+			ashita_log(1, ("the projection calls not put back: " + why).c_str());
 		if (!hifi::game::zoneslot::stop(why))
 			ashita_log(1, ("the zone pass's slot markers not taken out: " + why).c_str());
 		// (native characters: the game draws every model again, then the model draw's stub out, the game's own drawing back
@@ -803,6 +860,19 @@ public:
 					chosen == "off" ? "En-spell effect: off." : "En-spell effect: always " + chosen + " on your blades (/hifi enspell auto for the real one).");
 			}
 		}
+		else if (arg == "upscale" || arg.rfind("upscale ", 0) == 0)
+		{
+			const std::string how = arg.size() > 8 ? arg.substr(8) : std::string();
+			if (how == "on" || how == "off")
+				hifi::game::set_option_on("upscale", "fsr", how == "on");
+			else if (how.rfind("sharpen ", 0) == 0)
+				hifixi_set_option("upscale", "sharpen", how.substr(8).c_str());
+			else if (!how.empty())
+				say("/hifi upscale [on|off] [sharpen <0..1>]: the world upscaled to the screen with AMD FSR 1 when the background resolution is below the screen's");
+			follow_upscale();
+			for (const std::string &line : hifi::upscale::status())
+				say(line);
+		}
 		else if (arg == "weather" || arg.rfind("weather ", 0) == 0)
 			weather(arg.substr(7));
 		else if (arg.empty() || arg == "menu")
@@ -854,6 +924,10 @@ public:
 		hifi::game::hifps::present(now);
 		hifi::game::hifps::exp::present(now);
 		hifi::game::drawcull::frame(now);
+		// (the next frame's offset, before the camera tick builds its projection: only while FSR 2 draws to take it back out)
+		hifi::game::jitter::set_on(hifi::upscale::temporal_running());
+		hifi::game::jitter::set_phases(hifi::upscale::jitter_phases());
+		hifi::game::jitter::next_frame();
 		if (now >= m_next_update)
 		{
 			m_next_update = now + 0.5;
@@ -866,6 +940,8 @@ public:
 			follow_nativechars();
 			follow_enspell();
 			follow_native();
+			follow_upscale();
+			follow_jitter();
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first
 		// time it's entered)

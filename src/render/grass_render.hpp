@@ -306,6 +306,9 @@ namespace grass
 		// night it is (0 day .. 1 full night: they fade in at dusk), the glow's radius and how far they're drawn
 		float fireflies = 1.0f, night = 0.0f;
 		float firefly_size = 0.15f, firefly_distance = 40.0f;
+		// ... and how much of their hours it is (1 the evening after dusk, fewer of them toward midnight, 0 after it until
+		// the next dusk): their number times this (the night above still fades them in)
+		float firefly_hours = 1.0f;
 		// Lamps lit now (the zone's, from its bake, on or off as the game's light table says), their glow added
 		// by the shading pass on the ground and walls around them, 8 floats each: where the light is (x, y, z,
 		// the game's world), how far its glow reaches (yalms), its colour times how strong its glow is (rgb, the

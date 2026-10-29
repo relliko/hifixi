@@ -105,6 +105,9 @@ namespace worldfx
 		D3D12_RESOURCE_STATES world_rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		D3D12_RESOURCE_STATES world_ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 		bool grass_done = false; // grass went in on this list at the world's end
+		// The world turned readable on this list in the last on_barrier (its end: the resolve reads it next), for the host
+		// to take and clear
+		ID3D12Resource *world_ended = nullptr;
 	};
 
 	// Before the game's Direct3D 12 device is made: the GPU crash record (GpuCrashReports) and, where the host can
@@ -121,6 +124,10 @@ namespace worldfx
 	void set_casters(grass::renderer::caster_fn fn, void *context);
 	// The zone's casters the host draws itself (grass::renderer::set_zone_casters), likewise
 	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context);
+	// The camera of the frame dgVoodoo is finishing (VIEW and PROJECTION, row vectors), from the host: the zone pass's
+	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called under the core's mutex.
+	using camera_source_fn = bool (*)(void *context, float view[16], float proj[16]);
+	void set_camera_source(camera_source_fn source, void *context);
 	// At process exit: the device may be gone, its objects are left to the process's end
 	void shutdown();
 

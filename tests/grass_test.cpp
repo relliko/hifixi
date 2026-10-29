@@ -1305,7 +1305,7 @@ int main(int argc, char **argv)
 	// 1d. Fireflies at night: added light only (nothing darker than the same frame by day), somewhere over the
 	// grass at some moment, none behind the near wall, the world's alpha untouched; with the grass off too
 	{
-		auto frame = [&](float night, float time, bool blades, draw_stats &st) {
+		auto frame = [&](float night, float time, bool blades, draw_stats &st, float hours = 1.0f, float rain = 0.0f) {
 			fresh_memory();
 			const float ground[4] = { 0.1f, 0.12f, 0.08f, 0.5f };
 			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1319,6 +1319,8 @@ int main(int argc, char **argv)
 			l2.grass = blades;
 			l2.night = night;
 			l2.fireflies = 2.0f;
+			l2.firefly_hours = hours;
+			l2.rain = rain;
 			l2.time = time;
 			st = r.draw(g.list, t, cam, l2, error);
 			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1369,6 +1371,17 @@ int main(int argc, char **argv)
 		check(darker == 0, "they only add light");
 		check(behind == 0, "none behind the near wall (depth test)");
 		check(alpha == 0, "the world's alpha is untouched (fireflies)");
+		// Their hours and weather: half their hours (toward midnight) fewer, past them (after midnight) and in rain none
+		{
+			draw_stats half_st, late_st, rain_st;
+			frame(1.0f, 1.0f, true, half_st, 0.5f);
+			frame(1.0f, 1.0f, true, late_st, 0.0f);
+			frame(1.0f, 1.0f, true, rain_st, 1.0f, 1.0f);
+			std::printf("  fireflies' homes: %u in their hours, %u halfway out of them, %u past them, %u in rain\n", homes, half_st.fireflies,
+				late_st.fireflies, rain_st.fireflies);
+			check(half_st.fireflies > 0 && half_st.fireflies < homes && late_st.fireflies == 0 && rain_st.fireflies == 0,
+				"fireflies fewer toward the end of their hours, none past them or in rain");
+		}
 		check(g.report_messages() == 0, "no debug-layer errors (fireflies)");
 	}
 
@@ -5514,7 +5527,7 @@ float4 ps_main(vout i) : SV_Target { return i.c; }
 			// weather_frame's for any camera and sun, the clouds' last picture carried over or not (forget: every pixel of it
 			// marched now, the same each time)
 			auto cloud_frame = [&](const camera &c, const look::sky_dome &d, const look::weather_fx &wx, const float *sun, bool forget, draw_stats &st,
-				float sun_shadow = 0.0f) {
+				float sun_shadow = 0.0f, float night = 0.0f) {
 				barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 				const float clear[4] = { d.clear[0] / 255.0f, d.clear[1] / 255.0f, d.clear[2] / 255.0f, 0.5f }, stripe[4] = { 0.25f, 0.3f, 0.18f, 0.5f };
 				g.list->ClearRenderTargetView(world_rtv, clear, 0, nullptr);
@@ -5529,6 +5542,7 @@ float4 ps_main(vout i) : SV_Target { return i.c; }
 				ls.ao_strength = ls.relief = 0.0f;
 				ls.sun_shadow = sun_shadow;
 				ls.fireflies = 0.0f;
+				ls.night = night;
 				ls.water = ls.water_debug = false;
 				ls.dome = d;
 				ls.time = 12.5f;
@@ -5754,6 +5768,22 @@ float4 ps_main(vout i) : SV_Target { return i.c; }
 				check(st_s.cloud_shadows && !st_o.cloud_shadows && darker > ground_n / 20 && darker < ground_n * 19 / 20,
 					"the clouds' shadows on the ground in patches (their own map made)");
 				check(off_changed == 0, "no clouds' shadows with the sun's shadows off");
+
+				// By night (the moon's shadows on): none either. The same clouds, the night at its deepest: the ground as without
+				// clouds (a dust storm's unseen clouds left dark patches by moonlight, 2026-10-29)
+				draw_stats st_n, st_nc;
+				const std::vector<uint8_t> night_clouds = cloud_frame(sky_cam, noon, suny_wx, behind, true, st_n, 0.6f, 1.0f);
+				const std::vector<uint8_t> night_clear = cloud_frame(sky_cam, noon, calm, behind, true, st_nc, 0.6f, 1.0f);
+				uint32_t night_changed = 0;
+				for (UINT y = 0; y < H; ++y)
+					for (UINT x = 0; x < W; ++x)
+					{
+						float yalms = 0.0f;
+						if (kind_of(x, y, yalms) == at_kind::ground && off_by(night_clouds, night_clear, (size_t(y) * W + x) * 4) != 0)
+							night_changed++;
+					}
+				std::printf("  by night: %u ground pixels changed by the clouds\n", night_changed);
+				check(!st_n.cloud_shadows && night_changed == 0, "no clouds' shadows by night");
 			}
 
 			// Clouds off (the setting: no cover, thickness or veil): nothing of their pass, the picture the same to the byte as

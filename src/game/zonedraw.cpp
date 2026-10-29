@@ -43,6 +43,7 @@
  */
 
 #include "zonedraw.hpp"
+#include "jitter.hpp"
 #include "../zone/frame.hpp"
 #include "../zone/zone_gpu.hpp"
 #include <cmath>
@@ -222,6 +223,11 @@ namespace hifi::game::zonedraw
 		void snapshot(zone::frame &f, uintptr_t r)
 		{
 			std::memcpy(f.view_proj, reinterpret_cast<const void *>(r + 0x38F5C), 64);
+			std::memcpy(f.view, reinterpret_cast<const void *>(r + 0x38D9C), 64);
+			std::memcpy(f.proj, reinterpret_cast<const void *>(r + 0x38DDC), 64);
+			const jitter::offset j = jitter::current();
+			f.jitter[0] = j.px[0];
+			f.jitter[1] = j.px[1];
 			std::memcpy(f.camera, reinterpret_cast<const void *>(r + 0x390F0), 12);
 			float dir[3];
 			std::memcpy(dir, reinterpret_cast<const void *>(r + 0x391C0), 12);

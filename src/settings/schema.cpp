@@ -249,6 +249,21 @@ namespace hifi::settings
 				"faces and folds. (/hifi nativechars perpixel)", nullptr, nullptr, false,
 				{ _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _ },
 				flag, 0.0f, 1.0f, chars::options::kPerPixelByDefault ? 1.0f : 0.0f },
+			// (the upscale: src/upscale)
+			{ "upscale.fsr", tab::game, "Upscaling", "Upscale the world with AMD FSR",
+				"When the game's background resolution is below the screen's, the world is stretched to the screen with AMD "
+				"FidelityFX Super Resolution 1 (sharp along edges) instead of the game's blur. The menus and text stay at the "
+				"screen's own size. Set a lower background resolution in the launcher for more frames. (/hifi upscale)", nullptr,
+				nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+			{ "upscale.temporal", tab::game, "Upscaling", "FSR 2: smooth edges over the frames",
+				"With the background resolution at or below the screen's, AMD FidelityFX Super Resolution 2 builds each frame "
+				"from the last ones (the world drawn a fraction of a pixel apart each frame): edges as smooth as a background twice "
+				"the screen's size, for far less work. Set the background resolution to the screen's (or lower, for more frames) "
+				"in the launcher. Off: FSR 1 when the background is smaller. (/hifi upscale)", nullptr, "upscale.fsr", false,
+				{ 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+			{ "upscale.sharpen", tab::game, "Upscaling", "Sharpening",
+				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most.", "%.2f", "upscale.fsr", false,
+				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.8f },
 
 			// Advanced
 			{ "GrassHue", tab::advanced, "Grass colour", "Grass colour where the ground hasn't been seen",

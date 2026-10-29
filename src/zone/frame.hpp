@@ -70,6 +70,9 @@ namespace hifi::zone
 		uint32_t map = 0;
 		// The pass's camera and light (renderer fields set by 17B510 for the zone's own environment)
 		float view_proj[16];            // +0x38F5C: VIEW x PROJECTION, row vectors
+		float view[16];                 // +0x38D9C: VIEW
+		float proj[16];                 // +0x38DDC: PROJECTION (the camera's, jitter in it)
+		float jitter[2];                // the jitter it was drawn with (game/jitter: A's pixels; 0 while off)
 		float camera[3];                // +0x390F0
 		float sun_dir[3];               // toward the sun (the D3DLIGHT8's Direction at +0x391C0, negated)
 		float sun[3];                   // its diffuse (+0x39184), fixed-function objects

@@ -41,7 +41,7 @@ call "%~dp0build_engine.cmd" build\engine || exit /b 1
 rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hifps and drawcull did
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
 set "FEED=src\game\game.cpp src\game\feed.cpp src\game\glows.cpp src\game\gamewater.cpp src\game\gamerain.cpp"
-set "MODULES=src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp src\game\zoneslot.cpp"
+set "MODULES=src\game\jitter.cpp src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp src\game\zoneslot.cpp"
 set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 rem The native zone renderer (src\zone): each zone's data on the GPU (the plugin alone)
@@ -50,11 +50,22 @@ rem The native character renderer (src\chars, src\game\charslot): the plugin alo
 set "CHARS=src\game\charslot.cpp src\chars\marks.cpp src\game\charmodel.cpp src\chars\charframe.cpp src\chars\cache.cpp src\chars\os2.cpp src\chars\tex.cpp"
 rem (its drawing on dgVoodoo's lists, with the engine's list_state: the plugin and the tests that draw)
 set "CHARS_DRAW=src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\chartest.cpp"
+rem The world upscaled to the screen (src\upscale: AMD FSR 1's headers in src\upscale\fsr1, FSR 2 in src\upscale\fsr2, both
+rem MIT), the shaders built in; FSR 2's own C++ with its own warning level
+if not exist build\gen mkdir build\gen
+python tools\embed.py src\upscale\upscale.hlsl build\gen\upscale_hlsl.inc || exit /b 1
+python tools\embed.py src\upscale\fsr1\ffx_a.h build\gen\ffx_a_h.inc || exit /b 1
+python tools\embed.py src\upscale\fsr1\ffx_fsr1.h build\gen\ffx_fsr1_h.inc || exit /b 1
+python tools\embed_dir.py src\upscale\fsr2\shaders build\gen\fsr2_shaders.inc .h .hlsl || exit /b 1
+if not exist build\obj\fsr2 mkdir build\obj\fsr2
+cl /nologo /c /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING ^
+  src\upscale\fsr2\ffx_fsr2.cpp src\upscale\fsr2\ffx_assert.cpp src\upscale\fsr2\dx12\ffx_fsr2_dx12.cpp /Fo"build\obj\fsr2\\" || exit /b 1
+set "UPSCALE=src\upscale\upscale.cpp src\upscale\temporal.cpp src\upscale\fsr2_shaders.cpp build\obj\fsr2\ffx_fsr2.obj build\obj\fsr2\ffx_assert.obj build\obj\fsr2\ffx_fsr2_dx12.obj"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
-cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% %ZONE% %CHARS% %CHARS_DRAW% build\engine\worldfx_engine.lib ^
+  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib ^
   /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
 echo Built build\hifixi.dll
@@ -106,9 +117,9 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEA
 echo Built build\shade_bench.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
-cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% %ZONE% %CHARS% %CHARS_DRAW% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib || exit /b 1
+  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\menu_test.exe
 
 rem The game side's feed on both FFXiMain dumps, World FX's functions stubbed: build\feed_test.exe
@@ -119,7 +130,7 @@ echo Built build\feed_test.exe
 rem The game side's pieces on both dumps, each against the addon it took over (its routines and patches byte for byte):
 rem build\glows_test.exe, gamewater_test, gamerain_test, drawcull_test; gamedraw_test (the off switches); zoneslot_test
 rem (the zone pass's slot markers)
-for %%t in (glows gamewater gamerain drawcull gamedraw zoneslot) do (
+for %%t in (glows gamewater gamerain drawcull gamedraw zoneslot jitter) do (
   cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
     tests\%%t_test.cpp src\game\%%t.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\%%t_test.exe" /link /NOLOGO user32.lib || exit /b 1
   echo Built build\%%t_test.exe
@@ -168,7 +179,7 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
 echo Built build\zonenative_test.exe
 rem The zone's objects handed to the native renderer (17CBA8's stub run on both dumps, zone 100 on WARP): build\zonedraw_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zonedraw_test.cpp src\game\zonedraw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  tests\zonedraw_test.cpp src\game\zonedraw.cpp src\game\jitter.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
   /Fo"build\test\\" /Fe"build\zonedraw_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zonedraw_test.exe
 rem The native renderer drawing at the zone's end marker on a list recorded as dgVoodoo records (WARP, debug layer):
@@ -177,6 +188,10 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp ^
   src\game\game.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\zoneinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zoneinject_test.exe
+rem The world upscaled to the screen on a list recorded as dgVoodoo records its own (src\upscale): build\upscale_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
+  tests\upscale_test.cpp %UPSCALE% %GAME% %ZONE% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\upscale_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\upscale_test.exe
 rem The visibility tests' answers (src\render\vistest.cpp): build\vistest_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\vistest_test.cpp src\render\vistest.cpp /Fo"build\test\\" /Fe"build\vistest_test.exe" /link /NOLOGO || exit /b 1

@@ -49,6 +49,19 @@ namespace hifi::zone::inject
 	// The world's depth planes' states as dgVoodoo's barriers left them (depth, stencil), for others drawing into it at
 	// the markers (World FX's blades at the zone's end); false when that isn't this depth or a plane isn't known yet
 	bool depth_planes(ID3D12Resource *depth, D3D12_RESOURCE_STATES out[2]);
+	// The world's depth as the markers found it, and its planes' states (false while either isn't known)
+	bool world_depth(ID3D12Resource *&depth, D3D12_RESOURCE_STATES planes[2]);
+	// The camera of the last zone pass whose end marker dgVoodoo's thread has recorded (its frame record's VIEW,
+	// PROJECTION with the jitter in it, the jitter, its seq; when, GetTickCount64): the frame being finished now, as
+	// dgVoodoo records one frame after another on its one thread. False before the first.
+	struct frame_camera
+	{
+		float view[16], proj[16];
+		float jitter[2];
+		uint32_t seq = 0;
+		uint64_t at = 0;
+	};
+	bool last_camera(frame_camera &out);
 	// The zone's end marker: the pass published under that seq drawn there when it's HiFi XI's
 	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
 

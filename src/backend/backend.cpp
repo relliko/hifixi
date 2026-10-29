@@ -9,6 +9,7 @@
 #include "../zone/frame.hpp"
 #include "../zone/native.hpp"
 #include "../zone/zone_gpu.hpp"
+#include "../upscale/upscale.hpp"
 #include "../host/events.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
@@ -436,6 +437,7 @@ namespace hifi::backend
 		{
 			zone::inject::on_reset(list);
 			chars::inject::on_reset(list); // (native characters)
+			upscale::on_reset(list);
 			worldfx::list_data *const d = data_of(list, true);
 			if (!g_attached.load(std::memory_order_acquire))
 			{
@@ -450,6 +452,7 @@ namespace hifi::backend
 			if (worldfx::list_data *const d = live(list))
 			{
 				host::quiet q;
+				upscale::before_other(list, d->state); // (the screen upscaled before the list closes, when it's waiting)
 				worldfx::on_close(list, *d);
 			}
 		}
@@ -547,6 +550,13 @@ namespace hifi::backend
 				if (n != 0)
 					worldfx::on_barrier(list, *d, n, res, after);
 			}
+			// (the world's end on this list: the upscale's resolve is the next draw out of it)
+			if (d->world_ended != nullptr)
+			{
+				upscale::on_world_end(list, d->world_ended, d->world_rt_state);
+				d->world_ended = nullptr;
+			}
+			upscale::after_barrier(list, count, barriers, d->state);
 		}
 		// The game side's slot markers (src/game/slotmark.hpp) as dgVoodoo hands them on: how many of each kind, how many
 		// came out of order (each zone begin, then its end with the same seq, then the next seq's begin), the last
@@ -633,6 +643,7 @@ namespace hifi::backend
 			if (port_resource_of_view(dsv.ptr) == nullptr)
 				return;
 			host::quiet q;
+			upscale::before_other(list, d->state);
 			worldfx::on_clear_depth(list, *d, dsv.ptr, true, rects != nullptr ? count : 0, rects);
 		}
 		void ev_clear_target(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT count, const D3D12_RECT *rects)
@@ -640,6 +651,7 @@ namespace hifi::backend
 			if (worldfx::list_data *const d = live(list))
 			{
 				host::quiet q;
+				upscale::before_other(list, d->state);
 				worldfx::on_clear_target(*d, rtv.ptr, color, rects != nullptr ? count : 0, rects);
 			}
 		}
@@ -649,12 +661,19 @@ namespace hifi::backend
 			{
 				zone::inject::on_heaps(list, count, heaps);
 				chars::inject::on_heaps(list, count, heaps); // (native characters)
+				upscale::on_heaps(list, count, heaps);
 			}
 		}
 		void ev_draw(ID3D12GraphicsCommandList *list, uint64_t vertices)
 		{
 			if (worldfx::list_data *const d = live(list))
+			{
+				{
+					host::quiet q;
+					upscale::before_draw(list, vertices, d->rt0, uint64_t(d->state.rtvs[0].ptr), port_format_of_view, d->state);
+				}
 				worldfx::on_draw(*d, vertices);
+			}
 		}
 		void ev_execute(ID3D12CommandQueue *queue, UINT, ID3D12CommandList *const *)
 		{
