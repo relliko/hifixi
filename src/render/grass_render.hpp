@@ -22,6 +22,13 @@
 
 namespace grass
 {
+	// Snapshots of the world for the upscaler's masks (src/upscale/masks), each at the world's end: before World FX's
+	// passes (0, the world in state), after its shading pass and the snow layer (1, RENDER_TARGET), before its light in
+	// the air and its look (2, RENDER_TARGET). The hook copies the world and leaves it in the state it came in; nullptr
+	// for none (the default).
+	using snapshot_fn = void (*)(ID3D12GraphicsCommandList *list, ID3D12Resource *world, D3D12_RESOURCE_STATES state, int when);
+	void set_snapshot_hook(snapshot_fn fn);
+
 	struct blade_file
 	{
 		struct cell

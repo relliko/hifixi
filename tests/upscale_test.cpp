@@ -771,6 +771,97 @@ int main(int argc, char **argv)
 				"a blade's own motion where it's still seen; the camera's where something was drawn over it, and where there's none" + (fail.empty() ? "" : " (" + fail + ")"));
 			check(tc.blade_frames() == 1, "  counted as a frame with the grass's own motion");
 			rbuf->Release();
+
+			// FSR's masks (masks.hpp) from the world's copies: the opaque world grey all over; with the game's effects (pre_fx,
+			// and shaded the same) a bright box in its middle; with World FX's own (pre_air) another at the left as well. The
+			// reactive mask in the first box only, the transparency mask in the second only.
+			{
+				ID3D12DescriptorHeap *rtvs = nullptr;
+				const D3D12_DESCRIPTOR_HEAP_DESC rh = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+				device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtvs));
+				const D3D12_RECT box_fx = { LONG(IW / 2 - 20), LONG(IH / 2 - 20), LONG(IW / 2 + 20), LONG(IH / 2 + 20) };
+				const D3D12_RECT box_wfx = { 10, LONG(IH / 2 - 20), 50, LONG(IH / 2 + 20) };
+				auto copy_of = [&](bool fx, bool wfx) {
+					D3D12_RESOURCE_DESC cd = {};
+					cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+					cd.Width = IW;
+					cd.Height = IH;
+					cd.DepthOrArraySize = 1;
+					cd.MipLevels = 1;
+					cd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+					cd.SampleDesc.Count = 1;
+					cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+					ID3D12Resource *c = nullptr;
+					device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&c));
+					device->CreateRenderTargetView(c, nullptr, rtvs->GetCPUDescriptorHandleForHeapStart());
+					const float grey[4] = { 0.3f, 0.3f, 0.3f, 1.0f }, white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+					list->ClearRenderTargetView(rtvs->GetCPUDescriptorHandleForHeapStart(), grey, 0, nullptr);
+					if (fx)
+						list->ClearRenderTargetView(rtvs->GetCPUDescriptorHandleForHeapStart(), white, 1, &box_fx);
+					if (wfx)
+						list->ClearRenderTargetView(rtvs->GetCPUDescriptorHandleForHeapStart(), white, 1, &box_wfx);
+					barrier(list, c, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+					g.run();
+					return c;
+				};
+				hifi::upscale::masks::taken mt;
+				mt.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				mt.copy[hifi::upscale::masks::opaque] = copy_of(false, false);
+				mt.copy[hifi::upscale::masks::pre_fx] = copy_of(true, false);
+				mt.copy[hifi::upscale::masks::shaded] = copy_of(true, false);
+				mt.copy[hifi::upscale::masks::pre_air] = copy_of(true, true);
+				for (bool &f : mt.fresh)
+					f = true;
+				std::string mfail;
+				const bool mrecorded = tc.record(list, A, D3D12_RESOURCE_STATE_RENDER_TARGET, Az, D3D12_RESOURCE_STATE_DEPTH_READ, nullptr, cam, 0.5f, 16.0f, true, mfail, &mt);
+				g.run();
+				auto read_r8 = [&](ID3D12Resource *t) {
+					barrier(list, t, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					const D3D12_RESOURCE_DESC td = t->GetDesc();
+					D3D12_PLACED_SUBRESOURCE_FOOTPRINT tfp = {};
+					UINT64 ttotal = 0;
+					device->GetCopyableFootprints(&td, 0, 1, 0, &tfp, nullptr, nullptr, &ttotal);
+					D3D12_RESOURCE_DESC bd2 = ud;
+					bd2.Width = ttotal;
+					ID3D12Resource *b2 = nullptr;
+					device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd2, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&b2));
+					D3D12_TEXTURE_COPY_LOCATION d2 = { b2, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, s2 = { t, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+					d2.PlacedFootprint = tfp;
+					list->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+					barrier(list, t, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+					g.run();
+					std::vector<uint8_t> out(size_t(IW) * IH);
+					uint8_t *m = nullptr;
+					b2->Map(0, nullptr, reinterpret_cast<void **>(&m));
+					for (UINT y = 0; y < IH; ++y)
+						std::memcpy(&out[size_t(y) * IW], m + size_t(y) * tfp.Footprint.RowPitch, IW);
+					b2->Unmap(0, nullptr);
+					b2->Release();
+					return out;
+				};
+				const std::vector<uint8_t> reactive = read_r8(tc.reactive()), comp = read_r8(tc.composition());
+				auto inside = [](const D3D12_RECT &b, UINT x, UINT y) { return LONG(x) >= b.left && LONG(x) < b.right && LONG(y) >= b.top && LONG(y) < b.bottom; };
+				uint32_t r_in = 0, r_out = 0, t_in = 0, t_out = 0, n_fx = 0, n_wfx = 0;
+				for (UINT y = 0; y < IH; ++y)
+					for (UINT x = 0; x < IW; ++x)
+					{
+						const uint8_t rv = reactive[size_t(y) * IW + x], tv = comp[size_t(y) * IW + x];
+						const bool in_fx = inside(box_fx, x, y), in_wfx = inside(box_wfx, x, y);
+						n_fx += in_fx ? 1 : 0;
+						n_wfx += in_wfx ? 1 : 0;
+						r_in += in_fx && rv > 150 ? 1 : 0;
+						r_out += !in_fx && rv != 0 ? 1 : 0;
+						t_in += in_wfx && tv > 120 ? 1 : 0;
+						t_out += !in_wfx && tv != 0 ? 1 : 0;
+					}
+				std::printf("  the masks: reactive in %u of %u of the effects' box, %u outside; transparency in %u of %u of World FX's box, %u outside\n",
+					r_in, n_fx, r_out, t_in, n_wfx, t_out);
+				check(mrecorded && r_in == n_fx && r_out == 0, "the reactive mask where the game's effects are, nowhere else" + (mfail.empty() ? "" : " (" + mfail + ")"));
+				check(t_in == n_wfx && t_out == 0 && tc.mask_frames() == 1, "  the transparency mask where World FX's own see-through things are, nowhere else");
+				for (ID3D12Resource *c : mt.copy)
+					c->Release();
+				rtvs->Release();
+			}
 			ub->Release();
 			blades->Release();
 			tc.release();

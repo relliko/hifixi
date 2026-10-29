@@ -266,6 +266,11 @@ namespace hifi::settings
 				"things, less shimmer, thin things (fences, hair, grass tips) kept better. Off: FSR 2. If it can't be made on "
 				"your graphics card, FSR 2 is used and the Upscaling tab says why.", nullptr, "upscale.temporal", false,
 				{ _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
+			{ "upscale.masks", tab::upscaling, "AMD FSR", "Keep effects, water and weather crisp",
+				"FSR is told where the picture changes in ways its motion can't follow: spells, fire and particles the game "
+				"draws, and World FX's water, rain, snow and fireflies. It leans on the frame itself there instead of on the "
+				"frames before, so they don't smear or leave trails. Costs four copies of the world a frame.", nullptr,
+				"upscale.temporal", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 			{ "upscale.sharpen", tab::upscaling, "AMD FSR", "Sharpening",
 				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most.", "%.2f", "upscale.fsr", false,
 				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.8f },

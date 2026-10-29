@@ -15,6 +15,7 @@
 #include "../zone/inject.hpp"
 #include "../render/worldfx_core.hpp"
 #include "temporal.hpp"
+#include "masks.hpp"
 #include "fsr2_shaders.hpp"
 #include "../framegen/framegen.hpp"
 #include "fsr2/ffx_fsr2.h"
@@ -364,7 +365,10 @@ namespace hifi::upscale
 				blades = nullptr;
 			g.blade_frames = blade_frames;
 			std::string fail;
-			const bool drawn = g.fsr2->record(list, l.world, l.world_state, depth, planes[0], blades, cam, std::clamp(g.sharpen.load(), 0.0f, 1.0f), dt, reset, fail);
+			// (this frame's copies of the world for FSR's masks: masks.hpp)
+			const masks::taken copies = masks::take();
+			const bool drawn = g.fsr2->record(list, l.world, l.world_state, depth, planes[0], blades, cam, std::clamp(g.sharpen.load(), 0.0f, 1.0f), dt, reset, fail,
+				masks::on() ? &copies : nullptr);
 			if (drawn)
 			{
 				// Its picture onto the back buffer
@@ -727,6 +731,11 @@ namespace hifi::upscale
 			lines.push_back(line);
 			if (!g.fsr3_refused.empty())
 				lines.push_back("upscale: FSR 3.1's upscaler couldn't be made, FSR 2's instead: " + g.fsr3_refused);
+			std::snprintf(line, sizeof(line), "upscale: masks %s; %u frames with them; the world copied for them in %llu frames at the characters' end, %llu before World FX, %llu shaded, %llu before its air",
+				masks::on() ? "on" : "off", g.fsr2 != nullptr ? g.fsr2->mask_frames() : 0u, static_cast<unsigned long long>(masks::frames_with(masks::opaque)),
+				static_cast<unsigned long long>(masks::frames_with(masks::pre_fx)), static_cast<unsigned long long>(masks::frames_with(masks::shaded)),
+				static_cast<unsigned long long>(masks::frames_with(masks::pre_air)));
+			lines.push_back(line);
 		}
 		return lines;
 	}

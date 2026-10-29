@@ -62,7 +62,7 @@ python tools\embed_dir.py src\upscale\fsr2\shaders build\gen\fsr2_shaders.inc .h
 if not exist build\obj\fsr2 mkdir build\obj\fsr2
 cl /nologo /c /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING ^
   src\upscale\fsr2\ffx_fsr2.cpp src\upscale\fsr2\ffx_assert.cpp src\upscale\fsr2\dx12\ffx_fsr2_dx12.cpp /Fo"build\obj\fsr2\\" || exit /b 1
-set "UPSCALE=src\upscale\upscale.cpp src\upscale\temporal.cpp src\upscale\fsr2_shaders.cpp build\obj\fsr2\ffx_fsr2.obj build\obj\fsr2\ffx_assert.obj build\obj\fsr2\ffx_fsr2_dx12.obj"
+set "UPSCALE=src\upscale\upscale.cpp src\upscale\temporal.cpp src\upscale\masks.cpp src\upscale\fsr2_shaders.cpp build\obj\fsr2\ffx_fsr2.obj build\obj\fsr2\ffx_assert.obj build\obj\fsr2\ffx_fsr2_dx12.obj"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^

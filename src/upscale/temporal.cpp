@@ -6,6 +6,12 @@
  *   1  table            t0 the depth copy (raw), t1 the blades' motion (World FX's; a null view when there's none),
  *                       u0 the depth (R32_FLOAT), u1 the motion (R16G16_FLOAT)
  * Its descriptors: kSlots fours in a shader-visible heap of its own, four a frame.
+ *
+ * The masks' pass (masks.hpp) before FSR's: 4 constants b0 (A's width, height, which masks: 1 reactive, 2 transparency),
+ * then a table: t0-t3 the world's copies (opaque, pre_fx, shaded, pre_air), u0 the reactive mask, u1 the transparency
+ * and composition mask (R8_UNORM). Where two copies differ (each tone-mapped, its largest channel), the mask rises from
+ * nothing at a difference of 0.03 to its most (0.9 reactive, 0.8 transparency) at 0.33: FSR leans on this frame there,
+ * not on what it remembers. Its descriptors: kSlots sixes in a heap of its own.
  */
 
 #include <windows.h>
@@ -61,8 +67,57 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 }
 )";
 
+		const char *kMask = R"(
+cbuffer mask_constants : register(b0)
+{
+	uint width, height, which, unused;
+};
+Texture2D<float4> opaque_in : register(t0);
+Texture2D<float4> pre_fx_in : register(t1);
+Texture2D<float4> shaded_in : register(t2);
+Texture2D<float4> pre_air_in : register(t3);
+RWTexture2D<float> reactive_out : register(u0);
+RWTexture2D<float> composition_out : register(u1);
+
+float3 tone(float3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+float apart(float3 a, float3 b)
+{
+	const float3 d = abs(tone(a) - tone(b));
+	return max(d.r, max(d.g, d.b));
+}
+
+[numthreads(8, 8, 1)]
+void mask_cs(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= width || id.y >= height)
+		return;
+	float r = 0.0, t = 0.0;
+	if ((which & 1) != 0)
+		r = apart(opaque_in[id.xy].rgb, pre_fx_in[id.xy].rgb);
+	if ((which & 2) != 0)
+		t = apart(shaded_in[id.xy].rgb, pre_air_in[id.xy].rgb);
+	reactive_out[id.xy] = 0.9 * saturate((r - 0.03) / 0.3);
+	composition_out[id.xy] = 0.8 * saturate((t - 0.03) / 0.3);
+}
+)";
+
 		constexpr UINT kSlots = 16;
 		constexpr UINT kConstants = 24;
+		constexpr UINT kMaskConstants = 4;
+
+		// (a copy's typeless format as its views read it)
+		DXGI_FORMAT typed(DXGI_FORMAT f)
+		{
+			switch (f)
+			{
+			case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+			case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+			case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+			case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+			case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+			default: return f;
+			}
+		}
 
 		template <typename T>
 		void drop(T *&p)
@@ -173,6 +228,12 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 		drop(_depth);
 		drop(_mv);
 		drop(_output);
+		drop(_mask);
+		drop(_mask_root);
+		drop(_mask_heap);
+		drop(_reactive);
+		drop(_tc);
+		_mask_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 		_made = false;
 		_have_last = false;
 		_device = nullptr;
@@ -263,9 +324,43 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			ok = _depth != nullptr && _mv != nullptr && _output != nullptr;
 			_depth_state = _mv_state = _output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 		}
+		// The masks' pass and its masks
+		if (ok)
+		{
+			ID3DBlob *mcs = nullptr;
+			ok = SUCCEEDED(compile(kMask, std::strlen(kMask), "hifixi_masks", nullptr, nullptr, "mask_cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &mcs, &errors));
+			drop(errors);
+			D3D12_DESCRIPTOR_RANGE mr[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 4 } };
+			D3D12_ROOT_PARAMETER mp[2] = {};
+			mp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+			mp[0].Constants.Num32BitValues = kMaskConstants;
+			mp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+			mp[1].DescriptorTable.NumDescriptorRanges = 2;
+			mp[1].DescriptorTable.pDescriptorRanges = mr;
+			const D3D12_ROOT_SIGNATURE_DESC mrd = { 2, mp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+			ID3DBlob *mblob = nullptr;
+			ok = ok && SUCCEEDED(serialize(&mrd, D3D_ROOT_SIGNATURE_VERSION_1, &mblob, &errors)) &&
+				SUCCEEDED(device->CreateRootSignature(0, mblob->GetBufferPointer(), mblob->GetBufferSize(), IID_PPV_ARGS(&_mask_root)));
+			drop(mblob);
+			drop(errors);
+			if (ok)
+			{
+				D3D12_COMPUTE_PIPELINE_STATE_DESC d = {};
+				d.pRootSignature = _mask_root;
+				d.CS = { mcs->GetBufferPointer(), mcs->GetBufferSize() };
+				ok = SUCCEEDED(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&_mask)));
+			}
+			drop(mcs);
+			const D3D12_DESCRIPTOR_HEAP_DESC mh = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * 6, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+			ok = ok && SUCCEEDED(device->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&_mask_heap)));
+			_reactive = ok ? texture(device, render_w, render_h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"hifixi: FSR's reactive mask") : nullptr;
+			_tc = ok ? texture(device, render_w, render_h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"hifixi: FSR's transparency mask") : nullptr;
+			ok = _reactive != nullptr && _tc != nullptr;
+			_mask_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+		}
 		if (!ok)
 		{
-			why = "FSR 2's motion pass or textures couldn't be made";
+			why = "FSR's motion or masks' pass or textures couldn't be made";
 			release();
 			return false;
 		}
@@ -311,7 +406,8 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 	}
 
 	bool context::record(ID3D12GraphicsCommandList *list, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state, ID3D12Resource *depth,
-		D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why)
+		D3D12_RESOURCE_STATES depth_state, ID3D12Resource *blades, const camera &cam, float sharpen, float dt_ms, bool reset, std::string &why,
+		const masks::taken *m)
 	{
 		if (!_made)
 		{
@@ -418,6 +514,55 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			list->SetComputeRootDescriptorTable(1, { _heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 4) * _step });
 			list->Dispatch((_rw + 7) / 8, (_rh + 7) / 8, 1);
 		}
+
+		// The masks: the game's effects (opaque against pre_fx) and World FX's own see-through things (shaded, or pre_fx
+		// when World FX didn't shade, against pre_air), from this frame's copies of A's size
+		uint32_t which = 0;
+		ID3D12Resource *copies[masks::kinds] = {};
+		if (m != nullptr && _mask != nullptr && m->copy[0] != nullptr && m->copy[0]->GetDesc().Width == _rw && m->copy[0]->GetDesc().Height == _rh)
+		{
+			for (int k = 0; k < masks::kinds; ++k)
+				copies[k] = m->copy[k];
+			if (m->fresh[masks::opaque] && m->fresh[masks::pre_fx])
+				which |= 1u;
+			if (m->fresh[masks::pre_air] && (m->fresh[masks::shaded] || m->fresh[masks::pre_fx]))
+			{
+				if (!m->fresh[masks::shaded])
+					copies[masks::shaded] = m->copy[masks::pre_fx];
+				which |= 2u;
+			}
+		}
+		if (which != 0)
+		{
+			const UINT step = _step;
+			const D3D12_CPU_DESCRIPTOR_HANDLE mc = { _mask_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(slot * 6) * step };
+			D3D12_SHADER_RESOURCE_VIEW_DESC s = {};
+			s.Format = typed(m->format);
+			s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			s.Texture2D.MipLevels = 1;
+			for (int k = 0; k < masks::kinds; ++k)
+				_device->CreateShaderResourceView(copies[k], &s, { mc.ptr + SIZE_T(k) * step });
+			D3D12_UNORDERED_ACCESS_VIEW_DESC u = {};
+			u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			u.Format = DXGI_FORMAT_R8_UNORM;
+			_device->CreateUnorderedAccessView(_reactive, nullptr, &u, { mc.ptr + 4 * step });
+			_device->CreateUnorderedAccessView(_tc, nullptr, &u, { mc.ptr + 5 * step });
+			transition(list, _reactive, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _mask_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			transition(list, _tc, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _mask_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			const uint32_t c[kMaskConstants] = { _rw, _rh, which, 0 };
+			list->SetDescriptorHeaps(1, &_mask_heap);
+			list->SetComputeRootSignature(_mask_root);
+			list->SetPipelineState(_mask);
+			list->SetComputeRoot32BitConstants(0, kMaskConstants, c, 0);
+			list->SetComputeRootDescriptorTable(1, { _mask_heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 6) * step });
+			list->Dispatch((_rw + 7) / 8, (_rh + 7) / 8, 1);
+			const D3D12_RESOURCE_STATES mask_read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			transition(list, _reactive, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, mask_read);
+			transition(list, _tc, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, mask_read);
+			_mask_state = mask_read;
+			_mask_frames++;
+		}
 		const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 		transition(list, _depth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
 		transition(list, _mv, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
@@ -442,6 +587,8 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			f.dt_ms = dt_ms;
 			f.fov = 2.0f * std::atan(1.0f / float(proj[5]));
 			f.reset = reset || _frames == 0;
+			f.reactive = which != 0 ? _reactive : nullptr;
+			f.composition = which != 0 ? _tc : nullptr;
 			if (!fsr3::dispatch(_fsr3, f, fsr3_why))
 				e = FFX_ERROR_BACKEND_API_ERROR;
 		}
@@ -454,8 +601,8 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 			d.depth = ffxGetResourceDX12(fsr, _depth, L"hifixi: FSR 2's depth", FFX_RESOURCE_STATE_COMPUTE_READ);
 			d.motionVectors = ffxGetResourceDX12(fsr, _mv, L"hifixi: FSR 2's motion", FFX_RESOURCE_STATE_COMPUTE_READ);
 			d.exposure = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no exposure");
-			d.reactive = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no reactive mask");
-			d.transparencyAndComposition = ffxGetResourceDX12(fsr, nullptr, L"hifixi: no transparency mask");
+			d.reactive = ffxGetResourceDX12(fsr, which != 0 ? _reactive : nullptr, L"hifixi: FSR's reactive mask", FFX_RESOURCE_STATE_COMPUTE_READ);
+			d.transparencyAndComposition = ffxGetResourceDX12(fsr, which != 0 ? _tc : nullptr, L"hifixi: FSR's transparency mask", FFX_RESOURCE_STATE_COMPUTE_READ);
 			d.output = ffxGetResourceDX12(fsr, _output, L"hifixi: FSR 2's picture", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 			d.jitterOffset = { cam.jitter[0], cam.jitter[1] };
 			d.motionVectorScale = { float(_rw), float(_rh) };

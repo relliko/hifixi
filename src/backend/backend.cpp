@@ -10,6 +10,7 @@
 #include "../zone/native.hpp"
 #include "../zone/zone_gpu.hpp"
 #include "../upscale/upscale.hpp"
+#include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
 #include "../host/events.hpp"
 #include "../render/worldfx_core.hpp"
@@ -617,7 +618,11 @@ namespace hifi::backend
 				w.ds_format = port_format_of_view(dsv);
 				w.rt_state = d.world_rt_state;
 				if (m.kind == slotmark::chars_end)
+				{
 					chars::inject::on_chars_end(list, d.state, w, m.seq);
+					// (the world with its opaque characters: FSR's reactive mask from here)
+					upscale::masks::snapshot(list, w.rt, w.rt_state, upscale::masks::opaque);
+				}
 				else
 					chars::inject::on_see_through(list, d.state, w, m.seq);
 			}

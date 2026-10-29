@@ -6,6 +6,7 @@
 #include "gpu_crash.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cwchar>
 #include <cmath>
@@ -17,6 +18,13 @@ namespace grass
 {
 	namespace
 	{
+		std::atomic<snapshot_fn> g_snapshot{ nullptr };
+		void snapshot(ID3D12GraphicsCommandList *list, ID3D12Resource *world, D3D12_RESOURCE_STATES state, int when)
+		{
+			if (const snapshot_fn fn = g_snapshot.load(std::memory_order_relaxed))
+				fn(list, world, state, when);
+		}
+
 		// Root parameters: 52 constants (b0), the blade buffer (t0), the copy of the world (t1), the actors
 		// near (t2; the water pass's parameters there) and the copy of the world's depth (t3), root SRVs, and
 		// the ground colours remembered (u0) and the sun's shadows (u1), root UAVs: no descriptor heap
@@ -4654,6 +4662,11 @@ namespace grass
 		return true;
 	}
 
+	void set_snapshot_hook(snapshot_fn fn)
+	{
+		g_snapshot.store(fn, std::memory_order_relaxed);
+	}
+
 	draw_stats renderer::draw(ID3D12GraphicsCommandList *list, const target &t, const camera &cam, const look &l, std::string &error)
 	{
 		draw_stats stats;
@@ -4661,6 +4674,8 @@ namespace grass
 			return stats;
 		// (look::phase_t: the blades alone at the zone's end; the rest without them at the world's end)
 		const bool only_blades = l.phase == look::phase_t::blades;
+		if (!only_blades)
+			snapshot(list, t.rt, t.rt_state, 0); // (the world as the game left it: the upscaler's reactive mask)
 		const bool grass = l.grass && l.phase != look::phase_t::rest && _buffer != nullptr && _memory != nullptr;
 		const uint32_t lamp_count = l.lamps != nullptr ? std::min<uint32_t>(l.lamp_count, kMaxLamps) : 0;
 		// (the sun's shadows and glints as the weather leaves them: none under an overcast sky, the sun pass skipped)
@@ -5546,6 +5561,7 @@ namespace grass
 				}
 			if ((run_count != 0 || (water_shade && (water_run_count != 0 || sea_here))) && copy_out(list, _ground, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)
 				transition(list, t.rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			snapshot(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1); // (shaded: the upscaler's transparency mask from here)
 		}
 		// The water: on the surface rebuilt over the zone's water collision (tools/bake_water.py), each pixel
 		// worked out from the copies (what the game drew there and around it) and written whole, so where the
@@ -5677,6 +5693,7 @@ namespace grass
 		// (no grass, fireflies or rain without the depth copy: it's their test against the world)
 		if ((run_count == 0 && firefly_run_count == 0 && !falling) || depth_kind == 0 || !blade_depth_for(rt_desc, error))
 		{
+			snapshot(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, 2);
 			air_pass();
 			if (look_on)
 				draw_look(list, t, l, stats, error);
@@ -5999,6 +6016,7 @@ namespace grass
 			}
 		}
 
+		snapshot(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, 2); // (World FX's water, rain, snow and fireflies drawn: to here)
 		air_pass();
 		if (look_on)
 			draw_look(list, t, l, stats, error);

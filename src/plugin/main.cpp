@@ -74,6 +74,7 @@
 #include "../zone/inject.hpp"
 #include "../zone/native.hpp"
 #include "../upscale/upscale.hpp"
+#include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
 #include "../host/hooks.hpp"
 #include "../render/worldfx_core.hpp"
@@ -616,6 +617,8 @@ class hifixi final : public IPlugin
 			hifi::game::option_on("upscale", "fsr3", true));
 		hifi::framegen::set_on(fsr && hifi::game::option_on("upscale", "framegen", false));
 		hifi::framegen::set_automatic(hifi::game::option_on("upscale", "framegen_auto", true));
+		// (FSR's masks: the world copied at World FX's passes as well as at the characters' end)
+		hifi::upscale::masks::set_on(hifi::game::option_on("upscale", "masks", true));
 		ID3D12Device *const device = worldfx::attached();
 		std::string why;
 		if (fsr && !m_upscale_refused && device != nullptr && !hifi::upscale::prepare(device, why))
