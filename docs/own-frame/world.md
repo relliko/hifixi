@@ -138,6 +138,10 @@ layer.
    caller passes as the depth flag isn't traced (both are handled).
 7. The font is read (the menu DAT, 4.3 MB, and two 256x256 DXT3 decodes) on the game's thread when the Direct3D 12 device is first seen.
 8. Battle numbers (element kind 0x5C) use the same font object but belong to the fx part.
+9. **The overlay's glue isn't driven by a test**: `renderer::names_over` is (world_test), but the frame kept at the
+   names' marker, the view of A's depth and its plane's barriers in `world_module.cpp` `overlay()` run only inside the
+   upscale's passes. Next: an upscale_test case with `set_overlay` and a names frame kept, or a hook in worldpass_test
+   that calls the overlay through `upscale::set_overlay`'s pointer.
 
 ## What needs checking in game
 - `/hifi sky`, `/hifi names`, `/hifi grid`: "HiFi XI draws it" once in the field; no "failed" counts climbing.
