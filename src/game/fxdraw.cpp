@@ -40,10 +40,11 @@
  *     draw (352348, D: alpha x 2); for kinds 5-7 without textures the first vertex's y comes from the DAT (their names
  *     begin where their vertices do, and the load stores the vertex buffer object over it once it has copied them:
  *     dat_first_y below; left to the game when it can't be found); else a draw per texture run (3524A8, bit 28: 3523D0; I: 352590), the texture object
- *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5. Lit (flags bit 16):
- *     left to the game for now.
+ *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5.
  *   03EB30 (CMoD3aElem): the frame +0x170 of the D3A (record_d3a below), lit or not (03E9A0 sets LIGHTING 0).
- *   0565A0 (the rings, kind 0x24): record_ring below; lit: left to the game.
+ *   0565A0 (the rings, kind 0x24): record_ring below.
+ * Lit elements (flags bit 16; D3M, MMB meshes and rings: the D3A sets LIGHTING 0 itself) get their lights as 0467E0
+ * works them out (record_light below), the game's own functions called for each step.
  *   Anything else: left to the game.
  * Weapon trails (CYyAfterImage) aren't elements: their flush callback 01C930 is recognised in the walk's stub and the
  * ring of samples recorded as one more element of the run (record_trail below).
@@ -113,6 +114,23 @@ namespace hifi::game::fxdraw
 		using matrix_fn = void(__fastcall *)(uintptr_t element, uintptr_t edx);
 		using weather_fn = float(__cdecl *)();
 		using fog_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, uint32_t *colour, float *end, float *start, uint32_t none, uint32_t area);
+		// The lighting's (0467E0 046A72-046D9E, 04719C): the element's frame matrix and attach matrix, the attach fix-up,
+		// the math object's turn (vt+0x78), products (vt+0x20, vt+0x24) and point transform (vt+0x50), the environment's
+		// one light, two lights (with an area, without) and ambient
+		using matrix_of_fn = uintptr_t(__fastcall *)(uintptr_t element, uintptr_t edx);
+		using fix_fn = void(__cdecl *)(float *m);
+		using turn_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float *in, float angle);
+		using product_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float *a, float *b);
+		using point_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float *m, float *in);
+		using light_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, void *light, uint32_t zero, uint32_t area);
+		using lights_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, void *light0, void *light1, uint32_t area);
+		using lights_default_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, void *light0, void *light1);
+		using ambient_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, uint32_t *colour, uint32_t zero, uint32_t area);
+		// Their calls in 0467E0 (from its start), and the material's push (0471C1: push VA 0490BC28)
+		constexpr intptr_t kFrameOfCall = 0x294, kAttachCall = 0x2F0, kFixCall = 0x339, kLightCall = 0x474, kLightsCall = 0x510, kLightsDefaultCall = 0x52A,
+			kAmbientCall = 0x9BC, kMaterialPush = 0x9E1;
+		constexpr uint32_t kTurn = 0x78, kProductA = 0x20, kProductB = 0x24, kPoint = 0x50;
+		constexpr uint32_t kThreeHalfPi = 0x4096CBE2, kPi = 0x40490FD8; // (the angles 0467E0 pushes)
 
 		// Element fields (notes-effects-update.md "Fields the frame touches")
 		constexpr uintptr_t kWorld = 0xA0, kGen = 0xFC, kModel = 0x104, kFlags = 0x10C, kUv = 0x120, kBias = 0x128, kLetter = 0x16C, kMmb = 0x179, kUvBits = 0x17B;
@@ -123,6 +141,7 @@ namespace hifi::game::fxdraw
 			uintptr_t setup_call = 0, setup = 0, flush_call = 0, walk = 0, entry_site = 0, element_cb = 0, element_draw = 0, d3m_draw = 0;
 			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0, mmb_draw = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
+			uintptr_t frame_of = 0, attach = 0, fix = 0, light1 = 0, lights2 = 0, lights2_default = 0, ambient = 0, material = 0; // (0 any: lit elements the game's)
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
 			bool in = false;
@@ -383,6 +402,131 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// A lit element's lights (flags bit 16) into the frame, as 0467E0 works them out for D3D8's lighting (046A72-
+		// 046D9E, 04719C-0471CC): L = the element's frame (045C50) without its translation; unless an MMB (+0x179) or the
+		// generator's +0xDF bit 1, with an attach matrix (0473F0): L turned by 3 pi / 2 (vt+0x78), the attach matrix fixed
+		// up (045800) and L = L x it (vt+0x20); bits 6-8 1 or 2 with bit 0: VIEW without its translation, vt+0x24 (L,
+		// VIEW, L), L = that VIEW, turned by pi. The lights: one (18B9A0, light 1 off) when the renderer's path
+		// +0x3949C, else two (18B960 with the generator's area, 188B70 without), each direction through L (vt+0x50);
+		// AMBIENT 18B9E0; the material VA 0490BC28. All read under record()'s guard; false: the game's (none of the
+		// calls found, no environment or math object, WORLD not invertible).
+		struct d3dlight
+		{
+			uint32_t type;
+			float diffuse[4], specular[4], ambient[4];
+			float position[3], direction[3];
+			float range, falloff, attenuation[3], theta, phi;
+		};
+		static_assert(sizeof(d3dlight) == 104, "D3DLIGHT8");
+
+		bool record_light(uintptr_t e, fx::element &out)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t env = at<uint32_t>(g.env), math = at<uint32_t>(g.math), renderer = at<uint32_t>(g.renderer), gfx = at<uint32_t>(g.gfx);
+			if (g.frame_of == 0 || g.attach == 0 || g.fix == 0 || g.light1 == 0 || g.lights2 == 0 || g.lights2_default == 0 || g.ambient == 0 || g.material == 0 ||
+				env == 0 || math == 0 || renderer == 0 || gfx == 0 || f.light_count >= fx::kMaxLit)
+				return false;
+			const uintptr_t vt = at<uint32_t>(math);
+			const auto turn = reinterpret_cast<turn_fn>(uintptr_t(at<uint32_t>(vt + kTurn)));
+			const auto product_a = reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(vt + kProductA)));
+			const auto product_b = reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(vt + kProductB)));
+			const auto point = reinterpret_cast<point_fn>(uintptr_t(at<uint32_t>(vt + kPoint)));
+			float three_half_pi, pi;
+			std::memcpy(&three_half_pi, &kThreeHalfPi, 4);
+			std::memcpy(&pi, &kPi, 4);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			// L, the frame the lights are turned into
+			alignas(16) float L[16];
+			std::memcpy(L, reinterpret_cast<const void *>(reinterpret_cast<matrix_of_fn>(g.frame_of)(e, 0)), 64);
+			L[12] = L[13] = L[14] = 0.0f;
+			L[15] = 1.0f;
+			const uint32_t handle = at<uint32_t>(e + kGen);
+			const uint32_t gen = handle != 0 ? at<uint32_t>(handle) : 0;
+			const bool own_frame = gen != 0 && ((at<uint8_t>(gen + 0xDF) >> 1) & 1) != 0;
+			if (at<uint8_t>(e + kMmb) == 0 && !own_frame)
+			{
+				const uintptr_t a = reinterpret_cast<matrix_of_fn>(g.attach)(e, 0);
+				if (a != 0)
+				{
+					alignas(16) float t[16];
+					std::memcpy(t, reinterpret_cast<const void *>(a), 64);
+					turn(math, 0, L, L, three_half_pi);
+					reinterpret_cast<fix_fn>(g.fix)(t);
+					product_a(math, 0, L, L, t);
+				}
+			}
+			const uint32_t facing = (flags >> 6) & 7;
+			if (facing >= 1 && facing <= 2 && (flags & 1) != 0)
+			{
+				alignas(16) float t[16];
+				std::memcpy(t, reinterpret_cast<const void *>(gfx + 0xB50), 64);
+				t[12] = t[13] = t[14] = 0.0f;
+				t[15] = 1.0f;
+				product_b(math, 0, L, t, L);
+				std::memcpy(L, t, 64);
+				turn(math, 0, L, L, pi);
+			}
+			// The lights and the ambient, from the environment for the generator's area
+			const uint32_t area = gen != 0 ? at<uint32_t>(gen + 0xC4) : 0;
+			d3dlight lights[2] = {};
+			const bool one = at<uint32_t>(renderer + 0x3949C) != 0;
+			if (one)
+				reinterpret_cast<light_fn>(g.light1)(env, 0, &lights[0], 0, area);
+			else if (gen != 0)
+				reinterpret_cast<lights_fn>(g.lights2)(env, 0, &lights[0], &lights[1], area);
+			else
+				reinterpret_cast<lights_default_fn>(g.lights2_default)(env, 0, &lights[0], &lights[1]);
+			for (int k = 0; k < (one ? 1 : 2); ++k)
+				point(math, 0, lights[k].direction, L, lights[k].direction);
+			uint32_t ambient = 0;
+			reinterpret_cast<ambient_fn>(g.ambient)(env, 0, &ambient, 0, area);
+			// Normals: by WORLD's 3x3, inverted and transposed
+			const float *w = out.world;
+			const float det = w[0] * (w[5] * w[10] - w[6] * w[9]) - w[1] * (w[4] * w[10] - w[6] * w[8]) + w[2] * (w[4] * w[9] - w[5] * w[8]);
+			if (!std::isfinite(det) || std::fabs(det) < 1e-20f)
+				return false;
+			const float inv[9] = { (w[5] * w[10] - w[6] * w[9]) / det, (w[2] * w[9] - w[1] * w[10]) / det, (w[1] * w[6] - w[2] * w[5]) / det,
+				(w[6] * w[8] - w[4] * w[10]) / det, (w[0] * w[10] - w[2] * w[8]) / det, (w[2] * w[4] - w[0] * w[6]) / det,
+				(w[4] * w[9] - w[5] * w[8]) / det, (w[1] * w[8] - w[0] * w[9]) / det, (w[0] * w[5] - w[1] * w[4]) / det };
+			fx::lighting &l = f.lights[f.light_count];
+			l = fx::lighting();
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					l.normal[i][j] = inv[j * 3 + i];
+			for (int k = 0; k < (one ? 1 : 2); ++k)
+			{
+				const float *d = lights[k].direction;
+				const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+				for (int c = 0; c < 3; ++c)
+				{
+					l.toward[k][c] = len > 0.0f ? -d[c] / len : 0.0f;
+					l.diffuse[k][c] = lights[k].diffuse[c];
+					l.ambient[c] += lights[k].ambient[c];
+				}
+			}
+			for (int c = 0; c < 3; ++c)
+			{
+				l.ambient[c] += float((ambient >> (16 - 8 * c)) & 0xFF) / 255.0f;
+				l.emissive[c] = at<float>(g.material + 0x30 + 4 * uintptr_t(c));
+			}
+			out.light = f.light_count++;
+			return true;
+		}
+
+		// An element's lighting when it's lit (flags bit 16): false, counted, when it can't be had (the game's)
+		bool lit_ok(uintptr_t e, fx::element &out)
+		{
+			if ((at<uint8_t>(e + kFlags + 2) & 1) == 0)
+				return true;
+			if (record_light(e, out))
+			{
+				g.n.lit_taken++;
+				return true;
+			}
+			g.n.lit++;
+			return false;
+		}
+
 		// The first vertex's y of an untextured D3M of kinds 5-7 (the load wrote the vertex buffer object over it in
 		// memory; record_d3m), from its DAT: the file id at its root (up the parents +0x28, as 072240; the root's +0x34),
 		// the chunk of its name (resource +0x20), type 0x1F and size whose other vertex positions are the ones in memory.
@@ -537,7 +681,7 @@ namespace hifi::game::fxdraw
 			}
 			fx::element &out = f.elements[f.element_count];
 			out = fx::element();
-			if (!common(e, out))
+			if (!common(e, out) || !lit_ok(e, out))
 				return false;
 			// (the D3M's TEXTUREFACTOR: D's alpha from 0x7F up full; I's colour white, blended DESTCOLOR / SRCALPHA)
 			if ((letter & 0xFF) == 0x44 && (out.tfactor >> 24) >= 0x7F)
@@ -684,7 +828,7 @@ namespace hifi::game::fxdraw
 			}
 			fx::element &out = f.elements[f.element_count];
 			out = fx::element();
-			if (!common(e, out))
+			if (!common(e, out) || !lit_ok(e, out))
 				return false;
 			for (int k = 0; k < 4; ++k)
 				out.world[12 + k] += at<float>(mesh + 0xE0 + 4 * uintptr_t(k));
@@ -913,7 +1057,7 @@ namespace hifi::game::fxdraw
 			}
 			fx::element &out = f.elements[f.element_count];
 			out = fx::element();
-			if (!common(e, out))
+			if (!common(e, out) || !lit_ok(e, out))
 				return false;
 			out.tfactor = at<uint32_t>(e + 0xF8);
 			const float step = 6.283184f / float(segments);
@@ -991,22 +1135,9 @@ namespace hifi::game::fxdraw
 				return record_d3a(e, resource);
 			}
 			if (cls == g.ring_draw && g.ring_draw != 0)
-			{
-				if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
-				{
-					g.n.lit++;
-					return false;
-				}
 				return record_ring(e);
-			}
 			if (cls == g.d3m_draw)
 			{
-				// (lit elements: the area's lights, not reproduced yet)
-				if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
-				{
-					g.n.lit++;
-					return false;
-				}
 				const uint32_t handle = at<uint32_t>(e + kModel);
 				if (handle == 0)
 				{
@@ -1083,7 +1214,7 @@ namespace hifi::game::fxdraw
 				g.seq = 1;
 			g.f = &fx::frame_slot(g.seq);
 			g.f->runs.store(0, std::memory_order_relaxed);
-			g.f->element_count = g.f->draw_count = g.f->vertex_count = 0;
+			g.f->element_count = g.f->draw_count = g.f->vertex_count = g.f->light_count = 0;
 			g.run_first = 0;
 			const uintptr_t renderer = word(g.renderer);
 			g.can_mark = g.wanted && markers_possible();
@@ -1189,6 +1320,19 @@ namespace hifi::game::fxdraw
 		n.renderer = word(s + kSetupRenderer + 2);
 		n.colour = word(d3m + kD3mColour + 1);
 		n.env = word(fog + kFogEnv);
+		{
+			// (the lighting's calls in 0467E0, each checked as a call; the material's push)
+			const auto call = [&](intptr_t at_) { uint8_t b = 0; return read(n.setup + at_, b) && b == 0xE8 ? uintptr_t(rel_target(n.setup + at_)) : uintptr_t(0); };
+			n.frame_of = call(kFrameOfCall);
+			n.attach = call(kAttachCall);
+			n.fix = call(kFixCall);
+			n.light1 = call(kLightCall);
+			n.lights2 = call(kLightsCall);
+			n.lights2_default = call(kLightsDefaultCall);
+			n.ambient = call(kAmbientCall);
+			uint8_t push = 0;
+			n.material = read(n.setup + kMaterialPush, push) && push == 0x68 ? word(n.setup + kMaterialPush + 1) : 0;
+		}
 		if (g.code == 0)
 			g.code = alloc_code(kCodeSize);
 		if (g.code == 0)
@@ -1330,16 +1474,16 @@ namespace hifi::game::fxdraw
 			taken += t;
 		char line[800];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, rings %llu, weapon trails %llu), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, rings %llu, weapon trails %llu; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
-			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
+			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
 			"%llu markers sent%s",
 			g.native ? "HiFi XI draws what it can" : g.probe ? "the game draws them (waiting for the markers to come through)" : "the game draws them",
 			static_cast<unsigned long long>(g.n.flushes), static_cast<unsigned long long>(taken), static_cast<unsigned long long>(g.n.taken[fx::class_d3m]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
-			static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
+			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
 			static_cast<unsigned long long>(g.n.overwritten), static_cast<unsigned long long>(g.n.mesh),
@@ -1364,6 +1508,11 @@ namespace hifi::game::fxdraw
 		s.trail_cb = g.trail_cb;
 		s.ring_draw = g.ring_draw;
 		s.mmb_draw = g.mmb_draw;
+		s.frame_of = g.frame_of;
+		s.light1 = g.light1;
+		s.lights2 = g.lights2;
+		s.ambient = g.ambient;
+		s.material = g.material;
 		s.colour = g.colour;
 		s.gfx = g.gfx;
 		s.renderer = g.renderer;

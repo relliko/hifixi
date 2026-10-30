@@ -6,7 +6,8 @@
  *
  * Root signature: 0 48 constants b0 (below), 1 the vertices t0 (a root view of the upload ring), 2 a table: the
  * texture t1, 3 and 4 an MMB effect mesh's zone vertices t2 and indices t3 (root views of the zone's buffers: its
- * draws read their vertices through the zone's indices). Static sampler s0: MIN/MAG LINEAR, no mips (the game sets no
+ * draws read their vertices through the zone's indices), 5 the frame's lights t4 (the upload ring, after the
+ * vertices: a lit element's D3D8 fixed-function lighting in the vertex shader). Static sampler s0: MIN/MAG LINEAR, no mips (the game sets no
  * MIPFILTER), WRAP (the D3M runs' and 183760's ADDRESS WRAP; D3D8's default for the rest).
  *
  * An MMB effect mesh's textures are the zone's (its heap bound for that element, ours again after).
@@ -32,7 +33,7 @@ cbuffer element : register(b0)
 	float4 tfactor;           // TEXTUREFACTOR
 	float4 fog_colour;        // rgb; a: 0 no fog, 1 by the view depth, 2 by the distance
 	float4 misc;              // fog start, fog end, TEXTURE0's offset u, v
-	uint4 flags;              // x the stage bits, y the first vertex
+	uint4 flags;              // x the stage bits, y the first vertex, z the element's light (0xFFFFFFFF: unlit)
 };
 struct vtx
 {
@@ -53,6 +54,15 @@ StructuredBuffer<vtx> verts : register(t0);
 Texture2D tex : register(t1);
 StructuredBuffer<zvtx> zverts : register(t2);
 StructuredBuffer<uint> zindices : register(t3);
+struct lit
+{
+	float4 n0, n1, n2;
+	float4 toward0, toward1;
+	float4 diffuse0, diffuse1;
+	float4 ambient;
+	float4 emissive;
+};
+StructuredBuffer<lit> lits : register(t4);
 SamplerState smp : register(s0);
 
 struct v2p
@@ -81,6 +91,14 @@ v2p vs(uint id : SV_VertexID)
 	o.pos = mul(float4(vp, 1.0), proj);
 	uint c = v.colour;
 	o.col = float4(float((c >> 16) & 255), float((c >> 8) & 255), float(c & 255), float(c >> 24)) / 255.0;
+	if (flags.z != 0xFFFFFFFF)
+	{
+		// (D3D8's lighting: the vertex colour both materials, directional lights, no specular)
+		lit l = lits[flags.z];
+		float3 n = v.normal.x * l.n0.xyz + v.normal.y * l.n1.xyz + v.normal.z * l.n2.xyz;
+		float3 light = l.ambient.rgb + l.diffuse0.rgb * max(0.0, dot(n, l.toward0.xyz)) + l.diffuse1.rgb * max(0.0, dot(n, l.toward1.xyz));
+		o.col.rgb = saturate(o.col.rgb * light + l.emissive.rgb);
+	}
 	o.uv = v.uv + misc.zw;
 	float d = fog_colour.a > 1.5 ? length(vp) : -vp.z;
 	o.fog = fog_colour.a > 0.5 ? saturate((misc.y - d) / max(misc.y - misc.x, 1e-6)) : 1.0;
@@ -131,7 +149,8 @@ float4 ps(v2p i) : SV_Target
 )";
 
 		constexpr UINT kConstants = 48;
-		constexpr UINT64 kSlotBytes = UINT64(kMaxVertices) * sizeof(vertex);
+		constexpr UINT64 kVertexBytes = UINT64(kMaxVertices) * sizeof(vertex);
+		constexpr UINT64 kSlotBytes = kVertexBytes + UINT64(kMaxLit) * sizeof(lighting);
 
 		float channel(uint32_t c, int shift)
 		{
@@ -239,7 +258,7 @@ float4 ps(v2p i) : SV_Target
 		}
 
 		D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1 };
-		D3D12_ROOT_PARAMETER p[5] = {};
+		D3D12_ROOT_PARAMETER p[6] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		p[0].Constants.ShaderRegister = 0;
 		p[0].Constants.Num32BitValues = kConstants;
@@ -250,7 +269,7 @@ float4 ps(v2p i) : SV_Target
 		p[2].DescriptorTable.NumDescriptorRanges = 1;
 		p[2].DescriptorTable.pDescriptorRanges = &range;
 		p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		for (UINT k = 3; k < 5; ++k)
+		for (UINT k = 3; k < 6; ++k)
 		{
 			p[k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
 			p[k].Descriptor.ShaderRegister = k - 1;
@@ -261,7 +280,7 @@ float4 ps(v2p i) : SV_Target
 		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
 		s.MaxLOD = 0.0f;
 		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 5, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 6, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -359,6 +378,16 @@ float4 ps(v2p i) : SV_Target
 		const UINT64 slot = UINT64(seq % kFrames) * kSlotBytes;
 		if (hi > lo)
 			std::memcpy(_mapped + slot + UINT64(lo) * sizeof(vertex), f.vertices + lo, size_t(hi - lo) * sizeof(vertex));
+		// (the lit elements' lights after them: the run's, at the frame's own indices)
+		uint32_t llo = kMaxLit, lhi = 0;
+		for (uint32_t i = r.first; i < r.first + r.count && i < kMaxElements; ++i)
+			if (f.elements[i].light < kMaxLit)
+			{
+				llo = std::min(llo, f.elements[i].light);
+				lhi = std::max(lhi, f.elements[i].light + 1);
+			}
+		if (lhi > llo)
+			std::memcpy(_mapped + slot + kVertexBytes + UINT64(llo) * sizeof(lighting), f.lights + llo, size_t(lhi - llo) * sizeof(lighting));
 
 		D3D12_VIEWPORT vp = { 0.0f, 0.0f, t.width, t.height, 0.0f, 1.0f };
 		D3D12_RECT sc = { 0, 0, LONG(t.width), LONG(t.height) };
@@ -371,6 +400,7 @@ float4 ps(v2p i) : SV_Target
 		// (the zone's views stand on the ring until an MMB mesh needs them: every root view set before a draw)
 		list->SetGraphicsRootShaderResourceView(3, _ring->GetGPUVirtualAddress());
 		list->SetGraphicsRootShaderResourceView(4, _ring->GetGPUVirtualAddress());
+		list->SetGraphicsRootShaderResourceView(5, _ring->GetGPUVirtualAddress() + slot + kVertexBytes);
 		ID3D12DescriptorHeap *const ours = textures::heap();
 		ID3D12DescriptorHeap *heap_bound = ours;
 		const zone::gpu_zone *zone_bound = nullptr;
@@ -416,8 +446,8 @@ float4 ps(v2p i) : SV_Target
 				const bool zoned = (dr.stages & stage_zone_mesh) != 0;
 				if (dr.count == 0 || (zoned ? z == nullptr : dr.first + dr.count > kMaxVertices))
 					continue;
-				const uint32_t fl[2] = { dr.stages, dr.first };
-				list->SetGraphicsRoot32BitConstants(0, 2, fl, 44);
+				const uint32_t fl[3] = { dr.stages, dr.first, e.light < kMaxLit ? e.light : kNone };
+				list->SetGraphicsRoot32BitConstants(0, 3, fl, 44);
 				if (zoned)
 					list->SetGraphicsRootDescriptorTable(2, z->texture_srv((dr.stages & (stage_mmb_textured | stage_mmb_textured_d)) != 0 ? dr.texture : textures::kNone));
 				else

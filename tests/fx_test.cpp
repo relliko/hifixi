@@ -212,11 +212,25 @@ int main()
 	ID3D12CommandQueue *queue = nullptr;
 	const D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT };
 	device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+	fx::frame_slot(0); // (the frames' ring, some 25 MB, made here too, clear of the dumps' place)
 
-	if (kept_free != nullptr)
-		VirtualFree(kept_free, 0, MEM_RELEASE);
+	// (and kept free while each dump is tested: what's around it stays reserved, so the threads WARP and the decoders
+	// start meanwhile don't put their stacks where the next dump goes)
+	void *around[2] = {};
+	const auto release_around = [&]() {
+		for (void *&p : around)
+			if (p != nullptr)
+			{
+				VirtualFree(p, 0, MEM_RELEASE);
+				p = nullptr;
+			}
+	};
 	for (const char *path : dump::kDumps)
 	{
+		if (kept_free != nullptr)
+			VirtualFree(kept_free, 0, MEM_RELEASE);
+		kept_free = nullptr;
+		release_around();
 		uintptr_t base = 0;
 		const size_t size = dump::map(path, base);
 		const std::string name = std::string(path).substr(std::string(path).rfind('\\') + 1);
@@ -225,6 +239,11 @@ int main()
 			check(false, "mapped " + name);
 			continue;
 		}
+		const uintptr_t end = (base + size + 0xFFFF) & ~uintptr_t(0xFFFF);
+		if (base > kDumpsFrom)
+			around[0] = VirtualAlloc(reinterpret_cast<void *>(kDumpsFrom), base - kDumpsFrom, MEM_RESERVE, PAGE_NOACCESS);
+		if (end < kDumpsTo)
+			around[1] = VirtualAlloc(reinterpret_cast<void *>(end), kDumpsTo - end, MEM_RESERVE, PAGE_NOACCESS);
 		fd::set_sink(&sink);
 		const bool started = fd::start(why);
 		check(started && fd::in(), name + ": start()" + (why.empty() ? "" : ": " + why));
@@ -729,6 +748,51 @@ int main()
 			gz.release();
 		}
 
+		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
+		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
+		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path
+		{
+			const uintptr_t env_block = take(0x400), env = env_block + 0x200;
+			put<uint32_t>(s.env, uint32_t(env));
+			put<uint32_t>(address(renderer) + 0x3949C, 1);
+			check(s.frame_of == base + 0x045C50 && s.light1 == base + 0x18B9A0 && s.lights2 == base + 0x18B960 && s.ambient == base + 0x18B9E0 &&
+					s.material == base + 0x47BC28,
+				name + ": the lighting's calls in 0467E0 (045C50, 18B9A0, 18B960, 18B9E0) and the material (VA +47BC28)");
+			const uintptr_t el = element(vt_d3m, textured_res, 0x48, 1u << 16 | 1u << 25, 0x80808080, -6.5f);
+			const uintptr_t list6 = take(16), node6 = take(32);
+			put<uint32_t>(node6 + 4, 0);
+			put<uint32_t>(node6 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node6 + 0xC, uint32_t(el));
+			put<uint32_t>(list6 + 4, uint32_t(node6));
+			put<uint32_t>(list6 + 8, 0);
+			const fd::counts c7 = fd::get_counts();
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list6, 0);
+			const fx::frame *f7 = fx::published(g_last_seq);
+			const fd::counts c8 = fd::get_counts();
+			bool ok = g_markers == 1 && f7 != nullptr && f7->element_count == 1 && c8.lit_taken == c7.lit_taken + 1 && f7->elements[0].light == 0 && f7->light_count == 1;
+			std::string what;
+			if (ok)
+			{
+				const fx::lighting &l = f7->lights[0];
+				const float t0 = std::sqrt(l.toward[0][0] * l.toward[0][0] + l.toward[0][1] * l.toward[0][1] + l.toward[0][2] * l.toward[0][2]);
+				char line[200];
+				std::snprintf(line, sizeof(line), " (toward %.3f %.3f %.3f, diffuse %.0f, ambient %.0f, emissive %.3f)", l.toward[0][0], l.toward[0][1], l.toward[0][2],
+					l.diffuse[0][0], l.ambient[0], l.emissive[0]);
+				what = line;
+				ok = std::fabs(t0 - 1.0f) < 1e-4f && l.diffuse[0][0] == 255.0f && l.diffuse[0][2] == 255.0f && l.diffuse[1][0] == 0.0f && l.ambient[0] == 256.0f &&
+					l.ambient[2] == 256.0f && l.emissive[0] == get<float>(s.material + 0x30) && l.emissive[2] == get<float>(s.material + 0x38);
+				// (WORLD the element's local matrix, its scale 1: the normals' rows its inverse transposed, nearly identity)
+				for (int i = 0; i < 3; ++i)
+					for (int j = 0; j < 3; ++j)
+						ok = ok && std::fabs(l.normal[i][j] - (i == j ? 1.0f : 0.0f)) < 1e-4f;
+			}
+			check(ok, name + ": a lit D3M taken with its lights: one white light of 255, AMBIENT + its ambient, the material's emissive, normals by WORLD" + what);
+			put<uint32_t>(s.env, 0);
+			put<uint32_t>(address(renderer) + 0x3949C, 0);
+		}
+
 		// Put back
 		fd::set_native(false);
 		fd::set_wanted(false);
@@ -744,6 +808,7 @@ int main()
 		fx::textures::stop();
 		dump::unmap(base);
 	}
+	release_around();
 	std::printf("\n%d passed, %d failed\n", passes, failures);
 	return failures == 0 ? 0 : 1;
 }

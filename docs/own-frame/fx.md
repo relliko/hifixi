@@ -48,14 +48,30 @@ to the game, nothing of it kept):
 Classes taken (by the vtable's class draw, vt+0x48):
 | Class | Draw | What's recorded | Left to the game |
 |---|---|---|---|
-| D3M (0x32AD80) | 040BA0 -> 040220 | vertices from the chunk in memory (03FEE0 doubled the colours in place), one draw per texture run (3524A8 / bit 28 3523D0 / I 352590), the untextured tail (352648), untextured (352348, D: alpha x 2) | lit (bit 16), untextured kinds 5-7 whose DAT chunk isn't found (below), a texture not on the GPU yet |
-| MMB meshes (D3M, +0x179) | 040BA0 -> 040C20 -> 183760 | the zone's own model (below): its pieces from the native zone renderer's data, 183760's tables, WORLD plus the mesh's +0xE0 | a model not in the zone's data on the GPU (or not as the game has it: below); kind 2, bump models; lit |
+| D3M (0x32AD80) | 040BA0 -> 040220 | vertices from the chunk in memory (03FEE0 doubled the colours in place), one draw per texture run (3524A8 / bit 28 3523D0 / I 352590), the untextured tail (352648), untextured (352348, D: alpha x 2) | untextured kinds 5-7 whose DAT chunk isn't found (below), a texture not on the GPU yet |
+| MMB meshes (D3M, +0x179) | 040BA0 -> 040C20 -> 183760 | the zone's own model (below): its pieces from the native zone renderer's data, 183760's tables, WORLD plus the mesh's +0xE0 | a model not in the zone's data on the GPU (or not as the game has it: below); kind 2, bump models |
 | D3A (CMoD3aElem) | 03EB30 -> 03E910 | the frame +0x170 (wrapped to 0 at the count and written back, as 03E910 does), its quads from the chunk, UVs x 1/(texture object +0x24, +0x26) when +0 >= 1 and +7 is 0 (as the load scales them), 351FA0 / bit 28 351EC8, no fog, no z write, unlit | a texture not up |
-| rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | lit, more than 4 rings |
+| rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | more than 4 rings |
 | weapon trails | flush callback 01C930 -> 01C940 | the 80-sample ring (newest first), one strip (tip A, base B) or two from the middle line (+0x151C), through VIEW, vertex colour only, additive, no z write, no fog | - |
 | everything else | | | all of it (below) |
 Elements whose class draw returns early in the game (no model, a weather element 002D80 hides, no vertex buffer, fewer
 than two trail samples, no segments) are taken with nothing drawn, as the game draws nothing.
+
+**Lit elements (flags bit 16: D3M, MMB meshes, rings).** 0467E0 turns D3D8's fixed-function lighting on for them;
+fxdraw works the lights out as it does, calling the game's own functions for each step (`record_light`): L = the
+element's frame (045C50) without its translation; unless an MMB or the generator's +0xDF bit 1, with an attach matrix
+(0473F0): L turned by 3 pi / 2 (math vt+0x78), the attach matrix fixed up (045800), L = L x it (vt+0x20); bits 6-8 1
+or 2 with bit 0: VIEW without its translation through vt+0x24, L = that, turned by pi. Then one light (18B9A0, light
+1 off) when the renderer's path +0x3949C is set, else two (18B960 with the generator's area, 188B70 without), each
+direction through L (vt+0x50); AMBIENT 18B9E0; the material VA 0490BC28. The calls are found at their call sites in
+0467E0. The device's own defaults (009A1C, 009A42: COLORVERTEX 1, DIFFUSE- and AMBIENTMATERIALSOURCE COLOR1,
+EMISSIVE MATERIAL, NORMALIZENORMALS 0; I: nothing in the frame changes them before the flush) make the vertex colour
+both materials, so the vertex shader computes colour = vertex x (AMBIENT + each light's ambient + each light's diffuse
+x max(0, N.L)) + emissive, alpha the vertex's, N by WORLD's inverse transpose and not normalized, L toward the light
+(the direction negated, normalized). Every light the environment gives is directional (188CA0 and 188B70 set type 3).
+A ring has no normals (FVF XYZ | DIFFUSE): N = 0, so only the ambient and emissive light it, as D3D does. The
+lights travel in the frame (`frame::lights`, after the vertices in the upload ring, a root view t4). Left to the
+game: no environment or math object, a WORLD that can't be inverted.
 
 **MMB meshes: the zone's own models.** An MMB effect mesh (water sheets, rivers, cloud domes, the fountains) isn't built
 for the effect: 049570 asks 183420 for the model of that name in the zone renderer's map slots (0, then 1; 170F30 on
@@ -136,22 +152,27 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   untextured kind-6 D3M, a lens-flare-like draw and a depth-pulled element; a D3A (frame wrap written back, UV scaling),
   a weapon trail, a ring; MMB meshes against a made-up map's data uploaded on WARP (the pieces, both tables by the
   letter, the +0xE0 offset, a mesh not in the data left to the game) and gamewater's list honoured (on the dump whose
-  040DC4 is the game's). 95 checks.
+  040DC4 is the game's); a lit D3M on a made-up environment (the game's own lighting calls: 045C50, 0473F0, the math
+  object, 18B9A0, 18B9E0; one white light of 255 down +y, AMBIENT and its ambient, the material's emissive, normals by
+  WORLD). 99 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
+  threads put their stacks there otherwise).
 - `build\fx_render_test.exe build\test\fx_fire.bin build\test\fx_cure.bin build\test\fx_fastblade.bin`: the D3D12 side
   at its marker on WARP with the debug layer, on a list recorded as dgVoodoo records (its own heap and targets),
   against `effects_play.py` through `tests\fx_oracle.py play` (Fire frame 150, Cure frame 60, Fast Blade frame 38: D3M and
   D3A elements with their real chunks and textures; Southern San d'Oria's fountain frame 120: 36 MMB meshes drawn from
   DAT 330's data as the native zone renderer loads it, `zonemesh::load_file` and a gpu_zone on WARP): mean difference
   0.00-0.05 of 255, no pixel off by more than 24; the debug layer silent. Plus the blend table (trail colour added, B
-  subtracted, F darkening) and 183760's three tables (plain, the textured mode, untextured) by value.
+  subtracted, F darkening), 183760's three tables (plain, the textured mode, untextured) and a lit element (vertex x
+  (ambient + diffuse x N.L, N not normalized) + emissive) by value.
 - `hook_test` (plain and --debug) and `menu_test` pass.
 The oracles are made when missing (`build.cmd`), about a minute.
 
 ## Open (exact next steps)
 1. (Done: MMB effect meshes, from the native zone renderer's data.) Kind-2 (swaying) and bump models stay the game's:
    183760 draws a part's +0x28 buffer with the mesh's stride, which for those isn't what the zone data holds.
-2. **Lit D3M/rings** (flags bit 16): record the area environment's lights as 0467E0 asks (`18B960`/`188B70`/`18B9A0`
-   for lights 0-1, `18B9E0` AMBIENT, material VA 0490BC28) and do D3D8's fixed-function lighting in the vertex shader.
+2. (Done: lit D3M, MMB meshes and rings.) Not checked against a real environment's lights offline (the test's
+   environment has no records loaded: 188CA0's fallback); a stream log of a lit effect would confirm the light colours
+   (188CA0 can give 255) and that the material sources are the device's defaults at the flush.
 3. (Done: untextured D3M kinds 5-7, the first vertex's y from the DAT.) A DAT read on the game's thread the first time
    such a mesh is drawn; if that shows as a hitch, move it to the textures' decoder thread (the element is the game's
    until it's back).
@@ -187,6 +208,8 @@ The oracles are made when missing (`build.cmd`), about a minute.
   renderer must be up (its data on the GPU) for them to be taken.
 - Depth-pulled effects close to the camera (cures on yourself) not cut by the ground.
 - Fog: distant glows (H) fading out, others to the fog colour.
+- Lit effects (shaded by the area's sun and ambient; spells and abilities with solid-looking pieces): as bright and as
+  shaded as before, the shading turning with the camera as the game's does.
 - With FSR on: effects not smeared (reactive mask).
 - Watch for: a missing effect for a frame or two when a new texture first appears (should not happen: the game draws
   it until it's up), anything drawn in the wrong order with see-through characters, and the "markers not seen" probe

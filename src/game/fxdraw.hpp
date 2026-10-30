@@ -17,7 +17,7 @@
 //
 // The gate: elements are taken only while set_native says so (the plugin's module: the Direct3D 12 side up and its
 // markers seen), the bound depth has a stencil for the markers, and per element only what's reproduced faithfully:
-// the classes handled, every texture on the GPU, unlit (flags bit 16 left to the game for now), a blend letter
+// the classes handled, every texture on the GPU, a lit element's lights worked out as 0467E0 does, a blend letter
 // 0467E0 knows. Everything else is the game's, element by element: never a hole.
 
 #include "game.hpp"
@@ -53,7 +53,8 @@ namespace hifi::game::fxdraw
 		uint64_t empty = 0;       // taken, nothing to draw (as the game's own early returns)
 		uint64_t game = 0;        // left to the game: not taking (native off, no stencil)
 		uint64_t unsupported = 0; // ... a class not handled yet
-		uint64_t lit = 0;         // ... lit (flags bit 16)
+		uint64_t lit = 0;         // ... lit (flags bit 16), its lights not to be had
+		uint64_t lit_taken = 0;   // (of those taken, lit)
 		uint64_t letter = 0;      // ... a blend letter 0467E0 has no case for (the blend inherited)
 		uint64_t texture = 0;     // ... a texture not on the GPU yet (or not found)
 		uint64_t full = 0;        // ... no room in the frame
@@ -77,6 +78,7 @@ namespace hifi::game::fxdraw
 		uintptr_t draw_matrix = 0, fog_env = 0;     // 045D40, 18BA20
 		uintptr_t d3a_draw = 0, trail_cb = 0, ring_draw = 0; // 03EB30, 01C930, 0565A0
 		uintptr_t mmb_draw = 0;                     // 040C20
+		uintptr_t frame_of = 0, light1 = 0, lights2 = 0, ambient = 0, material = 0; // 045C50, 18B9A0, 18B960, 18B9E0, VA 0490BC28
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
 		uintptr_t code = 0;                         // our stubs
 	};

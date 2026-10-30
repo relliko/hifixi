@@ -905,6 +905,79 @@ int main(int argc, char **argv)
 			const uint32_t messages3 = debug_messages(info, first);
 			check(messages3 == 0, "183760's tables: the debug layer: nothing (" + std::to_string(messages3) + (messages3 != 0 ? ": " + first : std::string()) + ")");
 		}
+
+		// A lit element by value (D3D8's lighting as 0467E0 sets it): a screen-filling untextured quad, its normals
+		// (0, 0, 2) (not normalized: NORMALIZENORMALS 0), one light toward +z of diffuse 0.5, ambient 0.25, emissive blue
+		// 0.1, ONE / ZERO: colour = vertex x (0.25 + 0.5 x 2) + emissive, then x TFACTOR x 2
+		{
+			fx::frame &g4 = fx::frame_slot(++seq);
+			g4.seq.store(0);
+			g4.element_count = g4.draw_count = g4.vertex_count = g4.light_count = 0;
+			std::memcpy(g4.proj, id, 64);
+			fx::element e;
+			std::memcpy(e.world, id, 64);
+			e.tfactor = 0x80808080u;
+			e.blend = fx::blend_one_zero;
+			e.first_draw = 0;
+			e.draws = 1;
+			fx::lighting &l = g4.lights[g4.light_count];
+			l = fx::lighting();
+			for (int i = 0; i < 3; ++i)
+				l.normal[i][i] = 1.0f;
+			l.toward[0][2] = 1.0f;
+			l.diffuse[0][0] = l.diffuse[0][1] = l.diffuse[0][2] = 0.5f;
+			l.ambient[0] = l.ambient[1] = l.ambient[2] = 0.25f;
+			l.emissive[2] = 0.1f;
+			e.light = g4.light_count++;
+			g4.draws[g4.draw_count++] = { 0, 6, fx::kNone, 0 };
+			const float c[6][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } };
+			for (const auto &p : c)
+			{
+				fx::vertex v = {};
+				v.pos[0] = p[0];
+				v.pos[1] = p[1];
+				v.pos[2] = 0.5f;
+				v.normal[2] = 2.0f;
+				v.colour = 0xFF806020u;
+				g4.vertices[g4.vertex_count++] = v;
+			}
+			g4.elements[g4.element_count++] = e;
+			g4.run_list[0] = { 0, 1 };
+			g4.runs.store(1);
+			g4.seq.store(seq);
+			alloc->Reset();
+			list->Reset(alloc, nullptr);
+			barrier(list, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			list->ClearRenderTargetView(rtv, black, 0, nullptr);
+			list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			list->SetDescriptorHeaps(1, &game_heap);
+			fx::inject::on_run(list, bound, w, seq & 15);
+			barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			list->Close();
+			queue->ExecuteCommandLists(1, lists);
+			queue->Signal(fence, ++fence_value);
+			HANDLE ev4 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, ev4);
+			WaitForSingleObject(ev4, 60000);
+			CloseHandle(ev4);
+			back->Map(0, nullptr, reinterpret_cast<void **>(&px));
+			const uint8_t *q = px + 32 * 256 + 32 * 4;
+			const double vc[3] = { 0x80 / 255.0, 0x60 / 255.0, 0x20 / 255.0 }, emi[3] = { 0.0, 0.0, 0.1 }, tf = 2.0 * 0x80 / 255.0;
+			bool ok = true;
+			std::string got;
+			for (int k = 0; k < 3; ++k)
+			{
+				const double lit = std::min(1.0, vc[k] * 1.25 + emi[k]);
+				const int want4 = int(std::min(1.0, lit * tf) * 255.0 + 0.5);
+				ok = ok && std::abs(int(q[k]) - want4) <= 2;
+				got += (got.empty() ? "" : " ") + std::to_string(q[k]) + "/" + std::to_string(want4);
+			}
+			back->Unmap(0, nullptr);
+			check(ok, "a lit element: vertex x (ambient + diffuse x N.L, N not normalized) + emissive (got/want: " + got + ", within 2)");
+			const uint32_t messages4 = debug_messages(info, first);
+			check(messages4 == 0, "a lit element: the debug layer: nothing (" + std::to_string(messages4) + (messages4 != 0 ? ": " + first : std::string()) + ")");
+		}
 		list->Release();
 		alloc->Release();
 		A->Release();
