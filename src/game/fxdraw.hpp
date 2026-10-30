@@ -49,7 +49,7 @@ namespace hifi::game::fxdraw
 	struct counts
 	{
 		uint64_t flushes = 0;
-		uint64_t taken[8] = {};   // (by fx::element_class)
+		uint64_t taken[12] = {};  // (by fx::element_class)
 		uint64_t empty = 0;       // taken, nothing to draw (as the game's own early returns)
 		uint64_t game = 0;        // left to the game: not taking (native off, no stencil)
 		uint64_t unsupported = 0; // ... a class not handled yet
@@ -78,6 +78,9 @@ namespace hifi::game::fxdraw
 		uintptr_t draw_matrix = 0, fog_env = 0;     // 045D40, 18BA20
 		uintptr_t d3a_draw = 0, trail_cb = 0, ring_draw = 0; // 03EB30, 01C930, 0565A0
 		uintptr_t mmb_draw = 0, morph_draw = 0;     // 040C20, 03FBB0
+		uintptr_t vuanm_draw = 0, vu_walk = 0, vu_cursor = 0; // 03F130, 063C80, VA 0490B9D4
+		uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // 0426F0, 043110, VA 048E666C
+		uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // 054B81, 03EBF0, VA 0490B970
 		uintptr_t frame_of = 0, light1 = 0, lights2 = 0, ambient = 0, material = 0; // 045C50, 18B9A0, 18B960, 18B9E0, VA 0490BC28
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
 		uintptr_t code = 0;                         // our stubs
@@ -92,4 +95,6 @@ namespace hifi::game::fxdraw
 	void __cdecl on_flush(uint32_t end);
 	void __cdecl on_entry(uintptr_t callback, uintptr_t arg);
 	uint32_t __fastcall on_setup(uintptr_t element, uintptr_t edx, uint32_t arg);
+	// A lens flare's pieces (0548D0's call of 03EBF0, thiscall on the flare's D3A resource, ret 0x18)
+	void __fastcall on_flare(uintptr_t resource, uintptr_t edx, int32_t visibility, float x, float y, float far_x, float far_y, uint32_t zero);
 }

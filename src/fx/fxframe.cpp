@@ -60,6 +60,12 @@ namespace hifi::fx
 
 	void element_projection(const frame &f, const element &e, float out[16])
 	{
+		if (e.projection == proj_identity)
+		{
+			static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+			std::memcpy(out, identity, sizeof(identity));
+			return;
+		}
 		std::memcpy(out, f.proj, sizeof(f.proj));
 		if (e.projection == proj_camera)
 			return;

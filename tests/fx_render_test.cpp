@@ -803,6 +803,196 @@ int main(int argc, char **argv)
 		const uint32_t messages = debug_messages(info, first);
 		check(messages == 0, "the blend table: the debug layer: nothing (" + std::to_string(messages) + (messages != 0 ? ": " + first : std::string()) + ")");
 
+		// A distortion quad by value (0426F0): the world red left of x 36, blue right; a CMoDist diamond of half the screen
+		// (WORLD scale 0.5, PROJECTION identity) whose grab is the unshifted diamond's (its screen points: centre (32, 32),
+		// 1 (16, 32), 2 (32, 48), 3 (48, 32), 4 (32, 16); box 16 .. 48, so moved by 16, scale 1; UVs / 64), drawn shifted
+		// right by 0.25 (8 pixels): at (40, 32) the fan shows the world from (32, 32): red where the world is blue; alpha
+		// there the centre's (0xFF x 0x80 x 4: full) and the colour the world's x 0x80 x 2; outside the fan the world.
+		{
+			fx::frame &fd = fx::frame_slot(++seq);
+			fd.seq.store(0);
+			fd.element_count = fd.draw_count = fd.vertex_count = fd.light_count = fd.grab_count = 0;
+			std::memcpy(fd.proj, id, 64);
+			fx::element e;
+			const float wm[16] = { 0.5f, 0, 0, 0, 0, 0.5f, 0, 0, 0, 0, 1, 0, 0.25f, 0, 0.5f, 1 };
+			std::memcpy(e.world, wm, 64);
+			e.tfactor = 0x80808080u;
+			e.blend = fx::blend_alpha;
+			e.cls = fx::class_dist;
+			e.first_draw = 0;
+			e.draws = 1;
+			const float moved[5][2] = { { 16, 16 }, { 0, 16 }, { 16, 32 }, { 32, 16 }, { 16, 0 } };
+			const float screen[5][2] = { { 32, 32 }, { 16, 32 }, { 32, 48 }, { 48, 32 }, { 32, 16 } };
+			const float dia[5][2] = { { 0, 0 }, { -1, 0 }, { 0, -1 }, { 1, 0 }, { 0, 1 } };
+			const int strip[4] = { 1, 2, 4, 3 };
+			fx::grab &gr = fd.grabs[fd.grab_count++];
+			for (int k = 0; k < 4; ++k)
+			{
+				gr.pos[k][0] = moved[strip[k]][0];
+				gr.pos[k][1] = moved[strip[k]][1];
+				gr.uv[k][0] = screen[strip[k]][0] / 64.0f;
+				gr.uv[k][1] = screen[strip[k]][1] / 64.0f;
+			}
+			for (int k = 1; k <= 4; ++k)
+				for (const int p : { 0, k, k == 4 ? 1 : k + 1 })
+				{
+					fx::vertex v = {};
+					v.pos[0] = dia[p][0];
+					v.pos[1] = dia[p][1];
+					v.colour = p == 0 ? 0xFF808080u : 0x00808080u;
+					v.uv[0] = moved[p][0] / 255.0f;
+					v.uv[1] = moved[p][1] / 255.0f;
+					fd.vertices[fd.vertex_count++] = v;
+				}
+			fx::draw dr;
+			dr.first = 0;
+			dr.count = 12;
+			dr.texture = fx::kDistTexture;
+			dr.stages = fx::stage_dist;
+			dr.grab = 0;
+			fd.draws[fd.draw_count++] = dr;
+			fd.elements[fd.element_count++] = e;
+			fd.run_list[0] = { 0, 1 };
+			fd.runs.store(1);
+			fd.seq.store(seq);
+			ID3D12CommandAllocator *da = nullptr;
+			ID3D12GraphicsCommandList *dl = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&da));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, da, nullptr, IID_PPV_ARGS(&dl));
+			barrier(dl, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET); // (as the blend table left it; left so again)
+			const float red[4] = { 1, 0, 0, 1 }, blue[4] = { 0, 0, 1, 1 };
+			const D3D12_RECT left = { 0, 0, 36, LONG(H) }, right = { 36, 0, LONG(W), LONG(H) };
+			dl->ClearRenderTargetView(rtv, red, 1, &left);
+			dl->ClearRenderTargetView(rtv, blue, 1, &right);
+			dl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			dl->SetDescriptorHeaps(1, &game_heap);
+			grass::list_state dbound;
+			hifi::passes::world dw;
+			dw.rt = A;
+			dw.ds = Az;
+			dw.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			dw.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			dw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			dw.planes_known = true;
+			dw.ds_planes[0] = dw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			dw.heap_count = 1;
+			dw.heaps[0] = game_heap;
+			fx::inject::on_run(dl, dbound, dw, seq & 15);
+			barrier(dl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION ddst = {}, dsrc = {};
+			ddst.pResource = back;
+			ddst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			ddst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+			dsrc.pResource = A;
+			dsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dl->CopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
+			dl->Close();
+			ID3D12CommandList *dls[] = { dl };
+			queue->ExecuteCommandLists(1, dls);
+			queue->Signal(fence, ++fence_value);
+			HANDLE dev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, dev_);
+			WaitForSingleObject(dev_, 60000);
+			CloseHandle(dev_);
+			uint8_t *dp = nullptr;
+			back->Map(0, nullptr, reinterpret_cast<void **>(&dp));
+			const uint8_t *at40 = dp + 32 * 256 + 40 * 4, *at60 = dp + 32 * 256 + 60 * 4, *at2 = dp + 2 * 256 + 2 * 4;
+			char dline[240];
+			std::snprintf(dline, sizeof(dline), "a distortion quad: at (40, 32) the world from (32, 32): %d %d %d (want red over blue); outside: %d %d %d, %d %d %d", at40[0], at40[1], at40[2],
+				at60[0], at60[1], at60[2], at2[0], at2[1], at2[2]);
+			check(at40[0] > 220 && at40[2] < 40 && at60[2] == 255 && at60[0] == 0 && at2[0] == 255 && at2[2] == 0, dline);
+			back->Unmap(0, nullptr);
+			const fx::inject::counts dc = fx::inject::get_counts();
+			std::string dfirst;
+			const uint32_t dmessages = debug_messages(info, dfirst);
+			check(dmessages == 0 && dc.failed == 0, "a distortion quad: the debug layer: nothing (" + std::to_string(dmessages) + (dmessages != 0 ? ": " + dfirst : std::string()) + ")");
+			dl->Release();
+			da->Release();
+		}
+
+		// A lens flare's pieces by value (3520A8, pre-transformed): a quad over the left half in the game's pixels (WORLD
+		// pixels to clip space, PROJECTION identity), untextured (white), vertex colour 0x40804020, TFACTOR alpha 0x80,
+		// SRCALPHA / ONE on black: colour 0x80 0x40 0x20 x 2, alpha 0x40 x 2 x 0x80 x 2 (0.504): 128 64 32; the right half
+		// untouched
+		{
+			fx::frame &ff = fx::frame_slot(++seq);
+			ff.seq.store(0);
+			ff.element_count = ff.draw_count = ff.vertex_count = ff.light_count = ff.grab_count = 0;
+			fx::element e;
+			const float pw[16] = { 2.0f / 64, 0, 0, 0, 0, -2.0f / 64, 0, 0, 0, 0, 1, 0, 1.0f / 64 - 1.0f, 1.0f - 1.0f / 64, 0, 1 };
+			std::memcpy(e.world, pw, 64);
+			e.projection = fx::proj_identity;
+			e.tfactor = 0x80FFFFFFu;
+			e.blend = fx::blend_add;
+			e.cls = fx::class_flare;
+			e.first_draw = 0;
+			e.draws = 1;
+			const float c[6][2] = { { -0.5f, -0.5f }, { 31.5f, -0.5f }, { -0.5f, 63.5f }, { -0.5f, 63.5f }, { 31.5f, -0.5f }, { 31.5f, 63.5f } };
+			for (const auto &p : c)
+			{
+				fx::vertex v = {};
+				v.pos[0] = p[0];
+				v.pos[1] = p[1];
+				v.colour = 0x40804020u;
+				ff.vertices[ff.vertex_count++] = v;
+			}
+			ff.draws[ff.draw_count++] = { 0, 6, fx::kNone, fx::stage_flare };
+			ff.elements[ff.element_count++] = e;
+			ff.run_list[0] = { 0, 1 };
+			ff.runs.store(1);
+			ff.seq.store(seq);
+			ID3D12CommandAllocator *fa = nullptr;
+			ID3D12GraphicsCommandList *fl = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fa));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, fa, nullptr, IID_PPV_ARGS(&fl));
+			barrier(fl, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const float none[4] = { 0, 0, 0, 0 };
+			fl->ClearRenderTargetView(rtv, none, 0, nullptr);
+			fl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			fl->SetDescriptorHeaps(1, &game_heap);
+			grass::list_state fbound;
+			hifi::passes::world fw;
+			fw.rt = A;
+			fw.ds = Az;
+			fw.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			fw.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			fw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			fw.planes_known = true;
+			fw.ds_planes[0] = fw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			fw.heap_count = 1;
+			fw.heaps[0] = game_heap;
+			fx::inject::on_run(fl, fbound, fw, seq & 15);
+			barrier(fl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION fdst = {}, fsrc = {};
+			fdst.pResource = back;
+			fdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			fdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+			fsrc.pResource = A;
+			fsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			fl->CopyTextureRegion(&fdst, 0, 0, 0, &fsrc, nullptr);
+			fl->Close();
+			ID3D12CommandList *fls[] = { fl };
+			queue->ExecuteCommandLists(1, fls);
+			queue->Signal(fence, ++fence_value);
+			HANDLE fev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, fev);
+			WaitForSingleObject(fev, 60000);
+			CloseHandle(fev);
+			uint8_t *fp = nullptr;
+			back->Map(0, nullptr, reinterpret_cast<void **>(&fp));
+			const uint8_t *lft = fp + 32 * 256 + 10 * 4, *edge = fp + 32 * 256 + 31 * 4, *rgt = fp + 32 * 256 + 32 * 4;
+			char fline[200];
+			std::snprintf(fline, sizeof(fline), "a lens flare's stage, pre-transformed: %d %d %d at x 10 (want 128 64 32, within 2), x 31 %d, x 32 %d (the half's edge)", lft[0], lft[1], lft[2],
+				edge[0], rgt[0]);
+			check(std::abs(lft[0] - 128) <= 2 && std::abs(lft[1] - 64) <= 2 && std::abs(lft[2] - 32) <= 2 && edge[0] > 100 && rgt[0] == 0, fline);
+			back->Unmap(0, nullptr);
+			std::string ffirst;
+			const uint32_t fmessages = debug_messages(info, ffirst);
+			check(fmessages == 0, "a lens flare's stage: the debug layer: nothing (" + std::to_string(fmessages) + (fmessages != 0 ? ": " + ffirst : std::string()) + ")");
+			fl->Release();
+			fa->Release();
+		}
+
 		// 183760's tables by value: an MMB mesh of three screen thirds (a made-up map's data on the GPU, its texture
 		// 2x2 of one texel), SRCALPHA / INVSRCALPHA on black: the left third textured (the plain table), the middle with
 		// the textured mode (no texture alpha), the right untextured

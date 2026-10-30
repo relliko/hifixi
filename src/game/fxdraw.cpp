@@ -92,6 +92,22 @@ namespace hifi::game::fxdraw
 		constexpr const char *kTrailCallback = "8B4C240485C97405E903000000C3"; // 01C930 (-> 01C940)
 		constexpr const char *kRingDraw = "83EC40535556578BF98A87B401000084C0"; // 0565A0
 		constexpr const char *kMorphDraw = "538BD98B83FC00000085C074048B00EB0233C08A88DE000000"; // 03FBB0
+		// 03F130 (CMoVuAnmElem): movsx esi, byte [ecx + 352218] (+0xCB), call 0473F0 (+0x1DF), mov [VA 0490BF34], edi
+		// (+0x219), push 03EFC0 (+0x259), mov [VA 0490B9D4], eax (+0x264), call 063C80 (+0x269)
+		constexpr const char *kVuAnmDraw = "83EC1053558BE933DB8B85040100003BC30F84????????568B308A85DC010000";
+		constexpr intptr_t kVuTable = 0xCB, kVuAttachCall = 0x1DF, kVuAttachStore = 0x219, kVuCallback = 0x259, kVuCursorStore = 0x264, kVuWalkCall = 0x269;
+		constexpr uint8_t kVuWalk[] = { 0x81, 0xEC, 0x4C, 0x0A, 0x00, 0x00, 0x53, 0x8B, 0xD9, 0x66, 0x8B, 0x43, 0x44 }; // 063C80's first bytes
+		constexpr uint32_t kMaxVuPoints = 2048;
+		// 0426F0 (CMoDist): mov eax, [VA 048E666C] at +0x19F (the app: +0x194 the world's texture); 043110 (CMoVuDist)
+		constexpr const char *kDistDraw = "81ECA40000005355568BF18A0D????????B00184C85789742448";
+		constexpr intptr_t kDistApp = 0x19F;
+		// 0548D0 (CMoLfdElem's own draw): its call of 03EBF0 at +0x2B1 (054B81); 075690: mov ecx, [VA 0490B970] at +8
+		constexpr const char *kFlareDraw = "83EC3C8D442410568BF15751D98638010000D88E34010000";
+		constexpr intptr_t kFlareCallAt = 0x2B1;
+		constexpr const char *kFlarePieces = "83EC2855568BF18B0D????????8974241C0FBE4636";
+		constexpr const char *kTextureByName = "538BD9833B0075488B0D????????55565733ED";
+		constexpr intptr_t kTextureManager = 0xA;
+		constexpr const char *kVuDistDraw = "51A1????????538BD9558B88900A000056578BAC88100A0000418988900A00008BCBE8";
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
 		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
@@ -144,6 +160,10 @@ namespace hifi::game::fxdraw
 			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0, mmb_draw = 0, morph_draw = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
 			uintptr_t frame_of = 0, attach = 0, fix = 0, light1 = 0, lights2 = 0, lights2_default = 0, ambient = 0, material = 0; // (0 any: lit elements the game's)
+			uintptr_t vuanm_draw = 0, vu_walk = 0, vu_callback = 0, vu_table = 0, vu_attach = 0, vu_cursor = 0; // (03F130's; 0 any: VuAnm the game's)
+			uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // (0426F0, 043110, VA 048E666C)
+			uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // (054B81 patched when all found; 03EBF0, VA 0490B970)
+			uint8_t saved_flare[5] = {}, ours_flare[5] = {};
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
 			bool in = false;
@@ -938,6 +958,456 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// The point walk of a CMoVuAnmElem (063C80 as 03F130 calls it: ecx the element's +0x194, the callback 03EFC0 and
+		// the element), with what it reads set as 03F130 and 0467E0 leave it: the cached WORLD (the wrapper's +0x93C,
+		// 06A4A0's: the element's draw matrix, as 0467E0 sets it), VA 0490BF34 the attach matrix without its translation,
+		// VA 0490B9D4 where the corners go (03EFC0 writes 6 vertices a point there and moves it on). The cache and the
+		// cursor are put back after (fault or not); 063C80 clears 0490BF34 itself. The points walked (its answer).
+		using walk_fn = int32_t(__fastcall *)(uintptr_t vu, uintptr_t edx, uintptr_t callback, uintptr_t element);
+		int32_t vu_walk(uintptr_t e, uintptr_t wrapper, const float *world, const float *attach, fx::vertex *out)
+		{
+			float kept[16];
+			std::memcpy(kept, reinterpret_cast<const void *>(wrapper + 0x93C), 64);
+			const uint32_t cursor = at<uint32_t>(g.vu_cursor);
+			__try
+			{
+				std::memcpy(reinterpret_cast<void *>(wrapper + 0x93C), world, 64);
+				*reinterpret_cast<uint32_t *>(g.vu_attach) = uint32_t(reinterpret_cast<uintptr_t>(attach));
+				*reinterpret_cast<uint32_t *>(g.vu_cursor) = uint32_t(reinterpret_cast<uintptr_t>(out));
+				return reinterpret_cast<walk_fn>(g.vu_walk)(e + 0x194, 0, g.vu_callback, e);
+			}
+			__finally
+			{
+				std::memcpy(reinterpret_cast<void *>(wrapper + 0x93C), kept, 64);
+				*reinterpret_cast<uint32_t *>(g.vu_cursor) = cursor;
+			}
+		}
+
+		// A CMoVuAnmElem (03F130: a D3A frame's first quad at every point of a walk) into the frame; false: the game's.
+		// Its first draw (+0x1DC 0) makes the corner table +0x22D the walk's callback reads and a vertex buffer of frames x
+		// (points +0x1D8 x 6) vertices whose template it fills once: each point's 6 vertices take the UV and colour of the
+		// frame's first quad's vertices 0, 0, 1, 2, 5, 5 (table 352218; the D3A's own UVs, not scaled), normal (0, 0, -1):
+		// left to the game (it makes them). After: the texture (075700 on +0x140: its +0x40, else +0x44; a wave of it when
+		// +0x148: the game's), the attach matrix (0473F0, else identity) without its translation into VA 0490BF34, the frame
+		// +0x170 wrapped at the count (written back), the frame's vertices locked into VA 0490B9D4, then the walk 063C80
+		// (vu_walk: the game's own, called once as 03F130 calls it; it moves the walk's clock +0x198 on and draws its random
+		// points from a generator seeded from +0x1A4 each time), 03EFC0 writing each point's 6 vertices (the corners 0, 0,
+		// 1, 2, 3, 3 through the point's matrix). Then 03E9A0's D3A states (351FA0 / bit 28 351EC8, LIGHTING 0, FOGENABLE
+		// 0, ZWRITEENABLE 0), WORLD math +0x810, and one TRIANGLESTRIP from vertex 1 of n x 4 - 2 triangles (n the points
+		// walked: so the strip covers vertices 1 .. 4n of the 6n written, about two points in three; as the game draws it).
+		// The strip is cut into a list here, its degenerate triangles (two corners the same) left out.
+		std::vector<fx::vertex> g_vu;
+
+		bool record_vuanm(uintptr_t e, uintptr_t resource)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t data = resource + 0x30;
+			const int32_t frames = at<int16_t>(data + 2), points = at<int16_t>(e + 0x1D8);
+			const uint32_t object = at<uint32_t>(e + 0x140);
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math);
+			const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+			if (g.vu_walk == 0 || g.attach == 0 || wrapper == 0 || math == 0 || at<uint8_t>(e + 0x1DC) == 0 || frames <= 0 || points < 0 ||
+				at<int32_t>(e + 0x229) != points * 6 || object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0) || at<float>(e + 0x148) != 0.0f)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// (the most points the walk can give: +0x1D8, or from 20 up with +0x1DA bit 0 that x 002D80's factor x 0.5)
+			uint32_t bound = uint32_t(points);
+			if (points >= 20 && (at<uint8_t>(e + 0x194 + 0x46) & 1) != 0)
+			{
+				const float k = reinterpret_cast<weather_fn>(g.weather)();
+				if (!(k >= 0.0f && k < 64.0f))
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				bound = std::max(bound, uint32_t(std::ceil(float(points) * k * 0.5f)) + 1);
+			}
+			if (bound > kMaxVuPoints)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t most = bound != 0 ? (4 * bound - 2) * 3 : 0;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + most > fx::kMaxVertices)
+			{
+				g.n.full++;
+				return false;
+			}
+			const uint32_t id = texture_of(object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			// The frame, wrapped as 03F130 wraps it, and its first quad's template
+			uint16_t frame = at<uint16_t>(e + 0x170);
+			if (int32_t(frame) >= frames)
+			{
+				frame = 0;
+				*reinterpret_cast<uint16_t *>(e + 0x170) = 0;
+			}
+			uintptr_t p = data + 0x18;
+			for (uint32_t i = 0; i < frame; ++i)
+				p += 4 + uintptr_t(at<uint8_t>(p + 2)) * 0x90;
+			fx::vertex tpl[6];
+			for (int j = 0; j < 6; ++j)
+			{
+				const uintptr_t s = p + 4 + uintptr_t(int32_t(at<int8_t>(g.vu_table + uintptr_t(j)))) * 0x18;
+				tpl[j] = fx::vertex();
+				tpl[j].normal[2] = -1.0f;
+				tpl[j].colour = at<uint32_t>(s + 12);
+				tpl[j].uv[0] = at<float>(s + 16);
+				tpl[j].uv[1] = at<float>(s + 20);
+			}
+			g_vu.resize(size_t(bound) * 6 + 6);
+			for (size_t i = 0; i < g_vu.size(); ++i)
+				g_vu[i] = tpl[i % 6];
+			// The attach matrix without its translation, the walk
+			alignas(16) float attach[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+			if (const uintptr_t a = reinterpret_cast<matrix_of_fn>(g.attach)(e, 0); a != 0)
+				std::memcpy(attach, reinterpret_cast<const void *>(a), 64);
+			attach[12] = attach[13] = attach[14] = 0.0f;
+			attach[15] = 1.0f;
+			const int32_t n = vu_walk(e, wrapper, out.world, attach, g_vu.data());
+			if (n <= 0 || uint32_t(n) > bound)
+			{
+				// (none walked: 03F130 draws nothing)
+				g.n.empty++;
+				return true;
+			}
+			// The strip from vertex 1, n x 4 - 2 triangles, as a list
+			uint32_t w = f.vertex_count;
+			const auto same = [](const fx::vertex &a, const fx::vertex &b) { return std::memcmp(a.pos, b.pos, 12) == 0; };
+			for (uint32_t k = 0; k < 4 * uint32_t(n) - 2; ++k)
+			{
+				const fx::vertex &a = g_vu[1 + k], &b = g_vu[2 + k], &c = g_vu[3 + k];
+				if (same(a, b) || same(b, c) || same(a, c))
+					continue;
+				f.vertices[w++] = a;
+				f.vertices[w++] = b;
+				f.vertices[w++] = c;
+			}
+			std::memcpy(out.world, reinterpret_cast<const void *>(math + 0x810), 64);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			out.z_write = 0;
+			out.fog = 0;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_vuanm;
+			f.draws[f.draw_count++] = { f.vertex_count, w - f.vertex_count, id, fx::stage_texture | ((flags & (1u << 28)) != 0 ? fx::stage_alpha_diffuse : 0u) };
+			f.vertex_count = w;
+			f.element_count++;
+			g.n.taken[fx::class_vuanm]++;
+			return true;
+		}
+
+		// A distortion quad (CMoDist 0426F0; CMoVuDist 043110 draws it once a point of its walk) into the frame; false: the
+		// game's. 0426F0 (R): the draw matrix (045D40), the diamond (0, 0, 0), (-1, 0, 0), (0, -1, 0), (1, 0, 0), (0, 1, 0)
+		// projected by math vt+0x80 (the draw matrix, gfx +0xB10, gfx +0xDC0 / +0xDC4: x = (x/|w| + 1) x +0xDC0, y = (1 -
+		// y/|w|) x +0xDC4) into pixels of the game's target (009E00: W +8, H +0xC), UV = them / (W, H). Nothing without the
+		// world's texture ([VA 048E666C] +0x194). The points' box (the centre too) moved to 0, each side scaled by 255 /
+		// size when 256 or more: the grab (3530D0 / 353028, into the 256 x 256 target VA 0490BB88) is the strip of points
+		// 1, 2, 4, 3 at those places with their UVs. Then the fan (353178 / 353108: SRCALPHA / INVSRCALPHA, z test,
+		// LIGHTING and fog off; colour TEXTURE x DIFFUSE x 2, alpha DIFFUSE x TFACTOR x 4, TFACTOR 0x80808080 as 3530D0
+		// left it, ADDRESS MIRROR as 353028 left it) of the centre (colour VA 0490BC0C) and points 1 2 3 4 1 (0x00808080),
+		// UVs the moved places / 255, WORLD the draw matrix with +0x194 added to x and y. BLENDOP is 046070's / 0467E0's:
+		// a subtractive letter keeps REVSUBTRACT: the game's. `repeat`: the quads drawn one after the other (VuDist's
+		// points: 0430D0 sets the point into the draw matrix, but 0426F0 builds it again first, so every one is drawn at
+		// the element's own place; R).
+		using project_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, const float *in, float *out, int32_t count, const float *m, const float *p, float hw, float hh);
+		constexpr float kDiamond[5][3] = { { 0, 0, 0 }, { -1, 0, 0 }, { 0, -1, 0 }, { 1, 0, 0 }, { 0, 1, 0 } };
+
+		bool record_dist(uintptr_t e, uint32_t repeat)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math);
+			const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+			const uintptr_t app = g.dist_app != 0 ? at<uint32_t>(g.dist_app) : 0;
+			if (gfx == 0 || math == 0 || wrapper == 0 || app == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			if (at<uint32_t>(app + 0x194) == 0 || repeat == 0)
+			{
+				g.n.empty++;
+				return true; // (no world texture: 0426F0 draws nothing)
+			}
+			if (f.element_count >= fx::kMaxElements || f.draw_count + repeat > fx::kMaxDraws || f.vertex_count + 12 > fx::kMaxVertices ||
+				f.grab_count + repeat > fx::kMaxGrabs)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			if (out.blend == fx::blend_subtract)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// The diamond in the game's target's pixels (math vt+0x80, as 0426F0 calls it)
+			const uintptr_t rt = wrapper + 0x98 + uintptr_t(at<uint8_t>(wrapper + 0x158)) * 0x18;
+			const int32_t W = at<int32_t>(rt + 8), H = at<int32_t>(rt + 0xC);
+			if (W <= 0 || H <= 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			float s[5][3];
+			const auto project = reinterpret_cast<project_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(math) + 0x80)));
+			project(math, 0, &kDiamond[0][0], &s[0][0], 5, reinterpret_cast<const float *>(e + kWorld), reinterpret_cast<const float *>(gfx + 0xB10),
+				at<float>(gfx + 0xDC0), at<float>(gfx + 0xDC4));
+			const float iw = 1.0f / float(W), ih = 1.0f / float(H);
+			float lo[2] = { s[0][0], s[0][1] }, hi[2] = { s[0][0], s[0][1] };
+			for (int k = 1; k < 5; ++k)
+				for (int c = 0; c < 2; ++c)
+				{
+					lo[c] = std::min(lo[c], s[k][c]);
+					hi[c] = std::max(hi[c], s[k][c]);
+				}
+			float scale[2];
+			for (int c = 0; c < 2; ++c)
+				scale[c] = hi[c] - lo[c] < 256.0f ? 1.0f : 255.0f / (hi[c] - lo[c]);
+			float moved[5][2];
+			for (int k = 0; k < 5; ++k)
+				for (int c = 0; c < 2; ++c)
+					moved[k][c] = (s[k][c] - lo[c]) * scale[c];
+			// The grab: points 1, 2, 4, 3
+			fx::grab gr;
+			const int order[4] = { 1, 2, 4, 3 };
+			for (int k = 0; k < 4; ++k)
+			{
+				gr.pos[k][0] = moved[order[k]][0];
+				gr.pos[k][1] = moved[order[k]][1];
+				gr.uv[k][0] = iw * s[order[k]][0];
+				gr.uv[k][1] = ih * s[order[k]][1];
+			}
+			// The fan as a list: (centre, k, k + 1) for k 1 .. 4 (point 5 is point 1)
+			fx::vertex fan[6];
+			for (int k = 0; k < 6; ++k)
+			{
+				const int p = k == 5 ? 1 : k;
+				fan[k] = fx::vertex();
+				fan[k].pos[0] = kDiamond[p][0];
+				fan[k].pos[1] = kDiamond[p][1];
+				fan[k].colour = k == 0 ? out.tfactor : 0x00808080u;
+				fan[k].uv[0] = moved[p][0] * (1.0f / 255.0f);
+				fan[k].uv[1] = moved[p][1] * (1.0f / 255.0f);
+			}
+			uint32_t w = f.vertex_count;
+			for (int k = 1; k <= 4; ++k)
+			{
+				f.vertices[w++] = fan[0];
+				f.vertices[w++] = fan[k];
+				f.vertices[w++] = fan[k + 1];
+			}
+			const float shift = at<float>(e + 0x194);
+			out.world[12] += shift;
+			out.world[13] += shift;
+			out.tfactor = 0x80808080u;
+			out.blend = fx::blend_alpha;
+			out.fog = 0;
+			out.uv[0] = out.uv[1] = 0.0f;
+			out.first_draw = f.draw_count;
+			out.draws = repeat;
+			out.cls = fx::class_dist;
+			for (uint32_t r = 0; r < repeat; ++r)
+			{
+				f.grabs[f.grab_count] = gr;
+				fx::draw d;
+				d.first = f.vertex_count;
+				d.count = 12;
+				d.texture = fx::kDistTexture;
+				d.stages = fx::stage_dist;
+				d.grab = f.grab_count++;
+				f.draws[f.draw_count++] = d;
+			}
+			f.vertex_count = w;
+			f.element_count++;
+			g.n.taken[fx::class_dist]++;
+			return true;
+		}
+
+		// A CMoVuDist (043110): the walk 063C80 (ecx the element's +0x198, its count +0x1DC) with 0430D0 at each point,
+		// which draws 0426F0 there: the walk run here with a callback of ours that only counts (the clock moves on as in
+		// the game), then that many quads (record_dist). The walk's points don't matter (above); WORLD's cache isn't read
+		// for anything drawn.
+		void __cdecl vu_count(uintptr_t, uintptr_t, uintptr_t)
+		{
+		}
+
+		bool record_vudist(uintptr_t e)
+		{
+			const int32_t points = at<int16_t>(e + 0x1DC);
+			uint32_t bound = points > 0 ? uint32_t(points) : 0;
+			if (points >= 20 && (at<uint8_t>(e + 0x198 + 0x46) & 1) != 0)
+			{
+				const float k = reinterpret_cast<weather_fn>(g.weather)();
+				if (!(k >= 0.0f && k < 64.0f))
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				bound = std::max(bound, uint32_t(std::ceil(float(points) * k * 0.5f)) + 1);
+			}
+			fx::frame &f = *g.f;
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math), app = g.dist_app != 0 ? at<uint32_t>(g.dist_app) : 0;
+			if (g.vu_walk == 0 || gfx == 0 || math == 0 || app == 0 || points < 0 || bound > 64)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			if (f.element_count >= fx::kMaxElements || f.draw_count + bound > fx::kMaxDraws || f.vertex_count + 12 > fx::kMaxVertices || f.grab_count + bound > fx::kMaxGrabs)
+			{
+				g.n.full++;
+				return false;
+			}
+			// (what record_dist checks before it draws, so the walk below runs only when the quads are taken)
+			fx::element probe;
+			if (!common(e, probe) || probe.blend == fx::blend_subtract)
+			{
+				if (probe.blend == fx::blend_subtract)
+					g.n.unsupported++;
+				return false;
+			}
+			const int32_t n = reinterpret_cast<walk_fn>(g.vu_walk)(e + 0x198, 0, reinterpret_cast<uintptr_t>(&vu_count), e);
+			if (n <= 0 || uint32_t(n) > bound)
+			{
+				g.n.empty++;
+				return true;
+			}
+			return record_dist(e, uint32_t(n));
+		}
+
+		// A lens flare's pieces (03EBF0, thiscall on the flare D3A's resource, called by the flare's own draw 0548D0 at
+		// 054B81 with (the visibility, the light's x and y, W - x, H - y, 0) once its visibility test 06C280 has passed:
+		// World FX's HideFlare (054AF1) and VisTest (054AE2) stay where they are, before it) into the frame; false: the
+		// game's. 03EBF0 (R): every vertex of the pieces (resource +0x35 of them from +0x48: a 4-byte head, +2 its quads;
+		// the float t at +4; then quads x 6 vertices of 24 bytes: x y, colour, u v) pre-transformed: x = W / 16 x vx + t x
+		// ((W - x) - x) + x, y the same with H; colour the vertex's with alpha min(255, its alpha x visibility >> 8); the
+		// texture by the name +0x44 points at (075690: its first dword a texture object, else the texture manager's [VA
+		// 0490B970] +8 list searched by name bytes 8-15 at +0x14, next +0x38); 352180 / 3520A8: SRCALPHA / ONE, no z,
+		// LIGHTING and fog off; colour DIFFUSE x TEXTURE x 2, alpha that x TFACTOR x 2 (TFACTOR VA 0490BC0C, 0548D0's colour);
+		// WRAP; quads x 2 triangles.
+		bool record_flare(uintptr_t resource, int32_t vis, float x, float y, float fx_, float fy)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t data = resource + 0x30;
+			const uintptr_t gfx = at<uint32_t>(g.gfx), mgr = g.flare_textures != 0 ? at<uint32_t>(g.flare_textures) : 0;
+			const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+			if (wrapper == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uintptr_t rt = wrapper + 0x98 + uintptr_t(at<uint8_t>(wrapper + 0x158)) * 0x18;
+			const int32_t W = at<int32_t>(rt + 8), H = at<int32_t>(rt + 0xC);
+			const int32_t pieces = at<int8_t>(data + 5), quads = at<int8_t>(data + 6);
+			if (W <= 0 || H <= 0 || pieces < 0 || quads < 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// The texture, as 075690 finds it
+			uint8_t name[16] = {};
+			if (const uintptr_t np = at<uint32_t>(resource + 0x44); np != 0)
+				std::memcpy(name, reinterpret_cast<const void *>(np), 16);
+			uint32_t object = 0;
+			std::memcpy(&object, name, 4);
+			if (object == 0 && mgr != 0)
+				for (uintptr_t node = at<uint32_t>(mgr + 8), n = 0; node != 0 && n < 65536; node = at<uint32_t>(node + 0x38), ++n)
+					if (std::memcmp(reinterpret_cast<const void *>(node + 0x14), name + 8, 8) == 0)
+					{
+						object = uint32_t(node);
+						break;
+					}
+			if (object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t id = texture_of(object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			const uint32_t n = uint32_t(quads) * 6;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + n > fx::kMaxVertices ||
+				f.runs.load(std::memory_order_relaxed) + 2 >= fx::kMaxRuns)
+			{
+				g.n.full++;
+				return false;
+			}
+			const float sw = float(W) * 0.0625f, sh = float(H) * 0.0625f, dx = fx_ - x, dy = fy - y;
+			uint32_t w = f.vertex_count;
+			uintptr_t p = resource + 0x48;
+			for (int32_t k = 0; k < pieces; ++k)
+			{
+				const float t = at<float>(p + 4);
+				const uint32_t m = uint32_t(at<int8_t>(p + 2)) * 6;
+				uintptr_t v = p + 0x14;
+				for (uint32_t i = 0; i < m; ++i, v += 24)
+				{
+					if (w >= f.vertex_count + n)
+					{
+						g.n.unsupported++;
+						return false; // (more vertices in the pieces than +0x36 says: the game draws +0x36's)
+					}
+					const uint32_t c = at<uint32_t>(v + 12);
+					const uint32_t a = std::min<uint32_t>((c >> 24) * uint32_t(vis) >> 8, 0xFF);
+					fx::vertex &o = f.vertices[w++];
+					o = fx::vertex();
+					o.pos[0] = sw * at<float>(v) + dx * t + x;
+					o.pos[1] = sh * at<float>(v + 4) + dy * t + y;
+					o.colour = (c & 0xFFFFFFu) | a << 24;
+					o.uv[0] = at<float>(v + 16);
+					o.uv[1] = at<float>(v + 20);
+				}
+				p = v;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			// (WORLD takes D3D9's pixels, centres on whole numbers, to clip space; PROJECTION identity)
+			const float world[16] = { 2.0f / float(W), 0, 0, 0, 0, -2.0f / float(H), 0, 0, 0, 0, 1, 0, 1.0f / float(W) - 1.0f, 1.0f - 1.0f / float(H), 0, 1 };
+			std::memcpy(out.world, world, 64);
+			out.projection = fx::proj_identity;
+			out.tfactor = at<uint32_t>(g.colour);
+			out.blend = fx::blend_add;
+			out.z_write = 0;
+			out.fog = 0;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_flare;
+			f.draws[f.draw_count++] = { f.vertex_count, w - f.vertex_count, id, fx::stage_flare };
+			f.vertex_count = w;
+			f.element_count++;
+			g.n.taken[fx::class_flare]++;
+			return true;
+		}
+
+		bool record_flare_guarded(uintptr_t resource, int32_t vis, float x, float y, float fx_, float fy)
+		{
+			__try
+			{
+				return pointer(uint32_t(resource)) && record_flare(resource, vis, x, y, fx_, fy);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				g.n.faulted++;
+				return false;
+			}
+		}
+
 		// A morph (03FBB0 -> 03F440, chunk 0x25 at resource +0x30) into the frame; false: the game's. 03FBB0 hands
 		// 03F440 the weights +0x194, the last frame's +0x1A8 and a blend made already (+0x1BC: then the game's), then
 		// clears +0x1BC and copies +0x194 to +0x1A8 (done here too once it's taken). The blend (03F8A0): K targets
@@ -1263,6 +1733,26 @@ namespace hifi::game::fxdraw
 			}
 			if (cls == g.ring_draw && g.ring_draw != 0)
 				return record_ring(e);
+			if (cls == g.dist_draw && g.dist_draw != 0)
+				return record_dist(e, 1);
+			if (cls == g.vudist_draw && g.vudist_draw != 0)
+				return record_vudist(e);
+			if (cls == g.vuanm_draw && g.vuanm_draw != 0)
+			{
+				const uint32_t handle = at<uint32_t>(e + kModel);
+				if (handle == 0)
+				{
+					g.n.empty++;
+					return true; // (03F130: no model, nothing drawn)
+				}
+				const uint32_t resource = at<uint32_t>(handle);
+				if (resource == 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				return record_vuanm(e, resource);
+			}
 			if (cls == g.morph_draw && g.morph_draw != 0)
 			{
 				// (03FBB0: a weather element 002D80 hides, or no model: nothing drawn)
@@ -1360,7 +1850,7 @@ namespace hifi::game::fxdraw
 				g.seq = 1;
 			g.f = &fx::frame_slot(g.seq);
 			g.f->runs.store(0, std::memory_order_relaxed);
-			g.f->element_count = g.f->draw_count = g.f->vertex_count = g.f->light_count = 0;
+			g.f->element_count = g.f->draw_count = g.f->vertex_count = g.f->light_count = g.f->grab_count = 0;
 			g.run_first = 0;
 			const uintptr_t renderer = word(g.renderer);
 			g.can_mark = g.wanted && markers_possible();
@@ -1398,6 +1888,18 @@ namespace hifi::game::fxdraw
 				close_run();
 		}
 		reinterpret_cast<callback_fn>(callback)(arg);
+	}
+
+	void __fastcall on_flare(uintptr_t resource, uintptr_t, int32_t visibility, float x, float y, float far_x, float far_y, uint32_t zero)
+	{
+		if (g.in_flush && g.taking)
+		{
+			if (record_flare_guarded(resource, visibility, x, y, far_x, far_y))
+				return;
+			close_run();
+		}
+		using pieces_fn = void(__fastcall *)(uintptr_t, uintptr_t, int32_t, float, float, float, float, uint32_t);
+		reinterpret_cast<pieces_fn>(g.flare_pieces)(resource, 0, visibility, x, y, far_x, far_y, zero);
 	}
 
 	uint32_t __fastcall on_setup(uintptr_t element, uintptr_t, uint32_t arg)
@@ -1480,6 +1982,46 @@ namespace hifi::game::fxdraw
 			uint8_t push = 0;
 			n.material = read(n.setup + kMaterialPush, push) && push == 0x68 ? word(n.setup + kMaterialPush + 1) : 0;
 		}
+		if (const uintptr_t d = find(kDistDraw); d != 0)
+		{
+			uint8_t b = 0;
+			if (read(d + kDistApp, b) && b == 0xA1)
+			{
+				n.dist_draw = d;
+				n.dist_app = word(d + kDistApp + 1);
+			}
+		}
+		{
+			// (the flare's call of 03EBF0, patched below when it's there as the game has it)
+			const uintptr_t flare = find(kFlareDraw), pieces = find(kFlarePieces), byname = find(kTextureByName);
+			uint8_t call[5] = {};
+			if (flare != 0 && pieces != 0 && byname != 0 && read(flare + kFlareCallAt, call, 5) && call[0] == 0xE8 && rel_target(flare + kFlareCallAt) == pieces)
+			{
+				n.flare_call = flare + kFlareCallAt;
+				n.flare_pieces = pieces;
+				n.flare_textures = word(byname + kTextureManager);
+				std::memcpy(n.saved_flare, call, 5);
+			}
+		}
+		if (const uintptr_t v = find(kVuDistDraw); v != 0 && n.dist_draw != 0)
+			n.vudist_draw = v;
+		if (const uintptr_t v = find(kVuAnmDraw); v != 0)
+		{
+			// (03F130's table, globals, callback and walk, each by its opcode; its attach call must be 0467E0's)
+			uint8_t b[3] = {};
+			const bool ok = read(v + kVuTable, b, 3) && b[0] == 0x0F && b[1] == 0xBE && b[2] == 0xB1 && read(v + kVuAttachStore, b, 2) && b[0] == 0x89 && b[1] == 0x3D &&
+				read(v + kVuCallback, b, 1) && b[0] == 0x68 && read(v + kVuCursorStore, b, 1) && b[0] == 0xA3 && read(v + kVuWalkCall, b, 1) && b[0] == 0xE8 &&
+				read(v + kVuAttachCall, b, 1) && b[0] == 0xE8 && rel_target(v + kVuAttachCall) == n.attach && code_is(rel_target(v + kVuWalkCall), kVuWalk, sizeof(kVuWalk));
+			if (ok)
+			{
+				n.vuanm_draw = v;
+				n.vu_table = word(v + kVuTable + 3);
+				n.vu_attach = word(v + kVuAttachStore + 2);
+				n.vu_callback = word(v + kVuCallback + 1);
+				n.vu_cursor = word(v + kVuCursorStore + 1);
+				n.vu_walk = rel_target(v + kVuWalkCall);
+			}
+		}
 		if (g.code == 0)
 			g.code = alloc_code(kCodeSize);
 		if (g.code == 0)
@@ -1534,6 +2076,13 @@ namespace hifi::game::fxdraw
 			why = "couldn't write the game's code";
 			return false;
 		}
+		// (the flare's pieces: only when the rest is in; without it the game draws them)
+		if (n.flare_call != 0)
+		{
+			put_call(n.ours_flare, n.flare_call, reinterpret_cast<uintptr_t>(&on_flare));
+			if (!write_code(n.flare_call, n.ours_flare, 5))
+				n.flare_call = 0;
+		}
 		n.native = g.native;
 		n.wanted = g.wanted;
 		n.probe = g.probe;
@@ -1551,12 +2100,14 @@ namespace hifi::game::fxdraw
 	{
 		if (!g.in)
 			return true;
-		if (!code_is(g.setup_call, g.ours_setup, 5) || !code_is(g.flush_call, g.ours_flush, 5) || !code_is(g.entry_site, g.ours_entry, 7))
+		if (!code_is(g.setup_call, g.ours_setup, 5) || !code_is(g.flush_call, g.ours_flush, 5) || !code_is(g.entry_site, g.ours_entry, 7) ||
+			(g.flare_call != 0 && !code_is(g.flare_call, g.ours_flare, 5)))
 		{
 			why = "something else has changed the effects' flush or element draw since: left as they are";
 			return false;
 		}
-		if (!write_code(g.setup_call, g.saved_setup, 5) || !write_code(g.flush_call, g.saved_flush, 5) || !write_code(g.entry_site, kEntryBytes, 7))
+		if (!write_code(g.setup_call, g.saved_setup, 5) || !write_code(g.flush_call, g.saved_flush, 5) || !write_code(g.entry_site, kEntryBytes, 7) ||
+			(g.flare_call != 0 && !write_code(g.flare_call, g.saved_flare, 5)))
 		{
 			why = "couldn't write the game's code";
 			return false;
@@ -1619,18 +2170,19 @@ namespace hifi::game::fxdraw
 		uint64_t taken = 0;
 		for (const uint64_t t : g.n.taken)
 			taken += t;
-		char line[800];
+		char line[1000];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, morphs %llu, rings %llu, weapon trails %llu; %llu lit), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
 			"%llu markers sent%s",
 			g.native ? "HiFi XI draws what it can" : g.probe ? "the game draws them (waiting for the markers to come through)" : "the game draws them",
 			static_cast<unsigned long long>(g.n.flushes), static_cast<unsigned long long>(taken), static_cast<unsigned long long>(g.n.taken[fx::class_d3m]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]), static_cast<unsigned long long>(g.n.taken[fx::class_vuanm]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_morph]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_dist]), static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
 			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
@@ -1657,6 +2209,15 @@ namespace hifi::game::fxdraw
 		s.ring_draw = g.ring_draw;
 		s.mmb_draw = g.mmb_draw;
 		s.morph_draw = g.morph_draw;
+		s.vuanm_draw = g.vuanm_draw;
+		s.vu_walk = g.vu_walk;
+		s.vu_cursor = g.vu_cursor;
+		s.dist_draw = g.dist_draw;
+		s.vudist_draw = g.vudist_draw;
+		s.dist_app = g.dist_app;
+		s.flare_call = g.flare_call;
+		s.flare_pieces = g.flare_pieces;
+		s.flare_textures = g.flare_textures;
 		s.frame_of = g.frame_of;
 		s.light1 = g.light1;
 		s.lights2 = g.lights2;
