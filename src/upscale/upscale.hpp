@@ -29,6 +29,19 @@ namespace hifi::upscale
 	// The colour the game's resolve multiplies the world by (0xRRGGBB, 0x80 each the picture as it is: game::resolve_tint),
 	// put on ours as well: every cutscene fade is it. Each present, from the game's thread.
 	void set_tint(uint32_t rgb);
+	// Drawn over the upscaled world right after it lands on the screen's target, before the UI (the names over the screen,
+	// src/world): the list, the target (in RENDER_TARGET: its view, format, size) and A. The upscale binds dgVoodoo's heaps
+	// and state again after.
+	struct overlay_target
+	{
+		ID3D12Resource *target = nullptr;
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		UINT width = 0, height = 0;
+		ID3D12Resource *world = nullptr;
+	};
+	using overlay_fn = void (*)(ID3D12GraphicsCommandList *list, const overlay_target &t);
+	void set_overlay(overlay_fn fn);
 	// Whether FSR 2 drew in the last quarter second (the world's jitter goes with it: game/jitter), and the length of its
 	// jitter sequence for A's size and the screen's
 	bool temporal_running();

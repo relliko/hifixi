@@ -122,6 +122,7 @@ namespace hifi::upscale
 			std::string fsr2_why, fsr2_failed;
 			std::string fsr3_refused; // (why FSR 3.1's upscaler couldn't be made: FSR 2's since)
 			std::atomic<upscale::chars_motion_fn> chars_motion{ nullptr };
+			std::atomic<upscale::overlay_fn> overlay{ nullptr }; // (set_overlay)
 			uint64_t char_frames = 0;
 			std::atomic<bool> fsr3{ true };
 			std::atomic<ULONGLONG> fsr2_at{ 0 };   // (when FSR 2 last drew: the jitter follows it)
@@ -339,6 +340,22 @@ namespace hifi::upscale
 			list->ResourceBarrier(1, &b);
 		}
 
+		// What's drawn over the upscaled world (set_overlay), the target a target now
+		void draw_overlay(ID3D12GraphicsCommandList *list, const per_list &l, UINT out_w, UINT out_h)
+		{
+			if (const upscale::overlay_fn fn = g.overlay.load(std::memory_order_relaxed))
+			{
+				upscale::overlay_target t;
+				t.target = l.target;
+				t.rtv = { SIZE_T(l.target_rtv) };
+				t.format = l.target_format;
+				t.width = out_w;
+				t.height = out_h;
+				t.world = l.world;
+				fn(list, t);
+			}
+		}
+
 		// FSR 2 over l.target (temporal.hpp), its picture drawn onto it, dgVoodoo's heaps and state back; false (nothing
 		// drawn) when it can't be (mutex held)
 		bool record_temporal(ID3D12GraphicsCommandList *list, per_list &l, const grass::list_state &state, const D3D12_RESOURCE_DESC &in, UINT out_w, UINT out_h)
@@ -418,6 +435,7 @@ namespace hifi::upscale
 				list->OMSetRenderTargets(1, &target_rtv, FALSE, nullptr);
 				list->SetGraphicsRootDescriptorTable(1, { m.srv_heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * 2) * m.srv_step });
 				list->DrawInstanced(3, 1, 0, 0);
+				draw_overlay(list, l, out_w, out_h);
 				transition(list, l.target, D3D12_RESOURCE_STATE_RENDER_TARGET, l.target_state);
 				// The frame to frame generation, when on (framegen: AMD's swap chain in dgVoodoo's), FSR 2's picture the
 				// world without the UI. Not while the game's tint is on (a fade): the picture is the world before it, so
@@ -533,6 +551,7 @@ namespace hifi::upscale
 			list->OMSetRenderTargets(1, &target_rtv, FALSE, nullptr);
 			list->SetGraphicsRootDescriptorTable(1, { gpu0.ptr + UINT64(slot * 2 + 1) * m.srv_step });
 			list->DrawInstanced(3, 1, 0, 0);
+			draw_overlay(list, l, out_w, out_h);
 
 			transition(list, l.target, D3D12_RESOURCE_STATE_RENDER_TARGET, l.target_state);
 			if (world_moved)
@@ -547,6 +566,11 @@ namespace hifi::upscale
 			g.out_w = out_w;
 			g.out_h = out_h;
 		}
+	}
+
+	void set_overlay(overlay_fn fn)
+	{
+		g.overlay.store(fn, std::memory_order_relaxed);
 	}
 
 	void set_chars_motion_source(chars_motion_fn fn)
