@@ -168,6 +168,9 @@ namespace hifi::d3d8
 		make_auto_depth();
 		reset_state();
 		async_readback = setting("AsyncReadback", 0) != 0;
+		// (the shaders this DLL has met before, compiled now on workers when their blobs aren't in the folder)
+		if (setting("CompileAhead", 1) != 0)
+			compile_ahead();
 		for (int i = 0; i < 256; ++i)
 		{
 			gamma.red[i] = gamma.green[i] = gamma.blue[i] = WORD(i * 257);

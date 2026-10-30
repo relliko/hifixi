@@ -148,8 +148,16 @@ namespace hifi::d3d8
 	std::string hlsl_ps_tail(const ps_tail &t);
 
 	// Compiled bytecode by the text (target "vs_5_0" / "ps_5_0"); empty with the compiler's words in why
-	const std::vector<uint8_t> &compile(const std::string &hlsl, const char *target, std::string &why);
+	// (thread-safe; ahead: a worker of compile_ahead's, counted apart)
+	const std::vector<uint8_t> &compile(const std::string &hlsl, const char *target, std::string &why, bool ahead = false);
 	void set_shader_cache_folder(const std::wstring &folder);
-	struct compile_stats { uint32_t compiled = 0, from_disk = 0, failed = 0; double ms = 0.0; };
+	struct compile_stats { uint32_t compiled = 0, from_disk = 0, failed = 0, ahead = 0; double ms = 0.0, ahead_ms = 0.0; };
+	// Shader keys, kept in keys.bin in the cache folder as draws meet them (note_shader_key: a key's bytes, then more bytes
+	// for a program's tokens), compiled at the device's making by worker threads when their blob is missing (compile_ahead)
+	enum key_kind : uint8_t { key_ff_vs = 1, key_ff_ps = 2, key_sm1_vs = 3, key_sm1_ps = 4 };
+	void note_shader_key(uint8_t kind, const void *bytes, size_t n, const void *more = nullptr, size_t more_n = 0);
+	void compile_ahead();
+	// Every key in keys.bin compiled now, on this thread (the build's shipped cache: d3d8_unit --warm); how many blobs there are
+	uint32_t compile_keys_now();
 	compile_stats shader_stats();
 }
