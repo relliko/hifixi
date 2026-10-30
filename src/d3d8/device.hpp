@@ -167,6 +167,35 @@ namespace hifi::d3d8
 			uint64_t async_answered = 0, async_unanswered = 0; // asynchronous readbacks answered from an earlier frame, or not yet
 		} stats;
 
+		// The calling thread's time in the device (PerfLog=1: logged every 30 frames as a frame's average): draws, clears
+		// (the slot markers' apart: HiFi XI draws inside them), Present
+		bool perf_log = false;
+		struct perf_counters
+		{
+			double draw_ms = 0, clear_ms = 0, marker_ms = 0, present_ms = 0, max_marker_ms = 0;
+			uint64_t draws = 0, markers = 0, frames = 0;
+		} perf;
+		struct timer
+		{
+			LARGE_INTEGER t0;
+			double *into;
+			bool on;
+			timer(bool enabled, double *sum) : into(sum), on(enabled) { if (on) QueryPerformanceCounter(&t0); }
+			double stop()
+			{
+				if (!on)
+					return 0;
+				on = false;
+				LARGE_INTEGER t1, f;
+				QueryPerformanceCounter(&t1);
+				QueryPerformanceFrequency(&f);
+				const double ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
+				*into += ms;
+				return ms;
+			}
+			~timer() { stop(); }
+		};
+
 		// Asynchronous readbacks (AsyncReadback=1): a copy from a target into memory answered by the same copy (surface,
 		// rect, place in the frame's order) from the newest frame the GPU has finished; never waits
 		bool async_readback = false;

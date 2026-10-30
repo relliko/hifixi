@@ -168,6 +168,7 @@ namespace hifi::d3d8
 		make_auto_depth();
 		reset_state();
 		async_readback = setting("AsyncReadback", 0) != 0;
+		perf_log = setting("PerfLog", 0) != 0;
 		// (the shaders this DLL has met before, compiled now on workers when their blobs aren't in the folder)
 		if (setting("CompileAhead", 1) != 0)
 			compile_ahead();
@@ -406,7 +407,18 @@ namespace hifi::d3d8
 
 	HRESULT device::Present(CONST RECT *src, CONST RECT *dst, HWND w, CONST RGNDATA *)
 	{
-		present_frame(w, src, dst);
+		{
+			timer t(perf_log, &perf.present_ms);
+			present_frame(w, src, dst);
+		}
+		if (perf_log && ++perf.frames == 30)
+		{
+			const double n = double(perf.frames);
+			log(0, "perf (a frame, over 30): draws %.3f ms (%.0f draws), clears %.3f ms, slot markers %.3f ms (%.1f a frame, the longest %.3f ms), Present %.3f ms",
+				perf.draw_ms / n, double(stats.draws - perf.draws) / n, perf.clear_ms / n, perf.marker_ms / n, double(perf.markers) / n, perf.max_marker_ms, perf.present_ms / n);
+			perf = perf_counters();
+			perf.draws = stats.draws;
+		}
 		return D3D_OK;
 	}
 
@@ -823,7 +835,16 @@ namespace hifi::d3d8
 
 	HRESULT device::Clear(DWORD n, CONST D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil)
 	{
-		return clear(n, rects, flags, color, z, stencil);
+		// (a slot marker: one 1x1 rect, stencil only; HiFi XI draws inside its ClearDepthStencilView)
+		const bool marker = n == 1 && rects != nullptr && flags == D3DCLEAR_STENCIL && rects[0].x2 - rects[0].x1 == 1 && rects[0].y2 - rects[0].y1 == 1;
+		timer t(perf_log, marker ? &perf.marker_ms : &perf.clear_ms);
+		const HRESULT hr = clear(n, rects, flags, color, z, stencil);
+		if (marker && perf_log)
+		{
+			perf.markers++;
+			perf.max_marker_ms = std::max(perf.max_marker_ms, t.stop());
+		}
+		return hr;
 	}
 
 	// ---- State ----
@@ -1156,22 +1177,26 @@ namespace hifi::d3d8
 
 	HRESULT device::DrawPrimitive(D3DPRIMITIVETYPE t, UINT start, UINT count)
 	{
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, false, start, 0, 0, 0, nullptr, 0, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawIndexedPrimitive(D3DPRIMITIVETYPE t, UINT min_index, UINT vertices, UINT start, UINT count)
 	{
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, true, start, INT(cur.base_vertex), min_index, vertices, nullptr, 0, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawPrimitiveUP(D3DPRIMITIVETYPE t, UINT count, CONST void *v, UINT stride)
 	{
 		if (v == nullptr || stride == 0)
 			return D3DERR_INVALIDCALL;
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, false, 0, 0, 0, 0, v, stride, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE t, UINT min_index, UINT vertices, UINT count, CONST void *i, D3DFORMAT f, CONST void *v, UINT stride)
 	{
 		if (v == nullptr || i == nullptr || stride == 0)
 			return D3DERR_INVALIDCALL;
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, true, 0, 0, min_index, vertices, v, stride, i, f);
 	}
 	HRESULT device::ProcessVertices(UINT, UINT, UINT, IDirect3DVertexBuffer8 *, DWORD)
