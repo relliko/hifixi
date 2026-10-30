@@ -2156,7 +2156,10 @@ int main()
 		std::printf("  %s\n", people_line != std::string::npos ? log.substr(people_line, log.find('\n', people_line) - people_line).c_str() : "(no zone characters line)");
 		check(log.find("no characters from the worldfx addon (none sent, or none for half a second): no lamp shadows until there are") != std::string::npos,
 			"no characters sent: lamp shadows off, said in ReShade.log");
-		check(people_line != std::string::npos && (log.find("characters and monsters from the worldfx addon, the nearest", people_line) == people_line + 25 ||
+		// (with them, their count first: "1 characters and monsters ...")
+		const size_t counted = people_line != std::string::npos ? log.find_first_not_of("0123456789", people_line + 25) : std::string::npos;
+		check(people_line != std::string::npos && ((counted > people_line + 25 && counted != std::string::npos &&
+			log.find(" characters and monsters from the worldfx addon, the nearest", people_line) == counted) ||
 			log.find("no characters from the worldfx addon", people_line) == people_line + 25), "the zone's characters, logged once it's in");
 		// (the fake game's light, 0.3 0.8 0.2 toward the ground, turned round and made a unit vector)
 		check(log.find("the game's light -0.342 -0.912 -0.228") != std::string::npos, "the sun from the game's light (ReShade.log)");

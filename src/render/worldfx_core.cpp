@@ -1689,6 +1689,10 @@ namespace
 	// reaches the lamp's range (at most kLampMostRange) times the reach setting. Lamps further from the camera
 	// than kLampFar aren't drawn (faded out over the last kLampFade yalms before it).
 	constexpr float kLampMaxRange = 20.0f, kLampMostRange = 12.0f, kLampFar = 150.0f, kLampFade = 30.0f;
+	// In a Mog House (the zone 1000 + the room's model: feed.cpp) the room's lamp lights the whole small room already, and
+	// a glow as strong as a street lamp's on top washed it out yellow (in game, 2026-10-30): its glow this much as strong
+	constexpr uint32_t kMogHouseZone = 1000;
+	constexpr float kMogHouseGlow = 0.3f;
 
 	// The lamps lit now, near the camera and in view, for the renderer (mutex held): each baked lamp the game's light
 	// table has lit (with its brightness and where it is now: a few move), and with lamps_unbaked the lit lights the
@@ -1791,7 +1795,8 @@ namespace
 			if (baked != nullptr)
 				g.lamps_lit++;
 			// (as bright as the game's light for it: grass::lamp_glow_strength, by its brightness now and fully lit)
-			const float strength = grass::lamp_glow_strength(g.lamp_glow, light.brightness, baked != nullptr ? baked->brightness : 0.0f);
+			const float strength = grass::lamp_glow_strength(g.lamp_glow, light.brightness, baked != nullptr ? baked->brightness : 0.0f) *
+				(g.zone >= kMogHouseZone ? kMogHouseGlow : 1.0f);
 			if (consider(light.x, light.y, light.z, light.range, colour, strength, false) && baked == nullptr)
 				g.lamps_unbaked_used++;
 		}
