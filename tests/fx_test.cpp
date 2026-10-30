@@ -913,6 +913,108 @@ int main()
 			put<uint32_t>(tex_object + 0x40, 0);
 		}
 
+		// A CMoDist (0426F0) and a CMoVuDist (043110): the diamond projected by the game's own math vt+0x80 through gfx
+		// +0xB10 into the game's target (wrapper +0x98: 640 x 480), its box moved to 0 (the grab: points 1 2 4 3 with
+		// their UVs), the fan (centre the element's colour, the rest 0x00808080, UVs the moved places / 255), WORLD the
+		// draw matrix shifted by +0x194 in x and y; nothing without the world's texture ([VA 048E666C] +0x194). VuDist:
+		// the walk (count 3) run with a callback that counts: three grabs and quads, the walk's clock moved on.
+		{
+			check(s.dist_draw == base + 0x0426F0 && s.vudist_draw == base + 0x043110 && s.dist_app == base + 0x45666C, name + ": CMoDist 0426F0, CMoVuDist 043110, VA +45666C");
+			const uintptr_t app = take(0x200);
+			const uint32_t app_kept = get<uint32_t>(s.dist_app);
+			put<uint32_t>(s.dist_app, uint32_t(app));
+			const float P[16] = { 1.5f, 0, 0, 0, 0, 2.0f, 0, 0, 0, 0, -1.0f, -1, 0, 0, -0.1f, 0 };
+			std::memcpy(reinterpret_cast<void *>(address(gfx) + 0xB10), P, 64);
+			put<float>(address(gfx) + 0xDC0, 320.0f);
+			put<float>(address(gfx) + 0xDC4, 240.0f);
+			put<uint8_t>(address(wrapper) + 0x158, 1);
+			put<int32_t>(address(wrapper) + 0x98 + 0x18 + 8, 640);
+			put<int32_t>(address(wrapper) + 0x98 + 0x18 + 0xC, 480);
+			const uintptr_t vt_dist = take(0x100), vt_vudist = take(0x100);
+			for (const uintptr_t vt : { vt_dist, vt_vudist })
+			{
+				put<uint32_t>(vt + 0x2C, uint32_t(s.element_draw));
+				put<uint32_t>(vt + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			}
+			put<uint32_t>(vt_dist + 0x48, uint32_t(s.dist_draw));
+			put<uint32_t>(vt_vudist + 0x48, uint32_t(s.vudist_draw));
+			const uintptr_t ed = element(vt_dist, 0, 0x48, 0, 0x80406080, -4.0f);
+			put<float>(ed + 0x194, 0.1f);
+			const uintptr_t list9 = take(16), node9 = take(32);
+			put<uint32_t>(node9 + 4, 0);
+			put<uint32_t>(node9 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node9 + 0xC, uint32_t(ed));
+			put<uint32_t>(list9 + 4, uint32_t(node9));
+			put<uint32_t>(list9 + 8, 0);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list9, 0);
+			check(g_markers == 0 && g_seen.setups == 0, name + ": CMoDist without the world's texture: taken, nothing drawn");
+			put<uint32_t>(app + 0x194, 0x1234);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list9, 0);
+			const fx::frame *f9 = fx::published(g_last_seq);
+			bool ok = g_markers == 1 && g_seen.setups == 0 && f9 != nullptr && f9->element_count == 1 && f9->grab_count == 1;
+			float worst = 0.0f;
+			if (ok)
+			{
+				const fx::element &d = f9->elements[0];
+				const fx::draw &dr = f9->draws[d.first_draw];
+				ok = d.cls == fx::class_dist && d.draws == 1 && dr.count == 12 && dr.texture == fx::kDistTexture && dr.stages == fx::stage_dist && dr.grab == 0 &&
+					d.blend == fx::blend_alpha && d.tfactor == 0x80808080u && d.fog == 0 && std::fabs(d.world[12] - 0.6f) < 1e-5f && std::fabs(d.world[13] + 0.15f) < 1e-5f;
+				// (the diamond by hand: at (0.5, -0.25, -4), through P, into 640 x 480)
+				const float dia[5][2] = { { 0, 0 }, { -1, 0 }, { 0, -1 }, { 1, 0 }, { 0, 1 } };
+				float sx[5], sy[5];
+				for (int k = 0; k < 5; ++k)
+				{
+					const float x = dia[k][0] + 0.5f, y = dia[k][1] - 0.25f, z = -4.0f;
+					const float w = std::fabs(-z);
+					sx[k] = (x * 1.5f / w + 1.0f) * 320.0f;
+					sy[k] = (1.0f - y * 2.0f / w) * 240.0f;
+				}
+				float lo[2] = { sx[0], sy[0] }, hi[2] = { sx[0], sy[0] };
+				for (int k = 1; k < 5; ++k)
+				{
+					lo[0] = std::min(lo[0], sx[k]);
+					hi[0] = std::max(hi[0], sx[k]);
+					lo[1] = std::min(lo[1], sy[k]);
+					hi[1] = std::max(hi[1], sy[k]);
+				}
+				const float kx = hi[0] - lo[0] < 256.0f ? 1.0f : 255.0f / (hi[0] - lo[0]), ky = hi[1] - lo[1] < 256.0f ? 1.0f : 255.0f / (hi[1] - lo[1]);
+				const int corners[4] = { 1, 2, 4, 3 };
+				const fx::grab &gr = f9->grabs[0];
+				for (int k = 0; k < 4; ++k)
+				{
+					const int p = corners[k];
+					worst = std::max({ worst, std::fabs(gr.pos[k][0] - (sx[p] - lo[0]) * kx), std::fabs(gr.pos[k][1] - (sy[p] - lo[1]) * ky),
+						std::fabs(gr.uv[k][0] - sx[p] / 640.0f) * 640.0f, std::fabs(gr.uv[k][1] - sy[p] / 480.0f) * 480.0f });
+				}
+				// (the fan's first triangle: the centre, points 1 and 2)
+				const fx::vertex *v = f9->vertices + dr.first;
+				ok = ok && v[0].colour == 0x80406080u && v[1].colour == 0x00808080u && v[1].pos[0] == -1.0f && v[2].pos[1] == -1.0f && v[11].pos[0] == -1.0f;
+				worst = std::max({ worst, std::fabs(v[1].uv[0] * 255.0f - (sx[1] - lo[0]) * kx), std::fabs(v[2].uv[1] * 255.0f - (sy[2] - lo[1]) * ky) });
+				ok = ok && worst < 0.01f && kx == 1.0f;
+			}
+			check(ok, name + ": CMoDist: the grab (points 1 2 4 3 moved into the target, their UVs) and the fan, as 0426F0 makes them (worst " + std::to_string(worst) + " px)");
+			// VuDist: the walk at +0x198 (count +0x1DC 3, no point list)
+			const uintptr_t ev = element(vt_vudist, 0, 0x48, 0, 0x80406080, -4.0f);
+			const uintptr_t recs = take(3 * 0x24);
+			put<float>(ev + 0x19C, 1.0f);
+			put<uint32_t>(ev + 0x1D8, uint32_t(recs));
+			put<int16_t>(ev + 0x1DC, 3);
+			put<float>(address(gfx) + 0xEB0, 0.5f);
+			put<uint32_t>(node9 + 0xC, uint32_t(ev));
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list9, 0);
+			const fx::frame *fa = fx::published(g_last_seq);
+			ok = g_markers == 1 && g_seen.setups == 0 && fa != nullptr && fa->element_count == 1 && fa->grab_count == 3 && fa->elements[0].draws == 3 &&
+				fa->draws[fa->elements[0].first_draw + 2].grab == 2 && get<float>(ev + 0x19C) == 1.5f;
+			check(ok, name + ": CMoVuDist: the game's walk counted 3 points: three grabs and quads, its clock moved on by gfx +0xEB0");
+			put<uint32_t>(s.dist_app, app_kept);
+		}
+
 		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
 		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
 		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path

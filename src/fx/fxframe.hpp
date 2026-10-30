@@ -27,7 +27,9 @@ namespace hifi::fx
 	constexpr uint32_t kMaxVertices = 24576;  // their vertices (36 bytes each, as FVF 0x152)
 	constexpr uint32_t kMaxRuns = 256;        // runs a flush (see-through characters and the game's own draws between)
 	constexpr uint32_t kMaxLit = 1024;        // lit elements a flush (flags bit 16: their lights)
+	constexpr uint32_t kMaxGrabs = 256;       // distortion grabs a flush (the world copied into the 256 x 256 target)
 	constexpr uint32_t kNone = 0xFFFFFFFFu;
+	constexpr uint32_t kDistTexture = 0xFFFFFFFEu; // a draw's texture: the distortion target its grab filled
 
 	// A vertex as the game's FVF 0x152 has it: position, normal, D3DCOLOR (0xAARRGGBB), one UV
 	struct vertex
@@ -73,6 +75,8 @@ namespace hifi::fx
 		                                // TFACTOR x 2, then x DIFFUSE x 4
 		stage_mmb_textured_d = 1u << 10, // ... with the textured mode (letter d, or flags bit 28): colour TEXTURE x
 		                                 // DIFFUSE, then x TFACTOR x 4; alpha DIFFUSE x TFACTOR x 4
+		stage_dist = 1u << 11,          // the distortion fan (353108): colour TEXTURE x DIFFUSE x 2, alpha DIFFUSE x TFACTOR x
+		                                // 4, stage 1 off; the texture the distortion target, sampled MIRROR (353028's)
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -102,8 +106,19 @@ namespace hifi::fx
 	struct draw
 	{
 		uint32_t first = 0, count = 0; // vertices
-		uint32_t texture = kNone;      // (src/fx/textures' id)
+		uint32_t texture = kNone;      // (src/fx/textures' id; kDistTexture: the distortion target)
 		uint32_t stages = 0;           // stage_bits
+		uint32_t grab = kNone;         // a distortion grab drawn into the distortion target first (frame::grabs)
+	};
+
+	// A distortion grab (0426F0, 042D00): the world as drawn so far, copied into the game's 256 x 256 target (VA
+	// 0490BB88) through a quad of pre-transformed vertices (a strip 0 1 2 3: D3D9 pixels of that target, z 0, rhw 1),
+	// each with its UV into the world (3530D0 / 353028: colour the texture, alpha TFACTOR 0x80; no blend, no z; LINEAR,
+	// ADDRESS MIRROR)
+	struct grab
+	{
+		float pos[4][2];
+		float uv[4][2];
 	};
 
 	// One element: everything 0467E0 and its class draw set for it
@@ -137,7 +152,8 @@ namespace hifi::fx
 		class_morph = 4,
 		class_ring = 5,
 		class_trail = 6,   // a weapon trail (CYyAfterImage, 01C940): not an element, a flush callback of its own
-		classes = 7,
+		class_dist = 7,    // a distortion quad (CMoDist 0426F0, CMoVuDist 043110)
+		classes = 8,
 	};
 
 	struct run
@@ -153,9 +169,10 @@ namespace hifi::fx
 		float proj[16];
 		// The camera's VIEW (gfx +0xB50): what the weapon trails' world-space points are drawn through (WORLD identity)
 		float view[16];
-		uint32_t element_count = 0, draw_count = 0, vertex_count = 0, light_count = 0;
+		uint32_t element_count = 0, draw_count = 0, vertex_count = 0, light_count = 0, grab_count = 0;
 		run run_list[kMaxRuns];
 		lighting lights[kMaxLit];
+		grab grabs[kMaxGrabs];
 		element elements[kMaxElements];
 		draw draws[kMaxDraws];
 		vertex vertices[kMaxVertices];

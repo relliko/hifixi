@@ -8,7 +8,12 @@
  * texture t1, 3 and 4 an MMB effect mesh's zone vertices t2 and indices t3 (root views of the zone's buffers: its
  * draws read their vertices through the zone's indices), 5 the frame's lights t4 (the upload ring, after the
  * vertices: a lit element's D3D8 fixed-function lighting in the vertex shader). Static sampler s0: MIN/MAG LINEAR, no mips (the game sets no
- * MIPFILTER), WRAP (the D3M runs' and 183760's ADDRESS WRAP; D3D8's default for the rest).
+ * MIPFILTER), WRAP (the D3M runs' and 183760's ADDRESS WRAP; D3D8's default for the rest); s1 the same, MIRROR (the
+ * distortion's: 353028 sets it on stage 0 and the fan after keeps it).
+ *
+ * A distortion grab (vs_grab / ps_grab, the same root signature: its quad's 4 corners in b0's first 16 constants, the
+ * world's copy as the table's texture) draws into the 256 x 256 target with pre-transformed vertices as D3D9 places
+ * them (pixel centres on whole numbers: + 0.5 here), no blend, no depth: colour the world's, alpha 0x80 (TFACTOR).
  *
  * An MMB effect mesh's textures are the zone's (its heap bound for that element, ours again after).
  */
@@ -64,6 +69,7 @@ struct lit
 };
 StructuredBuffer<lit> lits : register(t4);
 SamplerState smp : register(s0);
+SamplerState smp_mirror : register(s1);
 
 struct v2p
 {
@@ -128,6 +134,12 @@ float4 ps(v2p i) : SV_Target
 		c = saturate(saturate(t.rgb * d.rgb) * tfactor.rgb * 4.0);
 		a = saturate(d.a * tfactor.a * 4.0);
 	}
+	else if (s & 2048)
+	{
+		float4 t = tex.SampleLevel(smp_mirror, i.uv, 0);
+		c = saturate(t.rgb * d.rgb * 2.0);
+		a = saturate(d.a * tfactor.a * 4.0);
+	}
 	else if (s & 1)
 	{
 		float4 t = tex.SampleLevel(smp, i.uv, 0);
@@ -145,6 +157,28 @@ float4 ps(v2p i) : SV_Target
 		discard;
 	c = lerp(fog_colour.rgb, c, i.fog);
 	return float4(c, a);
+}
+
+struct g2p
+{
+	float4 pos : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+
+g2p vs_grab(uint id : SV_VertexID)
+{
+	// (the strip 0 1 2 3 as the list 0 1 2, 1 2 3; each corner a row of b0: x, y in the target's D3D9 pixels, u, v)
+	static const uint corner[6] = { 0, 1, 2, 1, 2, 3 };
+	float4 r = world[corner[id]];
+	g2p o;
+	o.pos = float4((r.x + 0.5) / 128.0 - 1.0, 1.0 - (r.y + 0.5) / 128.0, 0.0, 1.0);
+	o.uv = r.zw;
+	return o;
+}
+
+float4 ps_grab(g2p i) : SV_Target
+{
+	return float4(tex.SampleLevel(smp_mirror, i.uv, 0).rgb, 128.0 / 255.0);
 }
 )";
 
@@ -201,8 +235,19 @@ float4 ps(v2p i) : SV_Target
 	void fx_renderer::release()
 	{
 		for (auto &p : _pipelines)
-			p.second->Release();
+			if (p.second != nullptr)
+				p.second->Release();
 		_pipelines.clear();
+		for (IUnknown **u : { reinterpret_cast<IUnknown **>(&_grab_pso), reinterpret_cast<IUnknown **>(&_dist), reinterpret_cast<IUnknown **>(&_scene),
+				 reinterpret_cast<IUnknown **>(&_dist_rtv) })
+		{
+			if (*u != nullptr)
+				(*u)->Release();
+			*u = nullptr;
+		}
+		_dist_format = DXGI_FORMAT_UNKNOWN;
+		_scene_width = 0;
+		_scene_height = 0;
 		if (_ring != nullptr)
 		{
 			_ring->Release();
@@ -214,7 +259,7 @@ float4 ps(v2p i) : SV_Target
 			_root->Release();
 			_root = nullptr;
 		}
-		for (void **b : { &_vs, &_ps })
+		for (void **b : { &_vs, &_ps, &_vs_grab, &_ps_grab })
 		{
 			if (*b != nullptr)
 				static_cast<ID3DBlob *>(*b)->Release();
@@ -240,7 +285,7 @@ float4 ps(v2p i) : SV_Target
 			const char *name, *target;
 			void **out;
 		};
-		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps } };
+		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "vs_grab", "vs_5_0", &_vs_grab }, { "ps_grab", "ps_5_0", &_ps_grab } };
 		for (const entry &e : entries)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
@@ -275,12 +320,15 @@ float4 ps(v2p i) : SV_Target
 			p[k].Descriptor.ShaderRegister = k - 1;
 			p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 		}
-		D3D12_STATIC_SAMPLER_DESC s = {};
-		s.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-		s.MaxLOD = 0.0f;
-		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 6, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		D3D12_STATIC_SAMPLER_DESC s[2] = {};
+		s[0].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+		s[0].AddressU = s[0].AddressV = s[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		s[0].MaxLOD = 0.0f;
+		s[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		s[1] = s[0];
+		s[1].AddressU = s[1].AddressV = s[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+		s[1].ShaderRegister = 1;
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 6, p, 2, s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -348,6 +396,161 @@ float4 ps(v2p i) : SV_Target
 			pso = nullptr;
 		_pipelines[key] = pso;
 		return pso;
+	}
+
+	// The distortion target (256 x 256, the world's format: as 044270 makes the game's with 06A150), the world's copy (its
+	// size, not multisampled) and the grab's pipeline, made or made again for this world; their views in textures'
+	// reserved descriptors 1 and 2
+	bool fx_renderer::dist_resources(const target &t)
+	{
+		if (t.rt == nullptr || t.rtv_format == DXGI_FORMAT_UNKNOWN)
+			return false;
+		const D3D12_RESOURCE_DESC rd = t.rt->GetDesc();
+		D3D12_CPU_DESCRIPTOR_HANDLE dist_cpu, scene_cpu;
+		D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+		if (!textures::reserved(1, dist_cpu, gpu) || !textures::reserved(2, scene_cpu, gpu))
+			return false;
+		const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+		sv.Format = t.rtv_format;
+		sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sv.Texture2D.MipLevels = 1;
+		if (_dist == nullptr || _dist_format != t.rtv_format)
+		{
+			for (IUnknown **u : { reinterpret_cast<IUnknown **>(&_dist), reinterpret_cast<IUnknown **>(&_grab_pso) })
+			{
+				if (*u != nullptr)
+					(*u)->Release();
+				*u = nullptr;
+			}
+			if (_dist_rtv == nullptr)
+			{
+				const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+				if (FAILED(_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_dist_rtv))))
+				{
+					_dist_rtv = nullptr;
+					return false;
+				}
+			}
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = d.Height = 256;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = t.rtv_format;
+			d.SampleDesc.Count = 1;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			D3D12_CLEAR_VALUE cv = {};
+			cv.Format = t.rtv_format;
+			if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv, IID_PPV_ARGS(&_dist))))
+			{
+				_dist = nullptr;
+				return false;
+			}
+			_dist->SetName(L"hifixi: the distortion target");
+			D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+			rv.Format = t.rtv_format;
+			rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+			_device->CreateRenderTargetView(_dist, &rv, _dist_rtv->GetCPUDescriptorHandleForHeapStart());
+			_device->CreateShaderResourceView(_dist, &sv, dist_cpu);
+			_dist_format = t.rtv_format;
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+			pd.pRootSignature = _root;
+			pd.VS = { static_cast<ID3DBlob *>(_vs_grab)->GetBufferPointer(), static_cast<ID3DBlob *>(_vs_grab)->GetBufferSize() };
+			pd.PS = { static_cast<ID3DBlob *>(_ps_grab)->GetBufferPointer(), static_cast<ID3DBlob *>(_ps_grab)->GetBufferSize() };
+			pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			pd.NumRenderTargets = 1;
+			pd.RTVFormats[0] = t.rtv_format;
+			pd.SampleDesc.Count = 1;
+			pd.SampleMask = UINT_MAX;
+			pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			pd.RasterizerState.DepthClipEnable = TRUE;
+			pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			if (FAILED(_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&_grab_pso))))
+			{
+				_grab_pso = nullptr;
+				return false;
+			}
+		}
+		if (_scene == nullptr || _scene_width != rd.Width || _scene_height != rd.Height || _scene->GetDesc().Format != rd.Format)
+		{
+			if (_scene != nullptr)
+				_scene->Release();
+			D3D12_RESOURCE_DESC d = rd;
+			d.MipLevels = 1;
+			d.DepthOrArraySize = 1;
+			d.SampleDesc.Count = 1;
+			d.SampleDesc.Quality = 0;
+			d.Flags = D3D12_RESOURCE_FLAG_NONE;
+			d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			d.Alignment = 0;
+			if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&_scene))))
+			{
+				_scene = nullptr;
+				return false;
+			}
+			_scene->SetName(L"hifixi: the world's copy (distortion)");
+			_scene_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			_scene_width = rd.Width;
+			_scene_height = rd.Height;
+			_device->CreateShaderResourceView(_scene, &sv, scene_cpu);
+		}
+		return true;
+	}
+
+	bool fx_renderer::grab(ID3D12GraphicsCommandList *list, const target &t, const fx::grab &gr)
+	{
+		if (!dist_resources(t))
+			return false;
+		D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+		D3D12_GPU_DESCRIPTOR_HANDLE scene_srv;
+		textures::reserved(2, cpu, scene_srv);
+		const auto barrier = [&](ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = r;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = from;
+			b.Transition.StateAfter = to;
+			list->ResourceBarrier(1, &b);
+		};
+		// The world as drawn so far (resolved when multisampled)
+		const bool resolve = t.samples > 1;
+		const D3D12_RESOURCE_STATES from = resolve ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+		const D3D12_RESOURCE_STATES to = resolve ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST;
+		barrier(t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, from);
+		barrier(_scene, _scene_state, to);
+		if (resolve)
+			list->ResolveSubresource(_scene, 0, t.rt, 0, t.rtv_format);
+		else
+			list->CopyResource(_scene, t.rt);
+		barrier(_scene, to, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		_scene_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		barrier(t.rt, from, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		// Its quad into the distortion target
+		barrier(_dist, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtv = _dist_rtv->GetCPUDescriptorHandleForHeapStart();
+		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		const D3D12_VIEWPORT vp = { 0.0f, 0.0f, 256.0f, 256.0f, 0.0f, 1.0f };
+		const D3D12_RECT sc = { 0, 0, 256, 256 };
+		list->RSSetViewports(1, &vp);
+		list->RSSetScissorRects(1, &sc);
+		list->SetPipelineState(_grab_pso);
+		float c[16];
+		for (int k = 0; k < 4; ++k)
+		{
+			c[4 * k + 0] = gr.pos[k][0];
+			c[4 * k + 1] = gr.pos[k][1];
+			c[4 * k + 2] = gr.uv[k][0];
+			c[4 * k + 3] = gr.uv[k][1];
+		}
+		list->SetGraphicsRoot32BitConstants(0, 16, c, 0);
+		list->SetGraphicsRootDescriptorTable(2, scene_srv);
+		list->DrawInstanced(6, 1, 0, 0);
+		barrier(_dist, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		return true;
 	}
 
 	run_stats fx_renderer::record_run(ID3D12GraphicsCommandList *list, const target &t, const frame &f, uint32_t seq, uint32_t run)
@@ -446,9 +649,30 @@ float4 ps(v2p i) : SV_Target
 				const bool zoned = (dr.stages & stage_zone_mesh) != 0;
 				if (dr.count == 0 || (zoned ? z == nullptr : dr.first + dr.count > kMaxVertices))
 					continue;
+				if (dr.grab != kNone)
+				{
+					// (a distortion: the world so far into the distortion target first, then the world's target again)
+					if (z != nullptr || dr.grab >= kMaxGrabs || !grab(list, t, f.grabs[dr.grab]))
+						continue;
+					st.grabs++;
+					list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
+					list->RSSetViewports(1, &vp);
+					list->RSSetScissorRects(1, &sc);
+					list->SetPipelineState(pso);
+					bound = pso;
+					list->SetGraphicsRoot32BitConstants(0, 44, c, 0);
+				}
 				const uint32_t fl[3] = { dr.stages, dr.first, e.light < kMaxLit ? e.light : kNone };
 				list->SetGraphicsRoot32BitConstants(0, 3, fl, 44);
-				if (zoned)
+				D3D12_CPU_DESCRIPTOR_HANDLE dist_cpu;
+				D3D12_GPU_DESCRIPTOR_HANDLE dist_gpu;
+				if (dr.texture == kDistTexture)
+				{
+					if (!textures::reserved(1, dist_cpu, dist_gpu) || _dist == nullptr)
+						continue;
+					list->SetGraphicsRootDescriptorTable(2, dist_gpu);
+				}
+				else if (zoned)
 					list->SetGraphicsRootDescriptorTable(2, z->texture_srv((dr.stages & (stage_mmb_textured | stage_mmb_textured_d)) != 0 ? dr.texture : textures::kNone));
 				else
 					list->SetGraphicsRootDescriptorTable(2, textures::view((dr.stages & stage_texture) != 0 ? dr.texture : textures::kNone));

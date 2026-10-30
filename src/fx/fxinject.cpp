@@ -211,6 +211,7 @@ namespace hifi::fx::inject
 		target t;
 		t.rtv = rtv;
 		t.dsv = dsv;
+		t.rt = w.rt;
 		t.rtv_format = w.rt_format;
 		t.dsv_format = w.ds_format;
 		t.samples = rd.SampleDesc.Count;
@@ -228,6 +229,7 @@ namespace hifi::fx::inject
 		g.n.elements += st.elements;
 		g.n.draws += st.draws;
 		g.n.triangles += st.triangles;
+		g.n.grabs += st.grabs;
 	}
 
 	counts get_counts()
@@ -240,10 +242,10 @@ namespace hifi::fx::inject
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		char line[400];
-		std::snprintf(line, sizeof(line), "native effect renderer: %s; %llu markers, %llu runs drawn (%llu elements, %llu draws, %llu triangles), %llu textures copied in, "
+		std::snprintf(line, sizeof(line), "native effect renderer: %s; %llu markers, %llu runs drawn (%llu elements, %llu draws, %llu triangles, %llu distortion grabs), %llu textures copied in, "
 			"%llu markers without their flush, %llu couldn't be drawn%s%s",
 			g.renderer && g.renderer->ready() ? "up" : "not made", static_cast<unsigned long long>(g.n.markers), static_cast<unsigned long long>(g.n.runs),
-			static_cast<unsigned long long>(g.n.elements), static_cast<unsigned long long>(g.n.draws), static_cast<unsigned long long>(g.n.triangles),
+			static_cast<unsigned long long>(g.n.elements), static_cast<unsigned long long>(g.n.draws), static_cast<unsigned long long>(g.n.triangles), static_cast<unsigned long long>(g.n.grabs),
 			static_cast<unsigned long long>(g.n.textures), static_cast<unsigned long long>(g.n.no_frame), static_cast<unsigned long long>(g.n.failed),
 			g.why.empty() ? "" : " (the last: ", g.why.empty() ? "" : (g.why + ")").c_str());
 		return { line, textures::status() };

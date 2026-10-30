@@ -28,7 +28,7 @@ namespace hifi::fx::inject
 
 	struct counts
 	{
-		uint64_t markers = 0, runs = 0, elements = 0, draws = 0, triangles = 0, failed = 0, textures = 0;
+		uint64_t markers = 0, runs = 0, elements = 0, draws = 0, triangles = 0, failed = 0, textures = 0, grabs = 0;
 		uint64_t no_frame = 0; // a marker whose flush wasn't in the ring (any more)
 	};
 	counts get_counts();
