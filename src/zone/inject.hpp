@@ -69,6 +69,10 @@ namespace hifi::zone::inject
 	uint32_t last_lamps(frame_lamp out[kMaxLamps]);
 	// The zone's end marker: the pass published under that seq drawn there when it's HiFi XI's
 	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	// The characters' end marker: the model actors the walk under that seq left to HiFi XI (frame.hpp actor_frame) drawn
+	// there, before the characters; whether they can be handed over (the renderer up, none failed in the last two seconds)
+	void on_actors_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	bool actors_ready();
 
 	// World FX's sun shadow cascades from the zone this draws (zoneshadow.hpp; grass::renderer::set_zone_casters): the
 	// zone drawn here in the last kZoneFreshMs (only then: a zone left is let go 240 presents on), the box around what it

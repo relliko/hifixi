@@ -75,6 +75,8 @@
 #include "../zone/inject.hpp"
 #include "../zone/light_split.hpp"
 #include "../zone/native.hpp"
+#include "../zone/actordata.hpp"
+#include "../game/modelactor.hpp"
 #include "../upscale/upscale.hpp"
 #include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
@@ -88,7 +90,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.54;
+	constexpr double kVersion = 0.55;
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -282,6 +284,8 @@ class hifixi final : public IPlugin
 	bool m_charslot_refused = false; // (native characters: likewise the character slots)
 	bool m_chardata_refused = false; // (native characters: likewise the model draw's stub)
 	bool m_nativechars_refused = false; // (native characters: likewise their renderer)
+	bool m_char_flowing = false;     // (the characters' end markers coming through: m_char_flow's last word)
+	bool m_modelactor_refused = false; // (likewise the model actors' call: the game draws them)
 
 	void say(const std::string &text, bool error = false)
 	{
@@ -332,6 +336,9 @@ class hifixi final : public IPlugin
 		for (const std::string &line : hifi::zone::native::status())
 			say(line);
 		say(hifi::game::zonedraw::status());
+		say(hifi::game::modelactor::status());
+		for (const std::string &line : hifi::zone::actordata::status())
+			say(line);
 		for (const std::string &line : hifi::zone::inject::status())
 			say(line);
 		for (const std::string &line : hifi::upscale::status())
@@ -586,7 +593,15 @@ class hifixi final : public IPlugin
 			m_casters_set = true;
 		}
 		const bool flowing = m_char_flow.update(hifi::game::charslot::get_counts().sent[3], hifi::chars::marks::get_counts().end);
+		m_char_flowing = flowing;
 		hifi::game::charmodel::set_native(want && flowing && hifi::chars::inject::ready());
+	}
+
+	// charslot's listener: the walk's begin and end to the character models' recording and the model actors'
+	static void char_slot(uint32_t kind, uint32_t seq, uintptr_t actor)
+	{
+		hifi::game::charmodel::on_slot(kind, seq, actor);
+		hifi::game::modelactor::on_slot(kind, seq, actor);
 	}
 
 	// The native zone draw in (its renderer made for the game's device first), its per-pixel option; and each pass's
@@ -682,6 +697,28 @@ class hifixi final : public IPlugin
 		}
 	}
 
+	// The model actors (ships, Mog House furniture, gardening plants) drawn by the zone renderer at the characters' end
+	// marker (src/game/modelactor): the call through ours once the native zone draw and the character slots are in; their
+	// DATs' data loaded as they're seen; left to HiFi XI while its renderer is up and the characters' end markers come
+	// through (m_char_flow, kept by follow_nativechars)
+	void follow_modelactor()
+	{
+		namespace ma = hifi::game::modelactor;
+		std::string why;
+		if (!ma::in() && !m_modelactor_refused && hifi::game::zonedraw::in() && hifi::game::charslot::in())
+		{
+			ma::set_data(hifi::zone::actordata::find);
+			if (ma::start(why))
+				hifi::backend::log(0, "HiFi XI: the model actors drawn natively (0C4CC8's call through ours)");
+			else
+			{
+				m_modelactor_refused = true; // (not tried again: the game draws them itself)
+				hifi::backend::log(1, ("HiFi XI: the model actors left to the game: " + why).c_str());
+			}
+		}
+		ma::set_native(ma::in() && m_char_flowing && hifi::zone::inject::actors_ready());
+	}
+
 	void native_gate()
 	{
 		const bool want = hifi::game::zonedraw::in();
@@ -767,7 +804,7 @@ public:
 		hifi::backend::streamlog::set_d3d8_tap(hifi::game::hifps::exp::draw_tap, hifi::game::hifps::exp::draw_untap);
 		// (the zone pass's begin and end to the native zone draw)
 		hifi::game::zoneslot::set_listener(hifi::game::zonedraw::on_slot);
-		hifi::game::charslot::set_listener(hifi::game::charmodel::on_slot); // (native characters)
+		hifi::game::charslot::set_listener(char_slot); // (native characters, and the model actors in the same walk)
 		start();
 		hifi::bake::runner::start(hifi::backend::folder());
 		return true;
@@ -790,6 +827,10 @@ public:
 			ashita_log(1, ("the projection calls not put back: " + why).c_str());
 		if (!hifi::game::zoneslot::stop(why))
 			ashita_log(1, ("the zone pass's slot markers not taken out: " + why).c_str());
+		// (the model actors: the game draws them again; their data stays, as the zone's)
+		hifi::game::modelactor::set_native(false);
+		if (!hifi::game::modelactor::stop(why))
+			ashita_log(1, ("the model actors' call not put back: " + why).c_str());
 		// (native characters: the game draws every model again, then the model draw's stub out, the game's own drawing back
 		// with it; the renderer's objects are left: dgVoodoo's lists may still hold them)
 		hifi::game::charmodel::set_native(false);
@@ -1001,6 +1042,7 @@ public:
 			follow_nativechars();
 			follow_enspell();
 			follow_native();
+			follow_modelactor();
 			follow_upscale();
 			follow_jitter();
 		}
@@ -1013,6 +1055,8 @@ public:
 			// (the native zone renderer's data for the zone and its second map)
 			hifi::zone::native::frame(worldfx::attached(), p.in_game ? hifi::game::feed::zone() : 0, p.in_game ? hifi::game::zonedraw::second_map() : 0, true);
 			native_gate();
+			// (the model actors' DATs, as they're seen)
+			hifi::zone::actordata::frame(worldfx::attached(), p.in_game && hifi::game::modelactor::in());
 			// (only while World FX draws into the game's world: on another output its files would go unused)
 			if (const uint32_t zone = hifi::game::feed::zone(); zone != m_zone && worldfx_drawing() != 0)
 			{

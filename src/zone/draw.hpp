@@ -44,6 +44,21 @@ namespace hifi::zone
 		bool per_pixel = false; // sun and lamps per pixel on every piece
 	};
 
+	// What a list of objects is drawn with besides them: the camera, the lighting environments (0 the zone's own), the
+	// lamps, and the data each object's `zone` names (a frame: its zone and second map; the model actors: one DAT's each)
+	struct draw_pass
+	{
+		const float *view_proj = nullptr; // (16: VIEW x PROJECTION, row vectors)
+		const float *camera = nullptr;    // (3)
+		const frame_env *envs = nullptr;
+		uint32_t env_count = 0;
+		const frame_lamp *lamps = nullptr;
+		uint32_t lamp_count = 0;
+		bool no_bump = false;
+		gpu_zone *const *zones = nullptr;
+		uint32_t zone_count = 0;
+	};
+
 	struct draw_stats
 	{
 		uint32_t objects = 0, draws = 0, triangles = 0, skipped = 0;
@@ -65,6 +80,9 @@ namespace hifi::zone
 		// The frame's objects onto the list. `frame_number` picks the upload ring's slot: each slot is rewritten every
 		// kFrames frames, so the GPU must have finished the frame kFrames before (it never runs that far behind).
 		draw_stats record(ID3D12GraphicsCommandList *list, const draw_target &t, const frame &f, const draw_options &o, uint64_t frame_number);
+		// Objects of a pass of their own (up to kMaxObjects), likewise
+		draw_stats record(ID3D12GraphicsCommandList *list, const draw_target &t, const draw_pass &p, const frame_object *objects, uint32_t count,
+			const draw_options &o, uint64_t frame_number);
 
 	private:
 		ID3D12PipelineState *pipeline(const draw_target &t, bool blended, int cull, bool door);

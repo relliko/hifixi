@@ -346,7 +346,7 @@ light_out ps_light(v2p i)
 		// per-pixel lighting: up to kNearLamps, the strongest at the box first (colour / (a2 d^2) at its nearest point),
 		// a byte each into out (255 none). A box test per lamp: a frame has at most 64, and none by day outdoors.
 		constexpr uint32_t kNearLamps = 12;
-		void near_lamps(const frame &f, uint32_t lamp_count, const frame_object &fo, const zm::model &mo, uint32_t out[3])
+		void near_lamps(const frame_lamp *lamps, uint32_t lamp_count, const frame_object &fo, const zm::model &mo, uint32_t out[3])
 		{
 			out[0] = out[1] = out[2] = 0xFFFFFFFFu;
 			if (lamp_count == 0)
@@ -365,7 +365,7 @@ light_out ps_light(v2p i)
 			uint32_t n = 0;
 			for (uint32_t i = 0; i < lamp_count; ++i)
 			{
-				const frame_lamp &l = f.lamps[i];
+				const frame_lamp &l = lamps[i];
 				if (!(l.range > 0.0f) || !std::isfinite(l.range))
 					continue;
 				float d2 = 0.0f;
@@ -567,20 +567,12 @@ light_out ps_light(v2p i)
 
 	draw_stats zone_renderer::record(ID3D12GraphicsCommandList *list, const draw_target &t, const frame &f, const draw_options &o, uint64_t frame_number)
 	{
-		draw_stats st;
-		if (_root == nullptr || f.zone == nullptr || !f.zone->ready())
-			return st;
+		if (f.zone == nullptr || !f.zone->ready())
+			return draw_stats();
 		gpu_zone *const zones[2] = { f.zone, f.second != nullptr && f.second->ready() ? f.second : nullptr };
-
-		// The frame into its slot of the upload ring
-		const UINT64 slot = (frame_number % kFrames) * kSlotBytes;
-		uint8_t *at = _mapped + slot;
-		gpu_constants c = {};
-		std::memcpy(c.view_proj, f.view_proj, sizeof(c.view_proj));
-		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
-		std::memcpy(c.options + 1, f.camera, 12);
-		// (environment 0 is the frame's own fields; the rest its envs; any not filled are 0's)
-		frame_env own;
+		// (environment 0 is the frame's own fields; the rest its envs)
+		frame_env envs[kMaxEnvs];
+		frame_env &own = envs[0];
 		std::memcpy(own.sun_dir, f.sun_dir, 12);
 		std::memcpy(own.sun, f.sun, 12);
 		std::memcpy(own.sun_bump, f.sun_bump, 12);
@@ -590,9 +582,44 @@ light_out ps_light(v2p i)
 		own.fog_start = f.fog_start;
 		own.fog_end = f.fog_end;
 		own.fog_scale = f.fog_scale;
+		const uint32_t env_count = std::min(std::max(f.env_count, 1u), kMaxEnvs);
+		for (uint32_t i = 1; i < env_count; ++i)
+			envs[i] = f.envs[i];
+		draw_pass p;
+		p.view_proj = f.view_proj;
+		p.camera = f.camera;
+		p.envs = envs;
+		p.env_count = env_count;
+		p.lamps = f.lamps;
+		p.lamp_count = f.lamp_count;
+		p.no_bump = f.no_bump;
+		p.zones = zones;
+		p.zone_count = 2;
+		return record(list, t, p, f.objects, f.count, o, frame_number);
+	}
+
+	draw_stats zone_renderer::record(ID3D12GraphicsCommandList *list, const draw_target &t, const draw_pass &p, const frame_object *objs, uint32_t count,
+		const draw_options &o, uint64_t frame_number)
+	{
+		draw_stats st;
+		if (_root == nullptr || p.view_proj == nullptr || p.camera == nullptr || p.envs == nullptr || p.env_count == 0)
+			return st;
+		auto zone_of = [&p](uint32_t i) -> gpu_zone * {
+			gpu_zone *const z = i < p.zone_count ? p.zones[i] : nullptr;
+			return z != nullptr && z->ready() ? z : nullptr;
+		};
+
+		// The pass into its slot of the upload ring
+		const UINT64 slot = (frame_number % kFrames) * kSlotBytes;
+		uint8_t *at = _mapped + slot;
+		gpu_constants c = {};
+		std::memcpy(c.view_proj, p.view_proj, sizeof(c.view_proj));
+		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
+		std::memcpy(c.options + 1, p.camera, 12);
+		// (the pass's environments; any not filled are its first's)
 		for (uint32_t i = 0; i < kMaxEnvs; ++i)
 		{
-			const frame_env &e = i == 0 ? own : i < f.env_count ? f.envs[i] : own;
+			const frame_env &e = p.envs[i < p.env_count ? i : 0];
 			gpu_env &g = c.envs[i];
 			put3(g.sun_dir, e.sun_dir);
 			put3(g.sun, e.sun);
@@ -604,11 +631,11 @@ light_out ps_light(v2p i)
 			g.fog_end[0] = span > 1e-3f ? e.fog_end : 1e30f;
 		}
 		std::memcpy(at, &c, sizeof(c));
-		const uint32_t objects = std::min(f.count, kMaxObjects), lamp_count = std::min(f.lamp_count, kMaxLamps);
+		const uint32_t objects = std::min(count, kMaxObjects), lamp_count = p.lamps != nullptr ? std::min(p.lamp_count, kMaxLamps) : 0;
 		gpu_object *go = reinterpret_cast<gpu_object *>(at + kObjectsAt);
 		for (uint32_t i = 0; i < objects; ++i)
 		{
-			const frame_object &fo = f.objects[i];
+			const frame_object &fo = objs[i];
 			std::memcpy(go[i].c, fo.world, sizeof(go[i].c));
 			go[i].flags = fo.flags;
 			go[i].model = fo.model;
@@ -618,13 +645,14 @@ light_out ps_light(v2p i)
 			go[i].lamps[0] = 0;
 			for (uint32_t k = 0; k < 4; ++k)
 				go[i].lamps[0] |= (fo.lamps[k] < lamp_count ? fo.lamps[k] : 255u) << (8 * k);
-			gpu_zone *const z = fo.zone < 2 ? zones[fo.zone] : nullptr;
+			gpu_zone *const z = zone_of(fo.zone);
 			if (o.per_pixel && z != nullptr && fo.model < z->data().models.size())
-				near_lamps(f, lamp_count, fo, z->data().models[fo.model], go[i].lamps + 1);
+				near_lamps(p.lamps, lamp_count, fo, z->data().models[fo.model], go[i].lamps + 1);
 			else
 				go[i].lamps[1] = go[i].lamps[2] = go[i].lamps[3] = 0xFFFFFFFFu;
 		}
-		std::memcpy(at + kLampsAt, f.lamps, size_t(lamp_count) * sizeof(frame_lamp));
+		if (lamp_count != 0)
+			std::memcpy(at + kLampsAt, p.lamps, size_t(lamp_count) * sizeof(frame_lamp));
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
 
 		// Targets, heaps, root
@@ -645,8 +673,8 @@ light_out ps_light(v2p i)
 		gpu_zone *bound_zone = nullptr;
 		for (uint32_t i = 0; i < objects; ++i)
 		{
-			const frame_object &fo = f.objects[i];
-			gpu_zone *const z = fo.zone < 2 ? zones[fo.zone] : nullptr;
+			const frame_object &fo = objs[i];
+			gpu_zone *const z = zone_of(fo.zone);
 			if (z == nullptr || fo.model >= z->data().models.size())
 			{
 				st.skipped++;
@@ -676,8 +704,8 @@ light_out ps_light(v2p i)
 				if (pso != bound)
 					list->SetPipelineState(bound = pso);
 				// (doors take the fixed-function path, never the bump shader; their bit-28 pieces the door's environment)
-				const uint32_t flags = (pc.normal_map != zm::kNone && mo.bump && !door && !f.no_bump ? kBump : 0) | ((fo.flags & zm::kAlphaTested) != 0 ? kTested : 0) |
-					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !f.no_bump ? kMapped : 0) |
+				const uint32_t flags = (pc.normal_map != zm::kNone && mo.bump && !door && !p.no_bump ? kBump : 0) | ((fo.flags & zm::kAlphaTested) != 0 ? kTested : 0) |
+					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !p.no_bump ? kMapped : 0) |
 					(blended ? kBlended : 0);
 				const uint32_t dc[4] = { i, pc.first_index, flags, 0 };
 				list->SetGraphicsRoot32BitConstants(1, 4, dc, 0);

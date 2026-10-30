@@ -74,6 +74,12 @@ namespace hifi::zone::inject
 			std::atomic<ULONGLONG> failed_at { 0 };
 			std::string why;
 			draw_stats last;
+			// The model actors' (on_actors_end): their own failures, so the zone's gate isn't shut by theirs
+			uint32_t last_actor_seq = 0;
+			uint64_t actors_drawn = 0, actors_failed = 0;
+			std::atomic<ULONGLONG> actors_failed_at { 0 };
+			std::string actors_why;
+			draw_stats actors_last;
 		};
 		state g;
 
@@ -90,6 +96,13 @@ namespace hifi::zone::inject
 			g.failed++;
 			g.why = why;
 			g.failed_at.store(GetTickCount64(), std::memory_order_release);
+		}
+
+		void actors_fail(const char *why)
+		{
+			g.actors_failed++;
+			g.actors_why = why;
+			g.actors_failed_at.store(GetTickCount64(), std::memory_order_release);
 		}
 
 		void barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *r, UINT sub, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
@@ -135,6 +148,55 @@ namespace hifi::zone::inject
 			g.view_rt_format = w.rt_format;
 			g.view_ds_format = w.ds_format;
 			return true;
+		}
+
+		// A native pass into the world (g.mutex held): the depth's planes writable and the target a target (with the light
+		// split as well, while World FX reads it), draw(t, o) recorded, then all as dgVoodoo left it, its heaps and state
+		// bound again. Null, or why the world isn't ready for one.
+		template <typename F>
+		const char *draw_world(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, F draw)
+		{
+			if (g.renderer == nullptr || !g.renderer->ready() || g.device == nullptr)
+				return "the renderer isn't made";
+			if (w.rt == nullptr || w.ds == nullptr || w.ds != g.depth || w.rt_format == DXGI_FORMAT_UNKNOWN || w.ds_format == DXGI_FORMAT_UNKNOWN)
+				return "the world's target isn't known here";
+			if (g.plane[0] == kUnknown || g.plane[1] == kUnknown)
+				return "the world's depth planes' states aren't known yet";
+			D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv;
+			if (!views(w, rtv, dsv))
+				return "views of the world couldn't be made";
+
+			const D3D12_RESOURCE_DESC rd = w.rt->GetDesc();
+			draw_target t;
+			t.rtv = rtv;
+			t.dsv = dsv;
+			t.rtv_format = w.rt_format;
+			t.dsv_format = w.ds_format;
+			t.samples = rd.SampleDesc.Count;
+			t.width = float(rd.Width);
+			t.height = float(rd.Height);
+			draw_options o;
+			o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
+
+			// Depth and stencil planes writable, the target a target; the pass; all as it was
+			const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
+			barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			// (the light split as well, while World FX reads it: light_split.hpp)
+			const bool lit = light::begin(list, g.device, w.rt, t.light_rtv);
+			draw(t, o);
+			if (lit)
+				light::end(list);
+			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
+			barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
+			barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);
+			// (its heaps before its root tables: a table must be in the heaps bound when it's set)
+			const auto known = g.lists.find(list);
+			if (known != g.lists.end() && known->second.count != 0)
+				list->SetDescriptorHeaps(known->second.count, known->second.h);
+			bound.restore(list);
+			return nullptr;
 		}
 	}
 
@@ -257,6 +319,10 @@ namespace hifi::zone::inject
 		std::snprintf(line, sizeof(line), "native zone renderer: moving layer (swaying plants, doors) in the casters' map: %llu frames, %.0f instances and %.0f triangles a frame",
 			static_cast<unsigned long long>(mf), mf != 0 ? double(g.mover_instances.load()) / double(mf) : 0.0, mf != 0 ? double(g.mover_triangles.load()) / double(mf) : 0.0);
 		lines.push_back(line);
+		std::snprintf(line, sizeof(line), "native zone renderer: model actors (ships, furniture, plants): %llu passes drawn, %llu couldn't be%s%s; the last: %u objects, %u draws, %u triangles",
+			static_cast<unsigned long long>(g.actors_drawn), static_cast<unsigned long long>(g.actors_failed), g.actors_why.empty() ? "" : " (the last: ",
+			g.actors_why.empty() ? "" : (g.actors_why + ")").c_str(), g.actors_last.objects, g.actors_last.draws, g.actors_last.triangles);
+		lines.push_back(line);
 		return lines;
 	}
 
@@ -369,48 +435,10 @@ namespace hifi::zone::inject
 		if (seq == g.last_seq)
 			return;
 		g.last_seq = seq;
-		if (g.renderer == nullptr || !g.renderer->ready() || g.device == nullptr)
-			return fail("the renderer isn't made");
 		if (f->zone == nullptr || !f->zone->ready())
 			return fail("the zone's data isn't on the GPU");
-		if (w.rt == nullptr || w.ds == nullptr || w.ds != g.depth || w.rt_format == DXGI_FORMAT_UNKNOWN || w.ds_format == DXGI_FORMAT_UNKNOWN)
-			return fail("the world's target isn't known here");
-		if (g.plane[0] == kUnknown || g.plane[1] == kUnknown)
-			return fail("the world's depth planes' states aren't known yet");
-		D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv;
-		if (!views(w, rtv, dsv))
-			return fail("views of the world couldn't be made");
-
-		const D3D12_RESOURCE_DESC rd = w.rt->GetDesc();
-		draw_target t;
-		t.rtv = rtv;
-		t.dsv = dsv;
-		t.rtv_format = w.rt_format;
-		t.dsv_format = w.ds_format;
-		t.samples = rd.SampleDesc.Count;
-		t.width = float(rd.Width);
-		t.height = float(rd.Height);
-		draw_options o;
-		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
-
-		// Depth and stencil planes writable, the target a target; the zone; all as it was
-		const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
-		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		// (the light split as well, while World FX reads it: light_split.hpp)
-		const bool lit = light::begin(list, g.device, w.rt, t.light_rtv);
-		g.last = g.renderer->record(list, t, *f, o, ++g.frame_number);
-		if (lit)
-			light::end(list);
-		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
-		barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
-		barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);
-		// (its heaps before its root tables: a table must be in the heaps bound when it's set)
-		const auto known = g.lists.find(list);
-		if (known != g.lists.end() && known->second.count != 0)
-			list->SetDescriptorHeaps(known->second.count, known->second.h);
-		bound.restore(list);
+		if (const char *why = draw_world(list, bound, w, [&](const draw_target &t, const draw_options &o) { g.last = g.renderer->record(list, t, *f, o, ++g.frame_number); }))
+			return fail(why);
 		g.drawn++;
 		g.last_zone = f->zone;
 		g.last_second = f->second;
@@ -427,6 +455,39 @@ namespace hifi::zone::inject
 			if ((ob.flags & kDoor) != 0 || z->data().models[ob.model].kind == 2)
 				g.movers.push_back(ob);
 		}
+	}
+
+	bool actors_ready()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		const ULONGLONG at = g.actors_failed_at.load(std::memory_order_acquire);
+		return g.renderer != nullptr && g.renderer->ready() && (at == 0 || GetTickCount64() - at > kFailMs);
+	}
+
+	void on_actors_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
+	{
+		const actor_frame *f = actor_published(seq_low4);
+		if (f == nullptr || f->count == 0)
+			return;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		const uint32_t seq = f->seq.load(std::memory_order_acquire);
+		if (seq == g.last_actor_seq)
+			return;
+		g.last_actor_seq = seq;
+		draw_pass p;
+		p.view_proj = f->view_proj;
+		p.camera = f->camera;
+		p.envs = &f->env;
+		p.env_count = 1;
+		p.lamps = f->lamps;
+		p.lamp_count = f->lamp_count;
+		p.zones = f->data;
+		p.zone_count = std::min(f->data_count, kMaxActors);
+		const uint32_t count = std::min(f->count, kMaxActors);
+		if (const char *why = draw_world(list, bound, w,
+				[&](const draw_target &t, const draw_options &o) { g.actors_last = g.renderer->record(list, t, p, f->objects, count, o, ++g.frame_number); }))
+			return actors_fail(why);
+		g.actors_drawn++;
 	}
 
 	namespace

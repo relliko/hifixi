@@ -234,13 +234,11 @@ namespace hifi::bake::zonemesh
 		}
 	}
 
-	bool load(uint32_t map, zone &z, result &r)
+	// A DAT's models (and, given one, the bump DAT's normal maps; with placements, its MZB's)
+	static bool load_dat(uint32_t dat_id, uint32_t bump_id, bool with_placements, zone &z, result &r)
 	{
-		r = result();
-		z = zone();
-		z.map = map;
 		std::string why;
-		const std::wstring path = dat_path(map_dat(map), why);
+		const std::wstring path = dat_path(dat_id, why);
 		if (path.empty())
 		{
 			r.none = true;
@@ -297,7 +295,7 @@ namespace hifi::bake::zonemesh
 		std::vector<uint8_t> bump;
 		std::vector<height_map> heights;
 		{
-			const std::wstring bump_path = dat_path(bump_dat(map), why);
+			const std::wstring bump_path = bump_id != 0 ? dat_path(bump_id, why) : std::wstring();
 			if (!bump_path.empty() && read_file(bump_path, bump))
 				for (const chunk &c : chunks(bump))
 				{
@@ -349,6 +347,7 @@ namespace hifi::bake::zonemesh
 			const uint32_t stride = swaying ? 48 : 36;
 			mo.first_piece = uint32_t(z.pieces.size());
 			mo.first_vertex = uint32_t(z.vertices.size());
+			mo.raw_pieces = uint32_t(ps.size());
 			for (const raw_piece &p : ps)
 			{
 				scratch.clear();
@@ -377,7 +376,12 @@ namespace hifi::bake::zonemesh
 							break;
 						}
 				if (img == images.end())
+				{
 					z.missing_textures++;
+					// (a texture named but not in this DAT: the game may have found it in another one it has loaded)
+					if (tex.find_first_not_of(' ') != std::string::npos)
+						mo.missing++;
+				}
 				else
 				{
 					auto known = texture_of.find(tex);
@@ -454,7 +458,7 @@ namespace hifi::bake::zonemesh
 
 		// The MZB's placements of the models
 		std::vector<uint8_t> m;
-		if (find_chunk(dat, 0x1C, m) && mmb::decrypt_mzb(m, first))
+		if (with_placements && find_chunk(dat, 0x1C, m) && mmb::decrypt_mzb(m, first))
 		{
 			uint32_t n = 0;
 			u32(m.data(), m.size(), 4, n);
@@ -482,5 +486,21 @@ namespace hifi::bake::zonemesh
 			}
 		}
 		return true;
+	}
+
+	bool load(uint32_t map, zone &z, result &r)
+	{
+		r = result();
+		z = zone();
+		z.map = map;
+		return load_dat(map_dat(map), bump_dat(map), true, z, r);
+	}
+
+	bool load_file(uint32_t file, zone &z, result &r)
+	{
+		r = result();
+		z = zone();
+		z.map = file;
+		return load_dat(file, 0, false, z, r);
 	}
 }

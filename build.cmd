@@ -47,7 +47,7 @@ set "MODULES=src\game\jitter.cpp src\game\drawcull.cpp src\game\hifps\step.cpp s
 set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 rem The native zone renderer (src\zone): each zone's data on the GPU (the plugin alone)
-set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\game\zonedraw.cpp"
+set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\game\zonedraw.cpp src\zone\actordata.cpp src\game\modelactor.cpp"
 rem The native character renderer (src\chars, src\game\charslot): the plugin alone
 set "CHARS=src\game\charslot.cpp src\chars\marks.cpp src\game\charmodel.cpp src\chars\charframe.cpp src\chars\cache.cpp src\chars\os2.cpp src\chars\tex.cpp"
 rem (its drawing on dgVoodoo's lists, with the engine's list_state: the plugin and the tests that draw)
@@ -184,6 +184,11 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   tests\zonedraw_test.cpp src\game\zonedraw.cpp src\game\jitter.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
   /Fo"build\test\\" /Fe"build\zonedraw_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zonedraw_test.exe
+rem The model actors handed to the zone renderer (0C4CC8's call on both dumps, a model DAT on WARP): build\modelactor_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\modelactor_test.cpp src\game\modelactor.cpp src\zone\actordata.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
+  src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\modelactor_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\modelactor_test.exe
 rem The native renderer drawing at the zone's end marker on a list recorded as dgVoodoo records (WARP, debug layer):
 rem build\zoneinject_test.exe [out.bmp]
 rem (no address-space randomisation: the FFXiMain dump goes at its own base, which a system mapping took at times)

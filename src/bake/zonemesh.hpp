@@ -69,6 +69,8 @@ namespace hifi::bake::zonemesh
 		uint32_t first_piece = 0, pieces = 0;
 		uint32_t first_vertex = 0, vertices = 0;
 		float lo[3] = {}, hi[3] = {}; // (its positions' box, sways included)
+		uint32_t raw_pieces = 0; // (the MMB's pieces before those without a triangle are dropped: the live mesh's count)
+		uint32_t missing = 0;    // (its pieces whose texture is named but isn't in the DAT)
 	};
 
 	enum texture_format : uint32_t
@@ -126,6 +128,9 @@ namespace hifi::bake::zonemesh
 
 	// The zone's data; false with r.why (or r.none: no such DAT) when it can't be read
 	bool load(uint32_t map, zone &out, result &r);
+	// Any DAT's models and textures by its file id (a model actor's: a ship, furniture, a plant; no normal maps, no
+	// placements); out.map is the file id
+	bool load_file(uint32_t file, zone &out, result &r);
 
 	// 01E0A0: a height map (w x h bytes, rows top first) made into normals, wrapping at the edges. With gy = (the row
 	// above's 1 2 1) - (the row below's) and gx = (the left column's 1 2 1) - (the right's), and k = 127 /

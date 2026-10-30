@@ -647,6 +647,14 @@ namespace hifi::backend
 				w.rt_state = d.world_rt_state;
 				if (m.kind == slotmark::chars_end)
 				{
+					// (the model actors the walk left to HiFi XI: ships, furniture, plants, drawn by the zone renderer)
+					zone::inject::world zw;
+					zw.rt = w.rt;
+					zw.ds = w.ds;
+					zw.rt_format = w.rt_format;
+					zw.ds_format = w.ds_format;
+					zw.rt_state = w.rt_state;
+					zone::inject::on_actors_end(list, d.state, zw, m.seq);
 					chars::inject::on_chars_end(list, d.state, w, m.seq);
 					// (the world with its opaque characters: FSR's reactive mask from here)
 					upscale::masks::snapshot(list, w.rt, w.rt_state, upscale::masks::opaque);

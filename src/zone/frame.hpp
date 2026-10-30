@@ -97,4 +97,30 @@ namespace hifi::zone
 	void publish(frame &f, uint32_t seq);
 	// Every slot emptied (a zone change, unload)
 	void clear_frames();
+
+	// The model actors of one character pass (FFXiMain 0C4C20 -> 1844C0: ships, Mog House furniture, gardening plants,
+	// "model" NPCs: an actor whose look is one MMB), recorded in the actor walk by src/game/modelactor and drawn by the
+	// zone renderer at the characters' end marker (inject::on_actors_end). Their own ring, keyed by the walk's seq (the
+	// characters' markers carry its low 4 bits), filled and published as the zone's.
+	constexpr uint32_t kMaxActors = 256;
+	struct actor_frame
+	{
+		std::atomic<uint32_t> seq { 0 };
+		// The camera and light 1844C0 draws with: the zone renderer's (VIEW x PROJECTION +0x38F5C, the camera +0x390F0),
+		// lit by the default environment (the zone's own: its sun, ambient and fog)
+		float view_proj[16];
+		float camera[3];
+		frame_env env;
+		uint32_t count = 0;
+		frame_object objects[kMaxActors]; // (zone: the index into data; flags kDoor: fixed-function, blended parts with
+		                                  // Z writes, as 1844C0 leaves them)
+		uint32_t data_count = 0;
+		gpu_zone *data[kMaxActors];      // (each a DAT's models: zonemesh::load_file)
+		uint32_t lamp_count = 0;
+		frame_lamp lamps[1];             // (a Mog House's room lamp, l_01: lamp 0 of each object then)
+	};
+	actor_frame &actor_slot(uint32_t seq);
+	const actor_frame *actor_published(uint32_t seq_low4);
+	void actor_publish(actor_frame &f, uint32_t seq);
+	void clear_actor_frames();
 }

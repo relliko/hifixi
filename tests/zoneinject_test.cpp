@@ -10,6 +10,8 @@
  *     buffer, its pipeline (each would be wrong had our state been left bound);
  *   - the debug layer says nothing (the planes' states, the heaps, the views);
  *   - a pass not HiFi XI's, an old seq, a depth not yet followed: nothing drawn (and said why when it should have been);
+ *   - the model actors at a characters' end marker (on_actors_end): drawn once for their walk's seq, a walk with none
+ *     not at all, the debug layer saying nothing of it;
  *   - the light split (src/zone/light_split.hpp) drawn with it once World FX has asked: a word on most of the zone's
  *     pixels, its depth the depth buffer's, the ground facing up, lit mostly by the sun, the walls turned from it not;
  *     under the character dgVoodoo drew afterwards, its depth not the depth buffer's (World FX leaves those words);
@@ -442,6 +444,40 @@ int main(int argc, char **argv)
 	inj::on_zone_end(list, bound, w, 5);
 	fill(6, false);
 	inj::on_zone_end(list, bound, w, 6);
+	// A characters' end marker with the walk's model actors (one of the zone's models, as a model DAT's would be; high
+	// above the street, out of the picture the checks below read), the same seq again, and a walk with none
+	{
+		hifi::zone::actor_frame &af = hifi::zone::actor_slot(3);
+		const hifi::zone::frame *zf = hifi::zone::published(5);
+		std::memcpy(af.view_proj, vp.m, 64);
+		std::memcpy(af.camera, eye, 12);
+		af.env = hifi::zone::frame_env();
+		if (zf != nullptr)
+		{
+			std::memcpy(af.env.sun_dir, zf->sun_dir, 12);
+			std::memcpy(af.env.sun, zf->sun, 12);
+			std::memcpy(af.env.ambient, zf->ambient, 12);
+		}
+		af.count = 1;
+		af.objects[0] = zf != nullptr && zf->count != 0 ? zf->objects[0] : hifi::zone::frame_object();
+		af.objects[0].world[7] += 5000.0f;
+		af.objects[0].flags = hifi::zone::kDoor;
+		af.objects[0].zone = 0;
+		af.data_count = 1;
+		af.data[0] = &gz;
+		af.lamp_count = 0;
+		hifi::zone::actor_publish(af, 3);
+		hifi::zone::actor_slot(4).count = 0;
+		hifi::zone::actor_publish(hifi::zone::actor_slot(4), 4);
+		// (the planes as the characters' end marker finds them: as dgVoodoo left them for this one)
+		inj::on_actors_end(list, bound, w, 3);
+		inj::on_actors_end(list, bound, w, 3);
+		inj::on_actors_end(list, bound, w, 4);
+		const std::vector<std::string> st = inj::status();
+		const std::string &line = st.back();
+		check(line.find("model actors") != std::string::npos && line.find("1 passes drawn, 0 couldn't be") != std::string::npos && line.find("the last: 1 objects") != std::string::npos &&
+			inj::actors_ready(), "the model actors drawn at the characters' end once, from the zone renderer: " + line);
+	}
 	// World FX's sun shadow cascade from the zone just drawn (record_zone_casters): the sun overhead, a D32 map over the
 	// whole of what the zone places (x across, z down, depth by height), then the game's state back as World FX does
 	const bool bounds_after = inj::zone_bounds(zlo, zhi, zgen);

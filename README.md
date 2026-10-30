@@ -19,7 +19,7 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **FSR 2** in its place if you prefer it, or where FSR 3.1 can't run; **FSR 1** (edge-aware upscaling and sharpening) when both are off;
   - **Frame generation (AMD FSR 3):** a frame made between each two the game draws, for motion as smooth as twice the frames, the menus and text kept sharp. By default only while the game runs below half your screen's refresh rate;
   - the menus and text are always drawn at the screen's own size.
-- **The zone and the characters drawn by HiFi XI itself**, from your own game files, in the game's own look:
+- **The zone, the characters and the zone's models drawn by HiFi XI itself** (ships and airships, Mog House furniture, garden plants), from your own game files, in the game's own look:
   - **Per-pixel light** with every texture's normal map, on the zone and on characters and monsters;
   - **Tone mapping, bloom and a colour grade** over the world;
   - Always on: the game draws only what HiFi XI can't yet.

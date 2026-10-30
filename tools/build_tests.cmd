@@ -1,6 +1,6 @@
 @echo off
 rem Builds chosen offline tests only, after "build.cmd quick" (which builds the engine they link): the names of build.cmd's
-rem test blocks to build, any of grass zoneinject charinject. "build.cmd" builds them all; this is for iterating on one.
+rem test blocks to build, any of grass zoneinject charinject modelactor. "build.cmd" builds them all; this is for iterating on one.
 setlocal
 cd /d "%~dp0.."
 set "VSDIR="
@@ -37,6 +37,12 @@ if /i "%~1"=="charinject" (
     tests\charinject_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
     /Fo"build\test\\" /Fe"build\charinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
   echo Built build\charinject_test.exe
+)
+if /i "%~1"=="modelactor" (
+  cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+    tests\modelactor_test.cpp src\game\modelactor.cpp src\zone\actordata.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
+    src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\modelactor_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  echo Built build\modelactor_test.exe
 )
 shift
 goto next
