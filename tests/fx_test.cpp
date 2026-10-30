@@ -1015,6 +1015,59 @@ int main()
 			put<uint32_t>(s.dist_app, app_kept);
 		}
 
+		// A lens flare's pieces (0548D0's call of 03EBF0 at 054B81 goes to on_flare): ROM/0/40 'lf01' (17 pieces, 18 quads)
+		// at visibility 128 for a light at (100, 50) in 640 x 480: each vertex W / 16 x its x + t x ((W - x) - x) + x (y the
+		// same), its alpha x 128 >> 8; the texture found by name in the texture manager's list ([VA 0490B970] +8, bytes 8-15
+		// at +0x14) as 075690 finds it; TEXTUREFACTOR VA 0490BC0C; additive, pre-transformed
+		{
+			std::vector<uint8_t> lf;
+			check(chunk("ROM\\0\\40.DAT", 0x21, "lf01", lf) && lf.size() > 0x20 && lf[4] == 1 && lf[5] == 17 && lf[6] == 18, name + ": the flare's D3A 'lf01' read");
+			check(s.flare_call == base + 0x054B81 && s.flare_pieces == base + 0x03EBF0 && s.flare_textures == base + 0x47B970 &&
+					calls_to(s.flare_call, address(reinterpret_cast<void *>(&fd::on_flare))),
+				name + ": the flare's call of 03EBF0 at 054B81 goes to on_flare; the texture manager VA +47B970");
+			const uintptr_t lres = resource(lf, 0x21), lname = take(16), mgr = take(0x20), node = take(0x60);
+			std::memcpy(reinterpret_cast<void *>(lname + 8), "lf01    ", 8);
+			put<uint32_t>(lres + 0x44, uint32_t(lname));
+			std::memcpy(reinterpret_cast<void *>(node + 0x14), "lf01    ", 8);
+			put<uint32_t>(node + 8, uint32_t(tex_res));
+			put<uint32_t>(node + 0x40, 0x5678);
+			put<uint32_t>(mgr + 8, uint32_t(node));
+			const uint32_t mgr_kept = get<uint32_t>(s.flare_textures), colour_kept = get<uint32_t>(s.colour);
+			put<uint32_t>(s.flare_textures, uint32_t(mgr));
+			put<uint32_t>(s.colour, 0x80FFC080u);
+			g_seen = seen();
+			g_markers = 0;
+			fd::on_flush(0);
+			fd::on_flare(lres, 0, 128, 100.0f, 50.0f, 540.0f, 430.0f, 0);
+			fd::on_flush(1);
+			const fx::frame *fl = fx::published(g_last_seq);
+			bool ok = g_markers == 1 && fl != nullptr && fl->element_count == 1 && fl->elements[0].cls == fx::class_flare;
+			if (ok)
+			{
+				const fx::element &e = fl->elements[0];
+				const fx::draw &d = fl->draws[e.first_draw];
+				ok = d.count == 108 && d.stages == fx::stage_flare && d.texture != fx::kNone && e.projection == fx::proj_identity && e.blend == fx::blend_add &&
+					e.tfactor == 0x80FFC080u && e.z_write == 0 && e.fog == 0;
+				// (the first piece's first vertex, and the last piece's last)
+				const uint8_t *p0 = lf.data() + 0x18;
+				float t0, vx, vy;
+				uint32_t col0;
+				std::memcpy(&t0, p0 + 4, 4);
+				std::memcpy(&vx, p0 + 0x14, 4);
+				std::memcpy(&vy, p0 + 0x18, 4);
+				std::memcpy(&col0, p0 + 0x14 + 12, 4);
+				const fx::vertex &v0 = fl->vertices[d.first];
+				ok = ok && std::fabs(v0.pos[0] - (40.0f * vx + 440.0f * t0 + 100.0f)) < 1e-3f && std::fabs(v0.pos[1] - (30.0f * vy + 380.0f * t0 + 50.0f)) < 1e-3f &&
+					v0.colour == ((col0 & 0xFFFFFFu) | std::min<uint32_t>((col0 >> 24) * 128 >> 8, 255) << 24);
+				// (WORLD: pixel (320, 240) to the screen's centre, less half a pixel)
+				const float cx = 320.0f * e.world[0] + e.world[12], cy = 240.0f * e.world[5] + e.world[13];
+				ok = ok && std::fabs(cx - 1.0f / 640.0f) < 1e-6f && std::fabs(cy + 1.0f / 480.0f) < 1e-6f;
+			}
+			check(ok, name + ": a lens flare's 108 vertices placed as 03EBF0 places them (light to its mirror by t), alpha x visibility, its texture by name");
+			put<uint32_t>(s.flare_textures, mgr_kept);
+			put<uint32_t>(s.colour, colour_kept);
+		}
+
 		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
 		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
 		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path

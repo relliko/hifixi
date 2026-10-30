@@ -134,6 +134,12 @@ float4 ps(v2p i) : SV_Target
 		c = saturate(saturate(t.rgb * d.rgb) * tfactor.rgb * 4.0);
 		a = saturate(d.a * tfactor.a * 4.0);
 	}
+	else if (s & 4096)
+	{
+		float4 t = tex.SampleLevel(smp, i.uv, 0);
+		c = saturate(d.rgb * t.rgb * 2.0);
+		a = saturate(saturate(d.a * t.a * 2.0) * tfactor.a * 2.0);
+	}
 	else if (s & 2048)
 	{
 		float4 t = tex.SampleLevel(smp_mirror, i.uv, 0);

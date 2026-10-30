@@ -910,6 +910,89 @@ int main(int argc, char **argv)
 			da->Release();
 		}
 
+		// A lens flare's pieces by value (3520A8, pre-transformed): a quad over the left half in the game's pixels (WORLD
+		// pixels to clip space, PROJECTION identity), untextured (white), vertex colour 0x40804020, TFACTOR alpha 0x80,
+		// SRCALPHA / ONE on black: colour 0x80 0x40 0x20 x 2, alpha 0x40 x 2 x 0x80 x 2 (0.504): 128 64 32; the right half
+		// untouched
+		{
+			fx::frame &ff = fx::frame_slot(++seq);
+			ff.seq.store(0);
+			ff.element_count = ff.draw_count = ff.vertex_count = ff.light_count = ff.grab_count = 0;
+			fx::element e;
+			const float pw[16] = { 2.0f / 64, 0, 0, 0, 0, -2.0f / 64, 0, 0, 0, 0, 1, 0, 1.0f / 64 - 1.0f, 1.0f - 1.0f / 64, 0, 1 };
+			std::memcpy(e.world, pw, 64);
+			e.projection = fx::proj_identity;
+			e.tfactor = 0x80FFFFFFu;
+			e.blend = fx::blend_add;
+			e.cls = fx::class_flare;
+			e.first_draw = 0;
+			e.draws = 1;
+			const float c[6][2] = { { -0.5f, -0.5f }, { 31.5f, -0.5f }, { -0.5f, 63.5f }, { -0.5f, 63.5f }, { 31.5f, -0.5f }, { 31.5f, 63.5f } };
+			for (const auto &p : c)
+			{
+				fx::vertex v = {};
+				v.pos[0] = p[0];
+				v.pos[1] = p[1];
+				v.colour = 0x40804020u;
+				ff.vertices[ff.vertex_count++] = v;
+			}
+			ff.draws[ff.draw_count++] = { 0, 6, fx::kNone, fx::stage_flare };
+			ff.elements[ff.element_count++] = e;
+			ff.run_list[0] = { 0, 1 };
+			ff.runs.store(1);
+			ff.seq.store(seq);
+			ID3D12CommandAllocator *fa = nullptr;
+			ID3D12GraphicsCommandList *fl = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fa));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, fa, nullptr, IID_PPV_ARGS(&fl));
+			barrier(fl, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const float none[4] = { 0, 0, 0, 0 };
+			fl->ClearRenderTargetView(rtv, none, 0, nullptr);
+			fl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			fl->SetDescriptorHeaps(1, &game_heap);
+			grass::list_state fbound;
+			hifi::passes::world fw;
+			fw.rt = A;
+			fw.ds = Az;
+			fw.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			fw.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			fw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			fw.planes_known = true;
+			fw.ds_planes[0] = fw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			fw.heap_count = 1;
+			fw.heaps[0] = game_heap;
+			fx::inject::on_run(fl, fbound, fw, seq & 15);
+			barrier(fl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION fdst = {}, fsrc = {};
+			fdst.pResource = back;
+			fdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			fdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+			fsrc.pResource = A;
+			fsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			fl->CopyTextureRegion(&fdst, 0, 0, 0, &fsrc, nullptr);
+			fl->Close();
+			ID3D12CommandList *fls[] = { fl };
+			queue->ExecuteCommandLists(1, fls);
+			queue->Signal(fence, ++fence_value);
+			HANDLE fev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, fev);
+			WaitForSingleObject(fev, 60000);
+			CloseHandle(fev);
+			uint8_t *fp = nullptr;
+			back->Map(0, nullptr, reinterpret_cast<void **>(&fp));
+			const uint8_t *lft = fp + 32 * 256 + 10 * 4, *edge = fp + 32 * 256 + 31 * 4, *rgt = fp + 32 * 256 + 32 * 4;
+			char fline[200];
+			std::snprintf(fline, sizeof(fline), "a lens flare's stage, pre-transformed: %d %d %d at x 10 (want 128 64 32, within 2), x 31 %d, x 32 %d (the half's edge)", lft[0], lft[1], lft[2],
+				edge[0], rgt[0]);
+			check(std::abs(lft[0] - 128) <= 2 && std::abs(lft[1] - 64) <= 2 && std::abs(lft[2] - 32) <= 2 && edge[0] > 100 && rgt[0] == 0, fline);
+			back->Unmap(0, nullptr);
+			std::string ffirst;
+			const uint32_t fmessages = debug_messages(info, ffirst);
+			check(fmessages == 0, "a lens flare's stage: the debug layer: nothing (" + std::to_string(fmessages) + (fmessages != 0 ? ": " + ffirst : std::string()) + ")");
+			fl->Release();
+			fa->Release();
+		}
+
 		// 183760's tables by value: an MMB mesh of three screen thirds (a made-up map's data on the GPU, its texture
 		// 2x2 of one texel), SRCALPHA / INVSRCALPHA on black: the left third textured (the plain table), the middle with
 		// the textured mode (no texture alpha), the right untextured

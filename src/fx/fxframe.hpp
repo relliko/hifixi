@@ -77,6 +77,8 @@ namespace hifi::fx
 		                                 // DIFFUSE, then x TFACTOR x 4; alpha DIFFUSE x TFACTOR x 4
 		stage_dist = 1u << 11,          // the distortion fan (353108): colour TEXTURE x DIFFUSE x 2, alpha DIFFUSE x TFACTOR x
 		                                // 4, stage 1 off; the texture the distortion target, sampled MIRROR (353028's)
+		stage_flare = 1u << 12,         // a lens flare's pieces (3520A8): colour DIFFUSE x TEXTURE x 2 (stage 1 CURRENT),
+		                                // alpha DIFFUSE x TEXTURE x 2, then x TFACTOR x 2
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -85,6 +87,7 @@ namespace hifi::fx
 		proj_camera = 0,   // the camera's, as the zone pass has it
 		proj_near_far = 1, // the depth pull: near and far both moved (by (1 - z/32)^3 x 0.03 x +0x128), as 2D83C6 rebuilds it
 		proj_screen = 2,   // screen-fixed elements: the fixed field of view 2 atan2(192, 350)
+		proj_identity = 3, // pre-transformed vertices: WORLD takes the game's pixels to clip space, PROJECTION identity
 	};
 
 	// A lit element's light (flags bit 16), as 0467E0 sets D3D8's fixed-function lighting: lights 0 and 1 (directional,
@@ -153,7 +156,8 @@ namespace hifi::fx
 		class_ring = 5,
 		class_trail = 6,   // a weapon trail (CYyAfterImage, 01C940): not an element, a flush callback of its own
 		class_dist = 7,    // a distortion quad (CMoDist 0426F0, CMoVuDist 043110)
-		classes = 8,
+		class_flare = 8,   // a lens flare's pieces (CMoLfdElem 0548D0 -> 03EBF0)
+		classes = 9,
 	};
 
 	struct run
