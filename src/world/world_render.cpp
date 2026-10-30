@@ -465,11 +465,14 @@ float4 names_over_ps(glyph_out i) : SV_Target
 			why = !ready() ? "the renderer isn't made" : "the name pages aren't up";
 			return false;
 		}
-		if (t.dsv_format == DXGI_FORMAT_UNKNOWN || f.width == 0 || f.height == 0)
+		if (t.dsv_format == DXGI_FORMAT_UNKNOWN)
 		{
-			why = "the names need the world's depth and its size";
+			why = "the names need the world's depth";
 			return false;
 		}
+		// (A's size as the game laid the names out in it; the target's own when gGame couldn't be read: the same but for
+		// dgVoodoo's scaling)
+		const float game_w = float(f.width != 0 ? f.width : t.width), game_h = float(f.height != 0 ? f.height : t.height);
 		ID3D12PipelineState *const pso = pipeline(names_kind, t);
 		if (pso == nullptr)
 		{
@@ -483,8 +486,8 @@ float4 names_over_ps(glyph_out i) : SV_Target
 		float k[kConstants] = {};
 		k[0] = float(t.width);
 		k[1] = float(t.height);
-		k[2] = float(t.width) / float(f.width);
-		k[3] = float(t.height) / float(f.height);
+		k[2] = float(t.width) / game_w;
+		k[3] = float(t.height) / game_h;
 		k[4] = 0.5f;
 		k[5] = 0.5f;
 		std::memcpy(&k[6], &_page1, 4);
@@ -511,11 +514,12 @@ float4 names_over_ps(glyph_out i) : SV_Target
 			why = !ready() ? "the renderer isn't made" : "the name pages aren't up";
 			return false;
 		}
-		if (f.width == 0 || f.height == 0 || o.a_width == 0 || o.a_height == 0 || o.depth.ptr == 0)
+		if (o.a_width == 0 || o.a_height == 0 || o.depth.ptr == 0)
 		{
 			why = "the world's size or depth isn't known";
 			return false;
 		}
+		const float game_w = float(f.width != 0 ? f.width : o.a_width), game_h = float(f.height != 0 ? f.height : o.a_height); // (as names())
 		ID3D12PipelineState *const pso = pipeline(over_kind, t);
 		if (pso == nullptr)
 		{
@@ -543,7 +547,7 @@ float4 names_over_ps(glyph_out i) : SV_Target
 		}
 		if (n == 0)
 			return true;
-		const float sx = float(t.width) / float(f.width), sy = float(t.height) / float(f.height); // (screen pixels a game pixel)
+		const float sx = float(t.width) / game_w, sy = float(t.height) / game_h; // (screen pixels a game pixel)
 		const float ax = float(o.a_width) / float(t.width), ay = float(o.a_height) / float(t.height);
 		float k[kConstants] = {};
 		k[0] = float(t.width);
@@ -559,8 +563,8 @@ float4 names_over_ps(glyph_out i) : SV_Target
 		k[11] = float(_page_h[1]);
 		k[12] = ax;
 		k[13] = ay;
-		k[14] = f.jitter[0] * float(o.a_width) / float(f.width);
-		k[15] = f.jitter[1] * float(o.a_height) / float(f.height);
+		k[14] = f.jitter[0] * float(o.a_width) / game_w;
+		k[15] = f.jitter[1] * float(o.a_height) / game_h;
 		k[16] = float(o.a_width);
 		k[17] = float(o.a_height);
 		list->SetDescriptorHeaps(1, &_heap); // (the caller binds dgVoodoo's again)

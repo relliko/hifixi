@@ -56,6 +56,7 @@ layer.
   UVs; the page from 120590's choice (the last of the font's first codes at +0x24/+0x28 at or below the character);
   ALPHAREF 0x60 when the colour 120590 handed back is the linkshell colour (086210 0867E6, 086900 086D77), else 0. Each
   name's arguments are kept too (point, text, scale, colour, linkshell colour; the star line marked).
+  A's size the game laid them out in is gGame +0x18 / +0x1A (the target's own when gGame can't be read).
 - The PNG font 'font high' (config 0x24) is the text object's (11BAE0: chat, menus); the names' font object binds only
   its two DAT pages (120590 -> +0x1C / +0x20, loaded by name by 120660). R.
 - **Into A** (no FSR, or `/hifi names over off`): colour = texture x vertex x 2, alpha = texture x vertex x 4,
@@ -78,8 +79,8 @@ layer.
 - Per pass: native only when its option is on (`[world] sky / names / grid`, default on), its game side is in, the
   renderer is made (and the pages read, for the names), its markers come through (32 half-seconds of counts: at least one
   seen, no more than 8 fewer seen than sent, as the plugin's zone check), none of its draws failed in the last 2 s, and
-  for the sky the world's target is known (the sky's marker comes before the zone's, from which it is learnt). Until
-  then the game draws it; a frame recorded as native that can't be drawn is a failure (2 s of the game's again).
+  its last marker named the world's target (the backend learns it from the zone's markers; the sky's marker comes
+  before them, so it goes by the frame before). Until then the game draws it; a frame recorded as native that can't be drawn is a failure (2 s of the game's again).
 - `[world] names_over` (default on): the names over the upscaled screen while FSR draws.
 - `/hifi sky|names|grid` status; `... on|off`; `/hifi names over on|off`.
 
@@ -106,6 +107,12 @@ layer.
   result, a glyph behind a wall hidden, a farther glyph kept off a nearer one's depth writes, an icon's 0x60 alpha test);
   names over a screen twice A's size (placed without the jitter, hidden by A's depth); the grid's outlines in their
   colours exactly.
+- `build\worldpass_test.exe` (15 checks): the modules as the plugin and the backend drive them, on the first dump and
+  WARP: registered, the device handed over, update() putting the game sides in, each gate shut until its markers come
+  through and open after, the handlers drawing a native frame of each pass into the world (the depth's planes taken from
+  zone/inject's tracking and put back, dgVoodoo's state bound again, the debug layer quiet), /hifi on/off and status,
+  stop() leaving the dump as it was. (Based at 0x10000000: with the plugin's statics its image pushes the system's
+  early file mappings over the dump's base.)
 - hook_test, upscale_test, menu_test pass with the change.
 
 ## Open (with next steps)

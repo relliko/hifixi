@@ -6,8 +6,9 @@
  *
  * The gate (each pass on its own): the game keeps drawing the pass until HiFi XI's side is up (the renderer made, the
  * font read for the names), its markers are coming through (over the last 32 half-seconds' counts, as the plugin checks
- * the zone's: at least one seen, no more than 8 fewer seen than sent), the world's target is known (the sky's marker
- * comes before the zone's, from which it's learnt), and none of its draws failed in the last two seconds. Its option
+ * the zone's: at least one seen, no more than 8 fewer seen than sent), its last marker named the world's target (the
+ * backend learns it from the zone's markers; the sky's comes before them), and none of its draws failed in the last two
+ * seconds. Its option
  * ([world] sky / names / grid, on by default) can keep it the game's.
  *
  * The names over the screen ([world] names_over, on by default): while the upscale draws (FSR: it called our overlay
@@ -70,6 +71,8 @@ namespace hifi::world
 		{
 			std::atomic<uint64_t> seen { 0 }, drawn { 0 }, failed { 0 };
 			std::atomic<ULONGLONG> failed_at { 0 };
+			std::atomic<bool> target_known { false }; // (the world's target named at its last marker)
+			uint64_t frame = 0; // (its draws: its upload ring's slot, each rewritten every 16 of them; dgVoodoo's thread)
 			std::string why; // (under the mutex)
 			// The game's thread
 			bool refused = false, native = false, flowing = false;
@@ -85,12 +88,10 @@ namespace hifi::world
 			bool pages = false;
 			std::string pages_why = "not read yet";
 			per_pass p[passes_count];
-			std::atomic<bool> target_known { false };
 			// Our views of the world (dgVoodoo's thread, under the mutex)
 			ID3D12DescriptorHeap *rtv_heap = nullptr, *dsv_heap = nullptr;
 			ID3D12Resource *view_rt = nullptr, *view_ds = nullptr;
 			DXGI_FORMAT view_rt_format = DXGI_FORMAT_UNKNOWN, view_ds_format = DXGI_FORMAT_UNKNOWN;
-			uint64_t frame = 0;
 			// The names over the screen
 			std::atomic<ULONGLONG> over_at { 0 };
 			std::atomic<bool> over_wanted { true }; // ([world] names_over, followed by update(): read on dgVoodoo's thread)
@@ -206,7 +207,7 @@ namespace hifi::world
 			}
 			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			std::string why;
-			const bool ok = draw(t, g.frame++, why);
+			const bool ok = draw(t, g.p[k].frame++, why);
 			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
 			if (depth)
 			{
@@ -220,11 +221,17 @@ namespace hifi::world
 				fail(k, why.empty() ? "not drawn" : why.c_str());
 		}
 
-		// The marker handlers (dgVoodoo's thread)
+		// The marker handlers (dgVoodoo's thread): each marker counted, whether it named the world's target (the sky's
+		// comes before the zone's, from which the backend learns it; the others need the zone's markers coming too)
+		void seen(pass k, const passes::world &w)
+		{
+			g.p[k].seen++;
+			g.p[k].target_known.store(w.rt != nullptr && w.rt_format != DXGI_FORMAT_UNKNOWN, std::memory_order_relaxed);
+		}
+
 		void on_sky(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq)
 		{
-			g.p[sky_pass].seen++;
-			g.target_known.store(w.rt != nullptr && w.rt_format != DXGI_FORMAT_UNKNOWN, std::memory_order_relaxed);
+			seen(sky_pass, w);
 			const sky_frame *const f = sky_published(seq);
 			if (f == nullptr || !f->native)
 				return;
@@ -251,7 +258,7 @@ namespace hifi::world
 
 		void on_names(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq)
 		{
-			g.p[names_pass].seen++;
+			seen(names_pass, w);
 			const names_frame *const f = names_published(seq);
 			if (f == nullptr || !f->native)
 				return;
@@ -274,7 +281,7 @@ namespace hifi::world
 
 		void on_grid(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq)
 		{
-			g.p[grid_pass].seen++;
+			seen(grid_pass, w);
 			const grid_frame *const f = grid_published(seq);
 			if (f == nullptr || !f->native || f->count == 0)
 				return;
@@ -320,7 +327,7 @@ namespace hifi::world
 				g.over_why = why;
 				return;
 			}
-			const uint64_t frame = g.frame++;
+			const uint64_t frame = g.p[names_pass].frame++; // (the names' ring and the depth's view: one draw of them a frame, here or into A)
 			D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
 			sd.Format = srv_format;
 			sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -392,7 +399,7 @@ namespace hifi::world
 				ready = g.r != nullptr && g.r->ready() && (k != names_pass || g.pages);
 			}
 			const bool failing = GetTickCount64() - p.failed_at.load(std::memory_order_acquire) < kFailMs;
-			p.native = in_pass(k) && option(kNames[k]) && ready && p.flowing && !failing && (k != sky_pass || g.target_known.load(std::memory_order_relaxed));
+			p.native = in_pass(k) && option(kNames[k]) && ready && p.flowing && !failing && p.target_known.load(std::memory_order_relaxed);
 			set_native(k, p.native);
 		}
 

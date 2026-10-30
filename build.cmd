@@ -136,6 +136,13 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp src\game\jitter.cpp src\chars\tex.cpp src\bake\dat.cpp src\game\game.cpp ^
   build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\world_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\world_test.exe
+rem The world part's modules as the plugin and the backend drive them (the gates, the handlers into the world on WARP):
+rem build\worldpass_test.exe (based high: with the plugin's statics its image would reach up to where the system maps its
+rem early files, pushing them over the dump's base)
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen /I src\render ^
+  tests\worldpass_test.cpp src\host\passes.cpp %PASSES_WORLD% src\chars\tex.cpp %UPSCALE% %GAME% %ZONE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
+  /Fo"build\test\\" /Fe"build\worldpass_test.exe" /link /NOLOGO /DYNAMICBASE:NO /BASE:0x10000000 user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\worldpass_test.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
