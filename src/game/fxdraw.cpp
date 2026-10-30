@@ -44,6 +44,8 @@
  *   03EB30 (CMoD3aElem): the frame +0x170 of the D3A (record_d3a below), lit or not (03E9A0 sets LIGHTING 0).
  *   0565A0 (the rings, kind 0x24): record_ring below.
  *   03FBB0 (the morphs, chunk 0x25): record_morph below (03F440 with its weights 03F8A0).
+ *   0426F0 / 043110 (CMoDist, CMoVuDist), and the 042D00 distortions 043320 / 043590 / 043720 (a D3M, a morph, rings
+ *     drawn with a copy of the world): record_dist, record_dist_model, record_morph's dist, record_dist_ring below.
  * Lit elements (flags bit 16; D3M, MMB meshes and rings: the D3A sets LIGHTING 0 itself) get their lights as 0467E0
  * works them out (record_light below), the game's own functions called for each step.
  *   Anything else: left to the game.
@@ -108,6 +110,20 @@ namespace hifi::game::fxdraw
 		constexpr const char *kTextureByName = "538BD9833B0075488B0D????????55565733ED";
 		constexpr intptr_t kTextureManager = 0xA;
 		constexpr const char *kVuDistDraw = "51A1????????538BD9558B88900A000056578BAC88100A0000418988900A00008BCBE8";
+		// The 042D00 distortions: CMoDistModelElem 043320, CMoDistMorphElem 043590, CMoDistRingElem 043720
+		constexpr const char *kDistModelDraw = "83EC1C535556578BF9897C24148B87FC00000085C074048B00EB0233C08A88DE00000084C97916E8";
+		constexpr const char *kDistMorphDraw = "83EC08558BE9568B850401000085C00F84????????85C07408";
+		constexpr const char *kDistRingDraw = "83EC2C53558BE956570FBE85B40100008D4C00020FBE85B5010000";
+		// The specular D3M 0412B0; 044250 (mov ecx, the global environment 'cubemap spec' VA 0490BB90 at +0xB)
+		constexpr const char *kSpecDraw = "83EC1053558BE95733FF39BD040100000F84????????8A857901000084C0";
+		constexpr const char *kSpecCubemap = "8B4424088B4C24045051B9????????E8????????C3";
+		constexpr intptr_t kSpecCubemapAt = 0xB;
+		// The battle numbers: 041AF0; in 041C20 the glyph bind (call 1207B0 at +0xB, the font object mov ecx, imm at +6) and
+		// draw (call 00CD00 at +0xE)
+		constexpr const char *kNumberDraw = "83EC4056578BF98B87FC00000085C074048B00EB0233C08D4830E8";
+		constexpr const char *kGlyphBind = "0FBE14295052B9????????E8????????84C074548B5424288D8424D4000000B904000000";
+		constexpr const char *kGlyphDraw = "8D9424C40000006A1C526A026A05E8????????8B442414";
+		constexpr intptr_t kGlyphBindAt = 0xB, kGlyphDrawAt = 0xE;
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
 		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
@@ -162,6 +178,11 @@ namespace hifi::game::fxdraw
 			uintptr_t frame_of = 0, attach = 0, fix = 0, light1 = 0, lights2 = 0, lights2_default = 0, ambient = 0, material = 0; // (0 any: lit elements the game's)
 			uintptr_t vuanm_draw = 0, vu_walk = 0, vu_callback = 0, vu_table = 0, vu_attach = 0, vu_cursor = 0; // (03F130's; 0 any: VuAnm the game's)
 			uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // (0426F0, 043110, VA 048E666C)
+			uintptr_t distmodel_draw = 0, distmorph_draw = 0, distring_draw = 0; // (043320, 043590, 043720; 0 without 0426F0's)
+			uintptr_t spec_draw = 0, spec_cubemap = 0; // (0412B0, VA 0490BB90)
+			// (the battle numbers: 041AF0; 041C20's two calls, patched when both are as the game has them, and their targets)
+			uintptr_t number_draw = 0, glyph_bind_call = 0, glyph_bind = 0, glyph_draw_call = 0, glyph_draw = 0;
+			uint8_t saved_bind[5] = {}, ours_bind[5] = {}, saved_glyph[5] = {}, ours_glyph[5] = {};
 			uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // (054B81 patched when all found; 03EBF0, VA 0490B970)
 			uint8_t saved_flare[5] = {}, ours_flare[5] = {};
 			uintptr_t code = 0;
@@ -864,6 +885,209 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// A specular D3M (CMoD3mSpecularElem, 0412B0) into the frame; false: the game's. Its pre-draw (vt+0x4C 041160, run
+		// before the setup, so before this) clears flags bit 16 (unlit) and sets bit 25 (no fog), sets the stages +0x1BC 0
+		// and +0x1BD 1 when the D3M has no textures, and binds the environment at stage +0x1BD with 0759C0: the element's
+		// own (+0x1A8's resource +0x30, when its first dword is set) else the global 'cubemap spec' (VA 0490BB90, 044250),
+		// tinted by +0x1AC (unless +0x198 bit 0, its R G B x VA 0490BC0C's / 128, truncated to their low bytes): 0x80808080
+		// binds it as it is, anything else a copy of it x the tint x 2 (0755A0's target): done here in the shader. 0412B0
+		// (R): an MMB goes to 040C20 (record_mmb); no vertex buffer: nothing; ZENABLE 1, TEXTUREFACTOR VA 0490BC0C as it
+		// is; the texture matrix of stage +0x1BD: math vt+0x58 of (0, -pi/2, 0), or with +0x198 bit 0 of (-+0x19C,
+		// -(+0x1A0 + pi/2), -+0x1A4), times (with bit 1 too) the camera's matrix (015230: [VA 048E68FC] +0xD4) without its
+		// translation; no textures: 3529B0 / 3528F0 (NORMALIZENORMALS 1; stage 0 CURRENT x TFACTOR x 2, alpha x 4; stage 1
+		// the camera-space normal through it, COUNT3, colour CURRENT + CURRENT's alpha x TEXTURE, alpha CURRENT), ADDRESS
+		// of stage 1 CLAMP with +0x198 bit 3, else WRAP; the triangles in one draw. Textures: +0x1B8 bit 1 352B24 /
+		// 3529C8 (three stages, the environment at 2) else 352C60 / 352B40 (two), the alpha of the stage after the
+		// texture's SELECTARG1 with letter d or flags bit 28, else MODULATE4X with TFACTOR; the UV scroll of stage +0x1BC
+		// (+0x17B: the TEXTURE0 offset); each texture run (075700 at stage +0x1BC: a wave of it when +0x148, the game's)
+		// and the rest with 352C78 (the untextured table, no environment) when +5. Taken only when the stages are where
+		// the tables put them (+0x1BC 0, +0x1BD 1, or 2 with three stages).
+		using euler_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float x, float y, float z);
+
+		bool record_spec(uintptr_t e, uintptr_t handle)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t math = at<uint32_t>(g.math), camera = at<uint32_t>(g.camera);
+			if (g.spec_cubemap == 0 || math == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uintptr_t resource = at<uint32_t>(handle);
+			if (resource == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uintptr_t data = resource + 0x30;
+			const uint32_t textures = at<uint8_t>(data + 4), tail = at<uint8_t>(data + 5), triangles = at<uint16_t>(data + 6);
+			const uintptr_t names = d3m_names(data), vertices = d3m_vertices(data);
+			if (at<uint32_t>(names + 4) == 0)
+			{
+				g.n.empty++;
+				return true; // (no vertex buffer: 0412B0 draws nothing)
+			}
+			const uint8_t mode = at<uint8_t>(e + 0x198);
+			const bool three = textures != 0 && (at<uint8_t>(e + 0x1B8) & 2) != 0;
+			const uint8_t stage0 = at<uint8_t>(e + 0x1BC), stage_env = at<uint8_t>(e + 0x1BD);
+			if (textures > 13 || (textures != 0 && (stage0 != 0 || stage_env != (three ? 2 : 1) || at<float>(e + 0x148) != 0.0f)) || (textures == 0 && stage_env != 1))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// The environment and its tint, as the pre-draw bound them
+			uintptr_t entry = g.spec_cubemap;
+			if (const uint32_t h = at<uint32_t>(e + 0x1A8); h != 0)
+				if (const uint32_t r = at<uint32_t>(h); r != 0 && at<uint32_t>(r + 0x30) != 0)
+					entry = r + 0x30;
+			const uint32_t object = at<uint32_t>(entry);
+			if (object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			uint32_t tint = at<uint32_t>(e + 0x1AC);
+			if ((mode & 1) == 0)
+			{
+				const uint32_t colour = at<uint32_t>(g.colour);
+				for (int k = 0; k < 3; ++k)
+				{
+					const uint32_t p = uint32_t(float(int32_t((colour >> (8 * k)) & 0xFF) * int32_t((tint >> (8 * k)) & 0xFF)) * 0.0078125f) & 0xFF;
+					tint = (tint & ~(0xFFu << (8 * k))) | p << (8 * k);
+				}
+			}
+			const uint32_t env = texture_of(object);
+			if (env == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			// The draws, as 0412B0 makes them
+			const uint16_t letter = at<uint16_t>(e + kLetter);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			uint32_t stages = fx::stage_spec | ((mode & 8) != 0 ? fx::stage_spec_clamp : 0u) | (tint != 0x80808080u ? fx::stage_spec_tint : 0u);
+			fx::draw draws[16];
+			uint32_t count = 0, used = 0;
+			bool patch_y = false;
+			float first_y_value = 0.0f;
+			if (textures == 0)
+			{
+				const uint32_t kind = at<uint8_t>(data) & 0xF;
+				if (kind >= 5 && kind <= 7)
+				{
+					if (!dat_first_y(resource, first_y_value))
+					{
+						g.n.overwritten++;
+						return false;
+					}
+					patch_y = true;
+				}
+				draws[count++] = { 0, triangles * 3, fx::kNone, stages };
+				used = triangles * 3;
+			}
+			else
+			{
+				stages |= fx::stage_texture | (three ? fx::stage_spec_three : 0u) | ((letter & 0xFF) == 0x64 || (flags & (1u << 28)) != 0 ? fx::stage_spec_keep : 0u);
+				uint32_t first = 0;
+				for (uint32_t i = 0; i < textures; ++i)
+				{
+					const uint32_t id = texture_of(at<uint32_t>(names + 16 * i));
+					if (id == fx::kNone)
+					{
+						g.n.texture++;
+						return false;
+					}
+					const uint32_t n = uint32_t(at<uint16_t>(data + 8 + 2 * i)) * 3;
+					draws[count++] = { first, n, id, stages };
+					first += n;
+				}
+				used = first;
+				if (tail != 0)
+				{
+					const uint32_t rest = first / 3 <= triangles ? (triangles - first / 3) * 3 : 0;
+					draws[count++] = { first, rest, fx::kNone, 0 };
+					used = first + rest;
+				}
+			}
+			if (used > triangles * 3)
+				used = triangles * 3;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + count > fx::kMaxDraws || f.vertex_count + used > fx::kMaxVertices || f.light_count >= fx::kMaxLit)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out) || !lit_ok(e, out))
+				return false;
+			// The texture matrix (math vt+0x58, vt+0x24 as 0412B0 calls them)
+			alignas(16) float tm[16];
+			const auto euler = reinterpret_cast<euler_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(math) + 0x58)));
+			if ((mode & 1) != 0)
+			{
+				euler(math, 0, tm, -at<float>(e + 0x19C), -(at<float>(e + 0x1A0) + 1.5707964f), -at<float>(e + 0x1A4));
+				if ((mode & 2) != 0)
+				{
+					if (camera == 0)
+					{
+						g.n.unsupported++;
+						return false;
+					}
+					alignas(16) float cm[16];
+					std::memcpy(cm, reinterpret_cast<const void *>(camera + 0xD4), 64);
+					cm[12] = cm[13] = cm[14] = 0.0f;
+					cm[15] = 1.0f;
+					reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(math) + kProductB)))(math, 0, tm, tm, cm);
+				}
+			}
+			else
+				euler(math, 0, tm, 0.0f, -1.5707964f, 0.0f);
+			// The camera-space normals: WORLD's 3x3 inverted and transposed (VIEW is identity)
+			const float *w = out.world;
+			const float det = w[0] * (w[5] * w[10] - w[6] * w[9]) - w[1] * (w[4] * w[10] - w[6] * w[8]) + w[2] * (w[4] * w[9] - w[5] * w[8]);
+			if (!std::isfinite(det) || std::fabs(det) < 1e-20f)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const float inv[9] = { (w[5] * w[10] - w[6] * w[9]) / det, (w[2] * w[9] - w[1] * w[10]) / det, (w[1] * w[6] - w[2] * w[5]) / det,
+				(w[6] * w[8] - w[4] * w[10]) / det, (w[0] * w[10] - w[2] * w[8]) / det, (w[2] * w[4] - w[0] * w[6]) / det,
+				(w[4] * w[9] - w[5] * w[8]) / det, (w[1] * w[8] - w[0] * w[9]) / det, (w[0] * w[5] - w[1] * w[4]) / det };
+			fx::lighting &l = f.lights[f.light_count];
+			l = fx::lighting();
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					l.normal[i][j] = inv[j * 3 + i];
+			for (int r = 0; r < 4; ++r)
+			{
+				l.toward[0][r] = tm[4 * r + 0];
+				l.toward[1][r] = tm[4 * r + 1];
+			}
+			for (int c = 0; c < 4; ++c)
+				l.diffuse[0][c] = float((tint >> (c == 3 ? 24 : 16 - 8 * c)) & 0xFF) / 255.0f;
+			out.spec = f.light_count++;
+			out.env = env;
+			out.tfactor = at<uint32_t>(g.colour);
+			std::memcpy(f.vertices + f.vertex_count, reinterpret_cast<const void *>(vertices), size_t(used) * sizeof(fx::vertex));
+			if (patch_y && used != 0)
+				f.vertices[f.vertex_count].pos[1] = first_y_value;
+			out.first_draw = f.draw_count;
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				fx::draw d = draws[i];
+				if (d.first + d.count > used)
+					d.count = d.first < used ? used - d.first : 0;
+				d.first += f.vertex_count;
+				f.draws[f.draw_count++] = d;
+			}
+			out.draws = count;
+			out.cls = fx::class_spec;
+			f.vertex_count += used;
+			f.element_count++;
+			g.n.taken[fx::class_spec]++;
+			return true;
+		}
+
 		// The D3A (03EB30 -> 03E910) into the frame; false: the game's. The resource keeps the texture object in the
 		// name's first dword (data +8, 075520), the vertex buffer object at +0xC and the frame table at +0x14 (03E6C0:
 		// per frame u16 quads, s16 first vertex); the frames' vertices stay in the chunk as the DAT has them (24 bytes:
@@ -1288,6 +1512,238 @@ namespace hifi::game::fxdraw
 			return record_dist(e, uint32_t(n));
 		}
 
+		// The 042D00 distortions (CMoDistModelElem 043320, CMoDistMorphElem 043590, CMoDistRingElem 043720). 042D00 (R;
+		// thiscall, (vertices, count, M, stage), ret 0x10): every vertex's screen point by math vt+0x84 (M, gfx +0xB10, the
+		// half sizes gfx +0xDC0 / +0xDC4; written into the 36-byte vertex's UV), then UV = ((x + 0.5) / W, (H - 0.5 - y) /
+		// H) in the game's target (009E00: W +8, H +0xC); false (nothing drawn) when W or H is 0 or without the world's
+		// texture ([VA 048E666C] +0x194). Then the grab of the whole world, flipped, into the 256 x 256 target (VA 0490BB88):
+		// the strip (0, 0) (256, 0) (0, 256) (256, 256) with UVs (-0.5/W, (H-0.5)/H), ((W-0.5)/W, (H-0.5)/H), (-0.5/W,
+		// -0.5/H), ((W-0.5)/W, -0.5/H) (35322C / 3531C0: no blend, no z, colour the texture, alpha TFACTOR 0x80, MIRROR);
+		// then ALPHABLENDENABLE and ZENABLE 1 and the target as the texture of the stage handed in. The vertices are drawn
+		// by the class after with that texture.
+		using project_list_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *box, void *vertices, int32_t count, const float *m, const float *p, float hw, float hh);
+
+		// The game's target's size (009E00) once 042D00 would draw (the world's texture there); false: it draws nothing
+		bool dist_target(int32_t &W, int32_t &H)
+		{
+			const uintptr_t gfx = at<uint32_t>(g.gfx);
+			const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+			const uintptr_t app = g.dist_app != 0 ? at<uint32_t>(g.dist_app) : 0;
+			if (wrapper == 0 || app == 0 || at<uint32_t>(app + 0x194) == 0)
+				return false;
+			const uintptr_t rt = wrapper + 0x98 + uintptr_t(at<uint8_t>(wrapper + 0x158)) * 0x18;
+			W = at<int32_t>(rt + 8);
+			H = at<int32_t>(rt + 0xC);
+			return W > 0 && H > 0;
+		}
+
+		// 042D00's UVs for count vertices: math vt+0x84 through M, as 042D00 calls it
+		void dist_uvs(fx::vertex *v, uint32_t count, const float *m, int32_t W, int32_t H)
+		{
+			if (count == 0)
+				return;
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math);
+			float box[4];
+			const auto project = reinterpret_cast<project_list_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(math) + 0x84)));
+			project(math, 0, box, v, int32_t(count), m, reinterpret_cast<const float *>(gfx + 0xB10), at<float>(gfx + 0xDC0), at<float>(gfx + 0xDC4));
+			const float iw = 1.0f / float(W), ih = -1.0f / float(H), top = float(H) - 0.5f;
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				v[i].uv[0] = (v[i].uv[0] + 0.5f) * iw;
+				v[i].uv[1] = (v[i].uv[1] - top) * ih;
+			}
+		}
+
+		// 042D00's grab: the whole world, flipped
+		fx::grab dist_full_grab(int32_t W, int32_t H)
+		{
+			const float w = float(W), h = float(H);
+			const float l = -0.5f / w, r = (w - 0.5f) / w, t = (h - 0.5f) / h, b = -0.5f / h;
+			fx::grab gr;
+			const float pos[4][2] = { { 0, 0 }, { 256, 0 }, { 0, 256 }, { 256, 256 } }, uv[4][2] = { { l, t }, { r, t }, { l, b }, { r, b } };
+			std::memcpy(gr.pos, pos, sizeof(pos));
+			std::memcpy(gr.uv, uv, sizeof(uv));
+			return gr;
+		}
+
+		// The matrix (identity moved by s in x and y) x m, as 043320 and 043590 make it with math vt+0x24
+		void shifted(const float *m, float s, float out[16])
+		{
+			std::memcpy(out, m, 64);
+			for (int c = 0; c < 4; ++c)
+				out[12 + c] = s * m[c] + s * m[4 + c] + m[12 + c];
+		}
+
+		// The element's draw: the grab first, then its vertices with the distortion target
+		void dist_draw_with_grab(fx::element &out, const fx::grab &gr, uint32_t first, uint32_t count, uint32_t stages)
+		{
+			fx::frame &f = *g.f;
+			f.grabs[f.grab_count] = gr;
+			fx::draw d;
+			d.first = first;
+			d.count = count;
+			d.texture = fx::kDistTexture;
+			d.stages = stages;
+			d.grab = f.grab_count++;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			f.draws[f.draw_count++] = d;
+		}
+
+		// A CMoDistModelElem (043320) into the frame; false: the game's. 043320 (R): nothing for a weather element 002D80
+		// hides or an MMB (+0x179); the D3M's vertices (03FD70, triangles x 3) copied, M = (identity moved by +0x194 in x and
+		// y) x WORLD (the draw matrix, 06A4A0's cache), 042D00 (the copy, from vertex 2 with count - 2 when 03FCB0 answers:
+		// no textures and kinds 5-7, whose first vertex the load overwrote; M; stage 1); WORLD the plain draw matrix again
+		// (06A480), the copy into the distortion buffer (VA 0490BBB0) and 040670 (the resource, that buffer, VA 0490BC0C,
+		// the element, 0): ALPHATEST GREATER 0x60 with the data's +2 bit 0; TEXTUREFACTOR the colour (D: alpha >= 0x7F
+		// full); 352740 (stage 0 CURRENT x TFACTOR x 2, colour and alpha; stage 1 TEXCOORDINDEX 0, colour TEXTURE, alpha
+		// TEXTURE x CURRENT x 4, WRAP; D: 352848, alpha x 2), stage 1's UV offset (+0x120 when +0x17B bits 0-1); no texture
+		// set (its 0 is skipped): each texture run drawn from the buffer, then the rest when +5 (without textures: only when
+		// +5, and from triangle 1 when 03FCB0 answers). All of it as one draw here.
+		bool record_dist_model(uintptr_t e, uintptr_t resource)
+		{
+			fx::frame &f = *g.f;
+			if (at<uint8_t>(e + kMmb) != 0)
+			{
+				g.n.empty++;
+				return true;
+			}
+			const uintptr_t data = resource + 0x30;
+			const uint32_t textures = at<uint8_t>(data + 4), tail = at<uint8_t>(data + 5), triangles = at<uint16_t>(data + 6), kind = at<uint8_t>(data) & 0xF;
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math);
+			if (gfx == 0 || math == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			int32_t W = 0, H = 0;
+			if (!dist_target(W, H))
+			{
+				g.n.empty++;
+				return true; // (042D00 answers 0: nothing drawn)
+			}
+			// What 040670 draws from the buffer
+			uint32_t first = 0, count = 0;
+			if (textures != 0)
+			{
+				for (uint32_t i = 0; i < textures; ++i)
+					count += uint32_t(at<uint16_t>(data + 8 + 2 * i)) * 3;
+				if (tail != 0 || count > triangles * 3)
+					count = triangles * 3;
+			}
+			else if (tail != 0)
+			{
+				const bool overwritten = kind >= 5 && kind <= 7;
+				first = overwritten ? 3 : 0;
+				count = triangles > (overwritten ? 1u : 0u) ? (triangles - (overwritten ? 1 : 0)) * 3 : 0;
+			}
+			const uintptr_t names = d3m_names(data), vertices = d3m_vertices(data);
+			if (at<uint32_t>(names + 4) == 0)
+				count = 0; // (no vertex buffer: 040670 draws nothing; the grab is made)
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + count > fx::kMaxVertices || f.grab_count + 1 > fx::kMaxGrabs)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out) || !lit_ok(e, out))
+				return false;
+			const uint16_t letter = at<uint16_t>(e + kLetter);
+			if ((letter & 0xFF) == 0x44 && (out.tfactor >> 24) >= 0x7F)
+				out.tfactor |= 0xFF000000u;
+			std::memcpy(f.vertices + f.vertex_count, reinterpret_cast<const void *>(vertices + uintptr_t(first) * sizeof(fx::vertex)), size_t(count) * sizeof(fx::vertex));
+			float m[16];
+			shifted(out.world, at<float>(e + 0x194), m);
+			dist_uvs(f.vertices + f.vertex_count, count, m, W, H);
+			const uint32_t stages = fx::stage_dist_model | ((letter & 0xFF) == 0x44 ? fx::stage_alpha_2x : 0u) | ((at<uint8_t>(data + 2) & 1) != 0 ? fx::stage_alpha_test : 0u);
+			dist_draw_with_grab(out, dist_full_grab(W, H), f.vertex_count, count, stages);
+			out.cls = fx::class_dist_model;
+			f.vertex_count += count;
+			f.element_count++;
+			g.n.taken[fx::class_dist_model]++;
+			return true;
+		}
+
+		// A CMoDistRingElem (043720) into the frame; false: the game's. 043720 (R): +0x1B4 segments n, +0x1B5 rings (signed
+		// bytes; the game's stack has room for 4); each ring's colour its bytes +0x1A4 + 4i (R G B A) x VA 0490BC0C's >> 7,
+		// each kept to its low byte (no clamp); per band between rings b and b + 1 (radii +0x194 + 4b) 2n + 2 vertices: at
+		// angles 0, d .. (n - 1) d (d = 2 pi / n, added up) the pair (sin a x r, cos a x r, 0) inner then outer, then the
+		// first pair again; their normals not written (a lit one is the game's). 042D00 (all of them, M the draw matrix: no
+		// shift; stage 0), 353378 (colour CURRENT x TEXTURE x 2, alpha DIFFUSE x TEXTURE x 4, MIRROR, stage 1 off), and a
+		// DrawPrimitiveUP strip of 2n triangles per band.
+		bool record_dist_ring(uintptr_t e)
+		{
+			fx::frame &f = *g.f;
+			const int32_t segments = at<int8_t>(e + 0x1B4), rings = at<int8_t>(e + 0x1B5);
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math);
+			if (gfx == 0 || math == 0 || rings > 4)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
+			{
+				g.n.lit++;
+				return false;
+			}
+			int32_t W = 0, H = 0;
+			if (!dist_target(W, H))
+			{
+				g.n.empty++;
+				return true;
+			}
+			const uint32_t bands = rings > 1 ? uint32_t(rings - 1) : 0, n = segments > 0 ? uint32_t(segments) : 0;
+			const uint32_t count = bands * n * 2 * 3;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + count > fx::kMaxVertices || f.grab_count + 1 > fx::kMaxGrabs)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			const uint32_t colour = at<uint32_t>(g.colour);
+			uint32_t col[4] = {};
+			for (int32_t i = 0; i < rings; ++i)
+			{
+				const uintptr_t c = e + 0x1A4 + 4 * uintptr_t(i);
+				const uint32_t r = (at<uint8_t>(c) * ((colour >> 16) & 0xFF)) >> 7, gr = (at<uint8_t>(c + 1) * ((colour >> 8) & 0xFF)) >> 7;
+				const uint32_t b = (at<uint8_t>(c + 2) * (colour & 0xFF)) >> 7, a = (at<uint8_t>(c + 3) * (colour >> 24)) >> 7;
+				col[i] = (a & 0xFF) << 24 | (r & 0xFF) << 16 | (gr & 0xFF) << 8 | (b & 0xFF);
+			}
+			const float step = 6.283184f / float(segments);
+			std::vector<fx::vertex> strip(size_t(n) * 2 + 2);
+			uint32_t w = f.vertex_count;
+			for (uint32_t b = 0; b < bands && n != 0; ++b)
+			{
+				const float r[2] = { at<float>(e + 0x194 + 4 * b), at<float>(e + 0x198 + 4 * b) };
+				float a = 0.0f;
+				for (uint32_t k = 0; k < n; ++k, a += step)
+					for (int j = 0; j < 2; ++j)
+					{
+						fx::vertex &v = strip[2 * k + j];
+						v = fx::vertex();
+						v.pos[0] = std::sin(a) * r[j];
+						v.pos[1] = std::cos(a) * r[j];
+						v.colour = col[b + j];
+					}
+				strip[2 * n] = strip[0];
+				strip[2 * n + 1] = strip[1];
+				dist_uvs(strip.data(), uint32_t(strip.size()), out.world, W, H);
+				for (uint32_t k = 0; k < 2 * n; ++k)
+					for (uint32_t j = 0; j < 3; ++j)
+						f.vertices[w++] = strip[k + j];
+			}
+			dist_draw_with_grab(out, dist_full_grab(W, H), f.vertex_count, w - f.vertex_count, fx::stage_dist_ring);
+			out.cls = fx::class_dist_ring;
+			f.vertex_count = w;
+			f.element_count++;
+			g.n.taken[fx::class_dist_ring]++;
+			return true;
+		}
+
 		// A lens flare's pieces (03EBF0, thiscall on the flare D3A's resource, called by the flare's own draw 0548D0 at
 		// 054B81 with (the visibility, the light's x and y, W - x, H - y, 0) once its visibility test 06C280 has passed:
 		// World FX's HideFlare (054AF1) and VisTest (054AE2) stay where they are, before it) into the frame; false: the
@@ -1418,12 +1874,25 @@ namespace hifi::game::fxdraw
 		// the positions'), the colours (+0xC, T x 3) doubled, the UVs (+0xE, + 0x10000 unless above +0xC); the texture
 		// the name's first dword (+0x10, 075700: its +0x40, else +0x44; a wave of it when +0x148: the game's); table
 		// 352258 (stage 0 TEXTURE x CURRENT x 2, colour and alpha; stage 1 x TFACTOR x 2, alpha x 4), one draw.
-		bool record_morph(uintptr_t e, uintptr_t resource)
+		//
+		// `dist`: a CMoDistMorphElem (043590, R): the blend made first (03F8A0 into +0x1BC unless one's there: then the
+		// game's), the draw matrix (045D40), 042D00 on the blend's P positions (M the plain draw matrix; stage 0: the
+		// distortion target is the morph's texture; when it answers 0, nothing drawn and +0x1BC kept: the game's), WORLD =
+		// (identity moved by +0x1C0 in x and y) x the draw matrix (06A480), then 03F440 with the blend and its flag 1: no
+		// texture set, the colours as they are (not doubled), each corner's UV its position's screen UV; then +0x1BC
+		// cleared and +0x194 copied to +0x1A8 as 03FBB0 does.
+		bool record_morph(uintptr_t e, uintptr_t resource, bool dist = false)
 		{
 			fx::frame &f = *g.f;
 			const uintptr_t data = resource + 0x30;
 			const size_t size = ((at<uint32_t>(resource + 0x24) >> 7) & 0x7FFFF) * 16;
-			if (at<uint32_t>(e + 0x1BC) != 0 || at<float>(e + 0x148) != 0.0f || size < 0x30)
+			if (at<uint32_t>(e + 0x1BC) != 0 || (!dist && at<float>(e + 0x148) != 0.0f) || size < 0x30)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			int32_t W = 0, H = 0;
+			if (dist && (at<uint32_t>(g.gfx) == 0 || at<uint32_t>(g.math) == 0 || !dist_target(W, H)))
 			{
 				g.n.unsupported++;
 				return false;
@@ -1443,22 +1912,26 @@ namespace hifi::game::fxdraw
 				return false;
 			}
 			const uint32_t n = triangles * 3;
-			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + n > fx::kMaxVertices)
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + n > fx::kMaxVertices || (dist && f.grab_count + 1 > fx::kMaxGrabs))
 			{
 				g.n.full++;
 				return false;
 			}
-			const uint32_t object = at<uint32_t>(data + 0x10);
-			if (object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0))
+			uint32_t id = fx::kDistTexture;
+			if (!dist)
 			{
-				g.n.unsupported++;
-				return false;
-			}
-			const uint32_t id = texture_of(object);
-			if (id == fx::kNone)
-			{
-				g.n.texture++;
-				return false;
+				const uint32_t object = at<uint32_t>(data + 0x10);
+				if (object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0))
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				id = texture_of(object);
+				if (id == fx::kNone)
+				{
+					g.n.texture++;
+					return false;
+				}
 			}
 			// The weights (03F8A0)
 			float weights[5], last[5], w[5];
@@ -1489,6 +1962,16 @@ namespace hifi::game::fxdraw
 				return false;
 			// The vertices: each corner's position and normal blended as 03F8A0 blends them
 			const uintptr_t pi = data + index_at, ni = pi + uintptr_t(n) * 2, colours = data + colour_at, uvs = data + uv_at;
+			if (dist)
+			{
+				// (042D00 on the blend's positions: their screen UVs)
+				g_vu.assign(size_t(positions), fx::vertex());
+				for (int32_t p = 0; p < positions; ++p)
+					for (int32_t k = 0; k < targets; ++k)
+						for (int c = 0; c < 3; ++c)
+							g_vu[size_t(p)].pos[c] = at<float>(data + 0x20 + stride * uintptr_t(k) + 12 * uintptr_t(p) + 4 * uintptr_t(c)) * w[k] + g_vu[size_t(p)].pos[c];
+				dist_uvs(g_vu.data(), uint32_t(positions), out.world, W, H);
+			}
 			for (uint32_t i = 0; i < n; ++i)
 			{
 				const uint32_t a = at<uint16_t>(pi + 2 * uintptr_t(i)), b = at<uint16_t>(ni + 2 * uintptr_t(i));
@@ -1511,6 +1994,13 @@ namespace hifi::game::fxdraw
 					v.normal[2] = float(int32_t(packed << 2) >> 22) * w[k] * 0.001953125f + v.normal[2];
 				}
 				const uint32_t c = at<uint32_t>(colours + 4 * uintptr_t(i));
+				if (dist)
+				{
+					v.colour = c;
+					v.uv[0] = g_vu[a].uv[0];
+					v.uv[1] = g_vu[a].uv[1];
+					continue;
+				}
 				uint32_t doubled = 0;
 				for (int k = 0; k < 4; ++k)
 					doubled |= std::min(((c >> (8 * k)) & 0xFFu) * 2u, 0xFFu) << (8 * k);
@@ -1523,13 +2013,24 @@ namespace hifi::game::fxdraw
 				std::memcpy(reinterpret_cast<void *>(e + 0x194), weights, sizeof(weights));
 			std::memcpy(reinterpret_cast<void *>(e + 0x1A8), reinterpret_cast<const void *>(e + 0x194), 20);
 			*reinterpret_cast<uint32_t *>(e + 0x1BC) = 0;
-			out.first_draw = f.draw_count;
-			out.draws = 1;
-			out.cls = fx::class_morph;
-			f.draws[f.draw_count++] = { f.vertex_count, n, id, fx::stage_texture | ((head & 0x80) != 0 ? fx::stage_alpha_test : 0u) };
+			const uint32_t stages = fx::stage_texture | ((head & 0x80) != 0 ? fx::stage_alpha_test : 0u);
+			if (dist)
+			{
+				float m[16];
+				shifted(out.world, at<float>(e + 0x1C0), m);
+				std::memcpy(out.world, m, 64);
+				dist_draw_with_grab(out, dist_full_grab(W, H), f.vertex_count, n, stages);
+			}
+			else
+			{
+				out.first_draw = f.draw_count;
+				out.draws = 1;
+				f.draws[f.draw_count++] = { f.vertex_count, n, id, stages };
+			}
+			out.cls = dist ? fx::class_dist_morph : fx::class_morph;
 			f.vertex_count += n;
 			f.element_count++;
-			g.n.taken[fx::class_morph]++;
+			g.n.taken[out.cls]++;
 			return true;
 		}
 
@@ -1703,6 +2204,168 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// Battle numbers (kind 0x5C: research/ffxi-re/notes-world-passes.md 5). Reachable on this client: 09E090 starts
+		// the 'damv' / 'misv' / 'curv' schedulers in the field for a battle message whose byte in the table VA 047ECAE0 is
+		// 1, 2 or 3 (168 messages, the melee hit 1 among them), once the chat filter lets it through (0ADE80) and config
+		// 0x13 isn't 0: conf3win's damage display ("Display damage on the game screen and in the log window." 1, "... as
+		// pop-up graphics ... only" 2; 0 "in the log window only"). 041AF0 (R): the element's source actor (03B700), its
+		// point (044C40), the name-visibility test 0830C0, TEXTUREFACTOR VA 0490BC0C, then 041C20: a frame around the point
+		// projected (0277E0 .. 027050), the string (+0x198, at most 16 characters) measured with the font object (VA
+		// 04971BF8, sprite set 'menu    dmgnum', 120730) and centred, and for each glyph: 1207B0 binds its texture (the
+		// font's +0x30 / +0x34 by the code's range +0x38 / +0x3C) and 00CD00 draws its XYZRHW quad (FVF 0x144, a strip of
+		// 2; the colour, UVs from the sprite set), stages 352D30 (DIFFUSE x TEXTURE x 2, colour and alpha; x TFACTOR x 2,
+		// alpha x 4: stage_texture), WRAP, 0467E0's blend and z. The projection is the game's, so the element isn't taken
+		// at its setup: 0467E0 and 041AF0 run as before (they set states, they don't draw), and the two calls in 041C20
+		// go to us: on_glyph notes the texture object 1207B0 binds, on_glyph_draw records the quad (pre-transformed, as
+		// the lens flares: WORLD takes the game's pixels to clip space, z as it is) into an element of the run, made at
+		// its first glyph with what common() worked out at the setup. No fog (pre-transformed: RHW 1, table fog sees w 1).
+		// A glyph whose texture isn't up, or anything not as expected: the run closed and the game draws it.
+		struct number_state
+		{
+			bool pending = false;     // a number's setup seen in this flush, its glyphs to come
+			bool made = false;        // its element made in the frame (its first glyph recorded)
+			uint32_t element = 0;     // (its index in the frame)
+			fx::element out;          // what the setup worked out (common)
+			uint32_t object = 0;      // the texture object 1207B0 bound for the glyph to be drawn
+		};
+		number_state g_number;
+
+		void end_number()
+		{
+			g_number.pending = g_number.made = false;
+			g_number.object = 0;
+		}
+
+		// At a number's setup (on_setup, before 0467E0): its states, as common() works them out; false: the game's
+		bool begin_number(uintptr_t e)
+		{
+			end_number();
+			fx::element out;
+			if (!common(e, out))
+				return false;
+			out.fog = 0;
+			out.cls = fx::class_number;
+			out.tfactor = at<uint32_t>(g.colour);
+			out.projection = fx::proj_identity;
+			g_number.out = out;
+			g_number.pending = true;
+			return true;
+		}
+
+		bool begin_number_guarded(uintptr_t e)
+		{
+			__try
+			{
+				return begin_number(e);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				g.n.faulted++;
+				end_number();
+				return false;
+			}
+		}
+
+		// A glyph's quad (00CD00's strip of 2: 4 vertices of FVF 0x144, x y z rhw, colour, u v) into the number's element
+		bool record_glyph(const uint8_t *data, uint32_t type, uint32_t count, uint32_t stride)
+		{
+			fx::frame &f = *g.f;
+			if (type != 5 || count != 2 || stride != 0x1C || g_number.object == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t id = texture_of(g_number.object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			if (f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + 6 > fx::kMaxVertices || (!g_number.made && f.element_count >= fx::kMaxElements) ||
+				f.runs.load(std::memory_order_relaxed) + 2 >= fx::kMaxRuns)
+			{
+				g.n.full++;
+				return false;
+			}
+			// (an element made by an earlier glyph must still be the run's last: draws stay contiguous)
+			if (g_number.made && (g_number.element + 1 != f.element_count || g_number.element < g.run_first ||
+									 f.elements[g_number.element].first_draw + f.elements[g_number.element].draws != f.draw_count))
+				g_number.made = false;
+			if (!g_number.made)
+			{
+				const uintptr_t gfx = at<uint32_t>(g.gfx);
+				const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+				if (wrapper == 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				const uintptr_t rt = wrapper + 0x98 + uintptr_t(at<uint8_t>(wrapper + 0x158)) * 0x18;
+				const int32_t W = at<int32_t>(rt + 8), H = at<int32_t>(rt + 0xC);
+				if (W <= 0 || H <= 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				fx::element &out = f.elements[f.element_count];
+				out = g_number.out;
+				const float world[16] = { 2.0f / float(W), 0, 0, 0, 0, -2.0f / float(H), 0, 0, 0, 0, 1, 0, 1.0f / float(W) - 1.0f, 1.0f - 1.0f / float(H), 0, 1 };
+				std::memcpy(out.world, world, 64);
+				out.first_draw = f.draw_count;
+				out.draws = 0;
+				g_number.element = f.element_count++;
+				g_number.made = true;
+				g.n.taken[fx::class_number]++;
+			}
+			fx::vertex q[4];
+			for (int k = 0; k < 4; ++k)
+			{
+				const uint8_t *s = data + 0x1C * k;
+				q[k] = fx::vertex();
+				std::memcpy(q[k].pos, s, 12);
+				std::memcpy(&q[k].colour, s + 0x10, 4);
+				std::memcpy(q[k].uv, s + 0x14, 8);
+			}
+			const int order[6] = { 0, 1, 2, 1, 3, 2 };
+			for (int k = 0; k < 6; ++k)
+				f.vertices[f.vertex_count + k] = q[order[k]];
+			f.draws[f.draw_count++] = { f.vertex_count, 6, id, fx::stage_texture };
+			f.vertex_count += 6;
+			f.elements[g_number.element].draws++;
+			return true;
+		}
+
+		bool record_glyph_guarded(const void *data, uint32_t type, uint32_t count, uint32_t stride)
+		{
+			__try
+			{
+				return data != nullptr && record_glyph(static_cast<const uint8_t *>(data), type, count, stride);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				g.n.faulted++;
+				return false;
+			}
+		}
+
+		// The texture object 1207B0 binds for code c (the font's +0x30 + 4 x its range: 1 from +0x3C, else 0; a negative
+		// code +0x30), after it has made them (120880)
+		uint32_t glyph_object(uintptr_t font, int32_t c)
+		{
+			__try
+			{
+				int32_t k = 0;
+				if (c >= 0 && uint32_t(c) >= at<uint32_t>(font + 0x3C))
+					k = 1;
+				const uint32_t object = at<uint32_t>(font + 0x30 + 4 * uintptr_t(k));
+				return object != 0 && (at<uint32_t>(object + 0x40) != 0 || at<uint32_t>(object + 0x44) != 0) ? object : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				return 0;
+			}
+		}
+
 		// An element into the frame: true when it's taken (the game's setup and draw skipped)
 		bool record(uintptr_t e)
 		{
@@ -1737,6 +2400,45 @@ namespace hifi::game::fxdraw
 				return record_dist(e, 1);
 			if (cls == g.vudist_draw && g.vudist_draw != 0)
 				return record_vudist(e);
+			if (cls == g.spec_draw && g.spec_draw != 0)
+			{
+				// (0412B0: no model, nothing; an MMB, 040C20 as the plain D3M's)
+				const uint32_t handle = at<uint32_t>(e + kModel);
+				if (handle == 0)
+				{
+					g.n.empty++;
+					return true;
+				}
+				return at<uint8_t>(e + kMmb) != 0 ? record_mmb(e, handle) : record_spec(e, handle);
+			}
+			if (cls == g.distring_draw && g.distring_draw != 0)
+				return record_dist_ring(e);
+			if ((cls == g.distmodel_draw && g.distmodel_draw != 0) || (cls == g.distmorph_draw && g.distmorph_draw != 0))
+			{
+				// (043320: a weather element 002D80 hides: nothing drawn; 043590 has no such check. Without a model 043590 draws
+				// nothing; 043320 would read through it: never so)
+				const uint32_t gh = at<uint32_t>(e + kGen);
+				const uint32_t gen = gh != 0 ? at<uint32_t>(gh) : 0;
+				const uint32_t handle = at<uint32_t>(e + kModel);
+				const bool model = cls == g.distmodel_draw;
+				if (model && gen != 0 && (at<uint8_t>(gen + 0xDE) & 0x80) != 0 && reinterpret_cast<weather_fn>(g.weather)() == 0.0f)
+				{
+					g.n.empty++;
+					return true;
+				}
+				const uint32_t resource = handle != 0 ? at<uint32_t>(handle) : 0;
+				if (!model && handle == 0)
+				{
+					g.n.empty++;
+					return true;
+				}
+				if (resource == 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				return model ? record_dist_model(e, resource) : record_morph(e, resource, true);
+			}
 			if (cls == g.vuanm_draw && g.vuanm_draw != 0)
 			{
 				const uint32_t handle = at<uint32_t>(e + kModel);
@@ -1817,6 +2519,22 @@ namespace hifi::game::fxdraw
 			}
 		}
 
+		// Whether an element's class draw (its vtable's +0x48) is `draw`, under a guard
+		bool drawn_by(uintptr_t e, uintptr_t draw)
+		{
+			__try
+			{
+				if (!pointer(uint32_t(e)))
+					return false;
+				const uint32_t vt = at<uint32_t>(e);
+				return vt != 0 && at<uint32_t>(vt + 0x48) == draw;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				return false;
+			}
+		}
+
 		// Whether a queued element is drawn through 046070 (its vtable's +0x2C), under a guard
 		bool drawn_by_046070(uintptr_t e)
 		{
@@ -1871,6 +2589,7 @@ namespace hifi::game::fxdraw
 			g.n.last_elements = g.f->element_count;
 			g.n.last_runs = g.f->runs.load(std::memory_order_relaxed);
 		}
+		end_number();
 		g.in_flush = false;
 		g.taking = false;
 		g.f = nullptr;
@@ -1878,6 +2597,7 @@ namespace hifi::game::fxdraw
 
 	void __cdecl on_entry(uintptr_t callback, uintptr_t arg)
 	{
+		end_number();
 		if (g.in_flush && g.taking)
 		{
 			// (a weapon trail: drawn by HiFi XI with the run, else the game's after it)
@@ -1902,10 +2622,41 @@ namespace hifi::game::fxdraw
 		reinterpret_cast<pieces_fn>(g.flare_pieces)(resource, 0, visibility, x, y, far_x, far_y, zero);
 	}
 
+	uint32_t __fastcall on_glyph(uintptr_t font, uintptr_t, int32_t c, uint32_t *colour, uint32_t *other)
+	{
+		using bind_fn = uint32_t(__fastcall *)(uintptr_t, uintptr_t, int32_t, uint32_t *, uint32_t *);
+		const uint32_t ok = reinterpret_cast<bind_fn>(g.glyph_bind)(font, 0, c, colour, other);
+		if (g_number.pending)
+			g_number.object = (ok & 0xFF) != 0 ? glyph_object(font, c) : 0;
+		return ok;
+	}
+
+	void __fastcall on_glyph_draw(uintptr_t wrapper, uintptr_t, uint32_t type, uint32_t count, const void *data, uint32_t stride)
+	{
+		if (g.in_flush && g.taking)
+		{
+			if (g_number.pending && record_glyph_guarded(data, type, count, stride))
+				return;
+			// (the game draws this one: what was recorded so far first)
+			g_number.made = false;
+			close_run();
+		}
+		using draw_fn = void(__fastcall *)(uintptr_t, uintptr_t, uint32_t, uint32_t, const void *, uint32_t);
+		reinterpret_cast<draw_fn>(g.glyph_draw)(wrapper, 0, type, count, data, stride);
+	}
+
 	uint32_t __fastcall on_setup(uintptr_t element, uintptr_t, uint32_t arg)
 	{
 		if (g.in_flush && g.taking && arg == 0xFFFF)
 		{
+			// (a battle number: its setup and class draw run as before, its glyphs come to on_glyph_draw)
+			end_number();
+			if (g.number_draw != 0 && drawn_by(element, g.number_draw))
+			{
+				if (!begin_number_guarded(element))
+					close_run();
+				return reinterpret_cast<setup_fn>(g.setup)(element, 0, arg);
+			}
 			if (record_guarded(element))
 				return 1;
 			close_run();
@@ -2005,6 +2756,17 @@ namespace hifi::game::fxdraw
 		}
 		if (const uintptr_t v = find(kVuDistDraw); v != 0 && n.dist_draw != 0)
 			n.vudist_draw = v;
+		if (const uintptr_t sp = find(kSpecDraw), cube = find(kSpecCubemap); sp != 0 && cube != 0)
+		{
+			n.spec_draw = sp;
+			n.spec_cubemap = word(cube + kSpecCubemapAt);
+		}
+		if (n.dist_draw != 0)
+		{
+			n.distmodel_draw = find(kDistModelDraw);
+			n.distmorph_draw = find(kDistMorphDraw);
+			n.distring_draw = find(kDistRingDraw);
+		}
 		if (const uintptr_t v = find(kVuAnmDraw); v != 0)
 		{
 			// (03F130's table, globals, callback and walk, each by its opcode; its attach call must be 0467E0's)
@@ -2076,6 +2838,30 @@ namespace hifi::game::fxdraw
 			why = "couldn't write the game's code";
 			return false;
 		}
+		// (the battle numbers' glyph calls in 041C20: both or neither, each where the game has it)
+		if (const uintptr_t nd = find(kNumberDraw), bind = find(kGlyphBind), draw = find(kGlyphDraw); nd != 0 && bind != 0 && draw != 0)
+		{
+			uint8_t b[5] = {}, d[5] = {};
+			if (read(bind + kGlyphBindAt, b, 5) && b[0] == 0xE8 && read(draw + kGlyphDrawAt, d, 5) && d[0] == 0xE8)
+			{
+				n.number_draw = nd;
+				n.glyph_bind_call = bind + kGlyphBindAt;
+				n.glyph_draw_call = draw + kGlyphDrawAt;
+				n.glyph_bind = rel_target(n.glyph_bind_call);
+				n.glyph_draw = rel_target(n.glyph_draw_call);
+				std::memcpy(n.saved_bind, b, 5);
+				std::memcpy(n.saved_glyph, d, 5);
+				put_call(n.ours_bind, n.glyph_bind_call, reinterpret_cast<uintptr_t>(&on_glyph));
+				put_call(n.ours_glyph, n.glyph_draw_call, reinterpret_cast<uintptr_t>(&on_glyph_draw));
+				if (!write_code(n.glyph_bind_call, n.ours_bind, 5))
+					n.number_draw = n.glyph_bind_call = n.glyph_draw_call = 0;
+				else if (!write_code(n.glyph_draw_call, n.ours_glyph, 5))
+				{
+					write_code(n.glyph_bind_call, n.saved_bind, 5);
+					n.number_draw = n.glyph_bind_call = n.glyph_draw_call = 0;
+				}
+			}
+		}
 		// (the flare's pieces: only when the rest is in; without it the game draws them)
 		if (n.flare_call != 0)
 		{
@@ -2101,13 +2887,15 @@ namespace hifi::game::fxdraw
 		if (!g.in)
 			return true;
 		if (!code_is(g.setup_call, g.ours_setup, 5) || !code_is(g.flush_call, g.ours_flush, 5) || !code_is(g.entry_site, g.ours_entry, 7) ||
-			(g.flare_call != 0 && !code_is(g.flare_call, g.ours_flare, 5)))
+			(g.flare_call != 0 && !code_is(g.flare_call, g.ours_flare, 5)) ||
+			(g.glyph_bind_call != 0 && (!code_is(g.glyph_bind_call, g.ours_bind, 5) || !code_is(g.glyph_draw_call, g.ours_glyph, 5))))
 		{
 			why = "something else has changed the effects' flush or element draw since: left as they are";
 			return false;
 		}
 		if (!write_code(g.setup_call, g.saved_setup, 5) || !write_code(g.flush_call, g.saved_flush, 5) || !write_code(g.entry_site, kEntryBytes, 7) ||
-			(g.flare_call != 0 && !write_code(g.flare_call, g.saved_flare, 5)))
+			(g.flare_call != 0 && !write_code(g.flare_call, g.saved_flare, 5)) ||
+			(g.glyph_bind_call != 0 && (!write_code(g.glyph_bind_call, g.saved_bind, 5) || !write_code(g.glyph_draw_call, g.saved_glyph, 5))))
 		{
 			why = "couldn't write the game's code";
 			return false;
@@ -2170,9 +2958,9 @@ namespace hifi::game::fxdraw
 		uint64_t taken = 0;
 		for (const uint64_t t : g.n.taken)
 			taken += t;
-		char line[1000];
+		char line[1400];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), specular %llu, battle numbers %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
@@ -2182,7 +2970,10 @@ namespace hifi::game::fxdraw
 			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]), static_cast<unsigned long long>(g.n.taken[fx::class_vuanm]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_morph]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_dist]), static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_dist]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_model]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_dist_morph]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_ring]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_spec]), static_cast<unsigned long long>(g.n.taken[fx::class_number]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
 			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
@@ -2215,6 +3006,16 @@ namespace hifi::game::fxdraw
 		s.dist_draw = g.dist_draw;
 		s.vudist_draw = g.vudist_draw;
 		s.dist_app = g.dist_app;
+		s.distmodel_draw = g.distmodel_draw;
+		s.distmorph_draw = g.distmorph_draw;
+		s.distring_draw = g.distring_draw;
+		s.spec_draw = g.spec_draw;
+		s.spec_cubemap = g.spec_cubemap;
+		s.number_draw = g.number_draw;
+		s.glyph_bind_call = g.glyph_bind_call;
+		s.glyph_bind = g.glyph_bind;
+		s.glyph_draw_call = g.glyph_draw_call;
+		s.glyph_draw = g.glyph_draw;
 		s.flare_call = g.flare_call;
 		s.flare_pieces = g.flare_pieces;
 		s.flare_textures = g.flare_textures;
@@ -2246,5 +3047,11 @@ namespace hifi::game::fxdraw
 	void set_setup(uintptr_t setup)
 	{
 		g.setup = setup;
+	}
+
+	void set_glyph_calls(uintptr_t bind, uintptr_t draw)
+	{
+		g.glyph_bind = bind;
+		g.glyph_draw = draw;
 	}
 }

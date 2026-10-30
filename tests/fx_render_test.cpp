@@ -910,6 +910,217 @@ int main(int argc, char **argv)
 			da->Release();
 		}
 
+		// The 042D00 distortions by value: the world red left of x 36, blue right, green above y 16; each element grabs the
+		// whole world flipped (as 042D00: (0, 0) .. (256, 256) from (-0.5/64, 63.5/64) .. (63.5/64, -0.5/64)) and draws a
+		// band of the screen whose UVs are 042D00's ((x + 0.5) / 64, (63.5 - y) / 64) of a point 16 pixels to the left (and,
+		// for the mesh, 16 up). The mesh (rows 16-40, 352740: colour the target's, alpha CURRENT x TFACTOR x 2 x the target's
+		// 0x80 x 4: full; WRAP): at (40, 24) green (from (24, 8)), at (40, 36) red, at (60, 36) blue, at (8, 36) blue (from
+		// x -8, wrapped); the ring (rows 40-64, 353378: colour vertex 0x80 x 2 x the target's, alpha 0x80 x 0x80 x 4: full;
+		// MIRROR): at (40, 50) red, at (8, 50) red (x -8 mirrored), at (60, 50) blue
+		{
+			fx::frame &fd = fx::frame_slot(++seq);
+			fd.seq.store(0);
+			fd.element_count = fd.draw_count = fd.vertex_count = fd.light_count = fd.grab_count = 0;
+			std::memcpy(fd.proj, id, 64);
+			const float rows[2][2] = { { 16, 40 }, { 40, 64 } };
+			for (int k = 0; k < 2; ++k)
+			{
+				fx::element e;
+				std::memcpy(e.world, id, 64);
+				e.tfactor = 0x80FFFFFFu;
+				e.blend = fx::blend_alpha;
+				e.cls = k == 0 ? fx::class_dist_model : fx::class_dist_ring;
+				e.first_draw = fd.draw_count;
+				e.draws = 1;
+				fx::grab &gr = fd.grabs[fd.grab_count];
+				const float pos[4][2] = { { 0, 0 }, { 256, 0 }, { 0, 256 }, { 256, 256 } };
+				const float uv[4][2] = { { -0.5f / 64, 63.5f / 64 }, { 63.5f / 64, 63.5f / 64 }, { -0.5f / 64, -0.5f / 64 }, { 63.5f / 64, -0.5f / 64 } };
+				std::memcpy(gr.pos, pos, sizeof(pos));
+				std::memcpy(gr.uv, uv, sizeof(uv));
+				fx::draw dr;
+				dr.first = fd.vertex_count;
+				dr.count = 6;
+				dr.texture = fx::kDistTexture;
+				dr.stages = k == 0 ? fx::stage_dist_model : fx::stage_dist_ring;
+				dr.grab = fd.grab_count++;
+				const float corner[6][2] = { { 0, rows[k][0] }, { 64, rows[k][0] }, { 0, rows[k][1] }, { 0, rows[k][1] }, { 64, rows[k][0] }, { 64, rows[k][1] } };
+				for (const auto &c : corner)
+				{
+					fx::vertex v = {};
+					v.pos[0] = c[0] / 32.0f - 1.0f;
+					v.pos[1] = 1.0f - c[1] / 32.0f;
+					v.pos[2] = 0.5f;
+					v.colour = k == 0 ? 0xFFFFFFFFu : 0x80808080u;
+					v.uv[0] = (c[0] - 16.0f + 0.5f) / 64.0f;
+					v.uv[1] = (63.5f - (c[1] - (k == 0 ? 16.0f : 0.0f))) / 64.0f;
+					fd.vertices[fd.vertex_count++] = v;
+				}
+				fd.draws[fd.draw_count++] = dr;
+				fd.elements[fd.element_count++] = e;
+			}
+			fd.run_list[0] = { 0, 2 };
+			fd.runs.store(1);
+			fd.seq.store(seq);
+			ID3D12CommandAllocator *da = nullptr;
+			ID3D12GraphicsCommandList *dl = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&da));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, da, nullptr, IID_PPV_ARGS(&dl));
+			barrier(dl, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const float red[4] = { 1, 0, 0, 1 }, blue[4] = { 0, 0, 1, 1 }, green[4] = { 0, 1, 0, 1 };
+			const D3D12_RECT left = { 0, 0, 36, LONG(H) }, right = { 36, 0, LONG(W), LONG(H) }, top = { 0, 0, LONG(W), 16 };
+			dl->ClearRenderTargetView(rtv, red, 1, &left);
+			dl->ClearRenderTargetView(rtv, blue, 1, &right);
+			dl->ClearRenderTargetView(rtv, green, 1, &top);
+			dl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			dl->SetDescriptorHeaps(1, &game_heap);
+			grass::list_state dbound;
+			hifi::passes::world dw;
+			dw.rt = A;
+			dw.ds = Az;
+			dw.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			dw.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			dw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			dw.planes_known = true;
+			dw.ds_planes[0] = dw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			dw.heap_count = 1;
+			dw.heaps[0] = game_heap;
+			fx::inject::on_run(dl, dbound, dw, seq & 15);
+			barrier(dl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION ddst = {}, dsrc = {};
+			ddst.pResource = back;
+			ddst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			ddst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+			dsrc.pResource = A;
+			dsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dl->CopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
+			dl->Close();
+			ID3D12CommandList *dls[] = { dl };
+			queue->ExecuteCommandLists(1, dls);
+			queue->Signal(fence, ++fence_value);
+			HANDLE dev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, dev_);
+			WaitForSingleObject(dev_, 60000);
+			CloseHandle(dev_);
+			uint8_t *dp = nullptr;
+			back->Map(0, nullptr, reinterpret_cast<void **>(&dp));
+			const auto at_px = [&](int x, int y) { return dp + y * 256 + x * 4; };
+			const auto is = [&](int x, int y, int r, int g, int b) {
+				const uint8_t *p = at_px(x, y);
+				return std::abs(p[0] - r) <= 8 && std::abs(p[1] - g) <= 8 && std::abs(p[2] - b) <= 8;
+			};
+			const bool mesh_ok = is(40, 24, 0, 255, 0) && is(40, 36, 255, 0, 0) && is(60, 36, 0, 0, 255) && is(8, 36, 0, 0, 255);
+			const bool ring_ok = is(40, 50, 255, 0, 0) && is(8, 50, 255, 0, 0) && is(60, 50, 0, 0, 255);
+			char dline[300];
+			std::snprintf(dline, sizeof(dline),
+				"the 042D00 distortions: the mesh (40, 24) %d %d %d (want green), (8, 36) %d %d %d (want blue: WRAP); the ring (40, 50) %d %d %d (want red), (8, 50) %d %d %d (want red: MIRROR)",
+				at_px(40, 24)[0], at_px(40, 24)[1], at_px(40, 24)[2], at_px(8, 36)[0], at_px(8, 36)[1], at_px(8, 36)[2], at_px(40, 50)[0], at_px(40, 50)[1], at_px(40, 50)[2], at_px(8, 50)[0], at_px(8, 50)[1], at_px(8, 50)[2]);
+			check(mesh_ok && ring_ok, dline);
+			back->Unmap(0, nullptr);
+			const fx::inject::counts dc = fx::inject::get_counts();
+			std::string dfirst;
+			const uint32_t dmessages = debug_messages(info, dfirst);
+			check(dmessages == 0 && dc.failed == 0, "the 042D00 distortions: the debug layer: nothing (" + std::to_string(dmessages) + (dmessages != 0 ? ": " + dfirst : std::string()) + ")");
+			dl->Release();
+			da->Release();
+		}
+
+		// A specular D3M's stages by value (3528F0, untextured): two quads facing the camera (camera-space normal (0, 0,
+		// 1)), the environment the white 1x1 (no texture of its own), ONE / ZERO: vertex 0x40202020, TFACTOR 0x80808080:
+		// CURRENT x TFACTOR x 2 = 0x20 x 1.004, alpha 0x40 x 0x80 x 4 = 0.502; + 0.502 x the environment: 160 on the left;
+		// the right with the tint 0x80404040 (the environment x 0x40 x 2 = 0.502): 96
+		{
+			fx::frame &fs = fx::frame_slot(++seq);
+			fs.seq.store(0);
+			fs.element_count = fs.draw_count = fs.vertex_count = fs.light_count = fs.grab_count = 0;
+			std::memcpy(fs.proj, id, 64);
+			for (int k = 0; k < 2; ++k)
+			{
+				fx::element e;
+				std::memcpy(e.world, id, 64);
+				e.tfactor = 0x80808080u;
+				e.blend = fx::blend_one_zero;
+				e.cls = fx::class_spec;
+				e.first_draw = fs.draw_count;
+				e.draws = 1;
+				fx::lighting &l = fs.lights[fs.light_count];
+				l = fx::lighting();
+				for (int i = 0; i < 3; ++i)
+					l.normal[i][i] = 1.0f;
+				l.toward[0][0] = 1.0f; // (u = n.x, v = n.y: the middle of the white texel)
+				l.toward[1][1] = 1.0f;
+				l.diffuse[0][0] = l.diffuse[0][1] = l.diffuse[0][2] = 64.0f / 255.0f;
+				l.diffuse[0][3] = 128.0f / 255.0f;
+				e.spec = fs.light_count++;
+				const float x0 = k == 0 ? -1.0f : 0.0f, x1 = k == 0 ? 0.0f : 1.0f;
+				const float c[6][2] = { { x0, -1 }, { x1, -1 }, { x0, 1 }, { x0, 1 }, { x1, -1 }, { x1, 1 } };
+				fs.draws[fs.draw_count++] = { fs.vertex_count, 6, fx::kNone, fx::stage_spec | (k == 1 ? fx::stage_spec_tint : 0u) };
+				for (const auto &p : c)
+				{
+					fx::vertex v = {};
+					v.pos[0] = p[0];
+					v.pos[1] = p[1];
+					v.pos[2] = 0.5f;
+					v.normal[2] = 1.0f;
+					v.colour = 0x40202020u;
+					fs.vertices[fs.vertex_count++] = v;
+				}
+				fs.elements[fs.element_count++] = e;
+			}
+			fs.run_list[0] = { 0, 2 };
+			fs.runs.store(1);
+			fs.seq.store(seq);
+			ID3D12CommandAllocator *sa = nullptr;
+			ID3D12GraphicsCommandList *sl = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&sa));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sa, nullptr, IID_PPV_ARGS(&sl));
+			barrier(sl, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const float none[4] = { 0, 0, 0, 0 };
+			sl->ClearRenderTargetView(rtv, none, 0, nullptr);
+			sl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			sl->SetDescriptorHeaps(1, &game_heap);
+			grass::list_state sbound;
+			hifi::passes::world sw;
+			sw.rt = A;
+			sw.ds = Az;
+			sw.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sw.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			sw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			sw.planes_known = true;
+			sw.ds_planes[0] = sw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			sw.heap_count = 1;
+			sw.heaps[0] = game_heap;
+			fx::inject::on_run(sl, sbound, sw, seq & 15);
+			barrier(sl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION sdst = {}, ssrc = {};
+			sdst.pResource = back;
+			sdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			sdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+			ssrc.pResource = A;
+			ssrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			sl->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
+			sl->Close();
+			ID3D12CommandList *sls[] = { sl };
+			queue->ExecuteCommandLists(1, sls);
+			queue->Signal(fence, ++fence_value);
+			HANDLE sev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, sev);
+			WaitForSingleObject(sev, 60000);
+			CloseHandle(sev);
+			uint8_t *sp = nullptr;
+			back->Map(0, nullptr, reinterpret_cast<void **>(&sp));
+			const uint8_t *lft = sp + 32 * 256 + 10 * 4, *rgt = sp + 32 * 256 + 50 * 4;
+			char sline[200];
+			std::snprintf(sline, sizeof(sline), "a specular D3M's stages: %d %d %d on the left (want 160, within 2), %d %d %d tinted on the right (want 96)", lft[0], lft[1], lft[2], rgt[0],
+				rgt[1], rgt[2]);
+			check(std::abs(lft[0] - 160) <= 2 && std::abs(lft[2] - 160) <= 2 && std::abs(rgt[0] - 96) <= 2 && std::abs(rgt[2] - 96) <= 2, sline);
+			back->Unmap(0, nullptr);
+			std::string sfirst;
+			const uint32_t smessages = debug_messages(info, sfirst);
+			check(smessages == 0, "a specular D3M's stages: the debug layer: nothing (" + std::to_string(smessages) + (smessages != 0 ? ": " + sfirst : std::string()) + ")");
+			sl->Release();
+			sa->Release();
+		}
+
 		// A lens flare's pieces by value (3520A8, pre-transformed): a quad over the left half in the game's pixels (WORLD
 		// pixels to clip space, PROJECTION identity), untextured (white), vertex colour 0x40804020, TFACTOR alpha 0x80,
 		// SRCALPHA / ONE on black: colour 0x80 0x40 0x20 x 2, alpha 0x40 x 2 x 0x80 x 2 (0.504): 128 64 32; the right half

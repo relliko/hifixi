@@ -501,6 +501,8 @@ namespace
 		check(s.lights == base + 0x4572B8 && s.ambient == base + 0x4571D8, "  the lights table at +4572B8, AMBIENT at +4571D8");
 		check(s.tfactor == base + 0x4574AC && s.renderer == base + 0x631F24, "  the colour factor at +4574AC, the renderer at +631F24");
 		check(s.device == base + 0x45666C, "  the device wrapper at +45666C");
+		check(s.aura_config == base + 0x193850 && s.aura_small == base + 0x47B958 && s.aura_second == base + 0x456D50 && s.aura_step == base + 0x014CF0,
+			"  the aura ring's (038E10): the config getter 193850, the 256 x 256 target +47B958, the second target +456D50, the frame step 014CF0");
 		check(site[0] == 0xE9 && s.site + 5 + *reinterpret_cast<const int32_t *>(site + 1) == s.stub, "  02B7E3: jmp the stub");
 		check(differences(path, base, size) <= 13, "  nothing else changed (" + std::to_string(differences(path, base, size)) + " bytes: the site's 5, charslot's 8)");
 		check(std::memcmp(reinterpret_cast<const uint8_t *>(s.stub + 0x15), kept, 2) == 0 && reinterpret_cast<const uint8_t *>(s.stub + 0x15)[0] == 0xB9,

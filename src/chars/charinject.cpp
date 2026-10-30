@@ -40,6 +40,7 @@ namespace hifi::chars::inject
 			std::mutex mutex;
 			ID3D12Device *device = nullptr;
 			std::unique_ptr<char_renderer> renderer; // (made and let go outside the mutex: see prepare)
+			std::unique_ptr<aura_ring> aura;         // (a see-through model's aura ring: made with it)
 			std::atomic<bool> per_pixel { false };
 			// Toward the zone's sun (set_sun: the plugin's, from the zone pass), for the light split's share
 			std::mutex sun_mutex;
@@ -401,13 +402,21 @@ namespace hifi::chars::inject
 		auto made = std::make_unique<char_renderer>();
 		if (!made->init(device, why))
 			return false;
+		// (the aura ring's: without it, no aura; the models still drawn)
+		auto made_aura = std::make_unique<aura_ring>();
+		std::string aura_why;
+		if (!made_aura->init(device, aura_why))
+			made_aura.reset();
 		std::unique_ptr<char_renderer> old;
+		std::unique_ptr<aura_ring> old_aura;
 		ID3D12DescriptorHeap *rtv = nullptr, *dsv = nullptr;
 		ID3D12Resource *t = nullptr, *scene = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			old = std::move(g.renderer);
 			g.renderer = std::move(made);
+			old_aura = std::move(g.aura);
+			g.aura = std::move(made_aura);
 			rtv = g.rtv_heap;
 			dsv = g.dsv_heap;
 			t = g.t;
@@ -428,6 +437,7 @@ namespace hifi::chars::inject
 	{
 		light::release(); // (both passes' target: let go with either)
 		std::unique_ptr<char_renderer> old;
+		std::unique_ptr<aura_ring> old_aura;
 		ID3D12DescriptorHeap *rtv = nullptr, *dsv = nullptr;
 		ID3D12Resource *t = nullptr, *scene = nullptr;
 		{
@@ -439,6 +449,7 @@ namespace hifi::chars::inject
 			g.motion_old.clear();
 			g.motion_state = D3D12_RESOURCE_STATE_COMMON;
 			old = std::move(g.renderer);
+			old_aura = std::move(g.aura);
 			rtv = g.rtv_heap;
 			dsv = g.dsv_heap;
 			t = g.t;
@@ -488,8 +499,9 @@ namespace hifi::chars::inject
 			static_cast<unsigned long long>(g.n.caster_frames), static_cast<unsigned long long>(g.n.caster_models),
 			g.n.caster_frames == 0 ? " (none yet: needs World FX's sun shadow map and Characters cast sun shadows)" : "");
 		lines.push_back(line);
-		std::snprintf(line, sizeof(line), "native character renderer: extra passes: %llu overlays, %llu cloaks drawn (%llu scene copies couldn't be made)",
-			static_cast<unsigned long long>(g.n.overlays), static_cast<unsigned long long>(g.n.cloaks), static_cast<unsigned long long>(g.n.cloak_failed));
+		std::snprintf(line, sizeof(line), "native character renderer: extra passes: %llu overlays, %llu cloaks drawn (%llu scene copies couldn't be made); %llu aura rings drawn (%llu couldn't be)",
+			static_cast<unsigned long long>(g.n.overlays), static_cast<unsigned long long>(g.n.cloaks), static_cast<unsigned long long>(g.n.cloak_failed),
+			static_cast<unsigned long long>(g.n.auras), static_cast<unsigned long long>(g.n.aura_failed));
 		lines.push_back(line);
 		return lines;
 	}
@@ -741,6 +753,16 @@ namespace hifi::chars::inject
 		barrier(list, g.t, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		g.t_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		// (its aura ring first, as 038A80 / 038E10 before 01D3B0: model_entry::aura, chardraw.hpp aura_ring)
+		if (m.aura != 0)
+		{
+			D3D12_CPU_DESCRIPTOR_HANDLE a_cpu;
+			D3D12_GPU_DESCRIPTOR_HANDLE a_gpu;
+			if (g.aura && cache::reserved(2, a_cpu, a_gpu) && g.aura->record(list, target_of(w, rtv, dsv), cache::heap(), t_srv, a_cpu, a_gpu, m))
+				g.n.auras++;
+			else
+				g.n.aura_failed++;
+		}
 		g.renderer->record_composite(list, target_of(w, rtv, dsv), t_srv, m.colour);
 		take_snapshot(list, w);
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);

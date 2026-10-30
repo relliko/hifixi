@@ -1012,6 +1012,163 @@ int main()
 			ok = g_markers == 1 && g_seen.setups == 0 && fa != nullptr && fa->element_count == 1 && fa->grab_count == 3 && fa->elements[0].draws == 3 &&
 				fa->draws[fa->elements[0].first_draw + 2].grab == 2 && get<float>(ev + 0x19C) == 1.5f;
 			check(ok, name + ": CMoVuDist: the game's walk counted 3 points: three grabs and quads, its clock moved on by gfx +0xEB0");
+
+			// The 042D00 distortions (043320, 043590, 043720): every vertex's UV its screen point by the game's math vt+0x84
+			// ((x + 0.5) / 640, (479.5 - y) / 480; checked against the projection by hand), the grab the whole world flipped
+			// (0 0 / 256 0 / 0 256 / 256 256 from (-0.5/640, 479.5/480) .. (639.5/640, -0.5/480)). The mesh (Fire's 'fa04'):
+			// its UVs from the vertices moved by +0x194 in x and y, drawn at the plain draw matrix, 352740's stages; the morph
+			// ('rng ' at 1:3): UVs from the blend's positions, the colours as they are, WORLD moved by +0x1C0, the morph's
+			// stages; the rings (8 segments, 3 rings): 2 bands of 16 triangles, the colours x VA 0490BC0C >> 7, 353378's
+			// stages; a lit ring the game's; the mesh without the world's texture taken with nothing drawn
+			{
+				check(s.distmodel_draw == base + 0x043320 && s.distmorph_draw == base + 0x043590 && s.distring_draw == base + 0x043720,
+					name + ": CMoDistModelElem 043320, CMoDistMorphElem 043590, CMoDistRingElem 043720");
+				const auto screen_uv = [](const float *wm, const float p[3], float &u, float &v) {
+					const float x = p[0] * wm[0] + p[1] * wm[4] + p[2] * wm[8] + wm[12], y = p[0] * wm[1] + p[1] * wm[5] + p[2] * wm[9] + wm[13];
+					const float z = p[0] * wm[2] + p[1] * wm[6] + p[2] * wm[10] + wm[14];
+					const float w = std::fabs(-z);
+					u = ((x * 1.5f / w + 1.0f) * 320.0f + 0.5f) / 640.0f;
+					v = (479.5f - (1.0f - y * 2.0f / w) * 240.0f) / 480.0f;
+				};
+				const auto full_grab = [](const fx::grab &gr) {
+					const float pos[4][2] = { { 0, 0 }, { 256, 0 }, { 0, 256 }, { 256, 256 } };
+					const float uv[4][2] = { { -0.5f / 640, 479.5f / 480 }, { 639.5f / 640, 479.5f / 480 }, { -0.5f / 640, -0.5f / 480 }, { 639.5f / 640, -0.5f / 480 } };
+					bool ok = true;
+					for (int k = 0; k < 4; ++k)
+						ok = ok && gr.pos[k][0] == pos[k][0] && gr.pos[k][1] == pos[k][1] && std::fabs(gr.uv[k][0] - uv[k][0]) < 1e-6f && std::fabs(gr.uv[k][1] - uv[k][1]) < 1e-6f;
+					return ok;
+				};
+				const uintptr_t vt_dm = take(0x100), vt_dmo = take(0x100), vt_dr = take(0x100);
+				for (const uintptr_t vt : { vt_dm, vt_dmo, vt_dr })
+				{
+					put<uint32_t>(vt + 0x2C, uint32_t(s.element_draw));
+					put<uint32_t>(vt + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+				}
+				put<uint32_t>(vt_dm + 0x48, uint32_t(s.distmodel_draw));
+				put<uint32_t>(vt_dmo + 0x48, uint32_t(s.distmorph_draw));
+				put<uint32_t>(vt_dr + 0x48, uint32_t(s.distring_draw));
+				const auto run_one = [&](uintptr_t e) {
+					put<uint32_t>(node9 + 0xC, uint32_t(e));
+					g_seen = seen();
+					g_markers = 0;
+					reinterpret_cast<flush_fn>(s.code)(list9, 0);
+					return fx::published(g_last_seq);
+				};
+				// The mesh
+				const uintptr_t edm = element(vt_dm, textured_res, 0x48, 0, 0x80406080, -4.0f);
+				put<float>(edm + 0x194, 0.1f);
+				put<uint32_t>(app + 0x194, 0);
+				run_one(edm);
+				check(g_markers == 0 && g_seen.setups == 0, name + ": a distortion mesh without the world's texture: taken, nothing drawn");
+				put<uint32_t>(app + 0x194, 0x1234);
+				const fx::frame *fm = run_one(edm);
+				ok = g_markers == 1 && g_seen.setups == 0 && fm != nullptr && fm->element_count == 1 && fm->grab_count == 1;
+				worst = 0.0f;
+				if (ok)
+				{
+					const fx::element &d = fm->elements[0];
+					const fx::draw &dr = fm->draws[d.first_draw];
+					const uint32_t want_stages = fx::stage_dist_model | ((textured[2] & 1) != 0 ? fx::stage_alpha_test : 0u);
+					ok = d.cls == fx::class_dist_model && d.draws == 1 && dr.count == 6 && dr.texture == fx::kDistTexture && dr.stages == want_stages && dr.grab == 0 &&
+						d.blend == fx::blend_add && d.tfactor == 0x80406080u && d.world[12] == 0.5f && full_grab(fm->grabs[0]);
+					const size_t at_vertices = geo::d3m_vertices_at(textured.data());
+					for (uint32_t i = 0; ok && i < 6; ++i)
+					{
+						const fx::vertex &v = fm->vertices[dr.first + i];
+						fx::vertex src;
+						std::memcpy(&src, textured.data() + at_vertices + 36 * i, 36);
+						const float p[3] = { src.pos[0] + 0.1f, src.pos[1] + 0.1f, src.pos[2] };
+						float u, vv;
+						screen_uv(d.world, p, u, vv);
+						ok = std::memcmp(v.pos, src.pos, 12) == 0 && v.colour == src.colour;
+						worst = std::max({ worst, std::fabs(v.uv[0] - u) * 640.0f, std::fabs(v.uv[1] - vv) * 480.0f });
+					}
+					ok = ok && worst < 0.01f;
+				}
+				check(ok, name + ": a distortion mesh: its 6 vertices' UVs from the game's vt+0x84 through the draw matrix moved by +0x194, the whole world grabbed (worst " +
+					std::to_string(worst) + " px)");
+				// The morph
+				std::vector<uint8_t> mp;
+				geo::morph gm;
+				check(chunk("ROM3\\9\\111.DAT", 0x25, "rng ", mp) && geo::parse_morph(mp.data(), mp.size(), gm, why), name + ": the morph chunk read again");
+				const uintptr_t dmorph_res = resource(mp, 0x25);
+				const uintptr_t edmo = element(vt_dmo, dmorph_res, 0x48, 0, 0x80808080, -6.0f);
+				const float wts[5] = { 1.0f, 3.0f, 0, 0, 0 };
+				std::memcpy(reinterpret_cast<void *>(edmo + 0x194), wts, 20);
+				put<float>(edmo + 0x1C0, 0.2f);
+				const fx::frame *fo = run_one(edmo);
+				ok = g_markers == 1 && g_seen.setups == 0 && fo != nullptr && fo->element_count == 1 && fo->grab_count == 1 && get<float>(edmo + 0x1AC) == 3.0f &&
+					get<uint32_t>(edmo + 0x1BC) == 0;
+				worst = 0.0f;
+				if (ok)
+				{
+					const fx::element &d = fo->elements[0];
+					const fx::draw &dr = fo->draws[d.first_draw];
+					std::vector<fx::vertex> want;
+					gm.blend(wts, want);
+					ok = d.cls == fx::class_dist_morph && dr.count == want.size() && dr.texture == fx::kDistTexture && dr.stages == fx::stage_texture && full_grab(fo->grabs[0]) &&
+						std::fabs(d.world[12] - 0.7f) < 1e-6f && std::fabs(d.world[13] + 0.05f) < 1e-6f;
+					// (the plain draw matrix: WORLD less the shift)
+					float unshifted[16];
+					std::memcpy(unshifted, d.world, 64);
+					unshifted[12] -= 0.2f;
+					unshifted[13] -= 0.2f;
+					// (each corner's colour the chunk's as it is: the doubled one halved back, as gm.blend doubles them)
+					for (size_t i = 0; ok && i < want.size(); ++i)
+					{
+						const fx::vertex &v = fo->vertices[dr.first + i];
+						float u, vv;
+						screen_uv(unshifted, v.pos, u, vv);
+						for (int c = 0; c < 3; ++c)
+							ok = ok && std::fabs(v.pos[c] - want[i].pos[c]) < 1e-4f;
+						for (int k = 0; k < 4; ++k)
+						{
+							const uint32_t raw = (v.colour >> (8 * k)) & 0xFF, doubled = (want[i].colour >> (8 * k)) & 0xFF;
+							ok = ok && std::min(raw * 2, 0xFFu) == doubled;
+						}
+						worst = std::max({ worst, std::fabs(v.uv[0] - u) * 640.0f, std::fabs(v.uv[1] - vv) * 480.0f });
+					}
+					ok = ok && worst < 0.01f;
+				}
+				check(ok, name + ": a distortion morph: its 360 corners blended 1:3, their UVs their positions' screen points, the colours not doubled, WORLD moved by +0x1C0; "
+					"the weights kept, +0x1BC cleared (worst " + std::to_string(worst) + " px)");
+				// The rings
+				const uintptr_t edr = element(vt_dr, 0, 0x48, 0, 0x80406080, -4.0f);
+				put<int8_t>(edr + 0x1B4, 8);
+				put<int8_t>(edr + 0x1B5, 3);
+				const float radii[3] = { 0.5f, 1.0f, 1.5f };
+				std::memcpy(reinterpret_cast<void *>(edr + 0x194), radii, 12);
+				const uint8_t ring_col[3][4] = { { 0xFF, 0x80, 0x40, 0xC0 }, { 0x80, 0x80, 0x80, 0x80 }, { 0x10, 0x20, 0x30, 0xFF } };
+				std::memcpy(reinterpret_cast<void *>(edr + 0x1A4), ring_col, 12);
+				const fx::frame *fr = run_one(edr);
+				ok = g_markers == 1 && g_seen.setups == 0 && fr != nullptr && fr->element_count == 1 && fr->grab_count == 1;
+				worst = 0.0f;
+				if (ok)
+				{
+					const fx::element &d = fr->elements[0];
+					const fx::draw &dr = fr->draws[d.first_draw];
+					const fx::vertex *v = fr->vertices + dr.first;
+					// (0x80406080: R 0x40, G 0x60, B 0x80, A 0x80; ring 0 R 0xFF G 0x80 B 0x40 A 0xC0 -> 0x7F 0x60 0x40 0xC0;
+					// ring 2 0x10 0x20 0x30 0xFF -> 0x08 0x18 0x30 0xFF)
+					ok = d.cls == fx::class_dist_ring && dr.count == 96 && dr.texture == fx::kDistTexture && dr.stages == fx::stage_dist_ring && full_grab(fr->grabs[0]) &&
+						v[0].colour == 0xC07F6040u && v[1].colour == 0x80406080u && v[0].pos[1] == 0.5f && v[1].pos[1] == 1.0f && v[0].pos[0] == 0.0f &&
+						v[48].colour == 0x80406080u && v[49].colour == 0xFF081830u;
+					const float s45 = std::sin(6.283184f / 8.0f);
+					ok = ok && std::fabs(v[2].pos[0] - s45 * 0.5f) < 1e-6f && v[47].pos[1] == 1.0f && v[47].pos[0] == 0.0f;
+					for (uint32_t i = 0; i < 96; ++i)
+					{
+						float u, vv;
+						screen_uv(d.world, v[i].pos, u, vv);
+						worst = std::max({ worst, std::fabs(v[i].uv[0] - u) * 640.0f, std::fabs(v[i].uv[1] - vv) * 480.0f });
+					}
+					ok = ok && worst < 0.01f;
+				}
+				check(ok, name + ": distortion rings: 2 bands of 16 triangles (angles 0 .. 7d, then 0), the colours x the element's >> 7, UVs their screen points (worst " +
+					std::to_string(worst) + " px)");
+				put<uint32_t>(edr + 0x10C, 1u << 16);
+				run_one(edr);
+				check(g_seen.setups == 1, name + ": a lit distortion ring left to the game (its normals aren't written)");
+			}
 			put<uint32_t>(s.dist_app, app_kept);
 		}
 
@@ -1065,6 +1222,166 @@ int main()
 			}
 			check(ok, name + ": a lens flare's 108 vertices placed as 03EBF0 places them (light to its mirror by t), alpha x visibility, its texture by name");
 			put<uint32_t>(s.flare_textures, mgr_kept);
+			put<uint32_t>(s.colour, colour_kept);
+		}
+
+		// A specular D3M (0412B0, its pre-draw's fields set by hand): Fire's 'fa04' with the global environment (VA
+		// 0490BB90: the same texture object): the two-stage table, the environment's id, its record (the normals' rows
+		// WORLD's inverse transposed, the texture matrix's columns 0 and 1 from the game's math vt+0x58 of (0, -pi/2, 0));
+		// then +0x198 bits 0 and 3 (its own angles, CLAMP) and +0x1AC 0xC0FF8040 (x 0x80808080 / 128: a tint); with three
+		// stages but the environment at stage 1, the game's
+		{
+			check(s.spec_draw == base + 0x0412B0 && s.spec_cubemap == base + 0x47BB90, name + ": the specular D3M 0412B0, the global environment VA +47BB90");
+			const uintptr_t vt_spec = take(0x100);
+			put<uint32_t>(vt_spec + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_spec + 0x48, uint32_t(s.spec_draw));
+			put<uint32_t>(vt_spec + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			// (math vt+0x58 06DCF0 builds its three rotations in statics, each made the first time with the game's own atexit:
+			// not up here, so they're made by hand as 06DCF0 makes them, identity, and their guard set; put back after)
+			std::vector<uint8_t> statics(0x47CE60 - 0x47CBB0);
+			std::memcpy(statics.data(), reinterpret_cast<const void *>(base + 0x47CBB0), statics.size());
+			for (const uintptr_t rot : { 0x47CBB0u, 0x47CBF0u, 0x47CE20u })
+				identity(base + rot);
+			put<uint8_t>(base + 0x47CCC0, uint8_t(get<uint8_t>(base + 0x47CCC0) | 7));
+			const uint32_t cube_kept = get<uint32_t>(s.spec_cubemap);
+			put<uint32_t>(s.spec_cubemap, uint32_t(tex_object));
+			put<uint32_t>(tex_object + 0x40, 0x5678);
+			const uintptr_t es = element(vt_spec, textured_res, 0x48, 1u << 25, 0x80808080, -5.0f);
+			put<uint8_t>(es + 0x1BD, 1);
+			put<uint32_t>(es + 0x1AC, 0x80808080u);
+			const uintptr_t list_s = take(16), node_s = take(32);
+			put<uint32_t>(node_s + 4, 0);
+			put<uint32_t>(node_s + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node_s + 0xC, uint32_t(es));
+			put<uint32_t>(list_s + 4, uint32_t(node_s));
+			put<uint32_t>(list_s + 8, 0);
+			const auto run_spec = [&]() {
+				g_seen = seen();
+				g_markers = 0;
+				reinterpret_cast<flush_fn>(s.code)(list_s, 0);
+				return fx::published(g_last_seq);
+			};
+			using euler_fn = void(__fastcall *)(uintptr_t, uintptr_t, float *, float, float, float);
+			const auto euler = reinterpret_cast<euler_fn>(uintptr_t(get<uint32_t>(get<uint32_t>(address(math)) + 0x58)));
+			const auto columns_are = [&](const fx::lighting &l, const float *tm) {
+				bool same = true;
+				for (int r = 0; r < 4; ++r)
+					same = same && std::fabs(l.toward[0][r] - tm[4 * r]) < 1e-6f && std::fabs(l.toward[1][r] - tm[4 * r + 1]) < 1e-6f;
+				return same;
+			};
+			const fx::frame *fs = run_spec();
+			bool ok = g_markers == 1 && g_seen.setups == 0 && fs != nullptr && fs->element_count == 1;
+			if (ok)
+			{
+				const fx::element &d = fs->elements[0];
+				const fx::draw &dr = fs->draws[d.first_draw];
+				alignas(16) float tm[16];
+				euler(address(math), 0, tm, 0.0f, -1.5707964f, 0.0f);
+				const fx::lighting &l = fs->lights[d.spec];
+				ok = d.cls == fx::class_spec && d.env != fx::kNone && d.env == dr.texture && dr.stages == (fx::stage_spec | fx::stage_texture) && dr.count == 6 &&
+					d.tfactor == 0x80808080u && d.light == fx::kNone && d.fog == 0 && columns_are(l, tm) && std::fabs(l.normal[0][0] - 1.0f) < 1e-4f &&
+					std::fabs(l.normal[1][1] - 1.0f) < 1e-4f && std::fabs(tm[0] * tm[0] + tm[1] * tm[1] + tm[2] * tm[2] - 1.0f) < 1e-4f;
+			}
+			check(ok, name + ": a specular D3M: two stages, the environment's texture and record (the normals' rows, the texture matrix's columns), unlit, no fog");
+			put<uint8_t>(es + 0x198, 1 | 8);
+			put<float>(es + 0x19C, 0.25f);
+			put<float>(es + 0x1A0, 0.5f);
+			put<float>(es + 0x1A4, -0.75f);
+			put<uint32_t>(es + 0x1AC, 0xC0FF8040u);
+			put<uint32_t>(es + 0x1A8, 0);
+			const fx::frame *ft = run_spec();
+			ok = g_markers == 1 && ft != nullptr && ft->element_count == 1;
+			if (ok)
+			{
+				const fx::element &d = ft->elements[0];
+				alignas(16) float tm[16];
+				euler(address(math), 0, tm, -0.25f, -(0.5f + 1.5707964f), 0.75f);
+				const fx::lighting &l = ft->lights[d.spec];
+				ok = ft->draws[d.first_draw].stages == (fx::stage_spec | fx::stage_texture | fx::stage_spec_clamp | fx::stage_spec_tint) && columns_are(l, tm) &&
+					l.diffuse[0][0] == 1.0f && std::fabs(l.diffuse[0][1] - 128.0f / 255.0f) < 1e-6f && std::fabs(l.diffuse[0][2] - 64.0f / 255.0f) < 1e-6f &&
+					std::fabs(l.diffuse[0][3] - 192.0f / 255.0f) < 1e-6f;
+			}
+			check(ok, name + ": a specular D3M with its own angles, CLAMP and a tint (0xC0FF8040 x 0x80808080 / 128)");
+			put<uint8_t>(es + 0x1B8, 2);
+			run_spec();
+			check(g_seen.setups == 1, name + ": a three-stage specular D3M with its environment at stage 1 left to the game");
+			put<uint32_t>(s.spec_cubemap, cube_kept);
+			std::memcpy(reinterpret_cast<void *>(base + 0x47CBB0), statics.data(), statics.size());
+			put<uint32_t>(tex_object + 0x40, 0);
+		}
+
+		// A battle number (kind 0x5C, 041AF0 -> 041C20): its setup and class draw left to run (the game's setup called),
+		// 041C20's calls of 1207B0 and 00CD00 patched to on_glyph / on_glyph_draw; two glyphs' quads (FVF 0x144 strips)
+		// recorded into one element, pre-transformed, with the texture object the font's +0x30 (its range +0x38 .. +0x3C);
+		// a glyph whose texture has no Direct3D texture: the run closed, the game's draw
+		{
+			check(s.number_draw == base + 0x041AF0 && s.glyph_bind_call == base + 0x041EBB && s.glyph_bind == base + 0x1207B0 && s.glyph_draw_call == base + 0x041F06 &&
+					s.glyph_draw == base + 0x00CD00 && calls_to(s.glyph_bind_call, address(reinterpret_cast<void *>(&fd::on_glyph))) &&
+					calls_to(s.glyph_draw_call, address(reinterpret_cast<void *>(&fd::on_glyph_draw))),
+				name + ": the battle numbers' 041AF0; 041C20's calls of 1207B0 (041EBB) and 00CD00 (041F06) go to on_glyph / on_glyph_draw");
+			static int game_glyphs = 0;
+			struct stubs
+			{
+				static uint32_t __fastcall bind(uintptr_t, uintptr_t, int32_t, uint32_t *, uint32_t *) { return 1; }
+				static void __fastcall draw(uintptr_t, uintptr_t, uint32_t, uint32_t, const void *, uint32_t) { game_glyphs++; }
+			};
+			game_glyphs = 0;
+			fd::set_glyph_calls(address(reinterpret_cast<void *>(&stubs::bind)), address(reinterpret_cast<void *>(&stubs::draw)));
+			const uintptr_t vt_num = take(0x100), font = take(0x60);
+			put<uint32_t>(vt_num + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_num + 0x48, uint32_t(s.number_draw));
+			put<uint32_t>(font + 0x30, uint32_t(tex_object));
+			put<uint32_t>(font + 0x38, 0x20);
+			put<uint32_t>(font + 0x3C, 0x100);
+			put<uint32_t>(tex_object + 0x40, 0x5678);
+			const uint32_t colour_kept = get<uint32_t>(s.colour);
+			put<uint32_t>(s.colour, 0x80FFFFFFu);
+			const uintptr_t en = element(vt_num, 0, 0x44, 0, 0x80808080, -3.0f);
+			float quad[2][28 / 4];
+			uint8_t verts[2][4 * 0x1C] = {};
+			for (int gl = 0; gl < 2; ++gl)
+				for (int k = 0; k < 4; ++k)
+				{
+					const float v[7] = { 100.0f + 10.0f * gl + 10.0f * (k & 1), 50.0f + 16.0f * (k >> 1), 0.25f, 1.0f, 0, 0.1f * (k & 1), 0.5f * (k >> 1) };
+					std::memcpy(quad[gl], v, sizeof(v));
+					std::memcpy(verts[gl] + 0x1C * k, v, 28);
+					put<uint32_t>(address(verts[gl]) + 0x1C * k + 0x10, 0xC0402010u);
+				}
+			uint32_t colour_arg = 0x80808080u, other = 0;
+			g_seen = seen();
+			g_markers = 0;
+			fd::on_flush(0);
+			fd::on_setup(en, 0, 0xFFFF);
+			for (int gl = 0; gl < 2; ++gl)
+			{
+				fd::on_glyph(font, 0, '5', &colour_arg, &other);
+				fd::on_glyph_draw(address(wrapper), 0, 5, 2, verts[gl], 0x1C);
+			}
+			fd::on_flush(1);
+			const fx::frame *fn = fx::published(g_last_seq);
+			bool ok = g_seen.setups == 1 && game_glyphs == 0 && g_markers == 1 && fn != nullptr && fn->element_count == 1;
+			if (ok)
+			{
+				const fx::element &d = fn->elements[0];
+				const fx::draw &d0 = fn->draws[d.first_draw], &d1 = fn->draws[d.first_draw + 1];
+				const fx::vertex &v0 = fn->vertices[d0.first], &v4 = fn->vertices[d0.first + 4], &w0 = fn->vertices[d1.first];
+				ok = d.cls == fx::class_number && d.draws == 2 && d0.count == 6 && d1.count == 6 && d0.texture != fx::kNone && d0.stages == fx::stage_texture &&
+					d.projection == fx::proj_identity && d.tfactor == 0x80FFFFFFu && d.blend == fx::blend_alpha && d.fog == 0 && v0.pos[0] == 100.0f && v0.pos[1] == 50.0f &&
+					v0.pos[2] == 0.25f && v0.colour == 0xC0402010u && v4.pos[0] == 110.0f && v4.pos[1] == 66.0f && v4.uv[0] == 0.1f && v4.uv[1] == 0.5f && w0.pos[0] == 110.0f &&
+					std::fabs(320.0f * d.world[0] + d.world[12] - 1.0f / 640.0f) < 1e-6f;
+			}
+			check(ok, name + ": a battle number: its setup the game's, its two glyphs' quads recorded into one element (pre-transformed, the font's texture, TEXTUREFACTOR "
+				"VA 0490BC0C, no fog)");
+			put<uint32_t>(tex_object + 0x40, 0);
+			g_seen = seen();
+			g_markers = 0;
+			fd::on_flush(0);
+			fd::on_setup(en, 0, 0xFFFF);
+			fd::on_glyph(font, 0, '5', &colour_arg, &other);
+			fd::on_glyph_draw(address(wrapper), 0, 5, 2, verts[0], 0x1C);
+			fd::on_flush(1);
+			check(game_glyphs == 1, name + ": a glyph without its Direct3D texture: the game's draw");
+			fd::set_glyph_calls(s.glyph_bind, s.glyph_draw);
 			put<uint32_t>(s.colour, colour_kept);
 		}
 
