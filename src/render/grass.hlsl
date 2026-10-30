@@ -2050,7 +2050,10 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	// Lamps lit near (lamp_light): their glow on top, darkened by the ambient occlusion like the rest
 	float3 glow = 0.0;
 	// (where the light split knows the pixel the native passes lit it with the zone's lamps: lamp_light_known)
-	[branch] if (lamps && known)
+	// (off: with the native zone lit by the game's own lamps again, World FX adds its glow as it always has; taking the
+	// lamp's light out of what was drawn blacked out characters at the login screen and in a Mog House, 2026-10-29)
+	static const bool kLampsKnown = false;
+	[branch] if (lamps && known && kLampsKnown)
 	{
 		float3 hidden;
 		glow = lamp_light_known(P, n, col, known_share, hidden) * ao;

@@ -571,7 +571,10 @@ class hifixi final : public IPlugin
 			static_assert(sizeof(hifi::zone::frame_lamp) == sizeof(hifi::chars::char_lamp) && hifi::zone::kMaxLamps == hifi::chars::kFrameLamps);
 			hifi::zone::frame_lamp lamps[hifi::zone::kMaxLamps];
 			const uint32_t lamp_count = known ? hifi::zone::inject::last_lamps(lamps) : 0;
-			hifi::chars::inject::set_lamps(lamp_count != 0 ? &lamps[0].pos[0] : nullptr, lamp_count);
+			// (none handed over for now: with the zone lit by the game's own lamps again, the characters keep the game's lamp
+			// slot too, 2026-10-29)
+			(void)lamp_count;
+			hifi::chars::inject::set_lamps(nullptr, 0);
 		}
 		// (their sun shadows from their meshes: World FX calls for them in its shading pass, once its renderer is up)
 		if (!m_casters_set && hifi::chars::inject::ready())

@@ -24,9 +24,13 @@ float3 hemi_ambient(float3 a, float3 n, float below, float above, float tint, fl
 
 // The sun's highlight (Blinn-Phong, kept to its energy: a sharper one is brighter, not wider), added after the
 // texture: n the surface's facing, to_sun and to_eye toward the sun and the camera (world, any length), sun its colour;
-// power how sharp, strength how much at a full one. None where the surface faces away from either.
+// power how sharp, strength how much at a full one. None where the surface faces away from either, nor where the sun or
+// the camera has no direction (the login screen, a Mog House: normalize(0) is NaN, and a NaN drew whole characters black,
+// 2026-10-29)
 float3 sun_spec(float3 n, float3 to_sun, float3 to_eye, float3 sun, float power, float strength)
 {
+	if (dot(n, n) < 1e-12 || dot(to_sun, to_sun) < 1e-12 || dot(to_eye, to_eye) < 1e-12 || strength <= 0 || max(sun.r, max(sun.g, sun.b)) <= 0)
+		return 0;
 	n = normalize(n);
 	const float3 l = normalize(to_sun), v = normalize(to_eye);
 	const float nl = dot(n, l);

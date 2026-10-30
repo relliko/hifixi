@@ -13,9 +13,9 @@
  *   - the light split (src/zone/light_split.hpp) drawn with it once World FX has asked: a word on most of the zone's
  *     pixels, its depth the depth buffer's, the ground facing up, lit mostly by the sun, the walls turned from it not;
  *     under the character dgVoodoo drew afterwards, its depth not the depth buffer's (World FX leaves those words);
- *   - a lamp in the frame that no object names (the game's per-object lamps): per pixel it lights the street near it all
- *     the same (draw.cpp near_lamps), per vertex it lights nothing (the game's own way); named by every object, per
- *     vertex it lights them;
+ *   - a lamp in the frame that no object names (the game's per-object lamps): it lights nothing, per pixel or per vertex
+ *     (the game's own way: every lamp in reach, draw.cpp near_lamp_light, lit a Mog House far too bright, so it's off);
+ *     named by every object, per vertex it lights them;
  *   - the sun's shadows from a made-up zone: the moving layer (a swaying card's shadow moves with its sway, an open door's
  *     is where the pass drew it), the near cascade leaving those to it while the far one keeps them at rest, and the
  *     second map's (an interior's) placements cast with the zone's.
@@ -768,7 +768,7 @@ int main(int argc, char **argv)
 		}
 		std::snprintf(line, sizeof(line), "a lamp no object names, at (%.1f %.1f %.1f): the street under it per pixel %.1f -> %.1f; per vertex %.1f (first pass %.1f)",
 			lamp.pos[0], lamp.pos[1], lamp.pos[2], lumas[0], lumas[1], lumas[2], first_luma);
-		check(d < 1.0 && lumas[1] > lumas[0] + 5.0, line);
+		check(d < 1.0 && std::fabs(lumas[1] - lumas[0]) < 0.5, line);
 		// (the first pass per vertex as the game draws it, unless ZONE_PERPIXEL drew it per pixel: then there's no per-vertex
 		// picture without the lamp to hold this one to)
 		const bool first_per_vertex = GetEnvironmentVariableA("ZONE_PERPIXEL", nullptr, 0) == 0;

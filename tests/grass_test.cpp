@@ -4365,7 +4365,8 @@ lamps:
 			std::printf("  with the light split: the wall beside a lantern %.1f unlit, %.1f lit without the split, %.1f with it, %.1f lit by a glow; behind a pillar %.1f -> %.1f with lamp shadows (%.1f unlit); clear the other side %.1f -> %.1f\n",
 				near_dark, near_unknown, near_known, near_glow, walled_lit, walled_shadow, walled_dark, clear_lit, clear_shadow);
 			check(near_unknown > near_dark + 5.0, "without the light split the lamp's glow is added as before");
-			check(std::fabs(near_known - near_dark) < 0.5, "with it the zone's lamp isn't added again (the native passes lit it)");
+			// (grass.hlsl kLampsKnown off since 2026-10-29: the native zone lit by the game's own lamps again, World FX's glow on top as before)
+			check(std::fabs(near_known - near_unknown) < 0.5, "with it the zone's lamp glow is added as without it (kLampsKnown off)");
 			check(near_glow > near_dark + 5.0, "an effect's glow still lights what the light split knows");
 			check(walled_shadow < walled_lit - 2.0 && walled_shadow >= 0.0, "a lamp shadow takes the lamp's light away where the light split knows the pixel");
 			check(std::fabs(clear_shadow - clear_lit) < 0.5, "and leaves it where the way to the lamp is clear");

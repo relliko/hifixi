@@ -245,7 +245,9 @@ float4 shade(v2p i, out float share)
 		}
 		n *= scale;
 		const float3 s_rgb = bump ? e.sun_bump.rgb : e.sun.rgb, a_rgb = bump ? e.ambient_bump.rgb : e.ambient.rgb;
-		const float3 rest = i.vcol.rgb * sky_ambient(e, a_rgb, n) + i.vcol.rgb * near_lamp_light(objects[object_index], i.world, n);
+		// (the lamps the game names for the object, as per vertex: every lamp in reach, near_lamp_light, lit a Mog House far
+		// too bright, 2026-10-29; kept for a tuned try)
+		const float3 rest = i.vcol.rgb * sky_ambient(e, a_rgb, n) + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
 		lit = saturate(i.vcol.rgb * s_rgb * saturate(dot(n, e.sun_dir.xyz)) + rest);
 		share = light_share(lit, saturate(rest));
 		// (the highlight goes on after the texture, the sun's all of it)
