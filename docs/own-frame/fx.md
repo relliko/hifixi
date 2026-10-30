@@ -51,6 +51,7 @@ Classes taken (by the vtable's class draw, vt+0x48):
 | D3M (0x32AD80) | 040BA0 -> 040220 | vertices from the chunk in memory (03FEE0 doubled the colours in place), one draw per texture run (3524A8 / bit 28 3523D0 / I 352590), the untextured tail (352648), untextured (352348, D: alpha x 2) | untextured kinds 5-7 whose DAT chunk isn't found (below), a texture not on the GPU yet |
 | MMB meshes (D3M, +0x179) | 040BA0 -> 040C20 -> 183760 | the zone's own model (below): its pieces from the native zone renderer's data, 183760's tables, WORLD plus the mesh's +0xE0 | a model not in the zone's data on the GPU (or not as the game has it: below); kind 2, bump models |
 | D3A (CMoD3aElem) | 03EB30 -> 03E910 | the frame +0x170 (wrapped to 0 at the count and written back, as 03E910 does), its quads from the chunk, UVs x 1/(texture object +0x24, +0x26) when +0 >= 1 and +7 is 0 (as the load scales them), 351FA0 / bit 28 351EC8, no fog, no z write, unlit | a texture not up |
+| morphs (0x32AC90) | 03FBB0 -> 03F440 | T x 3 corners: positions and normals blended as 03F8A0 does (below), colours doubled, the UVs; table 352258 (as the D3M's 3524A8), the header's bit 7 the alpha test GREATER 0x60; 03FBB0's side effects done (+0x194 -> +0x1A8, +0x1BC cleared) | a blend handed in (+0x1BC), the texture wave (+0x148), a texture not up |
 | rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | more than 4 rings |
 | weapon trails | flush callback 01C930 -> 01C940 | the 80-sample ring (newest first), one strip (tip A, base B) or two from the middle line (+0x151C), through VIEW, vertex colour only, additive, no z write, no fog | - |
 | everything else | | | all of it (below) |
@@ -72,6 +73,11 @@ x max(0, N.L)) + emissive, alpha the vertex's, N by WORLD's inverse transpose an
 A ring has no normals (FVF XYZ | DIFFUSE): N = 0, so only the ambient and emissive light it, as D3D does. The
 lights travel in the frame (`frame::lights`, after the vertices in the upload ring, a root view t4). Left to the
 game: no environment or math object, a WORLD that can't be inverted.
+
+**Morph weights (03F8A0).** K targets (header +2's low 7 bits, signed), the weights +0x194 over their sum; when the sum
+is under FLT_MIN, the largest of the last frame's weights (+0x1A8; the first of equals) is set to 1.0 in +0x194 and
+the weights are taken as they are. Positions accumulate target by target (weight x position + sum), normals the same
+from their packed words (bits 0-9, 10-19, 20-29 signed, x weight x 1/512). Not normalized.
 
 **MMB meshes: the zone's own models.** An MMB effect mesh (water sheets, rivers, cloud domes, the fountains) isn't built
 for the effect: 049570 asks 183420 for the model of that name in the zone renderer's map slots (0, then 1; 170F30 on
@@ -154,7 +160,9 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   letter, the +0xE0 offset, a mesh not in the data left to the game) and gamewater's list honoured (on the dump whose
   040DC4 is the game's); a lit D3M on a made-up environment (the game's own lighting calls: 045C50, 0473F0, the math
   object, 18B9A0, 18B9E0; one white light of 255 down +y, AMBIENT and its ambient, the material's emissive, normals by
-  WORLD). 99 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
+  WORLD); a morph (ROM3/9/111 'rng ': its 360 corners against `fxgeo::morph::blend` at weights 1:3, then with no
+  weights the last frame's largest set to 1.0, the side effects on +0x194/+0x1A8/+0x1BC; one handed a blend left to
+  the game). 109 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
   threads put their stacks there otherwise).
 - `build\fx_render_test.exe build\test\fx_fire.bin build\test\fx_cure.bin build\test\fx_fastblade.bin`: the D3D12 side
   at its marker on WARP with the debug layer, on a list recorded as dgVoodoo records (its own heap and targets),
@@ -176,11 +184,22 @@ The oracles are made when missing (`build.cmd`), about a minute.
 3. (Done: untextured D3M kinds 5-7, the first vertex's y from the DAT.) A DAT read on the game's thread the first time
    such a mesh is drawn; if that shows as a hitch, move it to the textures' decoder thread (the element is the game's
    until it's back).
-4. **Morph** (03FBB0 / 03F440): weights +0x194 (5, normalized; none: the largest of +0x1A8), the chunk in memory,
-   `fxgeo::morph::blend` (already checked against effects_geo), table 352258, alpha test bit 7 (`stage_alpha_test` is in
-   the shader). The texture wave (+0x148 != 0: 075700 renders into a 64x64 target) left to the game.
-5. **VuAnm / VuDist** (03F130, 043110): the points come from `063C80` with the instance's MT; call it with a collector of
-   ours (it takes a callback) rather than re-deriving the random points.
+4. (Done: morphs.) The texture wave (+0x148 != 0: 075700 renders a wave of the texture into a 64x64 target) and a
+   blend handed in ready (+0x1BC: who sets it isn't traced; I: the distortion morph) stay the game's.
+5. **VuAnm / VuDist** (03F130, 043110). 03F130 read (R): on its first draw (+0x1DC 0) it makes the corner table +0x22D
+   (frames x 0x30: each D3A frame's first quad's 4 corners by the index table 352219) and a vertex buffer of frames x
+   (points +0x1D8 x 6) vertices, the template filled once: UV and colour of each corner by 352218, normal (0, 0, -1);
+   +0x229 = points x 6, +0x225 = points x 4 - 2. Each draw: the texture (075700 +0x140..+0x148), the attach matrix
+   (0473F0, else identity 0746A0) without its translation into VA 0490BF34, the frame +0x170 wrapped, the frame's
+   vertices locked (0440A0) into VA 0490B9D4, then 063C80 (its ecx as 03F130 sets it; the arguments 03EFC0 and the
+   element): the game's point walk (the 0x3E list; its count, from 20 up scaled through 002D80; VA 0490BF34 turned into VIEW's frame and cleared;
+   random points from the instance's MT) calls 03EFC0 for each, which sets the matrix's translation to the point and
+   writes the 4 corners through math vt+0x50 into the locked vertices (the strip's 6 a point: the first and last
+   doubled for the joins). Then FOGENABLE 0, 03E9A0's D3A states, WORLD identity (math +0x810), one TRIANGLESTRIP of
+   points x 4 - 2. **Next:** in place of the lock, point VA 0490B9D4 at a buffer of ours holding the template (rebuilt
+   from the D3A frame as the first draw builds it) and call 063C80 exactly as 03F130 does (the walk and its
+   random draws then happen once a frame, as in the game), then cut the strip into a list for fxframe (WORLD
+   identity, D3A stages, no fog, no z write). VuDist: the same walk with 0426F0's quad at each point (needs 6.).
 6. **Distortion classes** (CMoDist, CMoDistModelElem, CMoDistMorphElem, CMoDistRingElem): copy the world target at the
    marker (a reserved descriptor in fxtextures' heap is ready: `textures::reserved`) and draw through the projected UVs
    (042D00, 0426F0).
@@ -210,6 +229,8 @@ The oracles are made when missing (`build.cmd`), about a minute.
 - Fog: distant glows (H) fading out, others to the fog colour.
 - Lit effects (shaded by the area's sun and ambient; spells and abilities with solid-looking pieces): as bright and as
   shaded as before, the shading turning with the camera as the game's does.
+- Morphs (meshes changing shape: rings, waves, the 'rng'/'morp' pieces of some spells and abilities): moving smoothly as
+  before, cut-out ones (alpha test) with the same edges.
 - With FSR on: effects not smeared (reactive mask).
 - Watch for: a missing effect for a frame or two when a new texture first appears (should not happen: the game draws
   it until it's up), anything drawn in the wrong order with see-through characters, and the "markers not seen" probe

@@ -748,6 +748,68 @@ int main()
 			gz.release();
 		}
 
+		// A morph (03FBB0 -> 03F440: ROM3/9/111 'rng ', 2 targets of 80 positions, 120 triangles): its corners blended as
+		// 03F8A0 blends them (the weights over their sum), the colours doubled; then with no weights at all the largest
+		// of the last frame's (target 1) set to 1.0 in +0x194; +0x194 copied to +0x1A8 and +0x1BC cleared each time
+		{
+			std::vector<uint8_t> mp;
+			geo::morph gm;
+			check(chunk("ROM3\\9\\111.DAT", 0x25, "rng ", mp) && geo::parse_morph(mp.data(), mp.size(), gm, why) && gm.targets == 2 && gm.triangles == 120,
+				name + ": the morph chunk read (2 targets, 120 triangles)");
+			check(s.morph_draw == base + 0x03FBB0, name + ": the morphs' draw 03FBB0");
+			const uintptr_t morph_res = resource(mp, 0x25);
+			put<uint32_t>(morph_res + 0x30 + 0x10, uint32_t(tex_object));
+			put<uint32_t>(tex_object + 0x40, 0x5678); // (its Direct3D texture made)
+			const uintptr_t vt_morph = take(0x100);
+			put<uint32_t>(vt_morph + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_morph + 0x48, uint32_t(s.morph_draw));
+			put<uint32_t>(vt_morph + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			const uintptr_t em = element(vt_morph, morph_res, 0x48, 0, 0x80808080, -6.0f);
+			const float wts[5] = { 1.0f, 3.0f, 0, 0, 0 };
+			std::memcpy(reinterpret_cast<void *>(em + 0x194), wts, 20);
+			const uintptr_t list7 = take(16), node7 = take(32);
+			put<uint32_t>(node7 + 4, 0);
+			put<uint32_t>(node7 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node7 + 0xC, uint32_t(em));
+			put<uint32_t>(list7 + 4, uint32_t(node7));
+			put<uint32_t>(list7 + 8, 0);
+			const auto morph_matches = [&](const float *weights, const fx::frame *fm) {
+				if (fm == nullptr || fm->element_count != 1 || fm->elements[0].cls != fx::class_morph)
+					return false;
+				const fx::draw &d = fm->draws[fm->elements[0].first_draw];
+				std::vector<fx::vertex> want;
+				gm.blend(weights, want);
+				bool same = d.count == want.size() && d.texture != fx::kNone && d.stages == fx::stage_texture;
+				for (size_t i = 0; same && i < want.size(); ++i)
+				{
+					const fx::vertex &v = fm->vertices[d.first + i];
+					for (int c = 0; c < 3; ++c)
+						same = same && std::fabs(v.pos[c] - want[i].pos[c]) < 1e-4f && std::fabs(v.normal[c] - want[i].normal[c]) < 1e-4f;
+					same = same && v.colour == want[i].colour && v.uv[0] == want[i].uv[0] && v.uv[1] == want[i].uv[1];
+				}
+				return same;
+			};
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list7, 0);
+			check(g_markers == 1 && morph_matches(wts, fx::published(g_last_seq)) && get<float>(em + 0x1A8) == 1.0f && get<float>(em + 0x1AC) == 3.0f,
+				name + ": a morph: its 360 corners blended 1:3 as the chunk's targets, the colours doubled; the weights kept as the last (+0x1A8)");
+			const float none[5] = {}, last[5] = { 0.2f, 0.7f, 0, 0, 0 }, target1[5] = { 0.0f, 1.0f, 0, 0, 0 };
+			std::memcpy(reinterpret_cast<void *>(em + 0x194), none, 20);
+			std::memcpy(reinterpret_cast<void *>(em + 0x1A8), last, 20);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list7, 0);
+			check(g_markers == 1 && morph_matches(target1, fx::published(g_last_seq)) && get<float>(em + 0x198) == 1.0f && get<float>(em + 0x1AC) == 1.0f &&
+					get<uint32_t>(em + 0x1BC) == 0,
+				name + ": no weights: the last frame's largest (target 1) set to 1.0 and drawn alone, as 03F8A0 does");
+			put<uint32_t>(em + 0x1BC, 0x1234); // (a blend handed in ready: the game's)
+			g_seen = seen();
+			reinterpret_cast<flush_fn>(s.code)(list7, 0);
+			check(g_seen.setups == 1, name + ": a morph with a blend handed in (+0x1BC) left to the game");
+			put<uint32_t>(tex_object + 0x40, 0);
+		}
+
 		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
 		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
 		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path

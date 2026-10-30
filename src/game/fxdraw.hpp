@@ -77,7 +77,7 @@ namespace hifi::game::fxdraw
 		uintptr_t element_draw = 0, d3m_draw = 0;   // 046070, 040BA0
 		uintptr_t draw_matrix = 0, fog_env = 0;     // 045D40, 18BA20
 		uintptr_t d3a_draw = 0, trail_cb = 0, ring_draw = 0; // 03EB30, 01C930, 0565A0
-		uintptr_t mmb_draw = 0;                     // 040C20
+		uintptr_t mmb_draw = 0, morph_draw = 0;     // 040C20, 03FBB0
 		uintptr_t frame_of = 0, light1 = 0, lights2 = 0, ambient = 0, material = 0; // 045C50, 18B9A0, 18B960, 18B9E0, VA 0490BC28
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
 		uintptr_t code = 0;                         // our stubs
