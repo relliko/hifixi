@@ -94,7 +94,8 @@ namespace hifi::d3d8
 		void free_srv(D3D12_CPU_DESCRIPTOR_HANDLE h);
 		D3D12_CPU_DESCRIPTOR_HANDLE null_srv(D3D12_SRV_DIMENSION dim) const;
 
-		// A table of n shader views for this draw, copied from CPU descriptors (null: the null view of dims[i])
+		// A table of n shader views for this draw, copied from CPU descriptors (null: the null view of dims[i]); the
+		// last one made again when the views are the same and its descriptors still this frame's
 		D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const D3D12_CPU_DESCRIPTOR_HANDLE *views, uint32_t n);
 		// kMaxStages samplers' table (the same descriptions give the same table)
 		D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const D3D12_SAMPLER_DESC *descs);
@@ -163,6 +164,9 @@ namespace hifi::d3d8
 		ID3D12Resource *white[3] = {};
 		UINT srv_step = 0, sampler_step = 0;
 		uint32_t srv_next = 0;
+		D3D12_CPU_DESCRIPTOR_HANDLE last_views[kMaxStages] = {};
+		uint32_t last_count = 0;
+		D3D12_GPU_DESCRIPTOR_HANDLE last_table = {};
 		std::unordered_map<uint64_t, D3D12_GPU_DESCRIPTOR_HANDLE> sampler_tables;
 		std::vector<std::vector<uint8_t>> sampler_keys;
 		uint32_t sampler_next = 0;

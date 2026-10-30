@@ -45,4 +45,8 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /wd4100 /permissive- /utf-8 /DWIN32_LEAN
   tests\d3d8_unit.cpp src\d3d8\format.cpp src\d3d8\ffp.cpp src\d3d8\sm1.cpp src\d3d8\compile.cpp /Fo"build\d3d8\test\\" /Fe"build\d3d8\d3d8_unit.exe" ^
   /link /NOLOGO "%D3DX8LIB%" legacy_stdio_definitions.lib /NODEFAULTLIB:libci.lib advapi32.lib gdi32.lib user32.lib || exit /b 1
 echo Built build\d3d8\d3d8_unit.exe
+rem HiFi XI's own hooks (src\host) over the DLL's Direct3D 12 stream, an FFXI-shaped frame on WARP: build\d3d8\d3d8_hooks.exe
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I "%D3D8INC%" ^
+  tests\d3d8_hooks.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\d3d8\test\\" /Fe"build\d3d8\d3d8_hooks.exe" /link /NOLOGO d3d12.lib dxgi.lib user32.lib || exit /b 1
+echo Built build\d3d8\d3d8_hooks.exe
 exit /b 0

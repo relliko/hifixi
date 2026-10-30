@@ -331,6 +331,7 @@ namespace hifi::d3d8
 		}
 		n.pages.clear();
 		srv_next = n.srv_begin;
+		last_table = {};
 		// The list was reset on the old set's allocator: closed empty and reset again on this one's
 		cmd->Close();
 		n.allocator->Reset();
@@ -403,6 +404,8 @@ namespace hifi::d3d8
 
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu::srv_table(const D3D12_CPU_DESCRIPTOR_HANDLE *views, uint32_t n)
 	{
+		if (n == last_count && last_table.ptr != 0 && std::memcmp(views, last_views, sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) * n) == 0)
+			return last_table;
 		frame_set &s = frames[current];
 		if (srv_next + n > s.srv_end)
 		{
@@ -423,6 +426,12 @@ namespace hifi::d3d8
 		}
 		D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap->GetGPUDescriptorHandleForHeapStart();
 		g.ptr += UINT64(at) * srv_step;
+		if (n <= kMaxStages)
+		{
+			std::memcpy(last_views, views, sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) * n);
+			last_count = n;
+			last_table = g;
+		}
 		return g;
 	}
 
