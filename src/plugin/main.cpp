@@ -81,6 +81,7 @@
 #include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
 #include "../host/hooks.hpp"
+#include "../host/passes.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../ui/menu.hpp"
 #include <cmath>
@@ -286,6 +287,35 @@ class hifixi final : public IPlugin
 	bool m_nativechars_refused = false; // (native characters: likewise their renderer)
 	bool m_char_flowing = false;     // (the characters' end markers coming through: m_char_flow's last word)
 	bool m_modelactor_refused = false; // (likewise the model actors' call: the game draws them)
+	ID3D12Device *m_pass_device = nullptr; // (the device the own-frame passes were last handed)
+
+	// /hifi <module> [args] for the own-frame passes (src/host/passes.hpp); whether one took it
+	bool pass_command(const std::string &arg)
+	{
+		std::vector<std::string> args;
+		for (size_t at = 0; at < arg.size();)
+		{
+			const size_t end = arg.find(' ', at);
+			const std::string word = arg.substr(at, end == std::string::npos ? std::string::npos : end - at);
+			if (!word.empty())
+				args.push_back(word);
+			at = end == std::string::npos ? arg.size() : end + 1;
+		}
+		if (args.empty())
+			return false;
+		for (const hifi::passes::module &m : hifi::passes::modules())
+		{
+			if (m.command == nullptr || m.name == nullptr || args[0] != m.name)
+				continue;
+			std::vector<std::string> out;
+			if (!m.command(args, out))
+				continue;
+			for (const std::string &line : out)
+				say(line);
+			return true;
+		}
+		return false;
+	}
 
 	void say(const std::string &text, bool error = false)
 	{
@@ -339,6 +369,11 @@ class hifixi final : public IPlugin
 		say(hifi::game::modelactor::status());
 		for (const std::string &line : hifi::zone::actordata::status())
 			say(line);
+		// (the own-frame passes, src/host/passes.hpp)
+		for (const hifi::passes::module &m : hifi::passes::modules())
+			if (m.status != nullptr)
+				for (const std::string &line : m.status())
+					say(line);
 		for (const std::string &line : hifi::zone::inject::status())
 			say(line);
 		for (const std::string &line : hifi::upscale::status())
@@ -815,6 +850,14 @@ public:
 		// (the game's own drawing back first, while the log still takes the reason it can't be)
 		hifi::backend::streamlog::set_d3d8_tap(nullptr, nullptr);
 		std::string why;
+		// (the own-frame passes first: the game draws each of them again)
+		for (const hifi::passes::module &m : hifi::passes::modules())
+		{
+			if (m.stop != nullptr && !m.stop(why))
+				ashita_log(1, (std::string(m.name) + " not put back: " + why).c_str());
+			if (m.device != nullptr)
+				m.device(nullptr);
+		}
 		if (!hifi::game::gamedraw::stop(why))
 			ashita_log(1, ("the game's own drawing not put back: " + why).c_str());
 		// (the game draws its zone again first; the renderer's objects are left: dgVoodoo's lists may still hold them)
@@ -872,6 +915,9 @@ public:
 		}
 		else if (arg == "status")
 			report();
+		else if (pass_command(arg))
+		{
+		}
 		else if (arg == "gpu")
 		{
 			// (World FX's GPU time by section, the costliest first)
@@ -1047,6 +1093,9 @@ public:
 			follow_modelactor();
 			follow_upscale();
 			follow_jitter();
+			for (const hifi::passes::module &m : hifi::passes::modules())
+				if (m.update != nullptr)
+					m.update(now);
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first
 		// time it's entered)
@@ -1059,6 +1108,17 @@ public:
 			native_gate();
 			// (the model actors' DATs, as they're seen)
 			hifi::zone::actordata::frame(worldfx::attached(), p.in_game && hifi::game::modelactor::in());
+			// (the own-frame passes, src/host/passes.hpp: the device as it's known, then each present)
+			if (ID3D12Device *const device = worldfx::attached(); device != m_pass_device)
+			{
+				m_pass_device = device;
+				for (const hifi::passes::module &m : hifi::passes::modules())
+					if (m.device != nullptr)
+						m.device(device);
+			}
+			for (const hifi::passes::module &m : hifi::passes::modules())
+				if (m.present != nullptr)
+					m.present(now, p.in_game);
 			// (only while World FX draws into the game's world: on another output its files would go unused)
 			if (const uint32_t zone = hifi::game::feed::zone(); zone != m_zone && worldfx_drawing() != 0)
 			{

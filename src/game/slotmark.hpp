@@ -25,12 +25,23 @@ namespace hifi::slotmark
 		chars_begin = 2, // just before the opaque actors' walk (0817E0's call of 082D70)
 		chars_end = 3,   // just after it
 		see_through = 4, // each see-through actor's callback from the priority-12 flush (0CBD90)
-		kinds = 5,
+		// (the own-frame passes, PLAN-own-frame.md: each handled by its module through src/host/passes.hpp)
+		first_pass = 5,
+		fx_run = 5,      // the effect draws recorded since the last fx_run or see-through marker (the priority-12 flush)
+		sky_end = 6,     // just after the sky dome (frame loop step 5, before the zone)
+		names_end = 7,   // just after the names pass (0817F0)
+		screen = 8,      // the loop tail on A, before the resolve (crossfade, wash, afterimage)
+		ui_begin = 9,    // just before the interface
+		ui_end = 10,     // just after it (before the fade after the menus, the movie and the text queue)
+		frame_end = 11,  // the game's last draw of the frame
+		spare_12 = 12, spare_13 = 13, spare_14 = 14, spare_15 = 15,
+		kinds = 16,
 	};
 	inline const char *kind_name(uint32_t k)
 	{
-		return k == zone_begin ? "zone begin" : k == zone_end ? "zone end" : k == chars_begin ? "characters begin" : k == chars_end ? "characters end" :
-			k == see_through ? "see-through character" : "?";
+		static const char *const names[kinds] = { "zone begin", "zone end", "characters begin", "characters end", "see-through character",
+			"effects run", "sky end", "names end", "screen", "interface begin", "interface end", "frame end", "spare 12", "spare 13", "spare 14", "spare 15" };
+		return k < kinds ? names[k] : "?";
 	}
 
 	// The x the marker's pixel goes at (in the world's own pixels, row 0)

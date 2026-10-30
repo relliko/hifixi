@@ -13,6 +13,7 @@
 #include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
 #include "../host/events.hpp"
+#include "../host/passes.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
 #include <algorithm>
@@ -600,6 +601,23 @@ namespace hifi::backend
 		void on_mark(ID3D12GraphicsCommandList *list, worldfx::list_data &d, uint64_t dsv, const slotmark::mark &m)
 		{
 			marks_seen[m.kind].fetch_add(1, std::memory_order_relaxed);
+			// (the own-frame passes: their module draws at its marker, src/host/passes.hpp)
+			if (m.kind >= slotmark::first_pass)
+			{
+				ID3D12Resource *const depth = port_resource_of_view(dsv);
+				zone::inject::on_marker(depth);
+				chars::inject::on_marker(depth);
+				if (depth == nullptr)
+					return;
+				passes::world w;
+				w.rt = zone_rt;
+				w.ds = depth;
+				w.rt_format = zone_rt_format;
+				w.ds_format = port_format_of_view(dsv);
+				w.rt_state = d.world_rt_state;
+				passes::dispatch(m.kind, list, d.state, w, m.seq);
+				return;
+			}
 			// (native characters: their markers are checked on their own, and leave the zone's order check alone)
 			if (m.kind >= slotmark::chars_begin)
 				chars::marks::seen(m.kind, m.seq);

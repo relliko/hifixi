@@ -64,10 +64,19 @@ cl /nologo /c /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINM
   src\upscale\fsr2\ffx_fsr2.cpp src\upscale\fsr2\ffx_assert.cpp src\upscale\fsr2\dx12\ffx_fsr2_dx12.cpp /Fo"build\obj\fsr2\\" || exit /b 1
 set "UPSCALE=src\upscale\upscale.cpp src\upscale\temporal.cpp src\upscale\masks.cpp src\upscale\fsr2_shaders.cpp build\obj\fsr2\ffx_fsr2.obj build\obj\fsr2\ffx_assert.obj build\obj\fsr2\ffx_fsr2_dx12.obj"
 
+rem The own-frame passes (PLAN-own-frame.md), each registered through src\host\passes.cpp. One line per part, so
+rem the parts built side by side merge cleanly.
+set "PASSES=src\host\passes.cpp"
+set "PASSES_FX="
+set "PASSES_WORLD="
+set "PASSES_ACTORS="
+set "PASSES_2D="
+set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
+
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
+  %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
   /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib dxgi.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
 echo Built build\hifixi.dll
@@ -121,7 +130,7 @@ echo Built build\shade_bench.exe
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
-  %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib dxgi.lib || exit /b 1
+  %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib dxgi.lib || exit /b 1
 echo Built build\menu_test.exe
 
 rem The game side's feed on both FFXiMain dumps, World FX's functions stubbed: build\feed_test.exe
