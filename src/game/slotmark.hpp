@@ -34,13 +34,14 @@ namespace hifi::slotmark
 		ui_begin = 9,    // just before the interface
 		ui_end = 10,     // just after it (before the fade after the menus, the movie and the text queue)
 		frame_end = 11,  // the game's last draw of the frame
-		spare_12 = 12, spare_13 = 13, spare_14 = 14, spare_15 = 15,
+		grid_end = 12,   // just after the Mog House layout grid (177B40)
+		spare_13 = 13, spare_14 = 14, spare_15 = 15,
 		kinds = 16,
 	};
 	inline const char *kind_name(uint32_t k)
 	{
 		static const char *const names[kinds] = { "zone begin", "zone end", "characters begin", "characters end", "see-through character",
-			"effects run", "sky end", "names end", "screen", "interface begin", "interface end", "frame end", "spare 12", "spare 13", "spare 14", "spare 15" };
+			"effects run", "sky end", "names end", "screen", "interface begin", "interface end", "frame end", "grid end", "spare 13", "spare 14", "spare 15" };
 		return k < kinds ? names[k] : "?";
 	}
 
