@@ -1948,4 +1948,291 @@ float4 pps(p2p i) : SV_Target
 		}
 		return st;
 	}
+
+	// The aura ring (chardraw.hpp aura_ring)
+	namespace
+	{
+		const char *kAuraShader = R"(
+cbuffer ring : register(b0)
+{
+	float4 place;  // where the whole source goes in the target's D3D9 pixels: x, y (the copy's offset), width, height
+	float4 colour; // the copy's (D3DCOLOR as 0..1)
+};
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+struct v2p
+{
+	float4 pos : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+v2p vs(uint id : SV_VertexID)
+{
+	// (the strip 0 1 2 3 of a quad over the target, moved by place.xy)
+	float2 c = float2(id & 1, id >> 1);
+	float2 px = place.xy + c * place.zw;
+	v2p o;
+	o.pos = float4(px.x / place.z * 2.0 - 1.0, 1.0 - px.y / place.w * 2.0, 0.0, 1.0);
+	o.uv = c;
+	return o;
+}
+float4 ps_copy(v2p i) : SV_Target
+{
+	return src.SampleLevel(smp, i.uv, 0);
+}
+float4 ps_ring(v2p i) : SV_Target
+{
+	// (DIFFUSE x TEXTURE x 2, alpha x 4; ALPHATEST GREATER 0 on the 8-bit alpha)
+	float4 t = src.SampleLevel(smp, i.uv, 0);
+	float a = saturate(colour.a * t.a * 4.0);
+	if (a < 0.5 / 255.0)
+		discard;
+	return float4(saturate(colour.rgb * t.rgb * 2.0), a);
+}
+float4 ps_solid(v2p i) : SV_Target
+{
+	// (SELECTARG2 TEXTURE, colour and alpha; ALPHATEST GREATER 0x60)
+	float4 t = src.SampleLevel(smp, i.uv, 0);
+	if (t.a < 96.5 / 255.0)
+		discard;
+	return t;
+}
+)";
+		enum aura_kind
+		{
+			aura_copy = 0,
+			aura_ring_copy = 1,
+			aura_solid = 2,
+		};
+	}
+
+	aura_ring::~aura_ring()
+	{
+		release();
+	}
+
+	void aura_ring::release()
+	{
+		for (auto &p : _pipelines)
+			if (p.second != nullptr)
+				p.second->Release();
+		_pipelines.clear();
+		for (IUnknown **u : { reinterpret_cast<IUnknown **>(&_root), reinterpret_cast<IUnknown **>(&_target), reinterpret_cast<IUnknown **>(&_rtv) })
+		{
+			if (*u != nullptr)
+				(*u)->Release();
+			*u = nullptr;
+		}
+		for (void **b : { &_vs, &_ps_copy, &_ps_ring, &_ps_solid })
+		{
+			if (*b != nullptr)
+				static_cast<ID3DBlob *>(*b)->Release();
+			*b = nullptr;
+		}
+		_format = DXGI_FORMAT_UNKNOWN;
+		_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		_device = nullptr;
+	}
+
+	bool aura_ring::init(ID3D12Device *device, std::string &why)
+	{
+		release();
+		_device = device;
+		using compile_fn = decltype(&D3DCompile);
+		HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+		const auto compile = compiler != nullptr ? reinterpret_cast<compile_fn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+		if (compile == nullptr)
+		{
+			why = "d3dcompiler_47.dll isn't there";
+			return false;
+		}
+		struct entry
+		{
+			const char *name, *target;
+			void **out;
+		};
+		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps_copy", "ps_5_0", &_ps_copy }, { "ps_ring", "ps_5_0", &_ps_ring }, { "ps_solid", "ps_5_0", &_ps_solid } };
+		for (const entry &e : entries)
+		{
+			ID3DBlob *code = nullptr, *errors = nullptr;
+			if (FAILED(compile(kAuraShader, std::strlen(kAuraShader), "hifixi_aura", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+			{
+				why = std::string("the aura ring's shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
+				if (errors != nullptr)
+					errors->Release();
+				release();
+				return false;
+			}
+			if (errors != nullptr)
+				errors->Release();
+			*e.out = code;
+		}
+		D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0 };
+		D3D12_ROOT_PARAMETER p[2] = {};
+		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		p[0].Constants.Num32BitValues = 8;
+		p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		p[1].DescriptorTable.NumDescriptorRanges = 1;
+		p[1].DescriptorTable.pDescriptorRanges = &range;
+		p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		D3D12_STATIC_SAMPLER_DESC sm = {};
+		sm.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+		sm.AddressU = sm.AddressV = sm.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		sm.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 2, p, 1, &sm, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		using serialize_fn = decltype(&D3D12SerializeRootSignature);
+		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
+		ID3DBlob *blob = nullptr, *errors = nullptr;
+		if (serialize == nullptr || FAILED(serialize(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
+			FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&_root))))
+		{
+			why = "the aura ring's root signature couldn't be made";
+			if (blob != nullptr)
+				blob->Release();
+			if (errors != nullptr)
+				errors->Release();
+			_root = nullptr;
+			release();
+			return false;
+		}
+		blob->Release();
+		const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+		if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_rtv))))
+		{
+			_rtv = nullptr;
+			why = "the aura ring's view heap couldn't be made";
+			release();
+			return false;
+		}
+		return true;
+	}
+
+	ID3D12PipelineState *aura_ring::pipeline(DXGI_FORMAT format, int kind)
+	{
+		const uint64_t key = uint64_t(format) | uint64_t(kind) << 32;
+		const auto known = _pipelines.find(key);
+		if (known != _pipelines.end())
+			return known->second;
+		void *const ps = kind == aura_copy ? _ps_copy : kind == aura_ring_copy ? _ps_ring : _ps_solid;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+		d.pRootSignature = _root;
+		d.VS = { static_cast<ID3DBlob *>(_vs)->GetBufferPointer(), static_cast<ID3DBlob *>(_vs)->GetBufferSize() };
+		d.PS = { static_cast<ID3DBlob *>(ps)->GetBufferPointer(), static_cast<ID3DBlob *>(ps)->GetBufferSize() };
+		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		d.NumRenderTargets = 1;
+		d.RTVFormats[0] = format;
+		d.SampleDesc.Count = 1;
+		d.SampleMask = UINT_MAX;
+		d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		d.RasterizerState.DepthClipEnable = TRUE;
+		D3D12_RENDER_TARGET_BLEND_DESC &b = d.BlendState.RenderTarget[0];
+		b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		if (kind == aura_ring_copy)
+		{
+			// (SRCALPHA / INVSRCALPHA; D3D8 blends alpha with the same factors)
+			b.BlendEnable = TRUE;
+			b.SrcBlend = b.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
+			b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+			b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		}
+		ID3D12PipelineState *pso = nullptr;
+		if (FAILED(_device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))))
+			pso = nullptr;
+		_pipelines[key] = pso;
+		return pso;
+	}
+
+	bool aura_ring::record(ID3D12GraphicsCommandList *list, const char_target &world, ID3D12DescriptorHeap *heap, D3D12_GPU_DESCRIPTOR_HANDLE t_srv,
+		D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu, D3D12_GPU_DESCRIPTOR_HANDLE slot_gpu, const model_entry &m)
+	{
+		const uint32_t n = std::min<uint32_t>(m.aura, kMaxAura);
+		if (n == 0 || _root == nullptr || heap == nullptr || world.samples > 1 || world.rtv_format == DXGI_FORMAT_UNKNOWN)
+			return false;
+		// The 256 x 256 target (the world's format, as 038930 makes it with the game's back buffer's)
+		if (_target == nullptr || _format != world.rtv_format)
+		{
+			if (_target != nullptr)
+				_target->Release();
+			_target = nullptr;
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = d.Height = 256;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = world.rtv_format;
+			d.SampleDesc.Count = 1;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+			D3D12_CLEAR_VALUE cv = {};
+			cv.Format = world.rtv_format;
+			if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv, IID_PPV_ARGS(&_target))))
+			{
+				_target = nullptr;
+				return false;
+			}
+			_target->SetName(L"hifixi: the aura ring's 256 x 256");
+			_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			_format = world.rtv_format;
+			D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+			rv.Format = world.rtv_format;
+			rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+			_device->CreateRenderTargetView(_target, &rv, _rtv->GetCPUDescriptorHandleForHeapStart());
+		}
+		ID3D12PipelineState *const copy = pipeline(_format, aura_copy), *const ring = pipeline(_format, aura_ring_copy), *const solid = pipeline(_format, aura_solid);
+		if (copy == nullptr || ring == nullptr || solid == nullptr)
+			return false;
+		D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+		sv.Format = _format;
+		sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sv.Texture2D.MipLevels = 1;
+		_device->CreateShaderResourceView(_target, &sv, slot_cpu);
+		const auto barrier = [&](D3D12_RESOURCE_STATES to) {
+			if (_state == to)
+				return;
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = _target;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = _state;
+			b.Transition.StateAfter = to;
+			list->ResourceBarrier(1, &b);
+			_state = to;
+		};
+		list->SetDescriptorHeaps(1, &heap);
+		list->SetGraphicsRootSignature(_root);
+		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		// 038A80: T drawn down
+		barrier(D3D12_RESOURCE_STATE_RENDER_TARGET);
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtv = _rtv->GetCPUDescriptorHandleForHeapStart();
+		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		const D3D12_VIEWPORT vp256 = { 0.0f, 0.0f, 256.0f, 256.0f, 0.0f, 1.0f };
+		const D3D12_RECT sc256 = { 0, 0, 256, 256 };
+		list->RSSetViewports(1, &vp256);
+		list->RSSetScissorRects(1, &sc256);
+		list->SetPipelineState(copy);
+		const float down[8] = { 0.0f, 0.0f, 256.0f, 256.0f, 0, 0, 0, 0 };
+		list->SetGraphicsRoot32BitConstants(0, 8, down, 0);
+		list->SetGraphicsRootDescriptorTable(1, t_srv);
+		list->DrawInstanced(4, 1, 0, 0);
+		barrier(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		// 038E10: the copies over the world, the last the solid one
+		list->OMSetRenderTargets(1, &world.rtv, FALSE, nullptr);
+		const D3D12_VIEWPORT vp = { 0.0f, 0.0f, world.width, world.height, 0.0f, 1.0f };
+		const D3D12_RECT sc = { 0, 0, LONG(world.width), LONG(world.height) };
+		list->RSSetViewports(1, &vp);
+		list->RSSetScissorRects(1, &sc);
+		list->SetGraphicsRootDescriptorTable(1, slot_gpu);
+		for (uint32_t i = 0; i < n; ++i)
+		{
+			const bool last = i + 1 == n;
+			const uint32_t c = m.aura_colour[i];
+			const float k[8] = { last ? 0.0f : m.aura_offset[i][0], last ? 0.0f : m.aura_offset[i][1], world.width, world.height, float((c >> 16) & 0xFF) / 255.0f,
+				float((c >> 8) & 0xFF) / 255.0f, float(c & 0xFF) / 255.0f, float(c >> 24) / 255.0f };
+			list->SetPipelineState(last ? solid : ring);
+			list->SetGraphicsRoot32BitConstants(0, 8, k, 0);
+			list->DrawInstanced(4, 1, 0, 0);
+		}
+		return true;
+	}
 }

@@ -66,6 +66,7 @@ namespace hifi::game::charmodel
 		// The extra passes (charframe.hpp model_entry::passes): models seen with an overlay, with a cloak that adds
 		// something; models the game drew for theirs (a texture not on the GPU yet)
 		uint64_t overlays = 0, cloaks = 0, passes_refused = 0;
+		uint64_t auras = 0; // (see-through models HiFi XI draws with their aura ring: 038E10's, model_entry::aura)
 		uint32_t last_models = 0, last_bones = 0; // the last published frame's
 	};
 	counts get_counts();
@@ -81,6 +82,9 @@ namespace hifi::game::charmodel
 		// offsets, factor
 		uintptr_t overlay_flag = 0, overlay_u = 0, overlay_v = 0, overlay_handle = 0, overlay_colour = 0;
 		uintptr_t cloak_flag = 0, cloak_projection = 0, cloak_a = 0, cloak_b = 0, cloak_factor = 0;
+		// The aura ring's (038E10): the config getter 193850, the 256 x 256 target's and the second target's globals, the
+		// frame step 014CF0
+		uintptr_t aura_config = 0, aura_small = 0, aura_second = 0, aura_step = 0;
 	};
 	sites where();
 	void set_exits(uintptr_t go_on, uintptr_t leave);

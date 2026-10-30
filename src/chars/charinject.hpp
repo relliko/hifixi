@@ -64,6 +64,7 @@ namespace hifi::chars::inject
 		uint64_t caster_frames = 0, caster_models = 0; // (drawn into the sun's casters' map)
 		uint64_t enspell_models = 0; // (models drawn with an en-spell effect)
 		uint64_t overlays = 0, cloaks = 0, cloak_failed = 0; // (models drawn with their extra passes; scene copies that couldn't be made)
+		uint64_t auras = 0, aura_failed = 0; // (see-through models drawn with their aura ring; ones whose ring couldn't be: a multisampled world)
 	};
 	counts get_counts();
 }

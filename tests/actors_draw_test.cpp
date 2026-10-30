@@ -851,6 +851,68 @@ int main(int argc, char **argv)
 		inj::release();
 	}
 
+	// ---- The aura ring (038A80 / 038E10, model_entry::aura) through the see-through marker: three copies, two moved 20
+	// pixels right and left in red (0x40 alpha: x 4, full where T is), the last the solid one: beside the model where it
+	// alone leaves the sky, the world turned red (its green and blue gone, partly on the copy's soft edge)
+	{
+		const auto draw_see_through = [&](uint32_t seq, uint8_t aura, std::vector<uint8_t> &px) {
+			std::string why_;
+			check(inj::prepare(g.device, why_), "aura: the renderer made" + (why_.empty() ? "" : ": " + why_));
+			ID3D12DescriptorHeap *heap = ch::cache::heap();
+			begin_list(g);
+			inj::on_reset(g.list);
+			inj::on_heaps(g.list, 1, &heap);
+			inj::on_marker(ds);
+			D3D12_RESOURCE_BARRIER planes[1] = {};
+			planes[0].Transition.pResource = ds;
+			planes[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			planes[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			planes[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			inj::on_barrier(1, planes);
+			g.list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
+			g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			ch::frame &f = make_frame(seq, now, 0x80808080u, ch::kNative | ch::kFromFlush, 0);
+			ch::model_entry &m = f.model[0];
+			m.aura = aura;
+			const float offsets[3][2] = { { 20.0f, 0.0f }, { -20.0f, 0.0f }, { 0.0f, 0.0f } };
+			std::memcpy(m.aura_offset, offsets, sizeof(offsets));
+			m.aura_colour[0] = m.aura_colour[1] = 0x40FF0000u;
+			inj::world w;
+			w.rt = rt;
+			w.ds = ds;
+			w.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			w.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			grass::list_state bound;
+			inj::on_see_through(g.list, bound, w, seq & 15);
+			run(g);
+			px = read_back(g, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, 4);
+		};
+		std::vector<uint8_t> plain, ringed;
+		draw_see_through(48, 0, plain);
+		draw_see_through(49, 3, ringed);
+		std::string first;
+		const uint32_t messages = debug_messages(g.info, first);
+		const inj::counts c = inj::get_counts();
+		uint32_t halo = 0, red = 0, full = 0, model = 0;
+		for (size_t i = 0; i < size_t(W) * H; ++i)
+		{
+			const uint8_t *a = &plain[i * 4], *b = &ringed[i * 4];
+			model += !is_sky(a);
+			if (!is_sky(a) || is_sky(b))
+				continue;
+			halo++;
+			// (its green and blue going: the copy's red over the sky, whole where T is whole, less on its softened edge)
+			red += b[1] < 69 && b[2] < 95 && b[0] >= b[1] ? 1 : 0;
+			full += b[1] < 8 && b[2] < 8 ? 1 : 0;
+		}
+		check(messages == 0 && g.device->GetDeviceRemovedReason() == S_OK, "aura: the debug layer nothing (" + std::to_string(messages) + (messages ? ": " + first : "") + ")");
+		check(c.auras == 1 && c.aura_failed == 0 && model > 1000 && halo > model / 10 && red >= halo * 9 / 10 && full >= halo / 2,
+			"aura: the ring beside the model (" + std::to_string(halo) + " pixels where it alone leaves the sky, " + std::to_string(red) + " of them reddened, " + std::to_string(full) + " all red; the model " +
+				std::to_string(model) + ")");
+		inj::release();
+	}
+
 	renderer.release();
 	ch::cache::stop();
 	if (failures == 0)

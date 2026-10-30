@@ -76,8 +76,9 @@ namespace hifi::chars::cache
 	bool mesh_ready(uint32_t id);
 	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out);
 	ID3D12DescriptorHeap *heap();
-	// The renderer's own descriptors in that heap (k < kReserved: the see-through target's view); false before the heap
-	constexpr uint32_t kReserved = 2;
+	// The renderer's own descriptors in that heap (k < kReserved: 0 the see-through target's view, 1 the scene's copy, 2
+	// the aura ring's 256 x 256 target); false before the heap. (The heap's last kReserved / 2 pairs.)
+	constexpr uint32_t kReserved = 4;
 	bool reserved(uint32_t k, D3D12_CPU_DESCRIPTOR_HANDLE &cpu, D3D12_GPU_DESCRIPTOR_HANDLE &gpu);
 
 	struct counts

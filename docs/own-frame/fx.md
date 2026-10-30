@@ -172,6 +172,21 @@ inverted and transposed, the texture matrix's columns 0 and 1, the tint) and the
 table t5, `element::env`; static sampler s2 CLAMP). Taken only with the stages where the tables put them (+0x1BC 0;
 +0x1BD 1, or 2 with three stages). Kinds 5-7 without textures take the first vertex's y from the DAT as the D3M does.
 
+**The aura ring (038A80, 038E10; on the native character renderer).** An actor with an aura (summons, some NPCs and
+monsters: a chunk 0x5E) goes into the priority-12 flush as a see-through model. Its ring is drawn by 02B6E0 at 02C19B
+after its parts, which is past charmodel's leave: for a model HiFi XI draws natively the game's ring never runs (so
+until now such models had no ring). Now charmodel reads it as 038E10 would (`read_aura`, R): config 0xC8 (193850; -1,
+the store not up, passes), the object at actor +0x710 (+4 the chunk's handle, +8 the angle in degrees, an int), the
+game's 256 x 256 target [VA 0490B958] and second target [VA 048E6D50] made; N copies (data +1, up to 8); copy i's angle
+(i x 360 / N + the angle) degrees x 0.017452778, wrapped to +-3.1415, radius data +0xC + 8i / 16: the offset (r sin a,
+r cos a) pixels; colour data +0x10 + 8i (R G B A); the last copy the solid one; then the angle moves on by int(014CF0())
+(the frame step), as 038E10 does. They travel in `model_entry::aura`. On the Direct3D 12 side charinject's see-through
+path draws them between the model into T and T's composite (`chars::aura_ring`, chardraw): T drawn down into a 256 x
+256 target (038A80: colour and alpha the texture's), the copies but the last over the world, the whole of it stretched
+over the screen moved by the offset (DIFFUSE x TEXTURE x 2, alpha x 4, ALPHATEST GREATER 0, SRCALPHA / INVSRCALPHA,
+no depth), the last at no offset unblended with ALPHATEST GREATER 0x60 (the solid low-resolution body), then T's
+composite as before (01D3B0). The 256 x 256 target's view is the character cache's reserved descriptor 2.
+
 **Lens flares (0548D0 -> 03EBF0).** The flare's own draw (vt+0x2C, so the run is closed before it as before) works
 out the light's screen point, runs its visibility test (06C280 at 054AE2: the game's readback, or World FX's VisTest
 answer when that's on) and, when it passes and the flare has a model, calls 03EBF0 (thiscall on the flare D3A's
@@ -250,6 +265,13 @@ The reactive mask is the world at the characters' end against the world before W
 drawn between the two, so they count as before. No motion vectors for effects (as before).
 
 ## Shared files touched (small, additive)
+- The native character renderer, for the aura ring (additive; the cloak and overlay passes and reserved descriptor 1
+  untouched): `src/chars/charframe.hpp` (`kMaxAura`, `model_entry::aura`, `aura_offset`, `aura_colour`),
+  `src/chars/cache.hpp/.cpp` (`kReserved` 2 -> 4: the heap's last two pairs; descriptor 2 the aura's 256 x 256),
+  `src/chars/chardraw.hpp/.cpp` (the class `aura_ring`, its own root signature and pipelines), `src/chars/charinject.hpp/
+  .cpp` (one made with the renderer, called before the see-through composite; counts `auras`, `aura_failed`),
+  `src/game/charmodel.hpp/.cpp` (`find_aura`, `read_aura`, the sites, a count); tests: `actors_draw_test` (the ring
+  through the see-through marker), `charmodel_test` (the sites).
 - `src/host/passes.hpp/.cpp`: `world` gained the depth planes' states (`planes_known`, `ds_planes`) and the list's
   descriptor heaps (`heap_count`, `heaps`), filled by `dispatch`; `passes::on_reset` / `on_heaps` follow each list's
   `SetDescriptorHeaps`. Any pass that binds its own heap or writes depth needs both.
@@ -358,9 +380,9 @@ The oracles are made when missing (`build.cmd`), about a minute.
    1207B0 from the font object [VA 04971BF8], not texture chunks, so fxtextures can't take them as they are); whether
    Phoenix ever starts them is open (notes-world-passes 5). Next, if they show: the glyphs' Direct3D textures (the font
    object's) copied once, 041C20's projection and centring on the game side.
-11. **Aura ring** (038A80/038E10, inside the aura actor's see-through draw): N offset tinted copies of the native
-   character's private target T (charinject's see-through path) before the composite; needs a hook in the actor's draw
-   (02C19B/02C1A2) and chars' T: coordinate with the actors/chars owner.
+11. (Done: the aura ring, on the native character renderer.) Not run offline: the game side's read of a live aura
+   actor (actor +0x710, its chunk 0x5E, config 0xC8; only its sites are checked on both dumps); a multisampled world gets
+   no aura (T's view is multisampled then: counted "couldn't be").
 12. **FSR motion** for effects: none (as before); the effects stay in the reactive mask (drawn between the world before
    World FX's passes and the characters' end). Not started.
 
@@ -377,6 +399,8 @@ The oracles are made when missing (`build.cmd`), about a minute.
   in the game; they move on as before.
 - Heat haze (CMoDist, VuDist: fire spells, some abilities): the world under a diamond shown shifted and fading to its
   edges, as before; with MSAA on in dgVoodoo the world is resolved for it. `/hifi status`: "distortion grabs".
+- Summons and other actors with an aura (Ifrit, Titan, Shiva...): the coloured halo round them, turning slowly, as
+  before (with the native character renderer it was missing); `/hifi status` "aura rings".
 - Shiny effect pieces (the specular D3M: an environment picture that turns with the camera added over them, as
   before; `/hifi status` "specular").
 - Distortion meshes, morphs and rings (the 042D00 kinds: shock waves, ripples, see-through shapes): the world seen

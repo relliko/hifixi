@@ -57,6 +57,9 @@ namespace hifi::chars
 	// the game's order
 	constexpr uint8_t kEnNone = 0, kEnFire = 1, kEnIce = 2, kEnWind = 3, kEnEarth = 4, kEnThunder = 5, kEnWater = 6, kEnLight = 7, kEnDark = 8;
 
+	// An aura ring's copies at most (model_entry::aura; the game's chunks have 4-8)
+	constexpr uint32_t kMaxAura = 8;
+
 	struct model_entry
 	{
 		uintptr_t actor = 0, model = 0;
@@ -87,6 +90,12 @@ namespace hifi::chars
 		uint32_t overlay_colour = 0;
 		float cloak_offset[2] = {};
 		uint32_t cloak_factor = 0;
+		// The aura ring of a see-through model (research/ffxi-re/notes-world-passes.md 3: 038A80, 038E10; src/game/charmodel
+		// sets it from actor +0x710 and its chunk 0x5E): its copies (0: none), each one's offset in the world target's pixels
+		// (r sin a, r cos a) and colour (0xAARRGGBB); the last is the solid one (its offset 0, its colour not used)
+		uint8_t aura = 0;
+		float aura_offset[kMaxAura][2] = {};
+		uint32_t aura_colour[kMaxAura] = {};
 	};
 
 	constexpr uint8_t kPassOverlay = 1u << 0, kPassCloak = 1u << 1;

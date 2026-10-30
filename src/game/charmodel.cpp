@@ -78,6 +78,11 @@ namespace hifi::game::charmodel
 		constexpr const char *kCloakSetup = "381D????????0F84????????68????????B9????????E8????????8B0D????????A1????????";
 		constexpr const char *kCloakFactor = "8B15????????8B0D????????528B15????????5150528D8D90000000E8";
 
+		// The aura ring 038E10 (research/ffxi-re/notes-world-passes.md 3): its call of the config getter 193850 at +0x13, mov eax,
+		// [the 256 x 256 target] at +0x30, mov eax, [the second target] at +0x39, its call of the frame step 014CF0 at +0x556
+		constexpr const char *kAuraRing = "81ECA800000053578BD968C8000000895C2420E8????????83C40485C074238B430485C0741C";
+		constexpr intptr_t kAuraConfigAt = 0x13, kAuraSmallAt = 0x30, kAuraSecondAt = 0x39, kAuraStepAt = 0x556;
+
 		constexpr uint32_t kColourAt = 0xA8; // (argument 7 at the site's esp)
 		constexpr uint32_t kMaxInstancesPerModel = 8, kMaxMeshesPerInstance = 32, kMaxBonesPerInstance = 255;
 		constexpr uint32_t kMaxClothPerModel = 8, kMaxClothVertices = 1024;
@@ -110,6 +115,9 @@ namespace hifi::game::charmodel
 			uintptr_t overlay_flag = 0, overlay_u = 0, overlay_v = 0, overlay_handle = 0, overlay_colour = 0;
 			uintptr_t cloak_flag = 0, cloak_projection = 0, cloak_a = 0, cloak_b = 0, cloak_factor = 0;
 			uintptr_t go_on = 0, leave = 0; // (the tests' exits; 0: the game's)
+			// The aura ring's (038E10's: config 193850, the 256 x 256 target and the second target's globals, the frame step's
+			// 014CF0; 0: not found, see-through models HiFi XI draws have none, as before)
+			uintptr_t aura_config = 0, aura_small = 0, aura_second = 0, aura_step = 0;
 			uint8_t saved[5] = {}, ours[5] = {};
 			bool in = false;
 			bool game_draws = true, recording = true, native = false;
@@ -518,6 +526,60 @@ namespace hifi::game::charmodel
 			return true;
 		}
 
+		// The aura ring (research/ffxi-re/notes-world-passes.md 3; model_entry::aura) of a see-through model HiFi XI
+		// draws, as 038E10 would have drawn it (its call in 02B6E0, 02C19B, is past the leave: the game's never runs for
+		// such a model): config 0xC8 on (193850; -1, the store not up, passes too), the object at actor +0x710 (+4 its
+		// chunk 0x5E's handle, +8 the angle in degrees, an int), the 256 x 256 target [VA 0490B958] and the second target
+		// [VA 048E6D50] made. N copies (data +1, at most kMaxAura); copy i's angle (i x 360 / N + the angle) degrees x
+		// 0.017452778, wrapped to +-3.1415 (by 6.283), its radius data +0xC + 8i x 1/16: offset (r sin a, r cos a) pixels;
+		// its colour data +0x10 + 8i (R G B A); the last copy is the solid one. Then the angle moves on by int(014CF0())
+		// (the frame step, at least 1), as 038E10 does after its copies.
+		void read_aura(uintptr_t actor, ch::model_entry &m)
+		{
+			m.aura = 0;
+			if (g.aura_config == 0)
+				return;
+			__try
+			{
+				using config_fn = int32_t(__cdecl *)(uint32_t id);
+				using frame_step_fn = float(__cdecl *)();
+				if (reinterpret_cast<config_fn>(g.aura_config)(0xC8) == 0)
+					return;
+				const uintptr_t obj = actor + 0x710;
+				const uint32_t handle = *reinterpret_cast<const uint32_t *>(obj + 4);
+				const uint32_t resource = handle != 0 ? *reinterpret_cast<const uint32_t *>(handle) : 0;
+				if (resource == 0 || *reinterpret_cast<const uint32_t *>(g.aura_small) == 0 || *reinterpret_cast<const uint32_t *>(g.aura_second) == 0)
+					return;
+				const uintptr_t data = resource + 0x30;
+				const uint32_t n = *reinterpret_cast<const uint8_t *>(data + 1);
+				if (n == 0 || n > ch::kMaxAura)
+					return;
+				const int32_t angle = *reinterpret_cast<const int32_t *>(obj + 8);
+				for (uint32_t i = 0; i + 1 < n; ++i)
+				{
+					float a = float(int32_t(i) * 360 / int32_t(n) + angle) * 0.017452778f;
+					if (a > 3.1414999961853027f)
+						a -= 6.2829999923706055f;
+					if (a < -3.1414999961853027f)
+						a += 6.2829999923706055f;
+					const float r = *reinterpret_cast<const float *>(data + 0xC + 8 * i) * 0.0625f;
+					m.aura_offset[i][0] = r * std::sin(a);
+					m.aura_offset[i][1] = r * std::cos(a);
+					const uint8_t *c = reinterpret_cast<const uint8_t *>(data + 0x10 + 8 * i);
+					m.aura_colour[i] = uint32_t(c[3]) << 24 | uint32_t(c[0]) << 16 | uint32_t(c[1]) << 8 | c[2];
+				}
+				m.aura_offset[n - 1][0] = m.aura_offset[n - 1][1] = 0.0f;
+				m.aura_colour[n - 1] = 0;
+				m.aura = uint8_t(n);
+				*reinterpret_cast<int32_t *>(obj + 8) = angle + int32_t(reinterpret_cast<frame_step_fn>(g.aura_step)());
+				g.n.auras++;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				m.aura = 0;
+			}
+		}
+
 		// From the stub: 1 = leave through the early return (the game doesn't draw it)
 		uint32_t __cdecl on_model(uintptr_t model, uintptr_t actor, uintptr_t esp)
 		{
@@ -554,6 +616,7 @@ namespace hifi::game::charmodel
 			m.model = model;
 			m.colour = r.colour;
 			m.flags = flush ? ch::kFromFlush : 0;
+			m.aura = 0;
 			std::memcpy(m.lights, r.lights, sizeof(m.lights));
 			m.ambient = r.ambient;
 			m.tfactor = r.tfactor;
@@ -673,6 +736,9 @@ namespace hifi::game::charmodel
 					f->bones += n;
 				}
 			}
+			// (a see-through model HiFi XI draws: its aura ring, which the game's draw would have made past the leave)
+			if (flush && (m.flags & ch::kNative) != 0)
+				read_aura(actor, m);
 			m.instances = r.instances + cloths;
 			f->instances += r.instances + cloths;
 			f->models++;
@@ -708,6 +774,21 @@ namespace hifi::game::charmodel
 			g.cloak_b = word(cloak + 0x1D);
 			g.cloak_a = word(cloak + 0x22);
 			g.cloak_factor = word(factor + 0xF);
+		}
+
+		// The aura ring's calls and globals out of 038E10 (each checked by its opcode)
+		void find_aura()
+		{
+			g.aura_config = g.aura_small = g.aura_second = g.aura_step = 0;
+			const uintptr_t at = find(kAuraRing);
+			uint8_t op[4] = {};
+			if (at == 0 || !read(at + kAuraConfigAt, op[0]) || op[0] != 0xE8 || !read(at + kAuraSmallAt, op[1]) || op[1] != 0xA1 || !read(at + kAuraSecondAt, op[2]) ||
+				op[2] != 0xA1 || !read(at + kAuraStepAt, op[3]) || op[3] != 0xE8)
+				return;
+			g.aura_config = rel_target(at + kAuraConfigAt);
+			g.aura_small = word(at + kAuraSmallAt + 1);
+			g.aura_second = word(at + kAuraSecondAt + 1);
+			g.aura_step = rel_target(at + kAuraStepAt);
 		}
 
 		void find_cloth()
@@ -787,6 +868,7 @@ namespace hifi::game::charmodel
 		g.device = word(device + 2);
 		find_cloth();
 		find_passes();
+		find_aura();
 		std::memcpy(g.saved, now, 5);
 		if (g.stub == 0)
 		{
@@ -906,7 +988,7 @@ namespace hifi::game::charmodel
 			"%llu new meshes, %llu new textures (%llu not found); "
 			"%llu couldn't be read, %llu didn't fit, %llu drawn outside the world's passes; "
 			"cloth: %llu meshes in HiFi XI's models, %llu steps, %llu faulted, %llu models left to the game for theirs%s; "
-			"extra passes: %llu overlays, %llu cloaks seen, %llu models left to the game for theirs%s%s",
+			"extra passes: %llu overlays, %llu cloaks seen, %llu models left to the game for theirs%s; %llu aura rings%s%s",
 			static_cast<unsigned long long>(g.n.models), static_cast<unsigned long long>(g.n.see_through), static_cast<unsigned long long>(g.n.native),
 			static_cast<unsigned long long>(g.n.not_ready), g.n.last_models, g.n.last_bones,
 			static_cast<unsigned long long>(g.n.new_meshes), static_cast<unsigned long long>(g.n.new_textures), static_cast<unsigned long long>(g.n.textures_missing),
@@ -915,6 +997,7 @@ namespace hifi::game::charmodel
 			static_cast<unsigned long long>(g.n.cloth_refused), g.cloth_step != 0 ? "" : " (its sites not found: the game's)",
 			static_cast<unsigned long long>(g.n.overlays), static_cast<unsigned long long>(g.n.cloaks), static_cast<unsigned long long>(g.n.passes_refused),
 			g.overlay_flag != 0 ? "" : " (their globals not found: not drawn)",
+			static_cast<unsigned long long>(g.n.auras), g.aura_config != 0 ? "" : " (038E10 not found: none drawn)",
 			g.game_draws ? "" : "; the game's own character drawing OFF");
 		return line;
 	}
@@ -923,7 +1006,8 @@ namespace hifi::game::charmodel
 	{
 		return { g.site, g.early_return, g.in ? g.stub : 0, g.lights, g.ambient, g.tfactor, g.renderer, g.device,
 			g.cloth_step, g.cloth_node, g.cloth_buffer, g.cloth_flag, g.cloth_palette,
-			g.overlay_flag, g.overlay_u, g.overlay_v, g.overlay_handle, g.overlay_colour, g.cloak_flag, g.cloak_projection, g.cloak_a, g.cloak_b, g.cloak_factor };
+			g.overlay_flag, g.overlay_u, g.overlay_v, g.overlay_handle, g.overlay_colour, g.cloak_flag, g.cloak_projection, g.cloak_a, g.cloak_b, g.cloak_factor,
+			g.aura_config, g.aura_small, g.aura_second, g.aura_step };
 	}
 
 	void set_exits(uintptr_t go_on, uintptr_t leave)

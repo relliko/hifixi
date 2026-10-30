@@ -247,8 +247,8 @@ namespace hifi::chars::cache
 			g.heap = p.heap;
 			g.step = p.step;
 			g.free_slots.clear();
-			// (the last pair is the renderer's own: reserved())
-			for (uint32_t s = kDescriptors / 2 - 1; s-- > 0;)
+			// (the last pairs are the renderer's own: reserved())
+			for (uint32_t s = kDescriptors / 2 - kReserved / 2; s-- > 0;)
 				g.free_slots.push_back(s);
 			return true;
 		}

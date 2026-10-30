@@ -159,4 +159,41 @@ namespace hifi::chars
 		uint8_t *_mapped = nullptr;
 		std::unordered_map<uint64_t, ID3D12PipelineState *> _pipelines;
 	};
+
+	// The aura ring of a see-through model (research/ffxi-re/notes-world-passes.md 3; model_entry::aura), drawn between
+	// the model into T and T's composite, as the game draws 038A80 and 038E10 between its parts and 01D3B0: T drawn down
+	// into a 256 x 256 target of its own (038A80: colour and alpha the texture's), then each copy but the last over the
+	// world's target, the whole 256 x 256 stretched over it moved by the copy's offset in pixels (038E10: DIFFUSE x TEXTURE
+	// x 2, alpha DIFFUSE x TEXTURE x 4, ALPHATEST GREATER 0, SRCALPHA / INVSRCALPHA, no depth), then the last at no
+	// offset, unblended, ALPHATEST GREATER 0x60, the texture's colour and alpha (the solid low-resolution body). Its own
+	// root signature and pipelines (the world's format, one sample: a multisampled world gets no aura).
+	class aura_ring
+	{
+	public:
+		aura_ring() = default;
+		aura_ring(const aura_ring &) = delete;
+		aura_ring &operator=(const aura_ring &) = delete;
+		~aura_ring();
+
+		bool init(ID3D12Device *device, std::string &why);
+		void release();
+		// The model's aura over `world` (its rtv in the state RENDER_TARGET), from T (t_srv, single-sampled, readable by a
+		// pixel shader) in `heap`; its 256 x 256 target's view goes into `slot` (cpu, gpu: a descriptor of that heap).
+		// False when nothing was drawn (no aura, a multisampled world, what it needs not made); the list's targets,
+		// viewport, root signature and pipeline are left as it set them.
+		bool record(ID3D12GraphicsCommandList *list, const char_target &world, ID3D12DescriptorHeap *heap, D3D12_GPU_DESCRIPTOR_HANDLE t_srv,
+			D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu, D3D12_GPU_DESCRIPTOR_HANDLE slot_gpu, const model_entry &m);
+
+	private:
+		ID3D12PipelineState *pipeline(DXGI_FORMAT format, int kind);
+
+		ID3D12Device *_device = nullptr;
+		ID3D12RootSignature *_root = nullptr;
+		void *_vs = nullptr, *_ps_copy = nullptr, *_ps_ring = nullptr, *_ps_solid = nullptr; // (ID3DBlob)
+		ID3D12Resource *_target = nullptr; // (256 x 256, the world's format)
+		ID3D12DescriptorHeap *_rtv = nullptr;
+		DXGI_FORMAT _format = DXGI_FORMAT_UNKNOWN;
+		D3D12_RESOURCE_STATES _state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		std::unordered_map<uint64_t, ID3D12PipelineState *> _pipelines;
+	};
 }
