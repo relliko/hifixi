@@ -15,8 +15,8 @@
  * stack, ret 4); test al, al; jne 046358 (past the depth pull, the class draw and 0472F0's restore). That call goes to
  * on_setup (a __fastcall with the same stack), which answers 1 for an element it recorded.
  *
- * What's recorded for an element (046070, 0467E0, the class draw), read straight from the game's memory under a
- * structured exception guard (an element whose memory faults is left to the game, nothing of it kept):
+ * What's recorded for an element (046070, 0467E0, the class draw), read straight from the game's memory (no
+ * ReadProcessMemory per field: a busy flush has hundreds of elements) under a structured exception guard (an element whose memory faults is left to the game, nothing of it kept):
  *   - WORLD: +0xA0 after 045D40 (called here as 0467E0 calls it: the draw matrix is built only in the setup path);
  *   - TEXTUREFACTOR: VA 0490BC0C (046070's colour, alpha x fade x brightness) with 0467E0's letter changes (d, h: alpha
  *     = min(255, the letter's high byte x 2); b: the high byte) and the class's (the D3M's D: alpha >= 0x7F -> 0xFF;
@@ -230,8 +230,8 @@ namespace hifi::game::fxdraw
 				return false;
 			if (blend != fx::blend_subtract)
 				return true;
-			const uintptr_t gfx = word(g.gfx);
-			return gfx != 0 && (word(gfx + 0xDEC) & 0x800) != 0;
+			const uintptr_t gfx = at<uint32_t>(g.gfx);
+			return gfx != 0 && (at<uint32_t>(gfx + 0xDEC) & 0x800) != 0;
 		}
 
 		// The D3M's names and vertices (03FCF0, 03FD70) from its data (resource + 0x30)
@@ -260,14 +260,14 @@ namespace hifi::game::fxdraw
 		{
 			if (!pointer(uint32_t(object)))
 				return fx::kNone;
-			const uint32_t res = word(object + 8);
+			const uint32_t res = at<uint32_t>(object + 8);
 			if (!pointer(res))
 				return fx::kNone;
 			fx::textures::key k;
 			k.resource = res;
-			k.handle = word(res + 0x14);
-			k.header = word(res + 0x24);
-			k.data = word(res + 0x30 + 6);
+			k.handle = at<uint32_t>(res + 0x14);
+			k.header = at<uint32_t>(res + 0x24);
+			k.data = at<uint32_t>(res + 0x30 + 6);
 			uint32_t id = fx::textures::find(k, g.clock);
 			if (id == fx::kNone)
 			{
@@ -288,7 +288,7 @@ namespace hifi::game::fxdraw
 		{
 			const uint32_t flags = at<uint32_t>(e + kFlags);
 			const uint16_t letter = at<uint16_t>(e + kLetter);
-			uint32_t colour = word(g.colour);
+			uint32_t colour = at<uint32_t>(g.colour);
 			uint8_t blend = fx::blend_add;
 			if (!letter_blend(letter, colour, blend))
 			{
@@ -302,7 +302,7 @@ namespace hifi::game::fxdraw
 			out.blend = blend;
 			out.z_write = (flags >> 12) & 1;
 			// PROJECTION (046070): the depth pull, else screen-fixed
-			const uintptr_t renderer = word(g.renderer), camera = word(g.camera);
+			const uintptr_t renderer = at<uint32_t>(g.renderer), camera = at<uint32_t>(g.camera);
 			const float bias = renderer != 0 && at<uint8_t>(renderer + 0x39598) != 0 ? at<float>(renderer + 0x39594) : 0.0f;
 			const float cam_near = camera != 0 ? at<float>(camera + 0x2DC) : 0.0f, cam_far = camera != 0 ? at<float>(camera + 0x2E0) : 0.0f;
 			const float pull = at<float>(e + kBias);
@@ -332,16 +332,16 @@ namespace hifi::game::fxdraw
 			out.fog = 0;
 			if ((flags & (1u << 25)) == 0)
 			{
-				const uintptr_t gfx = word(g.gfx);
-				const uintptr_t wrapper = gfx != 0 ? word(gfx + 0xDC8) : 0;
+				const uintptr_t gfx = at<uint32_t>(g.gfx);
+				const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
 				const uint8_t table = wrapper != 0 ? at<uint8_t>(wrapper + 0x92D) : 0, vertex = wrapper != 0 ? at<uint8_t>(wrapper + 0x92E) : 0;
 				const uint8_t range = wrapper != 0 ? at<uint8_t>(wrapper + 0x92F) : 0;
-				const uint32_t handle = word(e + kGen);
-				const uint32_t gen = handle != 0 ? word(handle) : 0;
-				const uint32_t area = gen != 0 ? word(gen + 0xC4) : 0;
+				const uint32_t handle = at<uint32_t>(e + kGen);
+				const uint32_t gen = handle != 0 ? at<uint32_t>(handle) : 0;
+				const uint32_t area = gen != 0 ? at<uint32_t>(gen + 0xC4) : 0;
 				uint32_t fog_colour = 0;
 				float fog_end = 0.0f, fog_start = 0.0f;
-				const uintptr_t env = word(g.env);
+				const uintptr_t env = at<uint32_t>(g.env);
 				if (env != 0)
 				{
 					reinterpret_cast<fog_fn>(g.fog_env)(env, 0, &fog_colour, &fog_end, &fog_start, 0, area);
@@ -367,7 +367,7 @@ namespace hifi::game::fxdraw
 			const uintptr_t data = resource + 0x30;
 			const uint32_t textures = at<uint8_t>(data + 4), tail = at<uint8_t>(data + 5), triangles = at<uint16_t>(data + 6);
 			const uintptr_t names = d3m_names(data), vertices = d3m_vertices(data);
-			if (word(names + 4) == 0)
+			if (at<uint32_t>(names + 4) == 0)
 			{
 				g.n.empty++;
 				return true; // (no vertex buffer: 040220 draws nothing)
@@ -403,7 +403,7 @@ namespace hifi::game::fxdraw
 				uint32_t first = 0;
 				for (uint32_t i = 0; i < textures; ++i)
 				{
-					const uint32_t object = word(names + 16 * i);
+					const uint32_t object = at<uint32_t>(names + 16 * i);
 					const uint32_t id = texture_of(object);
 					if (id == fx::kNone)
 					{
@@ -471,7 +471,7 @@ namespace hifi::game::fxdraw
 		{
 			fx::frame &f = *g.f;
 			const uintptr_t data = resource + 0x30;
-			if (word(data + 0xC) == 0)
+			if (at<uint32_t>(data + 0xC) == 0)
 			{
 				g.n.empty++;
 				return true; // (no vertex buffer: 03E910 draws nothing)
@@ -483,14 +483,14 @@ namespace hifi::game::fxdraw
 				frame = 0;
 				*reinterpret_cast<uint16_t *>(e + 0x170) = 0;
 			}
-			const uintptr_t table = word(data + 0x14);
+			const uintptr_t table = at<uint32_t>(data + 0x14);
 			if (table == 0 || frames <= 0)
 			{
 				g.n.unsupported++;
 				return false;
 			}
 			const int32_t quads = at<int16_t>(table + 4 * uintptr_t(frame)), first = at<int16_t>(table + 4 * uintptr_t(frame) + 2);
-			const uint32_t object = word(data + 8);
+			const uint32_t object = at<uint32_t>(data + 8);
 			const uint32_t id = texture_of(object);
 			if (id == fx::kNone)
 			{
@@ -726,10 +726,10 @@ namespace hifi::game::fxdraw
 		// An element into the frame: true when it's taken (the game's setup and draw skipped)
 		bool record(uintptr_t e)
 		{
-			const uintptr_t vt = word(e);
+			const uintptr_t vt = at<uint32_t>(e);
 			if (vt == 0)
 				return false;
-			const uintptr_t cls = word(vt + 0x48);
+			const uintptr_t cls = at<uint32_t>(vt + 0x48);
 			if (g.f->runs.load(std::memory_order_relaxed) + 2 >= fx::kMaxRuns)
 			{
 				g.n.full++;
@@ -737,13 +737,13 @@ namespace hifi::game::fxdraw
 			}
 			if (cls == g.d3a_draw && g.d3a_draw != 0)
 			{
-				const uint32_t handle = word(e + kModel);
+				const uint32_t handle = at<uint32_t>(e + kModel);
 				if (handle == 0)
 				{
 					g.n.empty++;
 					return true;
 				}
-				const uint32_t resource = word(handle);
+				const uint32_t resource = at<uint32_t>(handle);
 				if (resource == 0)
 				{
 					g.n.unsupported++;
@@ -768,14 +768,14 @@ namespace hifi::game::fxdraw
 					g.n.lit++;
 					return false;
 				}
-				const uint32_t handle = word(e + kModel);
+				const uint32_t handle = at<uint32_t>(e + kModel);
 				if (handle == 0)
 				{
 					g.n.empty++;
 					return true;
 				}
-				const uint32_t gh = word(e + kGen);
-				const uint32_t gen = gh != 0 ? word(gh) : 0;
+				const uint32_t gh = at<uint32_t>(e + kGen);
+				const uint32_t gen = gh != 0 ? at<uint32_t>(gh) : 0;
 				if (gen != 0 && (at<uint8_t>(gen + 0xDE) & 0x80) != 0 && reinterpret_cast<weather_fn>(g.weather)() == 0.0f)
 				{
 					g.n.empty++;
@@ -786,7 +786,7 @@ namespace hifi::game::fxdraw
 					g.n.unsupported++;
 					return false;
 				}
-				const uint32_t resource = word(handle);
+				const uint32_t resource = at<uint32_t>(handle);
 				if (resource == 0)
 				{
 					g.n.unsupported++;
@@ -809,6 +809,22 @@ namespace hifi::game::fxdraw
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
 				g.n.faulted++;
+				return false;
+			}
+		}
+
+		// Whether a queued element is drawn through 046070 (its vtable's +0x2C), under a guard
+		bool drawn_by_046070(uintptr_t e)
+		{
+			__try
+			{
+				if (!pointer(uint32_t(e)))
+					return false;
+				const uint32_t vt = at<uint32_t>(e);
+				return vt != 0 && at<uint32_t>(vt + 0x2C) == g.element_draw;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
 				return false;
 			}
 		}
@@ -864,13 +880,7 @@ namespace hifi::game::fxdraw
 			if (callback == g.trail_cb && g.trail_cb != 0 && record_trail_guarded(arg))
 				return;
 			// (anything but an element drawn through 046070 draws now: the run so far first)
-			bool element = false;
-			if (callback == g.element_cb && pointer(uint32_t(arg)))
-			{
-				const uint32_t vt = word(arg);
-				element = vt != 0 && word(vt + 0x2C) == g.element_draw;
-			}
-			if (!element)
+			if (callback != g.element_cb || !drawn_by_046070(arg))
 				close_run();
 		}
 		reinterpret_cast<callback_fn>(callback)(arg);
