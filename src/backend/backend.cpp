@@ -612,6 +612,10 @@ namespace hifi::backend
 					zone::inject::on_marker(depth);
 					chars::inject::on_marker(depth);
 				}
+				// (and the upscaled world, when it waits for the next call after the resolve, goes in before what they
+				// draw: a marker isn't a clear to it)
+				else
+					upscale::before_other(list, d.state);
 				if (depth == nullptr)
 					return;
 				passes::world w;
