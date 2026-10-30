@@ -301,6 +301,9 @@ class hifixi final : public IPlugin
 			say("Direct3D 12 hooks in, late: no starter (bootloader\\dxgi.dll), so the views dgVoodoo made before aren't known and World FX can't find the world.", true);
 		else
 			say("Direct3D 12 hooks not in: " + why, true);
+		if (hifi::backend::safe_start())
+			say("The GPU stopped last session (report: bootloader\\worldfx-gpu-crash.txt). Safe start: light in the air, ambient occlusion, "
+				"water reflections, rain, snow, cloud quality and lamp shadows are off until the next start; /hifi turns them on again now.", true);
 		hifi::host::reset_stats();
 		m_presents = 0;
 		m_since = now_seconds();

@@ -559,6 +559,20 @@ int main()
 		hifi::ui::delete_preset("Mine too", why);
 	}
 
+	// A safe start: the GPU stopped last session (the core's GpuStopped=1), so this one reads World FX's costliest parts
+	// as off; the file keeps them, and the start after is as before
+	{
+		write_text(settings_file, "[hifixi]\r\npreset=custom\r\naddons=1\r\n\r\n[worldfx]\r\nGpuStopped=1\r\nVolLight=1.5\r\nAOStrength=0.8\r\nSunShadows=0.5\r\n");
+		check(hifi::backend::start_settings_only(settings_file.c_str(), folder.c_str()), "the settings started after the GPU stopped");
+		const std::string s = read_all(settings_file);
+		check(hifi::backend::safe_start() && value("VolLight") == 0.0f && value("AOStrength") == 0.0f && value("SunShadows") == 0.5f,
+			"a safe start: light in the air and ambient occlusion off, the rest as set");
+		check(s.find("VolLight=1.5") != std::string::npos && s.find("AOStrength=0.8") != std::string::npos && s.find("GpuStopped") == std::string::npos,
+			"the file keeps their values; GpuStopped taken out (one safe start)");
+		check(hifi::backend::start_settings_only(settings_file.c_str(), folder.c_str()) && !hifi::backend::safe_start() && value("VolLight") == 1.5f &&
+			value("AOStrength") == 0.8f, "the start after: as set again");
+	}
+
 	check(read_all(reshade_ini) == old_ini, "ReShade.ini as it was, at the end");
 	std::printf(failures == 0 ? "\nall passed\n" : "\n%d failed\n", failures);
 	return failures == 0 ? 0 : 1;

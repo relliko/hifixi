@@ -81,7 +81,9 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 				motion = (was.xy / was.w - ndc) * float2(0.5, -0.5);
 		}
 	}
-	motion_out[id.xy] = motion;
+	// (FSR 2 keeps what it's given in its history: motion that isn't a number, by its bits, or is wildly off is none)
+	const uint2 bits = asuint(motion) & 0x7F800000u;
+	motion_out[id.xy] = all(bits != 0x7F800000u) ? clamp(motion, -2.0, 2.0) : float2(0.0, 0.0);
 }
 )";
 

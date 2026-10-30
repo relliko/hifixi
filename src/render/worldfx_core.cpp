@@ -263,6 +263,11 @@ namespace
 		std::string shader_status = "built in";
 		std::shared_ptr<shader_job> shader_compiling;
 
+		// The video memory, looked at every kMemoryCheckMs: over what Windows gives the game on the card, it swaps
+		// (stutters) and a slow card can stop. Said once in the log each time it goes over; the status while it is.
+		uint64_t memory_checked = 0;
+		std::string memory_status;
+
 		// Characters and monsters near (from the worldfx Ashita addon): x, y, z, radius each, and when sent
 		float actors[grass::kMaxActors * 4] = {};
 		uint32_t actor_count = 0;
@@ -2327,6 +2332,8 @@ namespace
 static void log_gpu_crash(const char *line)
 {
 	log_message(2, line);
+	// (for the host: the next start a safe one, see GpuStopped)
+	set_config("GpuStopped", true);
 }
 
 static std::vector<std::string> gpu_time_lines(const grass::renderer &r);
@@ -2605,6 +2612,9 @@ namespace worldfx
 		g.marker_ds = nullptr;
 		gpu_crash::watch(device, addon_folder() + L"worldfx-gpu-crash.txt", log_gpu_crash, crash_context);
 		log_message(0, ("FFXI World FX: the GPU: " + gpu_crash::gpu_name(device) + "; video memory: " + gpu_crash::gpu_memory(device)).c_str());
+		log_message(0, ("FFXI World FX: the GPU supports " + gpu_crash::gpu_features(device)).c_str());
+		g.memory_status.clear();
+		g.memory_checked = 0;
 	}
 
 	void detach(ID3D12Device *device)
@@ -2997,6 +3007,18 @@ namespace worldfx
 			{
 				check_zone();
 				check_shaders();
+			}
+			constexpr uint64_t kMemoryCheckMs = 5000;
+			const uint64_t now = GetTickCount64();
+			if (now - g.memory_checked >= kMemoryCheckMs)
+			{
+				g.memory_checked = now;
+				std::string line;
+				const bool over = gpu_crash::memory_over(g.dev, line);
+				if (over && g.memory_status.empty())
+					log_message(1, ("FFXI World FX: over the video memory: " + line + ". Expect stutters; a lower background "
+						"resolution or fewer World FX parts would fit").c_str());
+				g.memory_status = over ? line : std::string();
 			}
 		}
 	}
@@ -3761,6 +3783,8 @@ static void status_lines(const worldfx::ui &u)
 			text(u, "Last frame: not drawn: %s.", g.skip != nullptr ? g.skip : "-");
 		text(u, "Camera: %s", g.game_global != 0 ? "found" : g.game_scanned ? "not found in FFXiMain.dll" : "not looked for yet");
 		text_wrapped(u, "Shaders: %s", g.shader_status.c_str());
+		if (!g.memory_status.empty())
+			text_colored(u, warn, "Over the video memory: %s (stutters; a lower background resolution would fit).", g.memory_status.c_str());
 		if (g.renderer != nullptr)
 		{
 			text(u, "GPU time a frame: copies and shading %.2f ms, grass %.2f ms", g.renderer->shading_ms(), g.renderer->grass_ms());

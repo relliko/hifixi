@@ -25,6 +25,19 @@ ByteAddressBuffer zbuf : register(t3);  // and its depth
 
 static const uint kSegments = 4;
 
+// Whether a value is a number (not NaN, not infinite), by its bits: a compiler may fold an x != x test away, and
+// drivers differ in what their math makes of one (one GPU's min/max drops it, another's keeps it). Everything kept for
+// the next frame is read and written through finite_or (the ground's remembered colours and wear, the clouds carried
+// over, bloom's levels and history, the exposure), so one bad pixel can't stay and spread.
+bool finite1(float x) { return (asuint(x) & 0x7F800000u) != 0x7F800000u; }
+bool finite4(float4 v) { return finite1(v.x) && finite1(v.y) && finite1(v.z) && finite1(v.w); }
+float finite_or(float v, float fallback) { return finite1(v) ? v : fallback; }
+float2 finite_or(float2 v, float2 fallback) { return finite1(v.x) && finite1(v.y) ? v : fallback; }
+float3 finite_or(float3 v, float3 fallback) { return finite1(v.x) && finite1(v.y) && finite1(v.z) ? v : fallback; }
+float4 finite_or(float4 v, float4 fallback) { return finite4(v) ? v : fallback; }
+// (and within what a half float holds: above 65504 it's infinite)
+float4 half_safe(float4 v) { return clamp(finite_or(v, float4(0.0, 0.0, 0.0, 0.0)), -65504.0, 65504.0); }
+
 // The game's own fog, as its weather and the hour have it now (crowd.x rule bit 32; t2 after the lamps: [kHaze] its
 // colour, [kHaze + 1] where it starts and ends, yalms of view depth, and 1 / (end - start)). Linear by view depth,
 // as the game's fog render states have it: what's drawn at a depth shows clear_at(depth) of itself, the rest fog.
@@ -227,9 +240,10 @@ static const float kFollow = 0.03;
 float3 ground_colour(uint point_index, float3 p, bool first_vertex, out float seen_from)
 {
 	uint3 m = memory.Load3(point_index * kMemoryStride);
-	bool known = (m.y >> 16) != 0;
 	float3 kept = float3(f16tof32(m.x), f16tof32(m.x >> 16), f16tof32(m.y));
 	float kept_from = f16tof32(m.y >> 16);
+	// (a colour that isn't a number is learned again, as if never seen)
+	bool known = (m.y >> 16) != 0 && finite4(float4(kept, kept_from));
 	float shaded = 1.0 - (m.z & 0xFFFF) / 65535.0;
 	seen_from = kept_from;
 	if (known && !first_vertex)
@@ -267,9 +281,15 @@ float3 ground_colour(uint point_index, float3 p, bool first_vertex, out float se
 	float next_from = known ? lerp(kept_from, from, follow) : from;
 	// (one write a point a frame; every vertex draws with what was remembered, so a tuft is one colour and
 	// a frame's update shows from the next)
+	// (a bad sample isn't remembered: next_from 0 = not known)
+	if (!finite4(float4(next, next_from)))
+	{
+		next = float3(0.0, 0.0, 0.0);
+		next_from = 0.0;
+	}
 	if (first_vertex)
 		memory.Store3(point_index * kMemoryStride, uint3(f32tof16(next.r) | (f32tof16(next.g) << 16), f32tof16(next.b) | (f32tof16(next_from) << 16),
-			uint(darkness * 65535.0 + 0.5)));
+			uint(saturate(darkness) * 65535.0 + 0.5)));
 	seen_from = known ? kept_from : from;
 	return known ? kept * shaded : next;
 }
@@ -326,7 +346,7 @@ static const float kWearHold = 240.0, kWearFill = 20.0, kRegrow = 240.0;
 float2 wear_of(uint point_index, float3 p, bool first_vertex)
 {
 	uint at = point_index * kMemoryStride + 12;
-	float2 until = asfloat(memory.Load2(at));
+	float2 until = finite_or(asfloat(memory.Load2(at)), float2(0.0, 0.0));
 	float4 w = actors[kWear];
 	float now = w.x;
 	if (first_vertex)
@@ -354,6 +374,7 @@ float2 wear_of(uint point_index, float3 p, bool first_vertex)
 			if (length(p.xz - (a.xz + ab * s)) < a.w && abs(p.y - lerp(a.y, e.y, s)) < 3.0)
 				next.y = max(next.y, e.w + kRegrow);
 		}
+		next = finite_or(next, until);
 		if (any(next != until))
 			memory.Store2(at, asuint(next));
 		until = next;
@@ -1571,6 +1592,12 @@ void cloud_ps(float4 pos : SV_Position)
 			float2 n = was.xy * float2(r0.w, r1.w) / ahead;
 			float2 s = float2((n.x * 0.5 + 0.5) * ground.y, (0.5 - n.y * 0.5) * ground.z) / 4.0 - 0.5;
 			kept = cloud_sharp(asuint(c3.z), s, size, held);
+			// (a carried-over pixel that isn't a number is marched again)
+			if (!finite4(kept))
+			{
+				kept = float4(0.0, 0.0, 0.0, 1.0);
+				held = 0.0;
+			}
 		}
 		static const uint kOrder[4] = { 0, 2, 3, 1 };
 		bool turn = kOrder[(uint(q.x) & 1u) | ((uint(q.y) & 1u) << 1)] == uint(r2.w);
@@ -1582,6 +1609,7 @@ void cloud_ps(float4 pos : SV_Position)
 			c = held >= 0.5 ? lerp(kept, m, 0.5) : m;
 		}
 	}
+	c = half_safe(c);
 	sun_mask.Store2(now_at + (uint(q.y) * size.x + uint(q.x)) * 8, uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b) | (f32tof16(c.a) << 16)));
 }
 
@@ -1622,7 +1650,7 @@ void cloud_shadow_ps(float4 pos : SV_Position)
 		}
 		lit = exp(-od);
 	}
-	sun_mask.Store(asuint(m.w) + (q.y * n + q.x) * 4, asuint(lit));
+	sun_mask.Store(asuint(m.w) + (q.y * n + q.x) * 4, asuint(finite_or(lit, 1.0)));
 }
 
 // How much sunlight the clouds let through to a point of the world drawn (P in view space), from their shadow map: the
@@ -4315,10 +4343,11 @@ float4 look_read(uint at, int2 q, uint2 size)
 {
 	q = clamp(q, int2(0, 0), int2(size) - 1);
 	uint2 v = look_buf.Load2(at + (uint(q.y) * size.x + uint(q.x)) * 8);
-	return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+	return finite_or(float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16)), float4(0.0, 0.0, 0.0, 0.0));
 }
 void look_write(uint at, int2 q, uint width, float4 c)
 {
+	c = half_safe(c);
 	look_buf.Store2(at + (uint(q.y) * width + uint(q.x)) * 8, uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b) | (f32tof16(c.a) << 16)));
 }
 // A level read between its texels (q: texel coordinates, their centres whole)
@@ -4414,14 +4443,14 @@ void look_exposure_ps(float4 pos : SV_Position)
 			weights += w;
 		}
 	float key = log2(max(view_proj[2].w, 1e-3));
-	float mean = weights > 0.0 ? sum / weights : key;
+	float mean = finite_or(weights > 0.0 ? sum / weights : key, key);
 	const float kShare = 0.3, kSeconds = 2.5;
-	float want = clamp(kShare * (key - mean), log2(max(view_proj[3].x, 1e-3)), log2(max(view_proj[3].y, 1e-3)));
+	float want = finite_or(clamp(kShare * (key - mean), log2(max(view_proj[3].x, 1e-3)), log2(max(view_proj[3].y, 1e-3))), 0.0);
 	uint at = asuint(color.z);
 	float was = asfloat(look_buf.Load(at));
 	float dt = view_proj[2].z;
 	bool known = abs(was) < 4.0; // (not a number, or what a new buffer held: not known)
-	float now = dt < 0.0 || !known ? want : was + (want - was) * (1.0 - exp(-dt / kSeconds));
+	float now = finite_or(dt < 0.0 || !known ? want : was + (want - was) * (1.0 - exp(-dt / kSeconds)), want);
 	look_buf.Store2(at, uint2(asuint(now), asuint(mean)));
 }
 

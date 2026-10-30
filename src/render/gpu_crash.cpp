@@ -11,6 +11,7 @@
 #include <cwchar>
 #include <ctime>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -378,6 +379,70 @@ namespace gpu_crash
 			megabytes(local.CurrentUsage), megabytes(local.Budget), local.CurrentUsage > local.Budget ? " (OVER: Windows swaps it out)" : "",
 			megabytes(shared.CurrentUsage), megabytes(shared.Budget));
 		return line;
+	}
+
+	std::string gpu_features(ID3D12Device *device)
+	{
+		std::string out;
+		static const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+		D3D12_FEATURE_DATA_FEATURE_LEVELS fl = { UINT(sizeof(levels) / sizeof(levels[0])), levels, D3D_FEATURE_LEVEL_11_0 };
+		// (12_2 unknown to an older runtime: asked again without it)
+		if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl))))
+		{
+			fl.NumFeatureLevels -= 1;
+			fl.pFeatureLevelsRequested = levels + 1;
+			if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl))))
+				fl.MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL(0);
+		}
+		if (fl.MaxSupportedFeatureLevel != 0)
+			add(out, "feature level %u_%u", (unsigned(fl.MaxSupportedFeatureLevel) >> 12) & 0xF, (unsigned(fl.MaxSupportedFeatureLevel) >> 8) & 0xF);
+		else
+			out += "feature level unknown";
+		// (the highest the runtime knows: asked from the top down)
+		static const D3D_SHADER_MODEL models[] = { D3D_SHADER_MODEL(0x67), D3D_SHADER_MODEL(0x66), D3D_SHADER_MODEL(0x65), D3D_SHADER_MODEL(0x64),
+			D3D_SHADER_MODEL(0x63), D3D_SHADER_MODEL(0x62), D3D_SHADER_MODEL(0x61), D3D_SHADER_MODEL(0x60), D3D_SHADER_MODEL(0x51) };
+		for (D3D_SHADER_MODEL m : models)
+		{
+			D3D12_FEATURE_DATA_SHADER_MODEL sm = { m };
+			if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))))
+			{
+				add(out, ", shader model %u.%u", (unsigned(sm.HighestShaderModel) >> 4) & 0xF, unsigned(sm.HighestShaderModel) & 0xF);
+				break;
+			}
+		}
+		D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+		if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))))
+			add(out, ", resource binding tier %u, typed UAV loads %s, min precision %s", unsigned(o.ResourceBindingTier),
+				o.TypedUAVLoadAdditionalFormats ? "yes" : "NO (FSR 2 and 3 can't run: FSR 1 instead)",
+				o.MinPrecisionSupport == D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE ? "full only" : "16-bit");
+		D3D12_FEATURE_DATA_ARCHITECTURE a = {};
+		if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &a, sizeof(a))))
+			out += a.UMA ? ", memory shared with the CPU (integrated)" : ", memory of its own";
+		return out;
+	}
+
+	bool memory_over(ID3D12Device *device, std::string &line)
+	{
+		line.clear();
+		static std::mutex m;
+		static IDXGIAdapter3 *adapter = nullptr;
+		static LUID luid = {};
+		std::lock_guard<std::mutex> lock(m);
+		const LUID now = device->GetAdapterLuid();
+		if (adapter == nullptr || now.LowPart != luid.LowPart || now.HighPart != luid.HighPart)
+		{
+			if (adapter != nullptr)
+				adapter->Release();
+			adapter = adapter_of(device);
+			luid = now;
+		}
+		DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+		if (adapter == nullptr || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) || local.Budget == 0)
+			return false;
+		char text[200];
+		std::snprintf(text, sizeof(text), "the game uses %llu MB of the %llu MB Windows lets it have on the card", megabytes(local.CurrentUsage), megabytes(local.Budget));
+		line = text;
+		return local.CurrentUsage > local.Budget;
 	}
 
 	std::string report(ID3D12Device *device)

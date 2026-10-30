@@ -37,6 +37,8 @@ namespace hifi::backend
 	// HiFi XI's settings file, and one of World FX's settings in it as text (false: not set)
 	const std::wstring &settings_file();
 	bool setting(const char *key, std::string &value);
+	// A safe start: the GPU stopped last session, so World FX's costliest parts read as off for this one (not saved)
+	bool safe_start();
 	// The preset the settings were last set from ("off", "balanced", "high", "ultra"; "custom" once one was changed by
 	// hand, and for settings taken from elsewhere), kept in the settings file
 	std::string preset();

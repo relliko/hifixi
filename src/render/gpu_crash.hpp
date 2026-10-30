@@ -32,6 +32,12 @@ namespace gpu_crash
 	// process uses of the budget Windows gives it, on the card and shared. Each says so when DXGI can't tell.
 	std::string gpu_name(ID3D12Device *device);
 	std::string gpu_memory(ID3D12Device *device);
+	// What the device supports that HiFi XI's passes lean on, for the log and reports from other GPUs ("feature level
+	// 12_1, shader model 6.7, resource binding tier 3, typed UAV loads yes, ...")
+	std::string gpu_features(ID3D12Device *device);
+	// Whether the game is over the video memory Windows gives it on the card now (line: as gpu_memory says it; false
+	// and line empty when DXGI can't tell). The adapter is kept between calls: cheap enough every few seconds.
+	bool memory_over(ID3D12Device *device, std::string &line);
 
 	// Direct3D 12's debug layer (a diagnostic: it checks every call, the game's and the add-on's, and costs
 	// CPU time), before D3D12CreateDevice like enable(). False when it isn't installed (Windows' optional

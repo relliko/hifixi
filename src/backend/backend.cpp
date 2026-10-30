@@ -146,10 +146,27 @@ namespace hifi::backend
 			wkey[i] = 0;
 			WritePrivateProfileStringW(kSection, wkey, value, g_settings.c_str());
 		}
+		// A safe start: the last session's GPU stopped (Direct3D removed the device: hung, reset; the core then sets
+		// [worldfx] GpuStopped=1 with its report), so this one reads World FX's costliest parts as off. Only as read: the
+		// file keeps their values (the next start has them back) and one turned on in the menu is saved as usual.
+		bool g_safe_start = false;
+		const char *const kSafeOff[] = { "VolLight", "VolFog", "AOStrength", "WaterReflections", "Rain", "Snow", "CloudQuality", "LampShadows" };
+		bool safe_off(const char *key, std::wstring &out)
+		{
+			if (!g_safe_start)
+				return false;
+			for (const char *k : kSafeOff)
+				if (std::strcmp(k, key) == 0)
+				{
+					out = L"0";
+					return true;
+				}
+			return false;
+		}
 		bool port_get_bool(const char *key, bool &value)
 		{
 			std::wstring s;
-			if (!ini_get(key, s))
+			if (!safe_off(key, s) && !ini_get(key, s))
 				return false;
 			value = s == L"1" || _wcsicmp(s.c_str(), L"true") == 0;
 			return true;
@@ -157,7 +174,7 @@ namespace hifi::backend
 		bool port_get_float(const char *key, float &value)
 		{
 			std::wstring s;
-			if (!ini_get(key, s))
+			if (!safe_off(key, s) && !ini_get(key, s))
 				return false;
 			value = std::wcstof(s.c_str(), nullptr);
 			return true;
@@ -165,7 +182,7 @@ namespace hifi::backend
 		bool port_get_int(const char *key, int &value)
 		{
 			std::wstring s;
-			if (!ini_get(key, s))
+			if (!safe_off(key, s) && !ini_get(key, s))
 				return false;
 			value = int(std::wcstol(s.c_str(), nullptr, 10));
 			return true;
@@ -412,6 +429,17 @@ namespace hifi::backend
 				for (wchar_t c : g_settings)
 					where += c < 128 ? char(c) : '?';
 				write_log(0, ("HiFi XI: settings from " + where).c_str());
+			}
+			{
+				g_safe_start = false;
+				std::wstring stopped;
+				if (ini_get("GpuStopped", stopped) && stopped == L"1")
+				{
+					g_safe_start = true;
+					ini_set("GpuStopped", nullptr); // (one safe start: if it stops again, it's set again)
+					write_log(1, "HiFi XI: the GPU stopped last session (worldfx-gpu-crash.txt): a safe start, light in the air, "
+						"ambient occlusion, water reflections, rain, snow, cloud quality and lamp shadows off for this session");
+				}
 			}
 			worldfx::port p;
 			p.log = port_log;
@@ -877,6 +905,8 @@ namespace hifi::backend
 
 	const std::wstring &settings_file() { return g_settings; }
 
+	bool safe_start() { return g_safe_start; }
+
 	bool setting(const char *key, std::string &value)
 	{
 		std::wstring w;
@@ -976,6 +1006,9 @@ namespace hifi::backend
 				where += c < 128 ? char(c) : '?';
 			out.push_back("settings: " + (where.empty() ? std::string("not read yet") : where));
 		}
+		if (g_safe_start)
+			out.push_back("safe start: the GPU stopped last session (worldfx-gpu-crash.txt); light in the air, ambient occlusion, water "
+				"reflections, rain, snow, cloud quality and lamp shadows off until the next start (or turned on again in the menu)");
 		std::snprintf(line, sizeof(line), "started %s; World FX %s; %llu presents", !g_started.load() ? "not yet" : g_early ? "early (the starter)" : "late (no starter)",
 			g_attached.load() ? "attached to the game's device" : "not attached yet", static_cast<unsigned long long>(g_presents.load()));
 		out.push_back(line);
