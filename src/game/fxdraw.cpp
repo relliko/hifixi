@@ -42,6 +42,7 @@
  *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5. Lit (flags bit 16):
  *     left to the game for now.
  *   03EB30 (CMoD3aElem): the frame +0x170 of the D3A (record_d3a below), lit or not (03E9A0 sets LIGHTING 0).
+ *   0565A0 (the rings, kind 0x24): record_ring below; lit: left to the game.
  *   Anything else: left to the game.
  * Weapon trails (CYyAfterImage) aren't elements: their flush callback 01C930 is recognised in the walk's stub and the
  * ring of samples recorded as one more element of the run (record_trail below).
@@ -80,6 +81,7 @@ namespace hifi::game::fxdraw
 		constexpr const char *kD3mDraw = "568BF18B860401000085C074688B86FC000000"; // 040BA0: push colour at +0x58, call 002D80 at +0x27
 		constexpr const char *kD3aDraw = "8B810401000085C0741E85C074048B00EB0233C0518B0D????????68????????518BC8E8"; // 03EB30
 		constexpr const char *kTrailCallback = "8B4C240485C97405E903000000C3"; // 01C930 (-> 01C940)
+		constexpr const char *kRingDraw = "83EC40535556578BF98A87B401000084C0"; // 0565A0
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		// 047018: mov ecx, [env]; push 0; push fog start; push fog end; push fog colour; call 18BA20 (at +0x17); call 0464D0
 		constexpr const char *kFog = "8B0D????????6A0068????????68????????68????????E8????????E8";
@@ -110,7 +112,7 @@ namespace hifi::game::fxdraw
 		{
 			// The sites
 			uintptr_t setup_call = 0, setup = 0, flush_call = 0, walk = 0, entry_site = 0, element_cb = 0, element_draw = 0, d3m_draw = 0;
-			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0;
+			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
@@ -644,6 +646,83 @@ namespace hifi::game::fxdraw
 			}
 		}
 
+		// Procedural rings (kind 0x24, 0565A0) into the frame; false: the game's. +0x1B4 segments, +0x1B5 rings (signed
+		// bytes), radii +0x194 + 4i, colours +0x1A4 + 4i (bytes R G B A, made a D3DCOLOR by 03E280). Each band between
+		// two rings is a strip in the element's XY plane of (sin a x r, cos a x r, 0) pairs, inner then outer, at angles
+		// 0, 0, d, 2d .. (n - 2) d, then the first pair again (d = 2 pi / n): DrawPrimitive(TRIANGLESTRIP, 2n) per band,
+		// FVF XYZ | DIFFUSE, table 353810 (untextured), TEXTUREFACTOR the element's own colour +0xF8 (not 046070's: no
+		// fade, no brightness, no letter change).
+		bool record_ring(uintptr_t e)
+		{
+			fx::frame &f = *g.f;
+			const int32_t segments = at<int8_t>(e + 0x1B4), rings = at<int8_t>(e + 0x1B5);
+			if (segments <= 0 || rings <= 1)
+			{
+				g.n.empty++;
+				return true;
+			}
+			if (rings > 4)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t bands = uint32_t(rings - 1), per_band = uint32_t(segments) * 2 * 3;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + bands * per_band > fx::kMaxVertices)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			out.tfactor = at<uint32_t>(e + 0xF8);
+			const float step = 6.283184f / float(segments);
+			uint32_t w = f.vertex_count;
+			for (uint32_t b = 0; b < bands; ++b)
+			{
+				const float r[2] = { at<float>(e + 0x194 + 4 * b), at<float>(e + 0x194 + 4 * (b + 1)) };
+				uint32_t col[2];
+				for (int k = 0; k < 2; ++k)
+				{
+					const uint32_t c = at<uint32_t>(e + 0x1A4 + 4 * (b + k));
+					col[k] = (c & 0xFF000000u) | (c & 0xFF) << 16 | (c & 0xFF00) | ((c >> 16) & 0xFF);
+				}
+				// (the strip's 2n + 2 points: angle 0, then 0, d .. (n - 2) d, then angle 0 again)
+				fx::vertex strip[2 * 128 + 2];
+				const uint32_t points = uint32_t(segments) + 1;
+				if (points > 129)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				for (uint32_t p = 0; p < points; ++p)
+				{
+					const float a = p == 0 || p + 1 == points ? 0.0f : float(p - 1) * step;
+					for (int k = 0; k < 2; ++k)
+					{
+						fx::vertex &v = strip[2 * p + k];
+						v = fx::vertex();
+						v.pos[0] = std::sin(a) * r[k];
+						v.pos[1] = std::cos(a) * r[k];
+						v.colour = col[k];
+					}
+				}
+				for (uint32_t k = 0; k + 2 < 2 * points; ++k)
+					for (uint32_t j = 0; j < 3; ++j)
+						f.vertices[w++] = strip[k + j];
+			}
+			const uint32_t n = w - f.vertex_count;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_ring;
+			f.draws[f.draw_count++] = { f.vertex_count, n, fx::kNone, 0 };
+			f.vertex_count = w;
+			f.element_count++;
+			g.n.taken[fx::class_ring]++;
+			return true;
+		}
+
 		// An element into the frame: true when it's taken (the game's setup and draw skipped)
 		bool record(uintptr_t e)
 		{
@@ -671,6 +750,15 @@ namespace hifi::game::fxdraw
 					return false;
 				}
 				return record_d3a(e, resource);
+			}
+			if (cls == g.ring_draw && g.ring_draw != 0)
+			{
+				if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
+				{
+					g.n.lit++;
+					return false;
+				}
+				return record_ring(e);
 			}
 			if (cls == g.d3m_draw)
 			{
@@ -839,6 +927,7 @@ namespace hifi::game::fxdraw
 		n.d3m_draw = d3m;
 		n.d3a_draw = find(kD3aDraw);
 		n.trail_cb = find(kTrailCallback);
+		n.ring_draw = find(kRingDraw);
 		n.draw_matrix = rel_target(s + kSetupMatrixCall);
 		n.weather = rel_target(d3m + kD3mWeatherCall);
 		n.fog_env = rel_target(fog + kFogCall);
@@ -981,12 +1070,13 @@ namespace hifi::game::fxdraw
 			taken += t;
 		char line[600];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu), %llu with nothing to draw; the last flush %u elements in %u runs; "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, D3A %llu, rings %llu, weapon trails %llu), %llu with nothing to draw; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten); "
 			"%llu markers sent%s",
 			g.native ? "HiFi XI draws what it can" : g.probe ? "the game draws them (waiting for the markers to come through)" : "the game draws them",
 			static_cast<unsigned long long>(g.n.flushes), static_cast<unsigned long long>(taken), static_cast<unsigned long long>(g.n.taken[fx::class_d3m]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_d3a]), static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
 			static_cast<unsigned long long>(g.n.empty), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
@@ -1010,6 +1100,7 @@ namespace hifi::game::fxdraw
 		s.fog_env = g.fog_env;
 		s.d3a_draw = g.d3a_draw;
 		s.trail_cb = g.trail_cb;
+		s.ring_draw = g.ring_draw;
 		s.colour = g.colour;
 		s.gfx = g.gfx;
 		s.renderer = g.renderer;

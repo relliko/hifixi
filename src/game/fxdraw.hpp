@@ -65,7 +65,7 @@ namespace hifi::game::fxdraw
 		uintptr_t entry_site = 0, element_cb = 0;   // 055539, 0555A0
 		uintptr_t element_draw = 0, d3m_draw = 0;   // 046070, 040BA0
 		uintptr_t draw_matrix = 0, fog_env = 0;     // 045D40, 18BA20
-		uintptr_t d3a_draw = 0, trail_cb = 0;       // 03EB30, 01C930
+		uintptr_t d3a_draw = 0, trail_cb = 0, ring_draw = 0; // 03EB30, 01C930, 0565A0
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
 		uintptr_t code = 0;                         // our stubs
 	};

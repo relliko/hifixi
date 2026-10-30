@@ -230,6 +230,7 @@ int main()
 		check(s.setup_call == base + 0x04612E && s.setup == base + 0x0467E0, name + ": the setup's call at 04612E, to 0467E0");
 		check(s.flush_call == base + 0x05562B && s.walk == base + 0x055520, name + ": the flush's call at 05562B, to the walk 055520");
 		check(s.entry_site == base + 0x055539 && s.element_cb == base + 0x0555A0, name + ": the walk's callback call at 055539; the element callback 0555A0");
+		check(s.ring_draw == base + 0x0565A0, name + ": the rings' draw 0565A0");
 		check(s.d3a_draw == base + 0x03EB30 && s.trail_cb == base + 0x01C930, name + ": the D3A draw 03EB30, the weapon trails' callback 01C930");
 		check(s.element_draw == base + 0x046070 && s.d3m_draw == base + 0x040BA0 && s.draw_matrix == base + 0x045D40 && s.fog_env == base + 0x18BA20,
 			name + ": 046070, 040BA0, 045D40, 18BA20");
@@ -529,6 +530,42 @@ int main()
 			}
 			else
 				check(false, name + ": the D3A, the trail and e1 recorded (" + std::to_string(f2 != nullptr ? f2->element_count : 0) + ")");
+		}
+
+		// A ring element (0565A0): 4 segments, 2 rings of radius 1 and 2; TEXTUREFACTOR its own colour
+		{
+			const uintptr_t vt_ring = take(0x100);
+			put<uint32_t>(vt_ring + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_ring + 0x48, uint32_t(s.ring_draw));
+			put<uint32_t>(vt_ring + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			const uintptr_t er = element(vt_ring, 0, 0x48, 0, 0x40112233, -3.0f);
+			put<float>(er + 0x138, 0.5f); // (faded: 046070's colour, not the ring's)
+			put<int8_t>(er + 0x1B4, 4);
+			put<int8_t>(er + 0x1B5, 2);
+			put<float>(er + 0x194, 1.0f);
+			put<float>(er + 0x198, 2.0f);
+			put<uint32_t>(er + 0x1A4, 0xFF0000AAu); // (bytes AA 00 00 FF: red AA, alpha FF)
+			put<uint32_t>(er + 0x1A8, 0x8000BB00u);
+			const uintptr_t list3 = take(16), node3 = take(32);
+			put<uint32_t>(node3 + 4, 0);
+			put<uint32_t>(node3 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node3 + 0xC, uint32_t(er));
+			put<uint32_t>(list3 + 4, uint32_t(node3));
+			put<uint32_t>(list3 + 8, 0);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list3, 0);
+			const fx::frame *f3 = fx::published(g_last_seq);
+			bool ok = g_markers == 1 && f3 != nullptr && f3->element_count == 1;
+			if (ok)
+			{
+				const fx::element &r = f3->elements[0];
+				const fx::draw &d = f3->draws[r.first_draw];
+				const fx::vertex *v = f3->vertices + d.first;
+				ok = r.cls == fx::class_ring && r.tfactor == 0x40112233u && d.count == 24 && d.stages == 0 && v[0].pos[1] == 1.0f && v[1].pos[1] == 2.0f &&
+					v[0].colour == 0xFFAA0000u && v[1].colour == 0x8000BB00u && v[2].pos[0] == 0.0f && v[2].pos[1] == 1.0f && std::fabs(v[6 * 4 - 1].pos[1] - 2.0f) < 1e-6f;
+			}
+			check(ok, name + ": a ring: 4 segments x 2 triangles, inner then outer from angle 0, its colours made D3DCOLORs, its own TEXTUREFACTOR");
 		}
 
 		// Put back
