@@ -148,7 +148,7 @@ namespace
 		check(!read(false, true, 1, 3, 1, 4, 2, m), "  not in row 0: not a marker");
 		check(!read(false, true, 1, 3, 0, 5, 1, m), "  not a square: not a marker");
 		check(!read(false, true, 1, 3, 0, 5, 2, m), "  a 2x2 square at an odd x: not a marker");
-		check(!read(false, true, 1, 80, 0, 81, 1, m), "  x 80 (past the kinds): not a marker");
+		check(!read(false, true, 1, 256, 0, 257, 1, m), "  x 256 (past the kinds): not a marker");
 		check(!read(false, false, 1, 3, 0, 4, 1, m), "  nothing cleared: not a marker");
 		check(hifi::slotmark::x_of(hifi::slotmark::zone_end, 21) == 16 + 5, "  x_of: 16 kind + the seq's low 4 bits");
 	}

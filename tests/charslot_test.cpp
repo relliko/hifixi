@@ -184,7 +184,7 @@ namespace
 		check(read(false, true, 1, 48 + 15, 0, 48 + 16, 1, m) && m.kind == hifi::slotmark::chars_end && m.seq == 15, "x 63: characters end, seq 15");
 		check(read(false, true, 1, 64, 0, 65, 1, m) && m.kind == hifi::slotmark::see_through && m.seq == 0, "x 64: see-through, seq 0");
 		check(read(false, true, 1, 2 * 79, 0, 2 * 79 + 2, 2, m) && m.kind == hifi::slotmark::see_through && m.seq == 15, "  a 2x2 square at 2 x 79: see-through, seq 15");
-		check(!read(false, true, 1, 80, 0, 81, 1, m), "  x 80 (past the kinds): not a marker");
+		check(!read(false, true, 1, 256, 0, 257, 1, m), "  x 256 (past the kinds): not a marker");
 		check(std::string(hifi::slotmark::kind_name(hifi::slotmark::see_through)) == "see-through character", "  kind 4's name");
 	}
 
