@@ -202,7 +202,8 @@ float4 ps(v2p i) : SV_Target
 	}
 	else if (s & 1)
 	{
-		float4 t = tex.SampleLevel(smp, i.uv, 0);
+		// (a light spot's ground samples its picture CLAMP: 182700's ADDRESSU / V)
+		float4 t = (s & 1048576) ? tex.SampleLevel(smp_clamp, i.uv, 0) : tex.SampleLevel(smp, i.uv, 0);
 		float3 c0 = (s & 2) ? d.rgb : saturate(d.rgb * t.rgb * 2.0);
 		float a0 = (s & 4) ? d.a : saturate(d.a * t.a * 2.0);
 		c = (s & 8) ? tfactor.rgb : saturate(c0 * tfactor.rgb * 2.0);
@@ -299,7 +300,8 @@ float4 ps_grab(g2p i) : SV_Target
 				p.second->Release();
 		_pipelines.clear();
 		for (IUnknown **u : { reinterpret_cast<IUnknown **>(&_grab_pso), reinterpret_cast<IUnknown **>(&_dist), reinterpret_cast<IUnknown **>(&_scene),
-				 reinterpret_cast<IUnknown **>(&_dist_rtv) })
+				 reinterpret_cast<IUnknown **>(&_dist_rtv),
+				 reinterpret_cast<IUnknown **>(&_spot_depth), reinterpret_cast<IUnknown **>(&_spot_dsv) })
 		{
 			if (*u != nullptr)
 				(*u)->Release();
@@ -567,6 +569,45 @@ float4 ps_grab(g2p i) : SV_Target
 		return true;
 	}
 
+	// A light spot's target: the distortion target (the game's VA 0490BB88 is both) and a 256 x 256 depth of its own (the
+	// target's +0xC), made with the distortion's resources
+	bool fx_renderer::spot_resources(const target &t)
+	{
+		if (!dist_resources(t))
+			return false;
+		if (_spot_depth != nullptr)
+			return true;
+		if (_spot_dsv == nullptr)
+		{
+			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+			if (FAILED(_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_spot_dsv))))
+			{
+				_spot_dsv = nullptr;
+				return false;
+			}
+		}
+		const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_RESOURCE_DESC d = {};
+		d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		d.Width = d.Height = 256;
+		d.DepthOrArraySize = 1;
+		d.MipLevels = 1;
+		d.Format = DXGI_FORMAT_D32_FLOAT;
+		d.SampleDesc.Count = 1;
+		d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = DXGI_FORMAT_D32_FLOAT;
+		cv.DepthStencil.Depth = 1.0f;
+		if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&_spot_depth))))
+		{
+			_spot_depth = nullptr;
+			return false;
+		}
+		_spot_depth->SetName(L"hifixi: the light spots' depth");
+		_device->CreateDepthStencilView(_spot_depth, nullptr, _spot_dsv->GetCPUDescriptorHandleForHeapStart());
+		return true;
+	}
+
 	bool fx_renderer::grab(ID3D12GraphicsCommandList *list, const target &t, const fx::grab &gr)
 	{
 		if (!dist_resources(t))
@@ -681,7 +722,20 @@ float4 ps_grab(g2p i) : SV_Target
 		for (uint32_t i = r.first; i < r.first + r.count && i < kMaxElements; ++i)
 		{
 			const element &e = f.elements[i];
-			ID3D12PipelineState *const pso = pipeline(t, e.blend, e.z_write != 0);
+			// (a light spot's picture: into the 256 x 256 target, cleared first, with a depth of its own)
+			const bool spot = e.into_spot != 0 && e.zone == nullptr;
+			target st_spot = {};
+			if (spot)
+			{
+				if (!spot_resources(t))
+					continue;
+				st_spot.rtv = _dist_rtv->GetCPUDescriptorHandleForHeapStart();
+				st_spot.dsv = _spot_dsv->GetCPUDescriptorHandleForHeapStart();
+				st_spot.rtv_format = t.rtv_format;
+				st_spot.dsv_format = DXGI_FORMAT_D32_FLOAT;
+				st_spot.width = st_spot.height = 256.0f;
+			}
+			ID3D12PipelineState *const pso = pipeline(spot ? st_spot : t, e.blend, e.z_write != 0);
 			if (pso == nullptr)
 				continue;
 			if (pso != bound)
@@ -691,6 +745,26 @@ float4 ps_grab(g2p i) : SV_Target
 			}
 			float proj[16];
 			element_projection(f, e, proj);
+			if (spot)
+			{
+				// (the camera's PROJECTION as the game leaves it for 054D70, the jitter left out: a still picture)
+				proj[8] = proj[9] = 0.0f;
+				D3D12_RESOURCE_BARRIER b = {};
+				b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				b.Transition.pResource = _dist;
+				b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+				list->ResourceBarrier(1, &b);
+				const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+				list->OMSetRenderTargets(1, &st_spot.rtv, FALSE, &st_spot.dsv);
+				list->ClearRenderTargetView(st_spot.rtv, clear, 0, nullptr);
+				list->ClearDepthStencilView(st_spot.dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+				const D3D12_VIEWPORT svp = { 0.0f, 0.0f, 256.0f, 256.0f, 0.0f, 1.0f };
+				const D3D12_RECT ssc = { 0, 0, 256, 256 };
+				list->RSSetViewports(1, &svp);
+				list->RSSetScissorRects(1, &ssc);
+			}
 			std::memcpy(c, e.world, 64);
 			std::memcpy(c + 16, proj, 64);
 			const float tf[4] = { channel(e.tfactor, 16), channel(e.tfactor, 8), channel(e.tfactor, 0), channel(e.tfactor, 24) };
@@ -739,7 +813,7 @@ float4 ps_grab(g2p i) : SV_Target
 				list->SetGraphicsRoot32BitConstants(0, 4, fl, 44);
 				D3D12_CPU_DESCRIPTOR_HANDLE dist_cpu;
 				D3D12_GPU_DESCRIPTOR_HANDLE dist_gpu;
-				if (dr.texture == kDistTexture)
+				if (dr.texture == kDistTexture || dr.texture == kSpotTexture)
 				{
 					if (!textures::reserved(1, dist_cpu, dist_gpu) || _dist == nullptr)
 						continue;
@@ -752,6 +826,21 @@ float4 ps_grab(g2p i) : SV_Target
 				list->DrawInstanced(dr.count, 1, 0, 0);
 				st.draws++;
 				st.triangles += dr.count / 3;
+			}
+			if (spot)
+			{
+				// (the picture readable for the ground after it; the world's target again)
+				D3D12_RESOURCE_BARRIER b = {};
+				b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				b.Transition.pResource = _dist;
+				b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+				b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				list->ResourceBarrier(1, &b);
+				list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
+				list->RSSetViewports(1, &vp);
+				list->RSSetScissorRects(1, &sc);
+				st.spots++;
 			}
 			st.elements++;
 		}

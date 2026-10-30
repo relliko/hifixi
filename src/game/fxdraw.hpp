@@ -62,6 +62,7 @@ namespace hifi::game::fxdraw
 		uint64_t overwritten = 0; // ... an untextured D3M whose first vertex the load wrote over (below)
 		uint64_t mesh = 0;        // ... an MMB mesh not in the zone's data on the GPU (or not as the game has it)
 		uint64_t water = 0;       // taken, nothing drawn: an MMB mesh World FX's gamewater hides (its list)
+		uint64_t spot_triangles = 0; // the ground's triangles the light spots taken were laid on (182700's)
 		uint64_t runs = 0, markers = 0, not_sent = 0;
 		uint32_t last_elements = 0, last_runs = 0;
 	};
@@ -82,6 +83,7 @@ namespace hifi::game::fxdraw
 		uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // 0426F0, 043110, VA 048E666C
 		uintptr_t distmodel_draw = 0, distmorph_draw = 0, distring_draw = 0; // 043320, 043590, 043720
 		uintptr_t spec_draw = 0, spec_cubemap = 0; // 0412B0, VA 0490BB90
+		uintptr_t spot_draw = 0, spot_target = 0;  // 040E70, VA 0490BB88
 		uintptr_t number_draw = 0, glyph_bind_call = 0, glyph_bind = 0, glyph_draw_call = 0, glyph_draw = 0; // 041AF0; 041EBB -> 1207B0, 041F06 -> 00CD00
 		uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // 054B81, 03EBF0, VA 0490B970
 		uintptr_t frame_of = 0, light1 = 0, lights2 = 0, ambient = 0, material = 0; // 045C50, 18B9A0, 18B960, 18B9E0, VA 0490BC28

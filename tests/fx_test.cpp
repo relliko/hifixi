@@ -123,6 +123,12 @@ namespace
 		g_seen.order.push_back("game " + std::to_string(element & 0xFFFF) + (arg == 0xFFFF ? "" : " ?"));
 		return 1; // (as if the game skipped it: its class draw isn't run here)
 	}
+	// (a light spot's vt+0x3C: the ground's letter, D)
+	uint32_t __fastcall spot_letter(uintptr_t, uintptr_t)
+	{
+		return 0x44;
+	}
+
 	void __fastcall pre_draw(uintptr_t, uintptr_t)
 	{
 		g_seen.pre_draws++;
@@ -1383,6 +1389,109 @@ int main()
 			check(game_glyphs == 1, name + ": a glyph without its Direct3D texture: the game's draw");
 			fd::set_glyph_calls(s.glyph_bind, s.glyph_draw);
 			put<uint32_t>(s.colour, colour_kept);
+		}
+
+		// A light spot (040E70): Fire's 'fa04' into the light-spot target (WORLD the look-at's: its local origin 2 yalms in
+		// front of the eye), then 182700's ground: a made-up collision grid (4 x 4 cells, 4 yalms each) whose cell 0 holds
+		// a mesh of three triangles, two facing up (kept) and one down (skipped), its instance moved by (1, 0, 0) and its
+		// +0xBC not the renderer's +0x17C; then with the instance's +0xBC the renderer's (skipped: nothing under the spot)
+		{
+			check(s.spot_draw == base + 0x040E70 && s.spot_target == base + 0x47BB88, name + ": the light spots' 040E70, the target VA +47BB88");
+			const uint32_t target_kept = get<uint32_t>(s.spot_target);
+			const uintptr_t target_obj = take(16);
+			put<uint32_t>(target_obj + 4, 0x777);
+			put<uint32_t>(s.spot_target, uint32_t(target_obj));
+			const uintptr_t vt_spot = take(0x100);
+			put<uint32_t>(vt_spot + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_spot + 0x48, uint32_t(s.spot_draw));
+			put<uint32_t>(vt_spot + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			put<uint32_t>(vt_spot + 0x3C, uint32_t(address(reinterpret_cast<void *>(&spot_letter))));
+			const uintptr_t sp = element(vt_spot, textured_res, 0x48, 1u << 25, 0x80808080, -5.0f);
+			for (const uintptr_t at_ : { 0x54u, 0x58u, 0x5Cu })
+				put<float>(sp + at_, at_ == 0x58u ? -1.0f : 2.0f);
+			// (the grid: renderer + 0x178 its owner, + 0x1D8 set: 167940 answers + 0x180)
+			const uintptr_t r = address(renderer), grid = r + 0x180;
+			put<uint32_t>(r + 0x1D8, 1);
+			put<uint32_t>(r + 0x17C, 5);
+			put<float>(grid + 0x38, 0.0f);
+			put<float>(grid + 0x3C, 0.0f);
+			put<int32_t>(grid + 0x40, 4);
+			put<int32_t>(grid + 0x44, 4);
+			const uintptr_t cells = take(16 * 4);
+			put<uint32_t>(grid + 0x58, uint32_t(cells));
+			const uintptr_t group = take(32), inst = take(0x100), mesh = take(16), pos = take(12 * 4), nrm = take(12 * 2), tri = take(8 * 3);
+			put<uint32_t>(cells, uint32_t(group));
+			put<uint32_t>(group, 1);
+			put<uint32_t>(group + 4, uint32_t(inst));
+			put<uint32_t>(group + 8, uint32_t(mesh));
+			put<uint32_t>(group + 12, 0);
+			identity(inst);
+			put<float>(inst + 48, 1.0f);
+			put<uint32_t>(inst + 0xBC, 0);
+			const float corners[4][3] = { { 0, 0, 0 }, { 4, 0, 0 }, { 0, 0, 4 }, { 4, 0, 4 } };
+			std::memcpy(reinterpret_cast<void *>(pos), corners, sizeof(corners));
+			const float normals[2][3] = { { 0, -1, 0 }, { 0, 1, 0 } }; // (y down: -1 faces up)
+			std::memcpy(reinterpret_cast<void *>(nrm), normals, sizeof(normals));
+			const uint16_t tris[3][4] = { { 0, 1, 2, 0 }, { 1, 3, 2, 0 }, { 0, 2, 1, 1 } };
+			std::memcpy(reinterpret_cast<void *>(tri), tris, sizeof(tris));
+			put<uint32_t>(mesh, uint32_t(pos));
+			put<uint32_t>(mesh + 4, uint32_t(nrm));
+			put<uint32_t>(mesh + 8, uint32_t(tri));
+			put<int16_t>(mesh + 0xC, 3);
+			put<uint16_t>(mesh + 0xE, 0);
+			const uintptr_t list_p = take(16), node_p = take(32);
+			put<uint32_t>(node_p + 4, 0);
+			put<uint32_t>(node_p + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node_p + 0xC, uint32_t(sp));
+			put<uint32_t>(list_p + 4, uint32_t(node_p));
+			put<uint32_t>(list_p + 8, 0);
+			const auto run_spot = [&]() {
+				g_seen = seen();
+				g_markers = 0;
+				reinterpret_cast<flush_fn>(s.code)(list_p, 0);
+				return fx::published(g_last_seq);
+			};
+			// (the point as the game's own 044C40 gives it; the map's centre and height scale from the dump's statics)
+			using point_fn = float *(__fastcall *)(uintptr_t, uintptr_t, float *);
+			float p[3] = {};
+			reinterpret_cast<point_fn>(base + 0x044C40)(sp, 0, p);
+			const float cu = get<float>(base + 0x377338), cv = get<float>(base + 0x377340);
+			const fd::counts c1 = fd::get_counts();
+			const fx::frame *fp = run_spot();
+			bool ok = g_markers == 1 && g_seen.setups == 0 && fp != nullptr && fp->element_count == 2;
+			std::string got;
+			if (ok)
+			{
+				const fx::element &pic = fp->elements[0], &ground = fp->elements[1];
+				const fx::draw &gd = fp->draws[ground.first_draw];
+				ok = pic.into_spot == 1 && pic.cls == fx::class_spot && pic.draws >= 1 && ground.into_spot == 0 && ground.cls == fx::class_spot &&
+					ground.draws == 1 && gd.texture == fx::kSpotTexture && (gd.stages & fx::stage_clamp) != 0 && gd.count == 6 && ground.blend == fx::blend_alpha &&
+					std::memcmp(ground.world, fp->view, 64) == 0;
+				// (the picture's WORLD: the local origin (2, -1, 2) 2 yalms straight ahead of the eye)
+				ok = ok && std::fabs(pic.world[12]) < 1e-4f && std::fabs(pic.world[13]) < 1e-4f && std::fabs(pic.world[14] + 2.0f) < 1e-4f;
+				for (uint32_t v = 0; ok && v < 6; ++v)
+				{
+					const fx::vertex &x = fp->vertices[gd.first + v];
+					const float *c = corners[tris[v / 3][v % 3]];
+					const float wx = c[0] + 1.0f, wz = c[2];
+					ok = x.colour == 0xFF808080u && std::fabs(x.pos[0] - wx) < 1e-5f && std::fabs(x.pos[2] - wz) < 1e-5f &&
+						std::fabs(x.uv[0] - ((wx - p[0]) / 10.0f + cu)) < 1e-5f && std::fabs(x.uv[1] - ((wz - p[2]) / 10.0f + cv)) < 1e-5f;
+					if (!ok)
+						got = "vertex " + std::to_string(v) + ": " + std::to_string(x.pos[0]) + ", " + std::to_string(x.pos[2]) + " uv " + std::to_string(x.uv[0]) + ", " +
+							std::to_string(x.uv[1]);
+				}
+				ok = ok && fd::get_counts().taken[fx::class_spot] == c1.taken[fx::class_spot] + 1 && fd::get_counts().spot_triangles == c1.spot_triangles + 2;
+			}
+			check(ok, name + ": a light spot: its picture into the light-spot target (the look-at's WORLD), the ground's two up-facing triangles of the "
+				"cells round it, moved by their instance, UV the planar map (1/10 a yalm, the centre's statics), CLAMP, the ground's own letter" + (got.empty() ? "" : " (" + got + ")"));
+			put<uint32_t>(inst + 0xBC, 5);
+			const uint64_t empty_before = fd::get_counts().empty;
+			run_spot();
+			check(g_seen.setups == 0 && g_markers == 0 && fd::get_counts().empty == empty_before + 1,
+				name + ": a light spot with no ground under it: nothing drawn (no run, no marker), not the game's (counted with nothing to draw)");
+			put<uint32_t>(r + 0x1D8, 0);
+			put<uint32_t>(r + 0x17C, 0);
+			put<uint32_t>(s.spot_target, target_kept);
 		}
 
 		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,

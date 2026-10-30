@@ -370,8 +370,12 @@ The oracles are made when missing (`build.cmd`), about a minute.
    decode isn't checked on real data (should it fail, the element stays the game's). The tinted copy 0759C0 makes
    (0755A0, the source's size) is done as a tint in the shader: a filtered sample x the tint rather than the filtered
    tinted texture (the same up to the saturation at 1).
-8. **Light spots** (0x32B3B8 040E70, CMoD3aLightmapElem 03EE70) stay the game's (not started this round: two new
-   pieces of plumbing, below). Read (R, 2026-10-30): 040E70 pushes WORLD = the local matrix +0x60 (06A480), 054D70
+8. (Done 2026-10-30: light spots, 040E70, plain D3Ms; an MMB or lit picture and CMoD3aLightmapElem 03EE70 stay the
+   game's.) Recorded as two elements: the D3M into the light-spot target (`into_spot`: the distortion target, cleared,
+   with a 256 x 256 depth of ours, WORLD = 0.25 x +0x60 x the look-at, the camera's PROJECTION without jitter), then the
+   ground `spot_ground` walks as 182700 does (`kSpotTexture`, `stage_clamp`, the vt+0x3C letter); fx_test checks both
+   dumps (the picture's WORLD, the up-facing triangles, the planar UVs, a mesh skipped by +0xBC). Not seen in game. The
+   notes it was built from: Read (R, 2026-10-30): 040E70 pushes WORLD = the local matrix +0x60 (06A480), 054D70
    makes the 256 x 256 target (VA 0490BB88) the render target, clears it (Clear flags 3: colour and depth, 0, z 1),
    pushes VIEW and PROJECTION (06A420, 06A4C0), sets the viewport 256 x 256, VIEW = a look-at from WORLD's translation
    to 2 yalms below it, up (0, 0, -1) (2D7FF9 with VA 0490BC7C), and WORLD = scale 0.25 x WORLD (math vt+0x24); then
