@@ -167,6 +167,11 @@ namespace hifi::d3d8
 		*pp = params;
 		make_auto_depth();
 		reset_state();
+		async_readback = setting("AsyncReadback", 0) != 0;
+		perf_log = setting("PerfLog", 0) != 0;
+		// (the shaders this DLL has met before, compiled now on workers when their blobs aren't in the folder)
+		if (setting("CompileAhead", 1) != 0)
+			compile_ahead();
 		for (int i = 0; i < 256; ++i)
 		{
 			gamma.red[i] = gamma.green[i] = gamma.blue[i] = WORD(i * 257);
@@ -220,8 +225,58 @@ namespace hifi::d3d8
 			s->Release();
 	}
 
+	uint64_t device::async_key(const image *img, const image::pending_read &p, uint32_t index) const
+	{
+		const uint32_t k[7] = { uint32_t(reinterpret_cast<uintptr_t>(img)), p.sub, p.x, p.y, p.w, p.h, index };
+		return hash_bytes(k, sizeof(k));
+	}
+
+	void device::poll_async(bool all_done_only)
+	{
+		(void)all_done_only;
+		size_t kept = 0;
+		for (size_t i = 0; i < async_reads.size(); ++i)
+		{
+			async_read &a = async_reads[i];
+			if (!g.done(a.read.rb.fence))
+			{
+				async_reads[kept++] = a;
+				continue;
+			}
+			// (done: its pixels in the surface's format, the answer to this copy from now on)
+			async_result &r = async_results[a.key];
+			const UINT bpp = info(a.image->format).bpp != 0 ? info(a.image->format).bpp : 4;
+			r.w = a.read.w;
+			r.h = a.read.h;
+			r.frame = g.frame_number;
+			r.pixels.assign(size_t(r.w) * r.h * bpp, 0);
+			uint8_t *mapped = nullptr;
+			const D3D12_RANGE whole = { 0, SIZE_T(a.read.rb.size) };
+			if (SUCCEEDED(a.read.rb.buffer->Map(0, &whole, reinterpret_cast<void **>(&mapped))))
+			{
+				from_target(a.image->format, mapped, a.read.row_pitch, r.pixels.data(), r.w * bpp, r.w, r.h);
+				const D3D12_RANGE none = { 0, 0 };
+				a.read.rb.buffer->Unmap(0, &none);
+			}
+			g.free_readback(a.read.rb);
+		}
+		async_reads.resize(kept);
+	}
+
 	void device::forget(image *img)
 	{
+		// (its asynchronous copies dropped, their answers too)
+		for (size_t i = 0; i < async_reads.size();)
+			if (async_reads[i].image == img)
+			{
+				g.free_readback(async_reads[i].read.rb);
+				async_reads.erase(async_reads.begin() + ptrdiff_t(i));
+			}
+			else
+				++i;
+		if (!async_results.empty() && async_index.count(img) != 0)
+			async_results.clear();
+		async_index.erase(img);
 		const auto it = std::find(images.begin(), images.end(), img);
 		if (it != images.end())
 			images.erase(it);
@@ -352,7 +407,18 @@ namespace hifi::d3d8
 
 	HRESULT device::Present(CONST RECT *src, CONST RECT *dst, HWND w, CONST RGNDATA *)
 	{
-		present_frame(w, src, dst);
+		{
+			timer t(perf_log, &perf.present_ms);
+			present_frame(w, src, dst);
+		}
+		if (perf_log && ++perf.frames == 30)
+		{
+			const double n = double(perf.frames);
+			log(0, "perf (a frame, over 30): draws %.3f ms (%.0f draws), clears %.3f ms, slot markers %.3f ms (%.1f a frame, the longest %.3f ms), Present %.3f ms",
+				perf.draw_ms / n, double(stats.draws - perf.draws) / n, perf.clear_ms / n, perf.marker_ms / n, double(perf.markers) / n, perf.max_marker_ms, perf.present_ms / n);
+			perf = perf_counters();
+			perf.draws = stats.draws;
+		}
 		return D3D_OK;
 	}
 
@@ -581,8 +647,32 @@ namespace hifi::d3d8
 			p.from = si->format;
 			p.target = true;
 			di->copy(d->sub()); // (made, and older reads done)
-			di->reads.push_back(p);
 			stats.readbacks++;
+			if (async_readback && !sync_copies)
+			{
+				// Asynchronous (AsyncReadback=1): this copy is answered later; what the game reads now is the answer to the
+				// same copy (the same surface, rect and place in the frame's order) from the newest frame the GPU has
+				// finished, so nothing waits. One to three frames old; the first time, the surface as it was.
+				async_read a;
+				a.read = p;
+				a.image = di;
+				a.key = async_key(di, p, async_index[di]++);
+				async_reads.push_back(a);
+				poll_async(false);
+				const auto it = async_results.find(a.key);
+				if (it != async_results.end())
+				{
+					std::vector<uint8_t> &c = di->cpu[p.sub];
+					const UINT pt = di->pitch(d->level), dbpp = info(di->format).bpp != 0 ? info(di->format).bpp : 4;
+					for (UINT y = 0; y < p.h && y < it->second.h; ++y)
+						std::memcpy(c.data() + size_t(p.y + y) * pt + size_t(p.x) * dbpp, it->second.pixels.data() + size_t(y) * p.w * dbpp, size_t(std::min(p.w, it->second.w)) * dbpp);
+					stats.async_answered++;
+				}
+				else
+					stats.async_unanswered++;
+				return D3D_OK;
+			}
+			di->reads.push_back(p);
 			return D3D_OK;
 		}
 		if (src_gpu && dst_gpu)
@@ -669,13 +759,56 @@ namespace hifi::d3d8
 		surface *d = static_cast<surface *>(dst);
 		if (d->img->format != D3DFMT_A8R8G8B8)
 			return D3DERR_INVALIDCALL;
-		// (the last frame shown is the back buffer's picture till the next is drawn: read from it, as A8R8G8B8)
+		if (params.Windowed)
+		{
+			// Windowed, the front buffer is the screen: the adapter's monitor as it shows now (our window where it is, and
+			// whatever covers it), as dgVoodoo reads it (d3d8_frame front)
+			HMONITOR mon = MonitorFromWindow(chain->window, MONITOR_DEFAULTTOPRIMARY);
+			MONITORINFO mi = {};
+			mi.cbSize = sizeof(mi);
+			GetMonitorInfoW(mon, &mi);
+			const UINT w = d->width(), h = d->height();
+			BITMAPINFO bi = {};
+			bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+			bi.bmiHeader.biWidth = LONG(w);
+			bi.bmiHeader.biHeight = -LONG(h);
+			bi.bmiHeader.biPlanes = 1;
+			bi.bmiHeader.biBitCount = 32;
+			void *bits = nullptr;
+			HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
+			HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+			bool ok = false;
+			if (dib != nullptr && bits != nullptr)
+			{
+				HGDIOBJ old = SelectObject(mem, dib);
+				ok = BitBlt(mem, 0, 0, int(w), int(h), screen, mi.rcMonitor.left, mi.rcMonitor.top, SRCCOPY) != FALSE;
+				GdiFlush();
+				std::vector<uint8_t> &c = d->img->copy(d->sub());
+				const UINT pt = d->img->pitch(d->level);
+				for (UINT y = 0; y < h; ++y)
+				{
+					uint8_t *row = c.data() + size_t(y) * pt;
+					std::memcpy(row, static_cast<const uint8_t *>(bits) + size_t(y) * w * 4, size_t(w) * 4);
+					for (UINT x = 0; x < w; ++x)
+						row[x * 4 + 3] = 255;
+				}
+				SelectObject(mem, old);
+			}
+			if (dib != nullptr)
+				DeleteObject(dib);
+			DeleteDC(mem);
+			ReleaseDC(nullptr, screen);
+			return ok ? D3D_OK : D3DERR_INVALIDCALL;
+		}
+		// (full screen: the last frame shown is the back buffer's picture till the next is drawn: read from it, as A8R8G8B8)
 		surface *b = chain->back.get();
 		const D3DFORMAT was = b->img->format;
 		b->img->format = D3DFMT_A8R8G8B8;
+		sync_copies = true;
 		const RECT whole = { 0, 0, LONG(b->width()), LONG(b->height()) };
 		const HRESULT hr = copy_rect(b, whole, d, POINT { 0, 0 });
 		d->img->finish_reads();
+		sync_copies = false;
 		b->img->format = was;
 		// (the X formats' alpha read as opaque)
 		std::vector<uint8_t> &c = d->img->cpu[d->sub()];
@@ -743,7 +876,16 @@ namespace hifi::d3d8
 
 	HRESULT device::Clear(DWORD n, CONST D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil)
 	{
-		return clear(n, rects, flags, color, z, stencil);
+		// (a slot marker: one 1x1 rect, stencil only; HiFi XI draws inside its ClearDepthStencilView)
+		const bool marker = n == 1 && rects != nullptr && flags == D3DCLEAR_STENCIL && rects[0].x2 - rects[0].x1 == 1 && rects[0].y2 - rects[0].y1 == 1;
+		timer t(perf_log, marker ? &perf.marker_ms : &perf.clear_ms);
+		const HRESULT hr = clear(n, rects, flags, color, z, stencil);
+		if (marker && perf_log)
+		{
+			perf.markers++;
+			perf.max_marker_ms = std::max(perf.max_marker_ms, t.stop());
+		}
+		return hr;
 	}
 
 	// ---- State ----
@@ -1076,22 +1218,26 @@ namespace hifi::d3d8
 
 	HRESULT device::DrawPrimitive(D3DPRIMITIVETYPE t, UINT start, UINT count)
 	{
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, false, start, 0, 0, 0, nullptr, 0, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawIndexedPrimitive(D3DPRIMITIVETYPE t, UINT min_index, UINT vertices, UINT start, UINT count)
 	{
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, true, start, INT(cur.base_vertex), min_index, vertices, nullptr, 0, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawPrimitiveUP(D3DPRIMITIVETYPE t, UINT count, CONST void *v, UINT stride)
 	{
 		if (v == nullptr || stride == 0)
 			return D3DERR_INVALIDCALL;
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, false, 0, 0, 0, 0, v, stride, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE t, UINT min_index, UINT vertices, UINT count, CONST void *i, D3DFORMAT f, CONST void *v, UINT stride)
 	{
 		if (v == nullptr || i == nullptr || stride == 0)
 			return D3DERR_INVALIDCALL;
+		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, true, 0, 0, min_index, vertices, v, stride, i, f);
 	}
 	HRESULT device::ProcessVertices(UINT, UINT, UINT, IDirect3DVertexBuffer8 *, DWORD)

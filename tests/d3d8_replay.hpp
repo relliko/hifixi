@@ -193,6 +193,7 @@ namespace replay
 		UINT vb_at = 0, ib_at = 0;
 		IDirect3DSurface8 *sys16 = nullptr;
 		uint32_t readbacks = 0, skipped = 0, draws = 0;
+		double readback_ms = 0, present_ms = 0; // this frame's time in the visibility tests' CopyRects + LockRect, and in Present
 		std::map<int, std::string> pending_tex;
 		std::set<std::string> unknown; // stage -> sampled render target (resolved at the draw)
 	};
@@ -349,15 +350,16 @@ namespace replay
 		D3DVIEWPORT8 vp;
 		dev->GetViewport(&vp);
 		uint32_t r = seed * 7919u + 17u;
-		// (a patch: consecutive vertices near each other, so strips and lists make triangles of some size)
+		// (a small patch: consecutive vertices near each other, so strips and lists make triangles of some size, and the frame's
+		// fill stays near the game's: GPU-bound frames would hide what the calling thread does)
 		float cx = rnd(r) * 2 - 1, cy = rnd(r) * 2 - 1, cz = 3.0f + rnd(r) * 40.0f;
 		for (UINT i = 0; i < count; ++i)
 		{
 			float *p = reinterpret_cast<float *>(v.data() + size_t(i) * stride);
 			if ((f & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW)
 			{
-				p[0] = float(vp.X) + (cx * 0.5f + 0.5f) * float(vp.Width) + (rnd(r) - 0.5f) * 0.3f * float(vp.Width);
-				p[1] = float(vp.Y) + (cy * 0.5f + 0.5f) * float(vp.Height) + (rnd(r) - 0.5f) * 0.3f * float(vp.Height);
+				p[0] = float(vp.X) + (cx * 0.5f + 0.5f) * float(vp.Width) + (rnd(r) - 0.5f) * 0.04f * float(vp.Width);
+				p[1] = float(vp.Y) + (cy * 0.5f + 0.5f) * float(vp.Height) + (rnd(r) - 0.5f) * 0.04f * float(vp.Height);
 				p[2] = rnd(r);
 				p[3] = 1.0f / (1.0f + 10 * rnd(r));
 				p += 4;
@@ -365,8 +367,8 @@ namespace replay
 			else
 			{
 				const float z = cz + (rnd(r) - 0.5f) * 4.0f;
-				p[0] = (cx + (rnd(r) - 0.5f) * 0.4f) * z * 0.9f;
-				p[1] = (cy + (rnd(r) - 0.5f) * 0.4f) * z * 0.6f;
+				p[0] = (cx + (rnd(r) - 0.5f) * 0.06f) * z * 0.9f;
+				p[1] = (cy + (rnd(r) - 0.5f) * 0.06f) * z * 0.6f;
 				p[2] = z;
 				p += 3;
 			}
@@ -503,6 +505,8 @@ namespace replay
 			IDirect3DSurface8 *rt = st.surfaces[st.current_rt];
 			const RECT r16 = { 0, 0, 8, 8 };
 			const POINT p0 = { 0, 0 };
+			LARGE_INTEGER t0, t1, qf;
+			QueryPerformanceCounter(&t0);
 			if (rt != nullptr && SUCCEEDED(dev->CopyRects(rt, &r16, 1, st.sys16, &p0)))
 			{
 				D3DLOCKED_RECT lr;
@@ -512,6 +516,9 @@ namespace replay
 					st.readbacks++;
 				}
 			}
+			QueryPerformanceCounter(&t1);
+			QueryPerformanceFrequency(&qf);
+			st.readback_ms += double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(qf.QuadPart);
 		}
 	}
 
@@ -562,9 +569,16 @@ namespace replay
 		const D3DMATRIX id = identity();
 		std::vector<uint32_t> world_px, screen_px;
 		UINT ww = 0, wh = 0;
+		std::vector<double> ms;
+		double rb_sum = 0, present_sum = 0;
+		LARGE_INTEGER qf;
+		QueryPerformanceFrequency(&qf);
 		for (int frame = 0; frame < frames; ++frame)
 		{
+			LARGE_INTEGER f0, f1;
+			QueryPerformanceCounter(&f0);
 			st.readbacks = st.skipped = st.draws = 0;
+			st.readback_ms = st.present_ms = 0;
 			dev->SetTransform(D3DTS_WORLD, &id);
 			dev->SetTransform(D3DTS_VIEW, &id);
 			// (REPLAY_STOP=n: the frame cut after its n-th draw, to find where two runs part)
@@ -714,11 +728,31 @@ namespace replay
 				write_bmp(std::string(out) + "-world.bmp", ww, wh, world_px);
 				write_bmp(std::string(out) + "-screen.bmp", sw, sh, screen_px);
 			}
+			LARGE_INTEGER p0;
+			QueryPerformanceCounter(&p0);
 			dev->Present(nullptr, nullptr, nullptr, nullptr);
+			QueryPerformanceCounter(&f1);
+			st.present_ms = double(f1.QuadPart - p0.QuadPart) * 1000.0 / double(qf.QuadPart);
+			if (frame >= 2 && frame + 1 < frames)
+			{
+				rb_sum += st.readback_ms;
+				present_sum += st.present_ms;
+			}
+			ms.push_back(double(f1.QuadPart - f0.QuadPart) * 1000.0 / double(qf.QuadPart));
 			MSG msg;
 			while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
 				DispatchMessageA(&msg);
 		}
+		// (the game thread's time a frame, the frames after the first two, but the last, read back: the calls and Present, the readbacks' waits in them)
+		double sum = 0;
+		int counted = 0;
+		for (size_t i = 2; i + 1 < ms.size(); ++i)
+		{
+			sum += ms[i];
+			counted++;
+		}
+		if (counted != 0)
+			std::printf("replay %s: %.2f ms a frame on the calling thread (%d frames); in the visibility tests' readbacks %.3f ms, in Present %.3f ms\n", capture, sum / counted, counted, rb_sum / counted, present_sum / counted);
 		std::printf("replay %s: %zu calls, %u draws, %u readbacks, %u states not replayed\n", capture, st.calls.size(), st.draws, st.readbacks, st.skipped);
 		return 0;
 	}

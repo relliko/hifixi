@@ -321,9 +321,20 @@ namespace
 	}
 }
 
-int main()
+int main(int argc, char **argv)
 {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	// d3d8_unit.exe --warm <cache folder>: the folder's keys.bin compiled into blobs there (the shipped shader cache, made at
+	// build time without a GPU)
+	if (argc > 2 && std::strcmp(argv[1], "--warm") == 0)
+	{
+		const std::string f = argv[2];
+		set_shader_cache_folder(std::wstring(f.begin(), f.end()));
+		const uint32_t n = compile_keys_now();
+		const compile_stats cs = shader_stats();
+		std::printf("%s: %u shaders from keys.bin (%u compiled, %u already there, %u failed)\n", argv[2], n, cs.ahead, cs.from_disk, cs.failed);
+		return cs.failed == 0 && n != 0 ? 0 : 1;
+	}
 	test_formats();
 	test_fixed_function();
 	test_sm1();

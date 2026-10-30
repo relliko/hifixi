@@ -36,10 +36,19 @@ popd
 pushd "%OUT%\mine"
 .\d3d8_frame.exe "%OUT%\mine\d3d8.dll" scenes "%OUT%\mine\out" >"%OUT%\mine\scenes.txt" || (echo our scenes failed: %OUT%\mine\scenes.txt & exit /b 1)
 popd
-for %%s in (formats ops blend light fog texgen stencil streams shaders imgui readback) do (
+for %%s in (formats ops blend light fog texgen stencil streams shaders imgui readback dancer passes) do (
   <nul set /p "=%%s: "
   build\d3d8\d3d8_frame.exe compare "%OUT%\dgv\out\%%s.bmp" "%OUT%\mine\out\%%s.bmp" "%OUT%\diff\%%s.bmp"
 )
+rem GetFrontBuffer (the window topmost: the screen there is the same for both)
+pushd "%OUT%\dgv"
+.\d3d8_frame.exe "%OUT%\dgv\d3d8.dll" front "%OUT%\dgv\front" >nul
+popd
+pushd "%OUT%\mine"
+.\d3d8_frame.exe "%OUT%\mine\d3d8.dll" front "%OUT%\mine\front" >nul
+popd
+<nul set /p "=front (GetFrontBuffer, the window's area): "
+build\d3d8\d3d8_frame.exe compare "%OUT%\dgv\front-client.bmp" "%OUT%\mine\front-client.bmp" "%OUT%\diff\front.bmp"
 if /i "%WHAT%"=="scenes" exit /b 0
 
 :replay

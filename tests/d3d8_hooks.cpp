@@ -562,8 +562,17 @@ int main(int argc, char **argv)
 	for (const auto &l : lists)
 		heaps = heaps && l.second.draws_before_heaps == 0;
 	check(heaps, "descriptor heaps set after every reset before the list draws");
-	std::snprintf(line, sizeof(line), "the list closed and submitted between each visibility test's copy and its LockRect (%u of %u)", readbacks_ok, seq);
-	check(readbacks_ok == seq, line);
+	if (std::getenv("D3D8_ASYNCREADBACK") != nullptr)
+	{
+		// (asynchronous readbacks: the test's answer is an earlier frame's, nothing submitted or waited on for it)
+		std::snprintf(line, sizeof(line), "asynchronous readbacks: no list closed for the visibility tests (%u of %u closed)", readbacks_ok, seq);
+		check(readbacks_ok == 0, line);
+	}
+	else
+	{
+		std::snprintf(line, sizeof(line), "the list closed and submitted between each visibility test's copy and its LockRect (%u of %u)", readbacks_ok, seq);
+		check(readbacks_ok == seq, line);
+	}
 	std::snprintf(line, sizeof(line), "the resolve: A turned readable, the next draw of %d vertices into the bigger back buffer", resolve_draw_vertices);
 	check(resolve_draw_vertices == 4 && resolve_target != nullptr && resolve_target != world_rt && resolve_target->GetDesc().Width > AW, line);
 	const hifi::host::stats st = hifi::host::get_stats();

@@ -343,6 +343,10 @@ namespace hifi::d3d8
 			auto it = vs_cache.find(h);
 			if (it == vs_cache.end())
 			{
+				uint8_t head[17];
+				std::memcpy(head, decl->inputs, 16);
+				head[16] = clip;
+				note_shader_key(key_sm1_vs, head, sizeof(head), vsh->code.tokens.data(), vsh->code.tokens.size() * 4);
 				const std::string hlsl = sm1_vs_hlsl(vsh->code, decl->inputs, clip);
 				const std::vector<uint8_t> &b = compile(hlsl, "vs_5_0", why);
 				if (b.empty())
@@ -411,6 +415,7 @@ namespace hifi::d3d8
 			auto it = vs_cache.find(h);
 			if (it == vs_cache.end())
 			{
+				note_shader_key(key_ff_vs, &k, sizeof(k));
 				const std::string hlsl = ff_vs_hlsl(k);
 				const std::vector<uint8_t> &b = compile(hlsl, "vs_5_0", why);
 				if (b.empty())
@@ -452,6 +457,11 @@ namespace hifi::d3d8
 					ps_code = it->second;
 				else
 				{
+					uint8_t head[13];
+					std::memcpy(head, tex_kind, 8);
+					head[8] = projected;
+					std::memcpy(head + 9, &tail, sizeof(tail));
+					note_shader_key(key_sm1_ps, head, sizeof(head), psh->code.tokens.data(), psh->code.tokens.size() * 4);
 					hlsl = sm1_ps_hlsl(psh->code, tex_kind, projected, tail);
 					const std::vector<uint8_t> &b = compile(hlsl, "ps_5_0", why);
 					if (b.empty())
@@ -488,6 +498,7 @@ namespace hifi::d3d8
 					ps_code = it->second;
 				else
 				{
+					note_shader_key(key_ff_ps, &k, sizeof(k));
 					hlsl = ff_ps_hlsl(k);
 					const std::vector<uint8_t> &b = compile(hlsl, "ps_5_0", why);
 					if (b.empty())
@@ -885,12 +896,19 @@ namespace hifi::d3d8
 	{
 		chain->present(override_window);
 		stats.presents++;
+		async_index.clear();
+		if (!async_reads.empty())
+			poll_async(false);
+		// (answers not asked for in two seconds or so let go)
+		if (stats.presents % 120 == 0)
+			for (auto it = async_results.begin(); it != async_results.end();)
+				it = it->second.frame + 240 < g.frame_number ? async_results.erase(it) : std::next(it);
 		if (stats.presents == 1 || stats.presents == 100 || stats.presents % 3600 == 0)
 		{
 			const compile_stats cs = shader_stats();
-			log(0, "frame %llu: %llu draws, %llu clears, %llu readbacks, %llu pipelines, %u shaders compiled (%u from the cache folder, %u failed, %.0f ms)",
+			log(0, "frame %llu: %llu draws, %llu clears, %llu readbacks (%llu answered from an earlier frame, %llu not yet), %llu pipelines, %u shaders compiled in play (%.0f ms), %u ahead, %u from the cache folder, %u failed",
 				static_cast<unsigned long long>(stats.presents), static_cast<unsigned long long>(stats.draws), static_cast<unsigned long long>(stats.clears),
-				static_cast<unsigned long long>(stats.readbacks), static_cast<unsigned long long>(stats.pipelines), cs.compiled, cs.from_disk, cs.failed, cs.ms);
+				static_cast<unsigned long long>(stats.readbacks), static_cast<unsigned long long>(stats.async_answered), static_cast<unsigned long long>(stats.async_unanswered), static_cast<unsigned long long>(stats.pipelines), cs.compiled, cs.ms, cs.ahead, cs.from_disk, cs.failed);
 		}
 	}
 }

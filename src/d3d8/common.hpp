@@ -74,6 +74,8 @@ namespace hifi::d3d8
 	IDirect3D8 *interface_of(direct3d *d);
 	std::wstring dll_folder();
 	std::wstring env_value(const wchar_t *name);
+	// A setting: D3D8_<NAME> (upper case) in the environment, else [d3d8] <Name> in d3d8.ini beside the DLL, else fallback
+	int setting(const char *name, int fallback);
 	void fill_caps(D3DCAPS8 &c, UINT adapter);
 
 	class base_texture;
