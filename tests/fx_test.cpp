@@ -568,6 +568,38 @@ int main()
 			check(ok, name + ": a ring: 4 segments x 2 triangles, inner then outer from angle 0, its colours made D3DCOLORs, its own TEXTUREFACTOR");
 		}
 
+		// An untextured kind-6 D3M whose resource has a root (file id 0: ROM/0/0.DAT, where 'coll' is): its first
+		// vertex's y, written over by the vertex buffer object as the load does, comes back from the DAT
+		{
+			const uintptr_t r7 = resource(plain, 0x1F);
+			const size_t names = geo::d3m_names_at(reinterpret_cast<const uint8_t *>(r7 + 0x30));
+			put<uint16_t>(r7 + 0x32, uint16_t(get<uint16_t>(r7 + 0x32) | 0x8080));
+			put<uint32_t>(r7 + 0x30 + names + 4, 0x1234); // (over the first vertex's y, as 03FEE0 leaves it)
+			std::memcpy(reinterpret_cast<void *>(r7 + 0x20), "coll", 4);
+			const uintptr_t root = take(0x40), root_handle = take(16);
+			put<uint32_t>(root + 0x34, 0);
+			put<uint32_t>(root_handle, uint32_t(root));
+			put<uint32_t>(r7 + 0x28, uint32_t(root_handle));
+			const uintptr_t e7 = element(vt_d3m, r7, 0x48, 0, 0x80808080, -3.5f);
+			const uintptr_t list4 = take(16), node4 = take(32);
+			put<uint32_t>(node4 + 4, 0);
+			put<uint32_t>(node4 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node4 + 0xC, uint32_t(e7));
+			put<uint32_t>(list4 + 4, uint32_t(node4));
+			put<uint32_t>(list4 + 8, 0);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list4, 0);
+			const fx::frame *f4 = fx::published(g_last_seq);
+			bool ok = g_markers == 1 && f4 != nullptr && f4->element_count == 1;
+			if (ok)
+			{
+				const fx::draw &d = f4->draws[f4->elements[0].first_draw];
+				ok = d.count == 36 && std::memcmp(f4->vertices + d.first, plain_m.vertices.data(), 36 * sizeof(fx::vertex)) == 0;
+			}
+			check(ok, name + ": an untextured kind-6 D3M drawn, its first vertex's y from its DAT (every vertex as the chunk has it)");
+		}
+
 		// Put back
 		fd::set_native(false);
 		fd::set_wanted(false);
