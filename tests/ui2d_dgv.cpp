@@ -1800,6 +1800,113 @@ float4 ps() : SV_Target { return colour; }
 		ud::set_render_targets(0, 0);
 		a->Release(), ui->Release(), a_depth->Release(), ui_depth->Release(), bb->Release(), bb_depth->Release();
 	}
+	// Character creation's Dancer (notes-screen-passes 5) draws into A before the loop tail with A's stencil: its depth
+	// and stencil cleared, its scene counted into the stencil (INCR), composited where the count is above 0. The
+	// windows' markers come after it, on the same stencil: the frame must come out the same with them as without
+	// (the windows off), A and the back buffer alike; and a stencil-tested draw inside a window is the game's
+	void run_lobby(dgv &d)
+	{
+		std::printf("-- character creation: the Dancer's stencil before the windows\n");
+		IDirect3DDevice8 *dev = d.dev;
+		scenario sc = coverage();
+		std::vector<IDirect3DTexture8 *> tex = make_textures(d, sc);
+		std::vector<op> ui;
+		uint32_t draws = 0;
+		for (const op &o : sc.ops)
+		{
+			if (o.kind == op::draw && ++draws > 30)
+				break;
+			ui.push_back(o);
+		}
+		sc.ops = ui;
+		IDirect3DTexture8 *a = nullptr;
+		IDirect3DSurface8 *a_depth = nullptr, *bb = nullptr, *bb_depth = nullptr;
+		dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &a);
+		dev->CreateDepthStencilSurface(W, H, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, &a_depth);
+		dev->GetRenderTarget(&bb);
+		dev->GetDepthStencilSurface(&bb_depth);
+		IDirect3DSurface8 *const as = surface_of(a);
+		ud::set_render_targets(reinterpret_cast<uintptr_t>(a), 0);
+		struct v20
+		{
+			float x, y, z, rhw;
+			DWORD c;
+		};
+		const auto fill = [&](float x0, float y0, float x1, float y1, DWORD c) {
+			const v20 q[4] = { { x0 - 0.5f, y0 - 0.5f, 0, 1, c }, { x1 - 0.5f, y0 - 0.5f, 0, 1, c }, { x0 - 0.5f, y1 - 0.5f, 0, 1, c }, { x1 - 0.5f, y1 - 0.5f, 0, 1, c } };
+			dev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(v20));
+		};
+		std::vector<uint8_t> out[2][2];
+		uint64_t passed = 0;
+		for (int round = 0; round < 2; ++round)
+		{
+			const bool windows = round == 1;
+			dev->BeginScene();
+			dev->SetRenderTarget(as, a_depth);
+			dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0xFF000000, 1.0f, 0);
+			background(d);
+			// The Dancer: Z and stencil cleared, its model counted into the stencil (no colour), then its picture where
+			// the count is above 0; both over row 0, where the markers go
+			dev->Clear(0, nullptr, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+			dev->SetTexture(0, nullptr);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+			dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
+			dev->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_INCR);
+			dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+			fill(0, 0, 400, 300, 0xFFFFFFFF);
+			fill(100, 0, 300, 200, 0xFFFFFFFF);
+			dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+			dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_LESS);
+			dev->SetRenderState(D3DRS_STENCILREF, 0);
+			dev->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP);
+			fill(0, 0, 600, 400, 0xFFC03020);
+			dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+			// A's window: the interface's first draws, then a stencil-tested one (the game's)
+			const ud::counts c0 = ud::get_counts();
+			ud::set_mode(windows ? ud::shadow : ud::off);
+			ud::window_begin(reinterpret_cast<uintptr_t>(dev), true);
+			run_ops(d, sc, tex);
+			dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+			dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+			dev->SetRenderState(D3DRS_STENCILREF, 2);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			dev->SetTexture(0, nullptr);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			fill(250, 100, 700, 500, 0xFF20F040);
+			dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+			ud::window_end();
+			passed += ud::get_counts().passed - c0.passed;
+			read_surface(d, as, out[round][0]);
+			// The resolve onto the back buffer, then its window
+			dev->SetRenderTarget(bb, bb_depth);
+			copy(dev, a, bb, W, H, 0x80808080, bb, bb_depth);
+			ud::window_begin(reinterpret_cast<uintptr_t>(dev));
+			run_ops(d, sc, tex);
+			ud::window_flush(hifi::slotmark::ui_end);
+			ud::window_flush(hifi::slotmark::frame_end);
+			read_back(d, out[round][1]);
+			dev->EndScene();
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+		}
+		check(passed == 1, "character creation: the stencil-tested draw inside A's window left to the game (" + std::to_string(passed) + ")");
+		check(out[0][0] == out[1][0], "character creation: A the same with the windows' markers as without (the Dancer's stencil untouched)");
+		check(out[0][1] == out[1][1], "character creation: the back buffer the same with the windows' markers as without");
+		ud::set_mode(ud::off);
+		for (IDirect3DTexture8 *t : tex)
+			if (t != nullptr)
+				t->Release();
+		ud::drop_textures();
+		ud::set_render_targets(0, 0);
+		a->Release(), a_depth->Release(), bb->Release(), bb_depth->Release();
+	}
 }
 
 // (game.cpp's settings: the plugin's, not used here)
@@ -1885,6 +1992,7 @@ int main(int argc, char **argv)
 		run_screen_passes(d, g);
 		run_ui_target(d, g, W, H);
 		run_ui_target(d, g, W / 2, H / 2);
+		run_lobby(d);
 	}
 
 	std::printf("\n%d passed, %d failed\n", passes, failures);
