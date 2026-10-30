@@ -24,6 +24,9 @@ namespace hifi::game::gamewater
 	bool stop(std::string &why);
 	std::string status();
 	std::string seen();
+	// Whether its routine skips a mesh of this name now (mesh +0x18), counted and kept as seen as the routine does:
+	// the effects HiFi XI draws itself (src/game/fxdraw) never reach the routine, so they ask here
+	bool hides_mesh(uint32_t name);
 
 	// For the tests: the routines' memory (0 before the first route), the call's site and the game's draw it went to,
 	// the step's site and its spawn, the ring jump's site

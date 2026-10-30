@@ -5,13 +5,17 @@
  * (frame.hpp stage_bits), then D3D8's fog. Pipelines by blend and z write (and the target's formats).
  *
  * Root signature: 0 48 constants b0 (below), 1 the vertices t0 (a root view of the upload ring), 2 a table: the
- * texture t1. Static sampler s0: MIN/MAG LINEAR, no mips (the game sets no MIPFILTER), WRAP (the D3M runs' ADDRESS
- * WRAP; D3D8's default for the rest).
+ * texture t1, 3 and 4 an MMB effect mesh's zone vertices t2 and indices t3 (root views of the zone's buffers: its
+ * draws read their vertices through the zone's indices). Static sampler s0: MIN/MAG LINEAR, no mips (the game sets no
+ * MIPFILTER), WRAP (the D3M runs' and 183760's ADDRESS WRAP; D3D8's default for the rest).
+ *
+ * An MMB effect mesh's textures are the zone's (its heap bound for that element, ours again after).
  */
 
 #include <windows.h>
 #include "fxrender.hpp"
 #include "fxtextures.hpp"
+#include "../zone/zone_gpu.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
@@ -37,8 +41,18 @@ struct vtx
 	uint colour;
 	float2 uv;
 };
+struct zvtx
+{
+	float3 pos;
+	float3 normal;
+	uint colour;
+	float2 uv;
+	float3 sway;
+};
 StructuredBuffer<vtx> verts : register(t0);
 Texture2D tex : register(t1);
+StructuredBuffer<zvtx> zverts : register(t2);
+StructuredBuffer<uint> zindices : register(t3);
 SamplerState smp : register(s0);
 
 struct v2p
@@ -51,7 +65,17 @@ struct v2p
 
 v2p vs(uint id : SV_VertexID)
 {
-	vtx v = verts[flags.y + id];
+	vtx v;
+	if (flags.x & 256)
+	{
+		zvtx z = zverts[zindices[flags.y + id]];
+		v.pos = z.pos;
+		v.normal = z.normal;
+		v.colour = z.colour;
+		v.uv = z.uv;
+	}
+	else
+		v = verts[flags.y + id];
 	v2p o;
 	float3 vp = mul(float4(v.pos, 1.0), world).xyz;
 	o.pos = mul(float4(vp, 1.0), proj);
@@ -73,6 +97,18 @@ float4 ps(v2p i) : SV_Target
 	{
 		c = d.rgb;
 		a = d.a;
+	}
+	else if (s & 512)
+	{
+		float4 t = tex.SampleLevel(smp, i.uv, 0);
+		c = saturate(saturate(t.rgb * tfactor.rgb) * d.rgb * 4.0);
+		a = saturate(saturate(t.a * tfactor.a * 2.0) * d.a * 4.0);
+	}
+	else if (s & 1024)
+	{
+		float4 t = tex.SampleLevel(smp, i.uv, 0);
+		c = saturate(saturate(t.rgb * d.rgb) * tfactor.rgb * 4.0);
+		a = saturate(d.a * tfactor.a * 4.0);
 	}
 	else if (s & 1)
 	{
@@ -203,7 +239,7 @@ float4 ps(v2p i) : SV_Target
 		}
 
 		D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1 };
-		D3D12_ROOT_PARAMETER p[3] = {};
+		D3D12_ROOT_PARAMETER p[5] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		p[0].Constants.ShaderRegister = 0;
 		p[0].Constants.Num32BitValues = kConstants;
@@ -214,12 +250,18 @@ float4 ps(v2p i) : SV_Target
 		p[2].DescriptorTable.NumDescriptorRanges = 1;
 		p[2].DescriptorTable.pDescriptorRanges = &range;
 		p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		for (UINT k = 3; k < 5; ++k)
+		{
+			p[k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+			p[k].Descriptor.ShaderRegister = k - 1;
+			p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+		}
 		D3D12_STATIC_SAMPLER_DESC s = {};
 		s.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
 		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
 		s.MaxLOD = 0.0f;
 		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 3, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 5, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -297,21 +339,26 @@ float4 ps(v2p i) : SV_Target
 		const fx::run &r = f.run_list[run];
 		if (r.count == 0)
 			return st;
-		// The run's vertices into the flush's slot of the ring (at the frame's own offsets)
+		// The run's vertices into the flush's slot of the ring (at the frame's own offsets; an MMB mesh's are the zone's)
 		uint32_t lo = kMaxVertices, hi = 0;
+		bool any = false;
 		for (uint32_t i = r.first; i < r.first + r.count && i < kMaxElements; ++i)
 		{
 			const element &e = f.elements[i];
 			for (uint32_t k = e.first_draw; k < e.first_draw + e.draws && k < kMaxDraws; ++k)
 			{
+				any = any || f.draws[k].count != 0;
+				if ((f.draws[k].stages & stage_zone_mesh) != 0)
+					continue;
 				lo = std::min(lo, f.draws[k].first);
 				hi = std::max(hi, std::min(f.draws[k].first + f.draws[k].count, kMaxVertices));
 			}
 		}
-		if (hi <= lo)
+		if (!any)
 			return st;
 		const UINT64 slot = UINT64(seq % kFrames) * kSlotBytes;
-		std::memcpy(_mapped + slot + UINT64(lo) * sizeof(vertex), f.vertices + lo, size_t(hi - lo) * sizeof(vertex));
+		if (hi > lo)
+			std::memcpy(_mapped + slot + UINT64(lo) * sizeof(vertex), f.vertices + lo, size_t(hi - lo) * sizeof(vertex));
 
 		D3D12_VIEWPORT vp = { 0.0f, 0.0f, t.width, t.height, 0.0f, 1.0f };
 		D3D12_RECT sc = { 0, 0, LONG(t.width), LONG(t.height) };
@@ -321,6 +368,12 @@ float4 ps(v2p i) : SV_Target
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		list->SetGraphicsRootSignature(_root);
 		list->SetGraphicsRootShaderResourceView(1, _ring->GetGPUVirtualAddress() + slot);
+		// (the zone's views stand on the ring until an MMB mesh needs them: every root view set before a draw)
+		list->SetGraphicsRootShaderResourceView(3, _ring->GetGPUVirtualAddress());
+		list->SetGraphicsRootShaderResourceView(4, _ring->GetGPUVirtualAddress());
+		ID3D12DescriptorHeap *const ours = textures::heap();
+		ID3D12DescriptorHeap *heap_bound = ours;
+		const zone::gpu_zone *zone_bound = nullptr;
 		ID3D12PipelineState *bound = nullptr;
 		uint32_t c[kConstants] = {};
 		for (uint32_t i = r.first; i < r.first + r.count && i < kMaxElements; ++i)
@@ -343,20 +396,40 @@ float4 ps(v2p i) : SV_Target
 			const float fog[8] = { channel(e.fog_colour, 16), channel(e.fog_colour, 8), channel(e.fog_colour, 0), float(e.fog), e.fog_start, e.fog_end, e.uv[0], e.uv[1] };
 			std::memcpy(c + 36, fog, 32);
 			list->SetGraphicsRoot32BitConstants(0, 44, c, 0);
+			// (an MMB mesh: the zone's buffers and heap; anything else ours)
+			const zone::gpu_zone *const z = e.zone;
+			ID3D12DescriptorHeap *const want = z != nullptr ? z->heap() : ours;
+			if (want != heap_bound)
+			{
+				list->SetDescriptorHeaps(1, &want);
+				heap_bound = want;
+			}
+			if (z != nullptr && z != zone_bound)
+			{
+				list->SetGraphicsRootShaderResourceView(3, z->vertices()->GetGPUVirtualAddress());
+				list->SetGraphicsRootShaderResourceView(4, z->indices()->GetGPUVirtualAddress());
+				zone_bound = z;
+			}
 			for (uint32_t k = e.first_draw; k < e.first_draw + e.draws && k < kMaxDraws; ++k)
 			{
 				const draw &dr = f.draws[k];
-				if (dr.count == 0 || dr.first + dr.count > kMaxVertices)
+				const bool zoned = (dr.stages & stage_zone_mesh) != 0;
+				if (dr.count == 0 || (zoned ? z == nullptr : dr.first + dr.count > kMaxVertices))
 					continue;
 				const uint32_t fl[2] = { dr.stages, dr.first };
 				list->SetGraphicsRoot32BitConstants(0, 2, fl, 44);
-				list->SetGraphicsRootDescriptorTable(2, textures::view((dr.stages & stage_texture) != 0 ? dr.texture : textures::kNone));
+				if (zoned)
+					list->SetGraphicsRootDescriptorTable(2, z->texture_srv((dr.stages & (stage_mmb_textured | stage_mmb_textured_d)) != 0 ? dr.texture : textures::kNone));
+				else
+					list->SetGraphicsRootDescriptorTable(2, textures::view((dr.stages & stage_texture) != 0 ? dr.texture : textures::kNone));
 				list->DrawInstanced(dr.count, 1, 0, 0);
 				st.draws++;
 				st.triangles += dr.count / 3;
 			}
 			st.elements++;
 		}
+		if (heap_bound != ours)
+			list->SetDescriptorHeaps(1, &ours);
 		return st;
 	}
 }

@@ -169,16 +169,20 @@ rem The game side on both dumps, the game's own walk and element draw run throug
 rem build\fx_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\fx_test.cpp src\game\fxdraw.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxtextures.cpp src\chars\tex.cpp src\bake\dat.cpp src\game\game.cpp ^
+  src\game\gamewater.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
   /Fo"build\test\\" /Fe"build\fx_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\fx_test.exe
 rem The renderer at its marker on WARP with the debug layer against effects_play.py (tests\fx_oracle.py play: Fire, Cure,
-rem Fast Blade, made when missing, a minute or so): build\fx_render_test.exe build\test\fx_fire.bin ...
+rem Fast Blade, made when missing, a minute or so; Southern San d'Oria's fountain: MMB meshes):
+rem build\fx_render_test.exe build\test\fx_fire.bin ...
 if not exist build\test\fx_fire.bin python tests\fx_oracle.py play build\test\fx_fire.bin 150 --action spell 144 --size 480x270 || exit /b 1
 if not exist build\test\fx_cure.bin python tests\fx_oracle.py play build\test\fx_cure.bin 60 --action spell 1 --size 480x270 || exit /b 1
 if not exist build\test\fx_fastblade.bin python tests\fx_oracle.py play build\test\fx_fastblade.bin 38 --action ws 32 --size 480x270 || exit /b 1
+if not exist build\test\fx_fountain.bin python tests\fx_oracle.py play build\test\fx_fountain.bin 120 --dat ROM/1/31 --gen fun1 fun2 fun3 awgd --size 480x270 || exit /b 1
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\fx_render_test.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxinject.cpp src\fx\fxrender.cpp src\fx\fxtextures.cpp src\chars\tex.cpp ^
-  build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\fx_render_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\fx_render_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\fx_render_test.exe
 rem The screen's 2D (src\game\uidraw, src\ui2d; docs\own-frame\2d.md): the loop tail's calls, the recorder on a stand-in
 rem device and the gate on both dumps (build\uidraw_test.exe); the recorder on dgVoodoo's own d3d8.dll (the game's, with

@@ -14,6 +14,11 @@
 #include <atomic>
 #include <cstdint>
 
+namespace hifi::zone
+{
+	class gpu_zone;
+}
+
 namespace hifi::fx
 {
 	constexpr uint32_t kFrames = 16;          // (the markers' seq has 4 bits)
@@ -60,6 +65,13 @@ namespace hifi::fx
 		stage_alpha_2x = 1u << 5,       // untextured: alpha x TFACTOR x 2, not x 4 (the D3M's D, 3523B4)
 		stage_alpha_test = 1u << 6,     // ALPHATEST GREATER 0x60 (the morph's header bit 7)
 		stage_diffuse = 1u << 7,        // colour and alpha SELECTARG1 DIFFUSE, no TEXTUREFACTOR (the weapon trails, 01C940)
+		// The MMB effect meshes (183760): the draw's vertices are the element's zone mesh's (first and count index the
+		// zone's indices); without either bit below, the untextured parts' table (CURRENT x TFACTOR x 2, alpha x 4)
+		stage_zone_mesh = 1u << 8,
+		stage_mmb_textured = 1u << 9,   // a textured part: colour TEXTURE x TFACTOR, then x DIFFUSE x 4; alpha TEXTURE x
+		                                // TFACTOR x 2, then x DIFFUSE x 4
+		stage_mmb_textured_d = 1u << 10, // ... with the textured mode (letter d, or flags bit 28): colour TEXTURE x
+		                                 // DIFFUSE, then x TFACTOR x 4; alpha DIFFUSE x TFACTOR x 4
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -94,6 +106,9 @@ namespace hifi::fx
 		float uv[2] = {};         // TEXTURE0's offset (+0x120, +0x124 when +0x17B bits 0-1)
 		uint32_t first_draw = 0, draws = 0;
 		uint32_t cls = 0;         // what drew it (element_class, for the counts)
+		// An MMB effect mesh's: the zone's data on the GPU its model is in (the native zone renderer's: the effect's
+		// model is the zone's own, 183420), its draws stage_zone_mesh
+		const zone::gpu_zone *zone = nullptr;
 	};
 
 	enum element_class : uint32_t

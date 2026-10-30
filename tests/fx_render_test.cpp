@@ -7,7 +7,8 @@
  * Each oracle's elements become a flush's frame as src/game/fxdraw records one (WORLD from the player's view-space
  * matrix, TEXTUREFACTOR as it computes it, the blend by the letter, z write by flags bit 12, the class's stages and
  * geometry from the chunks through fxgeo), one run; the textures go through fxtextures (decoded on its thread, copied
- * in on the list at the marker). The marker is handled on a list recorded as dgVoodoo records (its own root signature,
+ * in on the list at the marker). An MMB effect mesh is drawn from its DAT's data on the GPU as the native zone
+ * renderer has it (zonemesh::load_file, gpu_zone uploaded on the test's queue): its pieces by the model's name. The marker is handled on a list recorded as dgVoodoo records (its own root signature,
  * heap and targets bound), which must be bound again after. The picture must match the oracle's: the mean difference
  * per channel and the share of pixels off by more than 24 (of 255) small (8-bit blending and the rasteriser's own
  * rounding differ, never the shapes, colours or order).
@@ -23,11 +24,14 @@
 #include "../src/fx/fxinject.hpp"
 #include "../src/fx/fxtextures.hpp"
 #include "../src/chars/tex.hpp"
+#include "../src/zone/zone_gpu.hpp"
+#include "game_dump.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -194,6 +198,28 @@ namespace
 	std::map<std::pair<const oracle *, uint32_t>, tex_entry> g_tex;
 	uint32_t g_next_resource = 0x10000;
 
+	// The DATs' data on the GPU (an MMB mesh's), by file id
+	ID3D12Device *g_device = nullptr;
+	ID3D12CommandQueue *g_queue = nullptr;
+	std::map<uint32_t, std::unique_ptr<hifi::zone::gpu_zone>> g_zones;
+
+	hifi::zone::gpu_zone *zone_data(uint32_t file)
+	{
+		auto it = g_zones.find(file);
+		if (it != g_zones.end())
+			return it->second.get();
+		auto z = std::make_unique<hifi::zone::gpu_zone>();
+		hifi::bake::zonemesh::zone d;
+		hifi::bake::result r;
+		std::string why;
+		if (!hifi::bake::zonemesh::load_file(file, d, r) || !z->upload(g_device, g_queue, std::move(d), why) || !z->wait(60000))
+		{
+			check(false, "DAT " + std::to_string(file) + "'s data: " + r.why + why);
+			z.reset();
+		}
+		return (g_zones[file] = std::move(z)).get();
+	}
+
 	tex_entry texture(const oracle &o, uint32_t blob)
 	{
 		if (blob >= o.blobs.size())
@@ -259,6 +285,46 @@ namespace
 			std::vector<fx::draw> draws;
 			std::string why;
 			const bool bit28 = (oe.flags & (1u << 28)) != 0;
+			if (oe.cls == 1 && oe.model < o.blobs.size() && o.blobs[oe.model].size() == 24 && std::memcmp(o.blobs[oe.model].data(), "MMB1", 4) == 0)
+			{
+				// (as fxdraw's record_mmb: the model's pieces in file order, untextured or by 183760's textured mode)
+				uint32_t file = 0;
+				std::memcpy(&file, o.blobs[oe.model].data() + 4, 4);
+				hifi::zone::gpu_zone *const z = zone_data(file);
+				const char *name = reinterpret_cast<const char *>(o.blobs[oe.model].data() + 8);
+				const uint32_t model = z != nullptr ? z->data().find(name) : hifi::bake::zonemesh::kNone;
+				if (model == hifi::bake::zonemesh::kNone)
+				{
+					skipped++;
+					continue;
+				}
+				const auto &d = z->data();
+				const auto &m = d.models[model];
+				const bool mode = (oe.letter & 0xFF) == 0x64 || bit28;
+				for (uint32_t i = m.first_piece; i < m.first_piece + m.pieces; ++i)
+				{
+					const auto &pc = d.pieces[i];
+					fx::draw dr;
+					dr.first = pc.first_index;
+					dr.count = pc.triangles * 3;
+					dr.texture = pc.texture == hifi::bake::zonemesh::kNone ? fx::kNone : pc.texture;
+					dr.stages = fx::stage_zone_mesh | (pc.texture == hifi::bake::zonemesh::kNone ? 0u : mode ? fx::stage_mmb_textured_d : fx::stage_mmb_textured);
+					draws.push_back(dr);
+				}
+				e.zone = z;
+				e.cls = fx::class_mmb;
+				if (f.draw_count + draws.size() > fx::kMaxDraws)
+				{
+					skipped++;
+					continue;
+				}
+				e.first_draw = f.draw_count;
+				e.draws = uint32_t(draws.size());
+				for (const fx::draw &d0 : draws)
+					f.draws[f.draw_count++] = d0;
+				f.elements[f.element_count++] = e;
+				continue;
+			}
 			if (oe.cls == 0 && oe.model < o.blobs.size())
 			{
 				geo::d3m m;
@@ -403,9 +469,19 @@ namespace
 	}
 }
 
+extern "C" int __cdecl hifixi_option(const char *, const char *, char *, uint32_t) { return 0; }
+extern "C" void __cdecl hifixi_set_option(const char *, const char *, const char *) {}
+extern "C" int __cdecl worldfx_setting(const char *, char *, uint32_t) { return 0; }
+extern "C" const char *__cdecl worldfx_folder() { return ""; }
+
 int main(int argc, char **argv)
 {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	// (the dump mapped first, before Direct3D's DLLs could take its place: zonemesh unscrambles MMBs with the game's
+	// key tables)
+	uintptr_t dump_base = 0;
+	const bool mapped = dump::map(dump::kDumps[0], dump_base) != 0;
+	check(mapped, "the dump mapped (the MMBs' key tables)");
 	ID3D12Debug *debug = nullptr;
 	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
 		debug->EnableDebugLayer();
@@ -426,6 +502,8 @@ int main(int argc, char **argv)
 	ID3D12CommandQueue *queue = nullptr;
 	const D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT };
 	device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+	g_device = device;
+	g_queue = queue;
 	ID3D12Fence *fence = nullptr;
 	device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
 	uint64_t fence_value = 0;
@@ -724,6 +802,109 @@ int main(int argc, char **argv)
 		std::string first;
 		const uint32_t messages = debug_messages(info, first);
 		check(messages == 0, "the blend table: the debug layer: nothing (" + std::to_string(messages) + (messages != 0 ? ": " + first : std::string()) + ")");
+
+		// 183760's tables by value: an MMB mesh of three screen thirds (a made-up map's data on the GPU, its texture
+		// 2x2 of one texel), SRCALPHA / INVSRCALPHA on black: the left third textured (the plain table), the middle with
+		// the textured mode (no texture alpha), the right untextured
+		{
+			namespace zm = hifi::bake::zonemesh;
+			zm::zone zd;
+			zd.map = 2;
+			for (int third = 0; third < 3; ++third)
+			{
+				const float x0 = -1.0f + 2.0f * third / 3.0f, x1 = -1.0f + 2.0f * (third + 1) / 3.0f;
+				const float c[6][2] = { { x0, -1 }, { x1, -1 }, { x0, 1 }, { x0, 1 }, { x1, -1 }, { x1, 1 } };
+				zm::piece pc;
+				pc.first_index = uint32_t(zd.indices.size());
+				pc.triangles = 2;
+				pc.texture = third < 2 ? 0 : zm::kNone;
+				for (const auto &p : c)
+				{
+					zm::vertex v = {};
+					v.pos[0] = p[0];
+					v.pos[1] = p[1];
+					v.pos[2] = 0.5f;
+					v.colour = 0x40806020u;
+					v.uv[0] = (p[0] + 1.0f) * 0.5f;
+					v.uv[1] = (p[1] + 1.0f) * 0.5f;
+					zd.indices.push_back(uint32_t(zd.vertices.size()));
+					zd.vertices.push_back(v);
+				}
+				zd.pieces.push_back(pc);
+			}
+			zm::model mo;
+			std::memcpy(mo.name, "fxtest_thirds   ", 16);
+			mo.pieces = mo.raw_pieces = 3;
+			mo.vertices = uint32_t(zd.vertices.size());
+			zd.models.push_back(mo);
+			zm::texture tx;
+			std::memcpy(tx.name, "fxtest  thirds  ", 16);
+			tx.w = tx.h = 2;
+			tx.format = zm::kBGRA8;
+			for (int k = 0; k < 4; ++k)
+				tx.data.insert(tx.data.end(), { 0x40, 0x80, 0xC0, 0xFF });
+			zd.textures.push_back(std::move(tx));
+			hifi::zone::gpu_zone gz;
+			check(gz.upload(device, queue, std::move(zd), why) && gz.wait(10000), "183760's tables: the made-up map's data on the GPU");
+			fx::frame &g3 = fx::frame_slot(++seq);
+			g3.seq.store(0);
+			g3.element_count = g3.draw_count = g3.vertex_count = 0;
+			std::memcpy(g3.proj, id, 64);
+			const uint32_t stages[3] = { fx::stage_zone_mesh | fx::stage_mmb_textured, fx::stage_zone_mesh | fx::stage_mmb_textured_d, fx::stage_zone_mesh };
+			for (uint32_t third = 0; third < 3; ++third)
+			{
+				fx::element e;
+				std::memcpy(e.world, id, 64);
+				e.tfactor = 0x80808080u;
+				e.blend = fx::blend_alpha;
+				e.zone = &gz;
+				e.cls = fx::class_mmb;
+				e.first_draw = g3.draw_count;
+				e.draws = 1;
+				g3.draws[g3.draw_count++] = { 6 * third, 6, third < 2 ? 0u : fx::kNone, stages[third] };
+				g3.elements[g3.element_count++] = e;
+			}
+			g3.run_list[0] = { 0, g3.element_count };
+			g3.runs.store(1);
+			g3.seq.store(seq);
+			alloc->Reset();
+			list->Reset(alloc, nullptr);
+			barrier(list, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			list->ClearRenderTargetView(rtv, black, 0, nullptr);
+			list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			list->SetDescriptorHeaps(1, &game_heap);
+			fx::inject::on_run(list, bound, w, seq & 15);
+			barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			list->Close();
+			queue->ExecuteCommandLists(1, lists);
+			queue->Signal(fence, ++fence_value);
+			HANDLE ev3 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, ev3);
+			WaitForSingleObject(ev3, 60000);
+			CloseHandle(ev3);
+			back->Map(0, nullptr, reinterpret_cast<void **>(&px));
+			const auto sat = [](double v) { return v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v; };
+			const double D[4] = { 0x80 / 255.0, 0x60 / 255.0, 0x20 / 255.0, 0x40 / 255.0 }, T[4] = { 0xC0 / 255.0, 0x80 / 255.0, 0x40 / 255.0, 1.0 }, F = 0x80 / 255.0;
+			bool ok = true;
+			std::string got;
+			for (int third = 0; third < 3; ++third)
+			{
+				const double a = third == 0 ? sat(sat(T[3] * F * 2.0) * D[3] * 4.0) : sat(D[3] * F * 4.0);
+				const uint8_t *q = px + 32 * 256 + size_t(10 + 21 * third) * 4;
+				for (int k = 0; k < 3; ++k)
+				{
+					const double c = third == 0 ? sat(sat(T[k] * F) * D[k] * 4.0) : third == 1 ? sat(sat(T[k] * D[k]) * F * 4.0) : sat(D[k] * F * 2.0);
+					const int want3 = int(c * a * 255.0 + 0.5);
+					ok = ok && std::abs(int(q[k]) - want3) <= 2;
+					got += (got.empty() ? "" : " ") + std::to_string(q[k]) + "/" + std::to_string(want3);
+				}
+			}
+			back->Unmap(0, nullptr);
+			check(ok, "183760's tables: plain, the textured mode, untextured (got/want: " + got + ", within 2)");
+			const uint32_t messages3 = debug_messages(info, first);
+			check(messages3 == 0, "183760's tables: the debug layer: nothing (" + std::to_string(messages3) + (messages3 != 0 ? ": " + first : std::string()) + ")");
+		}
 		list->Release();
 		alloc->Release();
 		A->Release();
@@ -735,6 +916,9 @@ int main(int argc, char **argv)
 	}
 	fx::inject::release();
 	fx::textures::stop();
+	g_zones.clear();
+	if (mapped)
+		dump::unmap(dump_base);
 	std::printf("\n%d passed, %d failed\n", passes, failures);
 	return failures == 0 ? 0 : 1;
 }

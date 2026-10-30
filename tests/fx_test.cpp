@@ -21,7 +21,9 @@
 #include "../src/fx/fxgeo.hpp"
 #include "../src/fx/fxtextures.hpp"
 #include "../src/game/fxdraw.hpp"
+#include "../src/game/gamewater.hpp"
 #include "../src/game/slotmark.hpp"
+#include "../src/zone/zone_gpu.hpp"
 #include "game_dump.hpp"
 #include <cmath>
 #include <cstdio>
@@ -598,6 +600,133 @@ int main()
 				ok = d.count == 36 && std::memcmp(f4->vertices + d.first, plain_m.vertices.data(), 36 * sizeof(fx::vertex)) == 0;
 			}
 			check(ok, name + ": an untextured kind-6 D3M drawn, its first vertex's y from its DAT (every vertex as the chunk has it)");
+		}
+
+		// MMB effect meshes (+0x179: 040C20 -> 183760): the zone's own model, drawn from the native zone renderer's data
+		// (a made-up map's on WARP: one model of two pieces, the first textured); the mesh as the zone builds it (16FCD0:
+		// its name +8, the 4-character one +0x18, FVF +0x20, stride +0x24, strips +0x2C, groups +0x60 / +0x44, the
+		// offset +0xE0 added to the draw matrix's last row)
+		{
+			namespace zm = hifi::bake::zonemesh;
+			zm::zone zd;
+			zd.map = 1;
+			for (int i = 0; i < 6; ++i)
+			{
+				zm::vertex v = {};
+				v.pos[0] = float(i);
+				v.colour = 0x80808080u;
+				zd.vertices.push_back(v);
+				zd.indices.push_back(uint32_t(i));
+			}
+			zm::piece p0, p1;
+			p0.first_index = 0;
+			p0.triangles = 1;
+			p0.texture = 0;
+			p1.first_index = 3;
+			p1.triangles = 1;
+			zd.pieces = { p0, p1 };
+			zm::model mo;
+			std::memcpy(mo.name, "fxtest_sheet    ", 16);
+			mo.kind = 1;
+			mo.first_piece = 0;
+			mo.pieces = 2;
+			mo.vertices = 6;
+			mo.raw_pieces = 2;
+			zd.models.push_back(mo);
+			zm::texture tx;
+			std::memcpy(tx.name, "fxtest  sheet   ", 16);
+			tx.w = tx.h = 2;
+			tx.format = zm::kBGRA8;
+			tx.data.assign(16, 0x80);
+			zd.textures.push_back(std::move(tx));
+			hifi::zone::gpu_zone gz;
+			const bool up = gz.upload(device, queue, std::move(zd), why) && gz.wait(10000);
+			check(up, name + ": a made-up map's data on the GPU" + (why.empty() ? "" : ": " + why));
+			fd::set_zones(&gz, nullptr);
+			// (the live mesh: one group of two parts, the first with a texture object whose Direct3D texture is made)
+			const auto mesh_of = [&](const char *full, const char *four) {
+				const uintptr_t mesh = take(0x100), groups = take(0x24), parts = take(2 * 0xC0), object = take(0x50);
+				std::memcpy(reinterpret_cast<void *>(mesh + 8), full, 16);
+				std::memcpy(reinterpret_cast<void *>(mesh + 0x18), four, 4);
+				put<uint32_t>(mesh + 0x20, 0x152);
+				put<uint32_t>(mesh + 0x24, 0x24);
+				put<uint32_t>(mesh + 0x2C, 5);
+				put<int32_t>(mesh + 0x44, 1);
+				put<uint32_t>(mesh + 0x60, uint32_t(groups));
+				put<float>(mesh + 0xE0, 1.0f);
+				put<float>(mesh + 0xE4, 2.0f);
+				put<float>(mesh + 0xE8, 3.0f);
+				put<int32_t>(groups, 2);
+				put<uint32_t>(groups + 4, uint32_t(parts));
+				put<uint32_t>(object + 0x40, 0x5678);
+				put<uint32_t>(parts + 4, uint32_t(object));
+				put<uint32_t>(parts + 0x28, 0x1234);
+				put<uint32_t>(parts + 0xC0 + 0x28, 0x1234);
+				return mesh;
+			};
+			const uintptr_t sheet = mesh_of("fxtest_sheet    ", "shet"), other = mesh_of("fxtest_other    ", "othr");
+			const auto mmb = [&](uintptr_t mesh, uint16_t letter, uint32_t flags, float z) {
+				const uintptr_t e = element(vt_d3m, 0, letter, flags, 0x80808080, z);
+				put<uint32_t>(e + 0x104, uint32_t(mesh));
+				put<uint8_t>(e + 0x179, 1);
+				return e;
+			};
+			const uintptr_t m1 = mmb(sheet, 0x48, 0, -12.0f), m2 = mmb(sheet, 0x64 | 0x40 << 8, 0, -11.0f), m3 = mmb(other, 0x48, 0, -10.5f);
+			const uintptr_t list5 = take(16), nodes5 = take(32 * 3);
+			const uintptr_t order5[] = { m1, m2, m3 };
+			for (size_t i = 0; i < 3; ++i)
+			{
+				const uintptr_t n = nodes5 + 32 * i;
+				put<uint32_t>(n + 4, i + 1 < 3 ? uint32_t(n + 32) : 0);
+				put<uint32_t>(n + 8, uint32_t(s.element_cb));
+				put<uint32_t>(n + 0xC, uint32_t(order5[i]));
+			}
+			put<uint32_t>(list5 + 4, uint32_t(nodes5));
+			put<uint32_t>(list5 + 8, 0);
+			const fd::counts before = fd::get_counts();
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list5, 0);
+			const fx::frame *f5 = fx::published(g_last_seq);
+			const fd::counts after = fd::get_counts();
+			check(s.mmb_draw == base + 0x040C20, name + ": the MMB draw 040C20 (040BA0's jump)");
+			check(g_markers == 1 && f5 != nullptr && f5->element_count == 2 && after.mesh == before.mesh + 1 && g_seen.setups == 1,
+				name + ": two MMB meshes taken, one run; a mesh not in the zone's data the game's (" + order_seen() + ")");
+			if (f5 != nullptr && f5->element_count == 2)
+			{
+				const fx::element &a = f5->elements[0], &b = f5->elements[1];
+				const fx::draw *ad = f5->draws + a.first_draw, *bd = f5->draws + b.first_draw;
+				check(a.cls == fx::class_mmb && a.zone == &gz && a.draws == 2 && ad[0].first == 0 && ad[0].count == 3 && ad[0].texture == 0 &&
+						ad[0].stages == (fx::stage_zone_mesh | fx::stage_mmb_textured) && ad[1].first == 3 && ad[1].count == 3 && ad[1].texture == fx::kNone &&
+						ad[1].stages == fx::stage_zone_mesh,
+					name + ": the first: its two pieces from the zone's indices, the textured one by 183760's plain table, the other untextured");
+				check(b.draws == 2 && bd[0].stages == (fx::stage_zone_mesh | fx::stage_mmb_textured_d) && b.blend == fx::blend_alpha && b.tfactor == 0x80808080,
+					name + ": letter d: the textured mode, SRCALPHA / INVSRCALPHA, the colour's alpha the letter's high byte x 2");
+				check(std::fabs(a.world[12] - 1.5f) < 1e-5f && std::fabs(a.world[13] - 1.75f) < 1e-5f && std::fabs(a.world[14] + 9.0f) < 1e-5f && a.world[15] == 1.0f,
+					name + ": the draw matrix's last row plus the mesh's +0xE0 (1, 2, 3, 0)");
+			}
+			// World FX's gamewater list: a mesh on it is taken with nothing drawn (its routine routed on this dump only
+			// where the dump has the game's own bytes there)
+			std::string gw_why;
+			if (hifi::game::gamewater::route(true, gw_why))
+			{
+				const uintptr_t gw = hifi::game::gamewater::where().memory;
+				put<uint32_t>(gw + 0x10, hifi::game::name_value("shet"));
+				put<uint32_t>(gw, 1);
+				const fd::counts c5 = fd::get_counts();
+				g_seen = seen();
+				g_markers = 0;
+				reinterpret_cast<flush_fn>(s.code)(list5, 0);
+				const fd::counts c6 = fd::get_counts();
+				check(g_markers == 0 && c6.taken[fx::class_mmb] == c5.taken[fx::class_mmb] && c6.water == c5.water + 2 && get<uint32_t>(gw + 4) >= 2,
+					name + ": gamewater's list: both 'shet' meshes taken with nothing drawn, counted as its routine counts them");
+				put<uint32_t>(gw, 0);
+				check(hifi::game::gamewater::stop(gw_why), name + ": gamewater put back" + (gw_why.empty() ? "" : ": " + gw_why));
+			}
+			else
+				std::printf("      (%s: gamewater not routed here: %s)\n", name.c_str(), gw_why.c_str());
+			fd::set_zones(nullptr, nullptr);
+			gz.release();
 		}
 
 		// Put back

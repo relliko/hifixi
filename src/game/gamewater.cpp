@@ -524,6 +524,25 @@ namespace hifi::game::gamewater
 		return !s.empty() ? s : std::string("none yet");
 	}
 
+	bool hides_mesh(uint32_t name)
+	{
+		if (!g.routed || g.mem == 0)
+			return false;
+		volatile uint32_t *p = reinterpret_cast<volatile uint32_t *>(g.mem);
+		const uint32_t at = p[gw::seen_at / 4];
+		p[gw::seen / 4 + (at & 63)] = name;
+		p[gw::seen_at / 4] = at + 1;
+		const uint32_t listed = p[gw::count / 4];
+		const uint32_t n = std::min<uint32_t>(listed, gw::max);
+		for (uint32_t i = 0; i < n; ++i)
+			if (p[gw::names / 4 + i] == name)
+			{
+				p[gw::skipped / 4] = p[gw::skipped / 4] + 1;
+				return true;
+			}
+		return false;
+	}
+
 	sites where()
 	{
 		sites s;

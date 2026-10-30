@@ -23,6 +23,11 @@
 #include "game.hpp"
 #include <string>
 
+namespace hifi::zone
+{
+	class gpu_zone;
+}
+
 namespace hifi::game::fxdraw
 {
 	// The stubs and the call in, or out; false and why (nothing changed then)
@@ -37,6 +42,9 @@ namespace hifi::game::fxdraw
 	void set_probe(bool on);
 	// The time new textures are stamped with (the plugin's clock; the textures' forgetting)
 	void set_clock(double now);
+	// Each present: the native zone renderer's data of the renderer's map slots (0 the zone, 1 a second map; nullptr
+	// while not on the GPU): an MMB effect mesh is the zone's own model, drawn from it
+	void set_zones(zone::gpu_zone *zone, zone::gpu_zone *second);
 
 	struct counts
 	{
@@ -51,6 +59,8 @@ namespace hifi::game::fxdraw
 		uint64_t full = 0;        // ... no room in the frame
 		uint64_t faulted = 0;     // ... its memory couldn't be read
 		uint64_t overwritten = 0; // ... an untextured D3M whose first vertex the load wrote over (below)
+		uint64_t mesh = 0;        // ... an MMB mesh not in the zone's data on the GPU (or not as the game has it)
+		uint64_t water = 0;       // taken, nothing drawn: an MMB mesh World FX's gamewater hides (its list)
 		uint64_t runs = 0, markers = 0, not_sent = 0;
 		uint32_t last_elements = 0, last_runs = 0;
 	};
@@ -66,6 +76,7 @@ namespace hifi::game::fxdraw
 		uintptr_t element_draw = 0, d3m_draw = 0;   // 046070, 040BA0
 		uintptr_t draw_matrix = 0, fog_env = 0;     // 045D40, 18BA20
 		uintptr_t d3a_draw = 0, trail_cb = 0, ring_draw = 0; // 03EB30, 01C930, 0565A0
+		uintptr_t mmb_draw = 0;                     // 040C20
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
 		uintptr_t code = 0;                         // our stubs
 	};

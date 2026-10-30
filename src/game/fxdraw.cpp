@@ -33,8 +33,9 @@
  *
  * Classes (by the vtable's class draw, vt+0x48):
  *   040BA0 (the D3M element, vtable 0x32AD80): no model (+0x104) or a weather element (generator +0xDE bit 7) that
- *     002D80 hides: nothing drawn (taken, as the game's own early return). The model an MMB (+0x179): left to the game
- *     for now. Else the D3M (040220, the resource [[+0x104]], data at +0x30): its vertices as the load left them
+ *     002D80 hides: nothing drawn (taken, as the game's own early return). The model an MMB (+0x179): 040C20 ->
+ *     183760 (record_mmb below: the zone's own model, drawn from the native zone renderer's data). Else the D3M
+ *     (040220, the resource [[+0x104]], data at +0x30): its vertices as the load left them
  *     (03FEE0 doubled their colours in place), no vertex buffer (03FCF0 + 4): nothing; no textures: one untextured
  *     draw (352348, D: alpha x 2); for kinds 5-7 without textures the first vertex's y comes from the DAT (their names
  *     begin where their vertices do, and the load stores the vertex buffer object over it once it has copied them:
@@ -50,15 +51,18 @@
 
 #include <windows.h>
 #include "fxdraw.hpp"
+#include "gamewater.hpp"
 #include "slotmark.hpp"
 #include "../fx/fxframe.hpp"
 #include "../fx/fxtextures.hpp"
 #include "../bake/dat.hpp"
+#include "../zone/zone_gpu.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace hifi::game::fxdraw
@@ -66,6 +70,7 @@ namespace hifi::game::fxdraw
 	namespace
 	{
 		namespace fx = hifi::fx;
+		namespace zm = hifi::bake::zonemesh;
 
 		// 04610E: mov eax, [math]; push 0FFFFh; ... mov ecx, ebp; call 0467E0 (at +0x20)
 		constexpr const char *kSetup = "A1????????68FFFF00008B88900A00008B9C88100A0000418988900A00008BCDE8";
@@ -85,6 +90,8 @@ namespace hifi::game::fxdraw
 		constexpr const char *kTrailCallback = "8B4C240485C97405E903000000C3"; // 01C930 (-> 01C940)
 		constexpr const char *kRingDraw = "83EC40535556578BF98A87B401000084C0"; // 0565A0
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
+		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
+		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
 		// 047018: mov ecx, [env]; push 0; push fog start; push fog end; push fog colour; call 18BA20 (at +0x17); call 0464D0
 		constexpr const char *kFog = "8B0D????????6A0068????????68????????68????????E8????????E8";
 		constexpr intptr_t kFogEnv = 2, kFogCall = 0x17;
@@ -114,7 +121,7 @@ namespace hifi::game::fxdraw
 		{
 			// The sites
 			uintptr_t setup_call = 0, setup = 0, flush_call = 0, walk = 0, entry_site = 0, element_cb = 0, element_draw = 0, d3m_draw = 0;
-			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0;
+			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0, mmb_draw = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
@@ -133,6 +140,20 @@ namespace hifi::game::fxdraw
 			counts n;
 		};
 		state g;
+
+		// The native zone renderer's data of the map slots (set each present), and each live MMB mesh's model in it
+		// (kNone: not there, or not as the game has it), for the data it was found in
+		struct mesh_model
+		{
+			const zone::gpu_zone *zone = nullptr;
+			uint32_t model = zm::kNone;
+		};
+		struct zones_state
+		{
+			zone::gpu_zone *data[2] = {};
+			std::unordered_map<uintptr_t, mesh_model> of;
+		};
+		zones_state g_zones;
 
 		template <typename T>
 		T at(uintptr_t a)
@@ -546,6 +567,137 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// An MMB mesh's model in the zone's data (cached by the mesh; kNone: the game's). 183420 found the mesh as the
+		// model of that name in the renderer's map slots (0, then 1: 170F30 on the slot's model list), so it's the
+		// same model the native zone renderer has by its name (mesh +8, 16 characters, as the zone's objects' models).
+		// Taken only when the mesh is as that model was read: FVF 0x152 in 36-byte strips (+0x20, +0x24, +0x2C 5: kind
+		// 1; not the bump shader's), as many parts as the MMB has pieces (+0x60 groups of 0x24 bytes, +0x44 of them;
+		// +0 a group's parts of 0xC0 bytes at +4), each part's vertex buffer made (+0x28), a texture object's (+4)
+		// Direct3D texture there (+0x40, else +0x44), and no texture the DAT doesn't have.
+		mesh_model model_of(uintptr_t mesh)
+		{
+			const auto known = g_zones.of.find(mesh);
+			if (known != g_zones.of.end() && (known->second.zone == nullptr || known->second.zone == g_zones.data[0] || known->second.zone == g_zones.data[1]))
+				return known->second;
+			mesh_model out;
+			char name[16];
+			std::memcpy(name, reinterpret_cast<const void *>(mesh + 8), 16);
+			for (zone::gpu_zone *z : g_zones.data)
+			{
+				if (z == nullptr)
+					continue;
+				const zm::zone &d = z->data();
+				uint32_t found = zm::kNone;
+				for (uint32_t i = 0; i < uint32_t(d.models.size()); ++i)
+					if (std::memcmp(d.models[i].name, name, 16) == 0)
+					{
+						found = i;
+						break;
+					}
+				if (found == zm::kNone)
+					continue;
+				out.zone = z;
+				out.model = found;
+				break;
+			}
+			if (out.zone == nullptr)
+				return out; // (not cached: the data may come up later)
+			const zm::model &m = out.zone->data().models[out.model];
+			bool same = m.kind == 1 && !m.bump && m.missing == 0 && at<uint32_t>(mesh + 0x20) == 0x152 && at<uint32_t>(mesh + 0x24) == 0x24 && at<uint32_t>(mesh + 0x2C) == 5;
+			const uintptr_t groups = at<uint32_t>(mesh + 0x60);
+			const int32_t group_count = at<int32_t>(mesh + 0x44);
+			uint32_t parts = 0;
+			for (int32_t gi = 0; same && groups != 0 && gi < group_count && gi < 4096; ++gi)
+			{
+				const int32_t n = at<int32_t>(groups + 0x24 * uintptr_t(gi));
+				const uintptr_t list = at<uint32_t>(groups + 0x24 * uintptr_t(gi) + 4);
+				for (int32_t k = 0; same && k < n && k < 4096; ++k)
+				{
+					const uintptr_t part = list + 0xC0 * uintptr_t(k);
+					const uint32_t object = at<uint32_t>(part + 4);
+					same = at<uint32_t>(part + 0x28) != 0 && (object == 0 || at<uint32_t>(object + 0x40) != 0 || at<uint32_t>(object + 0x44) != 0);
+					parts++;
+				}
+			}
+			if (!same || parts != m.raw_pieces)
+				out.model = zm::kNone;
+			g_zones.of[mesh] = out;
+			return out;
+		}
+
+		// An MMB effect mesh (040C20 -> 183760) into the frame; false: the game's. 183760 (thiscall on the zone
+		// renderer: the draw matrix +0xA0, the mesh +0x104, the textured mode: letter d, else flags bit 28) culls the
+		// mesh's box (+0x70) against the projection (182070: only when all eight corners are past one side, the near
+		// side at 0.2; not done here: what it would cull draws nothing on the GPU either, but for a mesh wholly within
+		// 0.2 of the eye), sets WORLD = the draw matrix with the mesh's +0xE0..+0xEC added to its last row, ADDRESS
+		// WRAP, and draws each part with its vertex buffer: untextured CURRENT x TFACTOR x 2, alpha x 4; textured by the
+		// mode (fx::stage_mmb_textured, _d). Blend, z write, fog and projection are 0467E0's; the UV scroll 040C20's.
+		// World FX's gamewater list (by the mesh's 4-character name +0x18) is honoured: such a mesh is taken with
+		// nothing drawn, as its routine would skip 183760.
+		bool record_mmb(uintptr_t e, uintptr_t mesh)
+		{
+			fx::frame &f = *g.f;
+			if (game::gamewater::hides_mesh(at<uint32_t>(mesh + 0x18)))
+			{
+				g.n.water++;
+				return true;
+			}
+			if (at<uint32_t>(mesh + 0x60) == 0)
+			{
+				g.n.empty++;
+				return true; // (no groups: 183760 draws nothing)
+			}
+			const mesh_model mm = model_of(mesh);
+			if (mm.zone == nullptr || mm.model == zm::kNone)
+			{
+				g.n.mesh++;
+				return false;
+			}
+			const zm::zone &d = mm.zone->data();
+			const zm::model &m = d.models[mm.model];
+			const uint16_t letter = at<uint16_t>(e + kLetter);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			const bool mode = (letter & 0xFF) == 0x64 || (flags & (1u << 28)) != 0;
+			// The draws: the pieces in file order, a run of them with the same texture as one
+			uint32_t count = 0;
+			const uint32_t first_draw = f.draw_count;
+			for (uint32_t i = m.first_piece; i < m.first_piece + m.pieces && i < d.pieces.size(); ++i)
+			{
+				const zm::piece &pc = d.pieces[i];
+				const uint32_t stages = fx::stage_zone_mesh | (pc.texture == zm::kNone ? 0u : mode ? fx::stage_mmb_textured_d : fx::stage_mmb_textured);
+				const uint32_t texture = pc.texture == zm::kNone ? fx::kNone : pc.texture;
+				if (count != 0)
+				{
+					fx::draw &last = f.draws[first_draw + count - 1];
+					if (last.texture == texture && last.stages == stages && last.first + last.count == pc.first_index)
+					{
+						last.count += pc.triangles * 3;
+						continue;
+					}
+				}
+				if (f.element_count >= fx::kMaxElements || first_draw + count + 1 > fx::kMaxDraws)
+				{
+					g.n.full++;
+					return false;
+				}
+				f.draws[first_draw + count++] = { pc.first_index, pc.triangles * 3, texture, stages };
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			for (int k = 0; k < 4; ++k)
+				out.world[12 + k] += at<float>(mesh + 0xE0 + 4 * uintptr_t(k));
+			out.zone = mm.zone;
+			out.first_draw = first_draw;
+			out.draws = count;
+			out.cls = fx::class_mmb;
+			f.draw_count += count;
+			f.element_count++;
+			g.n.taken[fx::class_mmb]++;
+			return true;
+		}
+
 		// The D3A (03EB30 -> 03E910) into the frame; false: the game's. The resource keeps the texture object in the
 		// name's first dword (data +8, 075520), the vertex buffer object at +0xC and the frame table at +0x14 (03E6C0:
 		// per frame u16 quads, s16 first vertex); the frames' vertices stay in the chunk as the DAT has them (24 bytes:
@@ -868,11 +1020,9 @@ namespace hifi::game::fxdraw
 					g.n.empty++;
 					return true;
 				}
+				// (an MMB: +0x104 is the mesh itself, 049570 having kept 183420's answer)
 				if (at<uint8_t>(e + kMmb) != 0)
-				{
-					g.n.unsupported++;
-					return false;
-				}
+					return record_mmb(e, handle);
 				const uint32_t resource = at<uint32_t>(handle);
 				if (resource == 0)
 				{
@@ -1025,6 +1175,11 @@ namespace hifi::game::fxdraw
 		n.d3a_draw = find(kD3aDraw);
 		n.trail_cb = find(kTrailCallback);
 		n.ring_draw = find(kRingDraw);
+		{
+			uint8_t jmp = 0;
+			const uintptr_t to = read(d3m + kD3mMmbJump, jmp) && jmp == 0xE9 ? rel_target(d3m + kD3mMmbJump) : 0;
+			n.mmb_draw = to != 0 && code_is(to, kMmbDraw, sizeof(kMmbDraw)) ? to : 0;
+		}
 		n.draw_matrix = rel_target(s + kSetupMatrixCall);
 		n.weather = rel_target(d3m + kD3mWeatherCall);
 		n.fog_env = rel_target(fog + kFogCall);
@@ -1153,6 +1308,14 @@ namespace hifi::game::fxdraw
 		g.clock = now;
 	}
 
+	void set_zones(zone::gpu_zone *zone, zone::gpu_zone *second)
+	{
+		if (zone != g_zones.data[0] || second != g_zones.data[1])
+			g_zones.of.clear();
+		g_zones.data[0] = zone;
+		g_zones.data[1] = second;
+	}
+
 	counts get_counts()
 	{
 		return g.n;
@@ -1165,19 +1328,21 @@ namespace hifi::game::fxdraw
 		uint64_t taken = 0;
 		for (const uint64_t t : g.n.taken)
 			taken += t;
-		char line[600];
+		char line[800];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, D3A %llu, rings %llu, weapon trails %llu), %llu with nothing to draw; the last flush %u elements in %u runs; "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, rings %llu, weapon trails %llu), %llu with nothing to draw, "
+			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
-			"%llu (untextured D3M, its first vertex overwritten); "
+			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
 			"%llu markers sent%s",
 			g.native ? "HiFi XI draws what it can" : g.probe ? "the game draws them (waiting for the markers to come through)" : "the game draws them",
 			static_cast<unsigned long long>(g.n.flushes), static_cast<unsigned long long>(taken), static_cast<unsigned long long>(g.n.taken[fx::class_d3m]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_d3a]), static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
-			static_cast<unsigned long long>(g.n.empty), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
+			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
+			static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
-			static_cast<unsigned long long>(g.n.overwritten),
+			static_cast<unsigned long long>(g.n.overwritten), static_cast<unsigned long long>(g.n.mesh),
 			static_cast<unsigned long long>(g.n.markers), g.n.not_sent != 0 ? (", not sent " + std::to_string(g.n.not_sent)).c_str() : "");
 		return line;
 	}
@@ -1198,6 +1363,7 @@ namespace hifi::game::fxdraw
 		s.d3a_draw = g.d3a_draw;
 		s.trail_cb = g.trail_cb;
 		s.ring_draw = g.ring_draw;
+		s.mmb_draw = g.mmb_draw;
 		s.colour = g.colour;
 		s.gfx = g.gfx;
 		s.renderer = g.renderer;
