@@ -33,16 +33,19 @@
  *
  * Classes (by the vtable's class draw, vt+0x48):
  *   040BA0 (the D3M element, vtable 0x32AD80): no model (+0x104) or a weather element (generator +0xDE bit 7) that
- *     002D80 hides: nothing drawn (taken, as the game's own early return). The model an MMB (+0x179): left to the game
- *     for now. Else the D3M (040220, the resource [[+0x104]], data at +0x30): its vertices as the load left them
+ *     002D80 hides: nothing drawn (taken, as the game's own early return). The model an MMB (+0x179): 040C20 ->
+ *     183760 (record_mmb below: the zone's own model, drawn from the native zone renderer's data). Else the D3M
+ *     (040220, the resource [[+0x104]], data at +0x30): its vertices as the load left them
  *     (03FEE0 doubled their colours in place), no vertex buffer (03FCF0 + 4): nothing; no textures: one untextured
  *     draw (352348, D: alpha x 2); for kinds 5-7 without textures the first vertex's y comes from the DAT (their names
  *     begin where their vertices do, and the load stores the vertex buffer object over it once it has copied them:
  *     dat_first_y below; left to the game when it can't be found); else a draw per texture run (3524A8, bit 28: 3523D0; I: 352590), the texture object
- *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5. Lit (flags bit 16):
- *     left to the game for now.
+ *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5.
  *   03EB30 (CMoD3aElem): the frame +0x170 of the D3A (record_d3a below), lit or not (03E9A0 sets LIGHTING 0).
- *   0565A0 (the rings, kind 0x24): record_ring below; lit: left to the game.
+ *   0565A0 (the rings, kind 0x24): record_ring below.
+ *   03FBB0 (the morphs, chunk 0x25): record_morph below (03F440 with its weights 03F8A0).
+ * Lit elements (flags bit 16; D3M, MMB meshes and rings: the D3A sets LIGHTING 0 itself) get their lights as 0467E0
+ * works them out (record_light below), the game's own functions called for each step.
  *   Anything else: left to the game.
  * Weapon trails (CYyAfterImage) aren't elements: their flush callback 01C930 is recognised in the walk's stub and the
  * ring of samples recorded as one more element of the run (record_trail below).
@@ -50,15 +53,18 @@
 
 #include <windows.h>
 #include "fxdraw.hpp"
+#include "gamewater.hpp"
 #include "slotmark.hpp"
 #include "../fx/fxframe.hpp"
 #include "../fx/fxtextures.hpp"
 #include "../bake/dat.hpp"
+#include "../zone/zone_gpu.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace hifi::game::fxdraw
@@ -66,6 +72,7 @@ namespace hifi::game::fxdraw
 	namespace
 	{
 		namespace fx = hifi::fx;
+		namespace zm = hifi::bake::zonemesh;
 
 		// 04610E: mov eax, [math]; push 0FFFFh; ... mov ecx, ebp; call 0467E0 (at +0x20)
 		constexpr const char *kSetup = "A1????????68FFFF00008B88900A00008B9C88100A0000418988900A00008BCDE8";
@@ -84,7 +91,10 @@ namespace hifi::game::fxdraw
 		constexpr const char *kD3aDraw = "8B810401000085C0741E85C074048B00EB0233C0518B0D????????68????????518BC8E8"; // 03EB30
 		constexpr const char *kTrailCallback = "8B4C240485C97405E903000000C3"; // 01C930 (-> 01C940)
 		constexpr const char *kRingDraw = "83EC40535556578BF98A87B401000084C0"; // 0565A0
+		constexpr const char *kMorphDraw = "538BD98B83FC00000085C074048B00EB0233C08A88DE000000"; // 03FBB0
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
+		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
+		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
 		// 047018: mov ecx, [env]; push 0; push fog start; push fog end; push fog colour; call 18BA20 (at +0x17); call 0464D0
 		constexpr const char *kFog = "8B0D????????6A0068????????68????????68????????E8????????E8";
 		constexpr intptr_t kFogEnv = 2, kFogCall = 0x17;
@@ -106,6 +116,23 @@ namespace hifi::game::fxdraw
 		using matrix_fn = void(__fastcall *)(uintptr_t element, uintptr_t edx);
 		using weather_fn = float(__cdecl *)();
 		using fog_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, uint32_t *colour, float *end, float *start, uint32_t none, uint32_t area);
+		// The lighting's (0467E0 046A72-046D9E, 04719C): the element's frame matrix and attach matrix, the attach fix-up,
+		// the math object's turn (vt+0x78), products (vt+0x20, vt+0x24) and point transform (vt+0x50), the environment's
+		// one light, two lights (with an area, without) and ambient
+		using matrix_of_fn = uintptr_t(__fastcall *)(uintptr_t element, uintptr_t edx);
+		using fix_fn = void(__cdecl *)(float *m);
+		using turn_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float *in, float angle);
+		using product_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float *a, float *b);
+		using point_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float *m, float *in);
+		using light_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, void *light, uint32_t zero, uint32_t area);
+		using lights_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, void *light0, void *light1, uint32_t area);
+		using lights_default_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, void *light0, void *light1);
+		using ambient_fn = void(__fastcall *)(uintptr_t env, uintptr_t edx, uint32_t *colour, uint32_t zero, uint32_t area);
+		// Their calls in 0467E0 (from its start), and the material's push (0471C1: push VA 0490BC28)
+		constexpr intptr_t kFrameOfCall = 0x294, kAttachCall = 0x2F0, kFixCall = 0x339, kLightCall = 0x474, kLightsCall = 0x510, kLightsDefaultCall = 0x52A,
+			kAmbientCall = 0x9BC, kMaterialPush = 0x9E1;
+		constexpr uint32_t kTurn = 0x78, kProductA = 0x20, kProductB = 0x24, kPoint = 0x50;
+		constexpr uint32_t kThreeHalfPi = 0x4096CBE2, kPi = 0x40490FD8; // (the angles 0467E0 pushes)
 
 		// Element fields (notes-effects-update.md "Fields the frame touches")
 		constexpr uintptr_t kWorld = 0xA0, kGen = 0xFC, kModel = 0x104, kFlags = 0x10C, kUv = 0x120, kBias = 0x128, kLetter = 0x16C, kMmb = 0x179, kUvBits = 0x17B;
@@ -114,8 +141,9 @@ namespace hifi::game::fxdraw
 		{
 			// The sites
 			uintptr_t setup_call = 0, setup = 0, flush_call = 0, walk = 0, entry_site = 0, element_cb = 0, element_draw = 0, d3m_draw = 0;
-			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0;
+			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0, mmb_draw = 0, morph_draw = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
+			uintptr_t frame_of = 0, attach = 0, fix = 0, light1 = 0, lights2 = 0, lights2_default = 0, ambient = 0, material = 0; // (0 any: lit elements the game's)
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
 			bool in = false;
@@ -133,6 +161,20 @@ namespace hifi::game::fxdraw
 			counts n;
 		};
 		state g;
+
+		// The native zone renderer's data of the map slots (set each present), and each live MMB mesh's model in it
+		// (kNone: not there, or not as the game has it), for the data it was found in
+		struct mesh_model
+		{
+			const zone::gpu_zone *zone = nullptr;
+			uint32_t model = zm::kNone;
+		};
+		struct zones_state
+		{
+			zone::gpu_zone *data[2] = {};
+			std::unordered_map<uintptr_t, mesh_model> of;
+		};
+		zones_state g_zones;
 
 		template <typename T>
 		T at(uintptr_t a)
@@ -362,6 +404,131 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// A lit element's lights (flags bit 16) into the frame, as 0467E0 works them out for D3D8's lighting (046A72-
+		// 046D9E, 04719C-0471CC): L = the element's frame (045C50) without its translation; unless an MMB (+0x179) or the
+		// generator's +0xDF bit 1, with an attach matrix (0473F0): L turned by 3 pi / 2 (vt+0x78), the attach matrix fixed
+		// up (045800) and L = L x it (vt+0x20); bits 6-8 1 or 2 with bit 0: VIEW without its translation, vt+0x24 (L,
+		// VIEW, L), L = that VIEW, turned by pi. The lights: one (18B9A0, light 1 off) when the renderer's path
+		// +0x3949C, else two (18B960 with the generator's area, 188B70 without), each direction through L (vt+0x50);
+		// AMBIENT 18B9E0; the material VA 0490BC28. All read under record()'s guard; false: the game's (none of the
+		// calls found, no environment or math object, WORLD not invertible).
+		struct d3dlight
+		{
+			uint32_t type;
+			float diffuse[4], specular[4], ambient[4];
+			float position[3], direction[3];
+			float range, falloff, attenuation[3], theta, phi;
+		};
+		static_assert(sizeof(d3dlight) == 104, "D3DLIGHT8");
+
+		bool record_light(uintptr_t e, fx::element &out)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t env = at<uint32_t>(g.env), math = at<uint32_t>(g.math), renderer = at<uint32_t>(g.renderer), gfx = at<uint32_t>(g.gfx);
+			if (g.frame_of == 0 || g.attach == 0 || g.fix == 0 || g.light1 == 0 || g.lights2 == 0 || g.lights2_default == 0 || g.ambient == 0 || g.material == 0 ||
+				env == 0 || math == 0 || renderer == 0 || gfx == 0 || f.light_count >= fx::kMaxLit)
+				return false;
+			const uintptr_t vt = at<uint32_t>(math);
+			const auto turn = reinterpret_cast<turn_fn>(uintptr_t(at<uint32_t>(vt + kTurn)));
+			const auto product_a = reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(vt + kProductA)));
+			const auto product_b = reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(vt + kProductB)));
+			const auto point = reinterpret_cast<point_fn>(uintptr_t(at<uint32_t>(vt + kPoint)));
+			float three_half_pi, pi;
+			std::memcpy(&three_half_pi, &kThreeHalfPi, 4);
+			std::memcpy(&pi, &kPi, 4);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			// L, the frame the lights are turned into
+			alignas(16) float L[16];
+			std::memcpy(L, reinterpret_cast<const void *>(reinterpret_cast<matrix_of_fn>(g.frame_of)(e, 0)), 64);
+			L[12] = L[13] = L[14] = 0.0f;
+			L[15] = 1.0f;
+			const uint32_t handle = at<uint32_t>(e + kGen);
+			const uint32_t gen = handle != 0 ? at<uint32_t>(handle) : 0;
+			const bool own_frame = gen != 0 && ((at<uint8_t>(gen + 0xDF) >> 1) & 1) != 0;
+			if (at<uint8_t>(e + kMmb) == 0 && !own_frame)
+			{
+				const uintptr_t a = reinterpret_cast<matrix_of_fn>(g.attach)(e, 0);
+				if (a != 0)
+				{
+					alignas(16) float t[16];
+					std::memcpy(t, reinterpret_cast<const void *>(a), 64);
+					turn(math, 0, L, L, three_half_pi);
+					reinterpret_cast<fix_fn>(g.fix)(t);
+					product_a(math, 0, L, L, t);
+				}
+			}
+			const uint32_t facing = (flags >> 6) & 7;
+			if (facing >= 1 && facing <= 2 && (flags & 1) != 0)
+			{
+				alignas(16) float t[16];
+				std::memcpy(t, reinterpret_cast<const void *>(gfx + 0xB50), 64);
+				t[12] = t[13] = t[14] = 0.0f;
+				t[15] = 1.0f;
+				product_b(math, 0, L, t, L);
+				std::memcpy(L, t, 64);
+				turn(math, 0, L, L, pi);
+			}
+			// The lights and the ambient, from the environment for the generator's area
+			const uint32_t area = gen != 0 ? at<uint32_t>(gen + 0xC4) : 0;
+			d3dlight lights[2] = {};
+			const bool one = at<uint32_t>(renderer + 0x3949C) != 0;
+			if (one)
+				reinterpret_cast<light_fn>(g.light1)(env, 0, &lights[0], 0, area);
+			else if (gen != 0)
+				reinterpret_cast<lights_fn>(g.lights2)(env, 0, &lights[0], &lights[1], area);
+			else
+				reinterpret_cast<lights_default_fn>(g.lights2_default)(env, 0, &lights[0], &lights[1]);
+			for (int k = 0; k < (one ? 1 : 2); ++k)
+				point(math, 0, lights[k].direction, L, lights[k].direction);
+			uint32_t ambient = 0;
+			reinterpret_cast<ambient_fn>(g.ambient)(env, 0, &ambient, 0, area);
+			// Normals: by WORLD's 3x3, inverted and transposed
+			const float *w = out.world;
+			const float det = w[0] * (w[5] * w[10] - w[6] * w[9]) - w[1] * (w[4] * w[10] - w[6] * w[8]) + w[2] * (w[4] * w[9] - w[5] * w[8]);
+			if (!std::isfinite(det) || std::fabs(det) < 1e-20f)
+				return false;
+			const float inv[9] = { (w[5] * w[10] - w[6] * w[9]) / det, (w[2] * w[9] - w[1] * w[10]) / det, (w[1] * w[6] - w[2] * w[5]) / det,
+				(w[6] * w[8] - w[4] * w[10]) / det, (w[0] * w[10] - w[2] * w[8]) / det, (w[2] * w[4] - w[0] * w[6]) / det,
+				(w[4] * w[9] - w[5] * w[8]) / det, (w[1] * w[8] - w[0] * w[9]) / det, (w[0] * w[5] - w[1] * w[4]) / det };
+			fx::lighting &l = f.lights[f.light_count];
+			l = fx::lighting();
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					l.normal[i][j] = inv[j * 3 + i];
+			for (int k = 0; k < (one ? 1 : 2); ++k)
+			{
+				const float *d = lights[k].direction;
+				const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+				for (int c = 0; c < 3; ++c)
+				{
+					l.toward[k][c] = len > 0.0f ? -d[c] / len : 0.0f;
+					l.diffuse[k][c] = lights[k].diffuse[c];
+					l.ambient[c] += lights[k].ambient[c];
+				}
+			}
+			for (int c = 0; c < 3; ++c)
+			{
+				l.ambient[c] += float((ambient >> (16 - 8 * c)) & 0xFF) / 255.0f;
+				l.emissive[c] = at<float>(g.material + 0x30 + 4 * uintptr_t(c));
+			}
+			out.light = f.light_count++;
+			return true;
+		}
+
+		// An element's lighting when it's lit (flags bit 16): false, counted, when it can't be had (the game's)
+		bool lit_ok(uintptr_t e, fx::element &out)
+		{
+			if ((at<uint8_t>(e + kFlags + 2) & 1) == 0)
+				return true;
+			if (record_light(e, out))
+			{
+				g.n.lit_taken++;
+				return true;
+			}
+			g.n.lit++;
+			return false;
+		}
+
 		// The first vertex's y of an untextured D3M of kinds 5-7 (the load wrote the vertex buffer object over it in
 		// memory; record_d3m), from its DAT: the file id at its root (up the parents +0x28, as 072240; the root's +0x34),
 		// the chunk of its name (resource +0x20), type 0x1F and size whose other vertex positions are the ones in memory.
@@ -516,7 +683,7 @@ namespace hifi::game::fxdraw
 			}
 			fx::element &out = f.elements[f.element_count];
 			out = fx::element();
-			if (!common(e, out))
+			if (!common(e, out) || !lit_ok(e, out))
 				return false;
 			// (the D3M's TEXTUREFACTOR: D's alpha from 0x7F up full; I's colour white, blended DESTCOLOR / SRCALPHA)
 			if ((letter & 0xFF) == 0x44 && (out.tfactor >> 24) >= 0x7F)
@@ -543,6 +710,137 @@ namespace hifi::game::fxdraw
 			f.vertex_count += used;
 			f.element_count++;
 			g.n.taken[fx::class_d3m]++;
+			return true;
+		}
+
+		// An MMB mesh's model in the zone's data (cached by the mesh; kNone: the game's). 183420 found the mesh as the
+		// model of that name in the renderer's map slots (0, then 1: 170F30 on the slot's model list), so it's the
+		// same model the native zone renderer has by its name (mesh +8, 16 characters, as the zone's objects' models).
+		// Taken only when the mesh is as that model was read: FVF 0x152 in 36-byte strips (+0x20, +0x24, +0x2C 5: kind
+		// 1; not the bump shader's), as many parts as the MMB has pieces (+0x60 groups of 0x24 bytes, +0x44 of them;
+		// +0 a group's parts of 0xC0 bytes at +4), each part's vertex buffer made (+0x28), a texture object's (+4)
+		// Direct3D texture there (+0x40, else +0x44), and no texture the DAT doesn't have.
+		mesh_model model_of(uintptr_t mesh)
+		{
+			const auto known = g_zones.of.find(mesh);
+			if (known != g_zones.of.end() && (known->second.zone == nullptr || known->second.zone == g_zones.data[0] || known->second.zone == g_zones.data[1]))
+				return known->second;
+			mesh_model out;
+			char name[16];
+			std::memcpy(name, reinterpret_cast<const void *>(mesh + 8), 16);
+			for (zone::gpu_zone *z : g_zones.data)
+			{
+				if (z == nullptr)
+					continue;
+				const zm::zone &d = z->data();
+				uint32_t found = zm::kNone;
+				for (uint32_t i = 0; i < uint32_t(d.models.size()); ++i)
+					if (std::memcmp(d.models[i].name, name, 16) == 0)
+					{
+						found = i;
+						break;
+					}
+				if (found == zm::kNone)
+					continue;
+				out.zone = z;
+				out.model = found;
+				break;
+			}
+			if (out.zone == nullptr)
+				return out; // (not cached: the data may come up later)
+			const zm::model &m = out.zone->data().models[out.model];
+			bool same = m.kind == 1 && !m.bump && m.missing == 0 && at<uint32_t>(mesh + 0x20) == 0x152 && at<uint32_t>(mesh + 0x24) == 0x24 && at<uint32_t>(mesh + 0x2C) == 5;
+			const uintptr_t groups = at<uint32_t>(mesh + 0x60);
+			const int32_t group_count = at<int32_t>(mesh + 0x44);
+			uint32_t parts = 0;
+			for (int32_t gi = 0; same && groups != 0 && gi < group_count && gi < 4096; ++gi)
+			{
+				const int32_t n = at<int32_t>(groups + 0x24 * uintptr_t(gi));
+				const uintptr_t list = at<uint32_t>(groups + 0x24 * uintptr_t(gi) + 4);
+				for (int32_t k = 0; same && k < n && k < 4096; ++k)
+				{
+					const uintptr_t part = list + 0xC0 * uintptr_t(k);
+					const uint32_t object = at<uint32_t>(part + 4);
+					same = at<uint32_t>(part + 0x28) != 0 && (object == 0 || at<uint32_t>(object + 0x40) != 0 || at<uint32_t>(object + 0x44) != 0);
+					parts++;
+				}
+			}
+			if (!same || parts != m.raw_pieces)
+				out.model = zm::kNone;
+			g_zones.of[mesh] = out;
+			return out;
+		}
+
+		// An MMB effect mesh (040C20 -> 183760) into the frame; false: the game's. 183760 (thiscall on the zone
+		// renderer: the draw matrix +0xA0, the mesh +0x104, the textured mode: letter d, else flags bit 28) culls the
+		// mesh's box (+0x70) against the projection (182070: only when all eight corners are past one side, the near
+		// side at 0.2; not done here: what it would cull draws nothing on the GPU either, but for a mesh wholly within
+		// 0.2 of the eye), sets WORLD = the draw matrix with the mesh's +0xE0..+0xEC added to its last row, ADDRESS
+		// WRAP, and draws each part with its vertex buffer: untextured CURRENT x TFACTOR x 2, alpha x 4; textured by the
+		// mode (fx::stage_mmb_textured, _d). Blend, z write, fog and projection are 0467E0's; the UV scroll 040C20's.
+		// World FX's gamewater list (by the mesh's 4-character name +0x18) is honoured: such a mesh is taken with
+		// nothing drawn, as its routine would skip 183760.
+		bool record_mmb(uintptr_t e, uintptr_t mesh)
+		{
+			fx::frame &f = *g.f;
+			if (game::gamewater::hides_mesh(at<uint32_t>(mesh + 0x18)))
+			{
+				g.n.water++;
+				return true;
+			}
+			if (at<uint32_t>(mesh + 0x60) == 0)
+			{
+				g.n.empty++;
+				return true; // (no groups: 183760 draws nothing)
+			}
+			const mesh_model mm = model_of(mesh);
+			if (mm.zone == nullptr || mm.model == zm::kNone)
+			{
+				g.n.mesh++;
+				return false;
+			}
+			const zm::zone &d = mm.zone->data();
+			const zm::model &m = d.models[mm.model];
+			const uint16_t letter = at<uint16_t>(e + kLetter);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			const bool mode = (letter & 0xFF) == 0x64 || (flags & (1u << 28)) != 0;
+			// The draws: the pieces in file order, a run of them with the same texture as one
+			uint32_t count = 0;
+			const uint32_t first_draw = f.draw_count;
+			for (uint32_t i = m.first_piece; i < m.first_piece + m.pieces && i < d.pieces.size(); ++i)
+			{
+				const zm::piece &pc = d.pieces[i];
+				const uint32_t stages = fx::stage_zone_mesh | (pc.texture == zm::kNone ? 0u : mode ? fx::stage_mmb_textured_d : fx::stage_mmb_textured);
+				const uint32_t texture = pc.texture == zm::kNone ? fx::kNone : pc.texture;
+				if (count != 0)
+				{
+					fx::draw &last = f.draws[first_draw + count - 1];
+					if (last.texture == texture && last.stages == stages && last.first + last.count == pc.first_index)
+					{
+						last.count += pc.triangles * 3;
+						continue;
+					}
+				}
+				if (f.element_count >= fx::kMaxElements || first_draw + count + 1 > fx::kMaxDraws)
+				{
+					g.n.full++;
+					return false;
+				}
+				f.draws[first_draw + count++] = { pc.first_index, pc.triangles * 3, texture, stages };
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out) || !lit_ok(e, out))
+				return false;
+			for (int k = 0; k < 4; ++k)
+				out.world[12 + k] += at<float>(mesh + 0xE0 + 4 * uintptr_t(k));
+			out.zone = mm.zone;
+			out.first_draw = first_draw;
+			out.draws = count;
+			out.cls = fx::class_mmb;
+			f.draw_count += count;
+			f.element_count++;
+			g.n.taken[fx::class_mmb]++;
 			return true;
 		}
 
@@ -637,6 +935,131 @@ namespace hifi::game::fxdraw
 			f.vertex_count += n;
 			f.element_count++;
 			g.n.taken[fx::class_d3a]++;
+			return true;
+		}
+
+		// A morph (03FBB0 -> 03F440, chunk 0x25 at resource +0x30) into the frame; false: the game's. 03FBB0 hands
+		// 03F440 the weights +0x194, the last frame's +0x1A8 and a blend made already (+0x1BC: then the game's), then
+		// clears +0x1BC and copies +0x194 to +0x1A8 (done here too once it's taken). The blend (03F8A0): K targets
+		// (+2's low 7 bits, signed; bit 7 the alpha test GREATER 0x60), each P positions (+4) then N packed normals
+		// (+6; bits 0-9, 10-19, 20-29 signed, / 512) from +0x20; the weights over their sum, or when that's under
+		// FLT_MIN the largest of the last frame's set to 1.0 (written back) and taken as they are. 03F440 then makes T
+		// (+0xA) x 3 vertices: the position and normal through the index lists (+8, bits 16-23 at +3; normals' after
+		// the positions'), the colours (+0xC, T x 3) doubled, the UVs (+0xE, + 0x10000 unless above +0xC); the texture
+		// the name's first dword (+0x10, 075700: its +0x40, else +0x44; a wave of it when +0x148: the game's); table
+		// 352258 (stage 0 TEXTURE x CURRENT x 2, colour and alpha; stage 1 x TFACTOR x 2, alpha x 4), one draw.
+		bool record_morph(uintptr_t e, uintptr_t resource)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t data = resource + 0x30;
+			const size_t size = ((at<uint32_t>(resource + 0x24) >> 7) & 0x7FFFF) * 16;
+			if (at<uint32_t>(e + 0x1BC) != 0 || at<float>(e + 0x148) != 0.0f || size < 0x30)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint8_t head = at<uint8_t>(data + 2);
+			const int32_t targets = int32_t(int8_t(uint8_t(head << 1))) >> 1;
+			const int32_t positions = at<int16_t>(data + 4), normals = at<int16_t>(data + 6);
+			const uint32_t triangles = at<uint16_t>(data + 0xA);
+			const uint32_t index_at = uint32_t(at<uint16_t>(data + 8)) + uint32_t(int32_t(at<int8_t>(data + 3)) * 0x10000);
+			const uint32_t colour_at = at<uint16_t>(data + 0xC), uv_word = at<uint16_t>(data + 0xE);
+			const uint32_t uv_at = colour_at < uv_word ? uv_word : uv_word + 0x10000;
+			const size_t body = size - 16, stride = (size_t(positions) * 3 + size_t(normals)) * 4;
+			if (targets < 1 || targets > 5 || positions <= 0 || normals <= 0 || triangles == 0 || 0x20 + stride * size_t(targets) > body ||
+				size_t(index_at) + size_t(triangles) * 12 > body || size_t(colour_at) + size_t(triangles) * 12 > body || size_t(uv_at) + size_t(triangles) * 24 > body)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t n = triangles * 3;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + n > fx::kMaxVertices)
+			{
+				g.n.full++;
+				return false;
+			}
+			const uint32_t object = at<uint32_t>(data + 0x10);
+			if (object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t id = texture_of(object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			// The weights (03F8A0)
+			float weights[5], last[5], w[5];
+			std::memcpy(weights, reinterpret_cast<const void *>(e + 0x194), sizeof(weights));
+			std::memcpy(last, reinterpret_cast<const void *>(e + 0x1A8), sizeof(last));
+			float sum = 0.0f;
+			for (int32_t k = 0; k < targets; ++k)
+				sum += weights[k];
+			float scale = 0.0f;
+			bool set_largest = false;
+			if (sum < 1.1754944e-38f)
+			{
+				int32_t largest = 0;
+				for (int32_t k = 1; k < targets; ++k)
+					if (last[largest] < last[k])
+						largest = k;
+				weights[largest] = 1.0f;
+				set_largest = true;
+				scale = 1.0f;
+			}
+			else
+				scale = 1.0f / sum;
+			for (int32_t k = 0; k < targets; ++k)
+				w[k] = scale * weights[k];
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out) || !lit_ok(e, out))
+				return false;
+			// The vertices: each corner's position and normal blended as 03F8A0 blends them
+			const uintptr_t pi = data + index_at, ni = pi + uintptr_t(n) * 2, colours = data + colour_at, uvs = data + uv_at;
+			for (uint32_t i = 0; i < n; ++i)
+			{
+				const uint32_t a = at<uint16_t>(pi + 2 * uintptr_t(i)), b = at<uint16_t>(ni + 2 * uintptr_t(i));
+				if (a >= uint32_t(positions) || b >= uint32_t(normals))
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				fx::vertex &v = f.vertices[f.vertex_count + i];
+				for (int c = 0; c < 3; ++c)
+					v.pos[c] = v.normal[c] = 0.0f;
+				for (int32_t k = 0; k < targets; ++k)
+				{
+					const uintptr_t target = data + 0x20 + stride * uintptr_t(k);
+					for (int c = 0; c < 3; ++c)
+						v.pos[c] = at<float>(target + 12 * uintptr_t(a) + 4 * uintptr_t(c)) * w[k] + v.pos[c];
+					const uint32_t packed = at<uint32_t>(target + 12 * uintptr_t(positions) + 4 * uintptr_t(b));
+					v.normal[0] = float(int32_t(packed << 22) >> 22) * w[k] * 0.001953125f + v.normal[0];
+					v.normal[1] = float(int32_t(packed << 12) >> 22) * w[k] * 0.001953125f + v.normal[1];
+					v.normal[2] = float(int32_t(packed << 2) >> 22) * w[k] * 0.001953125f + v.normal[2];
+				}
+				const uint32_t c = at<uint32_t>(colours + 4 * uintptr_t(i));
+				uint32_t doubled = 0;
+				for (int k = 0; k < 4; ++k)
+					doubled |= std::min(((c >> (8 * k)) & 0xFFu) * 2u, 0xFFu) << (8 * k);
+				v.colour = doubled;
+				v.uv[0] = at<float>(uvs + 8 * uintptr_t(i));
+				v.uv[1] = at<float>(uvs + 8 * uintptr_t(i) + 4);
+			}
+			// (03FBB0's side effects: the blend handed in cleared, this frame's weights kept as the last)
+			if (set_largest)
+				std::memcpy(reinterpret_cast<void *>(e + 0x194), weights, sizeof(weights));
+			std::memcpy(reinterpret_cast<void *>(e + 0x1A8), reinterpret_cast<const void *>(e + 0x194), 20);
+			*reinterpret_cast<uint32_t *>(e + 0x1BC) = 0;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_morph;
+			f.draws[f.draw_count++] = { f.vertex_count, n, id, fx::stage_texture | ((head & 0x80) != 0 ? fx::stage_alpha_test : 0u) };
+			f.vertex_count += n;
+			f.element_count++;
+			g.n.taken[fx::class_morph]++;
 			return true;
 		}
 
@@ -761,7 +1184,7 @@ namespace hifi::game::fxdraw
 			}
 			fx::element &out = f.elements[f.element_count];
 			out = fx::element();
-			if (!common(e, out))
+			if (!common(e, out) || !lit_ok(e, out))
 				return false;
 			out.tfactor = at<uint32_t>(e + 0xF8);
 			const float step = 6.283184f / float(segments);
@@ -839,22 +1262,28 @@ namespace hifi::game::fxdraw
 				return record_d3a(e, resource);
 			}
 			if (cls == g.ring_draw && g.ring_draw != 0)
+				return record_ring(e);
+			if (cls == g.morph_draw && g.morph_draw != 0)
 			{
-				if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
+				// (03FBB0: a weather element 002D80 hides, or no model: nothing drawn)
+				const uint32_t gh = at<uint32_t>(e + kGen);
+				const uint32_t gen = gh != 0 ? at<uint32_t>(gh) : 0;
+				const uint32_t handle = at<uint32_t>(e + kModel);
+				if ((gen != 0 && (at<uint8_t>(gen + 0xDE) & 0x80) != 0 && reinterpret_cast<weather_fn>(g.weather)() == 0.0f) || handle == 0)
 				{
-					g.n.lit++;
+					g.n.empty++;
+					return true;
+				}
+				const uint32_t resource = at<uint32_t>(handle);
+				if (resource == 0)
+				{
+					g.n.unsupported++;
 					return false;
 				}
-				return record_ring(e);
+				return record_morph(e, resource);
 			}
 			if (cls == g.d3m_draw)
 			{
-				// (lit elements: the area's lights, not reproduced yet)
-				if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
-				{
-					g.n.lit++;
-					return false;
-				}
 				const uint32_t handle = at<uint32_t>(e + kModel);
 				if (handle == 0)
 				{
@@ -868,11 +1297,9 @@ namespace hifi::game::fxdraw
 					g.n.empty++;
 					return true;
 				}
+				// (an MMB: +0x104 is the mesh itself, 049570 having kept 183420's answer)
 				if (at<uint8_t>(e + kMmb) != 0)
-				{
-					g.n.unsupported++;
-					return false;
-				}
+					return record_mmb(e, handle);
 				const uint32_t resource = at<uint32_t>(handle);
 				if (resource == 0)
 				{
@@ -933,7 +1360,7 @@ namespace hifi::game::fxdraw
 				g.seq = 1;
 			g.f = &fx::frame_slot(g.seq);
 			g.f->runs.store(0, std::memory_order_relaxed);
-			g.f->element_count = g.f->draw_count = g.f->vertex_count = 0;
+			g.f->element_count = g.f->draw_count = g.f->vertex_count = g.f->light_count = 0;
 			g.run_first = 0;
 			const uintptr_t renderer = word(g.renderer);
 			g.can_mark = g.wanted && markers_possible();
@@ -1025,6 +1452,12 @@ namespace hifi::game::fxdraw
 		n.d3a_draw = find(kD3aDraw);
 		n.trail_cb = find(kTrailCallback);
 		n.ring_draw = find(kRingDraw);
+		n.morph_draw = find(kMorphDraw);
+		{
+			uint8_t jmp = 0;
+			const uintptr_t to = read(d3m + kD3mMmbJump, jmp) && jmp == 0xE9 ? rel_target(d3m + kD3mMmbJump) : 0;
+			n.mmb_draw = to != 0 && code_is(to, kMmbDraw, sizeof(kMmbDraw)) ? to : 0;
+		}
 		n.draw_matrix = rel_target(s + kSetupMatrixCall);
 		n.weather = rel_target(d3m + kD3mWeatherCall);
 		n.fog_env = rel_target(fog + kFogCall);
@@ -1034,6 +1467,19 @@ namespace hifi::game::fxdraw
 		n.renderer = word(s + kSetupRenderer + 2);
 		n.colour = word(d3m + kD3mColour + 1);
 		n.env = word(fog + kFogEnv);
+		{
+			// (the lighting's calls in 0467E0, each checked as a call; the material's push)
+			const auto call = [&](intptr_t at_) { uint8_t b = 0; return read(n.setup + at_, b) && b == 0xE8 ? uintptr_t(rel_target(n.setup + at_)) : uintptr_t(0); };
+			n.frame_of = call(kFrameOfCall);
+			n.attach = call(kAttachCall);
+			n.fix = call(kFixCall);
+			n.light1 = call(kLightCall);
+			n.lights2 = call(kLightsCall);
+			n.lights2_default = call(kLightsDefaultCall);
+			n.ambient = call(kAmbientCall);
+			uint8_t push = 0;
+			n.material = read(n.setup + kMaterialPush, push) && push == 0x68 ? word(n.setup + kMaterialPush + 1) : 0;
+		}
 		if (g.code == 0)
 			g.code = alloc_code(kCodeSize);
 		if (g.code == 0)
@@ -1153,6 +1599,14 @@ namespace hifi::game::fxdraw
 		g.clock = now;
 	}
 
+	void set_zones(zone::gpu_zone *zone, zone::gpu_zone *second)
+	{
+		if (zone != g_zones.data[0] || second != g_zones.data[1])
+			g_zones.of.clear();
+		g_zones.data[0] = zone;
+		g_zones.data[1] = second;
+	}
+
 	counts get_counts()
 	{
 		return g.n;
@@ -1165,19 +1619,22 @@ namespace hifi::game::fxdraw
 		uint64_t taken = 0;
 		for (const uint64_t t : g.n.taken)
 			taken += t;
-		char line[600];
+		char line[800];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, D3A %llu, rings %llu, weapon trails %llu), %llu with nothing to draw; the last flush %u elements in %u runs; "
-			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
-			"%llu (untextured D3M, its first vertex overwritten); "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, morphs %llu, rings %llu, weapon trails %llu; %llu lit), %llu with nothing to draw, "
+			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
+			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
+			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
 			"%llu markers sent%s",
 			g.native ? "HiFi XI draws what it can" : g.probe ? "the game draws them (waiting for the markers to come through)" : "the game draws them",
 			static_cast<unsigned long long>(g.n.flushes), static_cast<unsigned long long>(taken), static_cast<unsigned long long>(g.n.taken[fx::class_d3m]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_d3a]), static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
-			static_cast<unsigned long long>(g.n.empty), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
+			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_morph]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
+			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
-			static_cast<unsigned long long>(g.n.overwritten),
+			static_cast<unsigned long long>(g.n.overwritten), static_cast<unsigned long long>(g.n.mesh),
 			static_cast<unsigned long long>(g.n.markers), g.n.not_sent != 0 ? (", not sent " + std::to_string(g.n.not_sent)).c_str() : "");
 		return line;
 	}
@@ -1198,6 +1655,13 @@ namespace hifi::game::fxdraw
 		s.d3a_draw = g.d3a_draw;
 		s.trail_cb = g.trail_cb;
 		s.ring_draw = g.ring_draw;
+		s.mmb_draw = g.mmb_draw;
+		s.morph_draw = g.morph_draw;
+		s.frame_of = g.frame_of;
+		s.light1 = g.light1;
+		s.lights2 = g.lights2;
+		s.ambient = g.ambient;
+		s.material = g.material;
 		s.colour = g.colour;
 		s.gfx = g.gfx;
 		s.renderer = g.renderer;

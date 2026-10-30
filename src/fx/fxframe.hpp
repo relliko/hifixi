@@ -14,6 +14,11 @@
 #include <atomic>
 #include <cstdint>
 
+namespace hifi::zone
+{
+	class gpu_zone;
+}
+
 namespace hifi::fx
 {
 	constexpr uint32_t kFrames = 16;          // (the markers' seq has 4 bits)
@@ -21,6 +26,7 @@ namespace hifi::fx
 	constexpr uint32_t kMaxDraws = 4096;      // their draws (one per texture run of a D3M, one per D3A frame...)
 	constexpr uint32_t kMaxVertices = 24576;  // their vertices (36 bytes each, as FVF 0x152)
 	constexpr uint32_t kMaxRuns = 256;        // runs a flush (see-through characters and the game's own draws between)
+	constexpr uint32_t kMaxLit = 1024;        // lit elements a flush (flags bit 16: their lights)
 	constexpr uint32_t kNone = 0xFFFFFFFFu;
 
 	// A vertex as the game's FVF 0x152 has it: position, normal, D3DCOLOR (0xAARRGGBB), one UV
@@ -60,6 +66,13 @@ namespace hifi::fx
 		stage_alpha_2x = 1u << 5,       // untextured: alpha x TFACTOR x 2, not x 4 (the D3M's D, 3523B4)
 		stage_alpha_test = 1u << 6,     // ALPHATEST GREATER 0x60 (the morph's header bit 7)
 		stage_diffuse = 1u << 7,        // colour and alpha SELECTARG1 DIFFUSE, no TEXTUREFACTOR (the weapon trails, 01C940)
+		// The MMB effect meshes (183760): the draw's vertices are the element's zone mesh's (first and count index the
+		// zone's indices); without either bit below, the untextured parts' table (CURRENT x TFACTOR x 2, alpha x 4)
+		stage_zone_mesh = 1u << 8,
+		stage_mmb_textured = 1u << 9,   // a textured part: colour TEXTURE x TFACTOR, then x DIFFUSE x 4; alpha TEXTURE x
+		                                // TFACTOR x 2, then x DIFFUSE x 4
+		stage_mmb_textured_d = 1u << 10, // ... with the textured mode (letter d, or flags bit 28): colour TEXTURE x
+		                                 // DIFFUSE, then x TFACTOR x 4; alpha DIFFUSE x TFACTOR x 4
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -69,6 +82,21 @@ namespace hifi::fx
 		proj_near_far = 1, // the depth pull: near and far both moved (by (1 - z/32)^3 x 0.03 x +0x128), as 2D83C6 rebuilds it
 		proj_screen = 2,   // screen-fixed elements: the fixed field of view 2 atan2(192, 350)
 	};
+
+	// A lit element's light (flags bit 16), as 0467E0 sets D3D8's fixed-function lighting: lights 0 and 1 (directional,
+	// 18B9A0 / 18B960 / 188B70, their directions turned by its frame), AMBIENT (18B9E0), the material (VA 0490BC28),
+	// with the device's COLORVERTEX 1 and AMBIENT/DIFFUSEMATERIALSOURCE COLOR1 (009A1C, 009A42): the vertex colour is
+	// both materials, so colour = vertex x (ambient + sum of diffuse x max(0, N.L)) + emissive, alpha the vertex's.
+	// Normals by the inverse transpose of WORLD, not normalized (NORMALIZENORMALS 0); D3DCOLOR parts as 0..1.
+	struct lighting
+	{
+		float normal[3][4];  // the rows normals are multiplied by: (WORLD's 3x3)^-1, transposed
+		float toward[2][4];  // toward each light (its direction negated, normalized, as D3D takes it)
+		float diffuse[2][4]; // each light's diffuse (0: the light is off)
+		float ambient[4];    // AMBIENT plus each light's ambient
+		float emissive[4];   // the material's
+	};
+	static_assert(sizeof(lighting) == 144, "the shader's");
 
 	// One draw: a triangle list of the frame's vertices with one texture (kNone: untextured) and stage program
 	struct draw
@@ -94,6 +122,10 @@ namespace hifi::fx
 		float uv[2] = {};         // TEXTURE0's offset (+0x120, +0x124 when +0x17B bits 0-1)
 		uint32_t first_draw = 0, draws = 0;
 		uint32_t cls = 0;         // what drew it (element_class, for the counts)
+		// An MMB effect mesh's: the zone's data on the GPU its model is in (the native zone renderer's: the effect's
+		// model is the zone's own, 183420), its draws stage_zone_mesh
+		const zone::gpu_zone *zone = nullptr;
+		uint32_t light = kNone;   // a lit element's lighting (the frame's lights), kNone: unlit (LIGHTING 0)
 	};
 
 	enum element_class : uint32_t
@@ -121,8 +153,9 @@ namespace hifi::fx
 		float proj[16];
 		// The camera's VIEW (gfx +0xB50): what the weapon trails' world-space points are drawn through (WORLD identity)
 		float view[16];
-		uint32_t element_count = 0, draw_count = 0, vertex_count = 0;
+		uint32_t element_count = 0, draw_count = 0, vertex_count = 0, light_count = 0;
 		run run_list[kMaxRuns];
+		lighting lights[kMaxLit];
 		element elements[kMaxElements];
 		draw draws[kMaxDraws];
 		vertex vertices[kMaxVertices];

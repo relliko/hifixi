@@ -13,6 +13,7 @@
 #include "../game/fxdraw.hpp"
 #include "../game/slotmark.hpp"
 #include "../host/passes.hpp"
+#include "../zone/native.hpp"
 #include <algorithm>
 #include <cstdio>
 
@@ -60,6 +61,8 @@ namespace hifi::fx
 		{
 			g.in_game = in_game;
 			fd::set_clock(now);
+			// (an MMB effect mesh is the zone's own model: drawn from the native zone renderer's data)
+			fd::set_zones(zone::native::ready_zone(0), zone::native::ready_zone(1));
 			if (now - g.last_tick > 1.0)
 			{
 				g.last_tick = now;

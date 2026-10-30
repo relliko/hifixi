@@ -8,14 +8,16 @@ tests/fx_geo_test.cpp and tests/fx_render_test.cpp to compare src/fx against.
     python tests/fx_oracle.py play <out.bin> <frame> [--action KIND ID] [--dat DAT --gen NAME...] [--camera C]
         An effect run by effects_play to <frame>, its elements as drawn at that frame (far to near), each with its
         model's chunk and its textures' chunks, and the picture effects_play's rasteriser makes of them on black (no
-        ground, no actors), W x H RGB8 at the end. Classes exported: D3M (0x1F; MMB models left out), D3A (0x21; not
-        lens flares), morph (0x25), rings; the Vu classes are left out of both.
+        ground, no actors), W x H RGB8 at the end. Classes exported: D3M (0x1F), MMB meshes (0x2E: the D3M fallback), D3A
+        (0x21; not lens flares), morph (0x25), rings; the Vu classes are left out of both.
 
 The .bin: 'FXO1', u32 W, H, f32 F (the focal length in pixels: the camera's 2 atan2(192, 350) field of view), u32
-elements, u32 blobs; each blob u32 size + bytes; each element: u32 class (0 D3M, 2 D3A, 4 morph, 5 ring), u32
+elements, u32 blobs; each blob u32 size + bytes; each element: u32 class (0 D3M, 1 MMB, 2 D3A, 4 morph, 5 ring), u32
 TEXTUREFACTOR (0xAARRGGBB), u32 letter, u32 flags, f32 uv u v (TEXTURE0's offset as the player applies it), u32 frame, f32 M (3x3, rows), f32 T (3), u32 the
 model's blob (0xFFFFFFFF none), u32 textures, u32 blob each (0xFFFFFFFF not found), f32 morph weights x 5, ring: u32
 segments, rings, f32 radii x 4, u32 colours x 4 (0xAABBGGRR as the element keeps them); then W x H x 3 bytes.
+An MMB's model blob is 'MMB1', u32 the DAT's file id, the MMB's 16-character name (its header bytes 16-31, unscrambled:
+the name the zone's model has); its textures are the DAT's (none exported).
 """
 import math
 import os
@@ -141,6 +143,18 @@ def play(out, frame, argv):
                     break
         return blob(data)
 
+    file_ids = {}
+    for fid, fp in SCH.file_table().items():
+        file_ids[os.path.normcase(os.path.abspath(str(fp)))] = fid
+    df_path = {id(df): p for p, df in P.LIB.files.items()}
+
+    def mmb_blob(m):
+        sys.path.insert(0, r'C:\code\LSB\reshade-worldfx\tools')
+        import bake_shadow_geo as bsg
+        b = bsg.decrypt_mmb(bytearray(m.res.data[16:]))
+        fid = file_ids.get(os.path.normcase(os.path.abspath(str(df_path.get(id(m.res.df), '')))), NONE)
+        return blob(b'MMB1' + struct.pack('<I', fid) + bytes(b[16:32]))
+
     R = P.Raster(W, H, bg=(0, 0, 0))
     vis = [e for e in world.elems if e.alive and e.visible]
     vis.sort(key=lambda e: -e.key)
@@ -150,6 +164,8 @@ def play(out, frame, argv):
         cls = None
         if e.cls == 'd3m' and m is not None and m.type == 0x1F:
             cls = 0
+        elif e.cls == 'd3m' and m is not None and m.type == 0x2E:
+            cls = 1
         elif e.cls in ('d3m', 'morph') and m is not None and m.type == 0x25:
             cls = 4
         elif e.cls == 'd3a' and m is not None and m.type == 0x21 and not m.flare:
@@ -161,7 +177,9 @@ def play(out, frame, argv):
         tf = P.element_tf(e)
         tfw = tf[3] << 24 | tf[0] << 16 | tf[1] << 8 | tf[2]
         mb, texs = NONE, []
-        if cls in (0, 2, 4):
+        if cls == 1:
+            mb = mmb_blob(m)
+        elif cls in (0, 2, 4):
             mb = blob(m.res.data[16:])
             names = [t for t in GEO.PARSERS[m.type](m.res.data[16:])['textures']]
             texs = [tex_blob(t, m.res) for t in names]

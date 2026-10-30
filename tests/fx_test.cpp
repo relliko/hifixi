@@ -21,7 +21,9 @@
 #include "../src/fx/fxgeo.hpp"
 #include "../src/fx/fxtextures.hpp"
 #include "../src/game/fxdraw.hpp"
+#include "../src/game/gamewater.hpp"
 #include "../src/game/slotmark.hpp"
+#include "../src/zone/zone_gpu.hpp"
 #include "game_dump.hpp"
 #include <cmath>
 #include <cstdio>
@@ -210,11 +212,25 @@ int main()
 	ID3D12CommandQueue *queue = nullptr;
 	const D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT };
 	device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+	fx::frame_slot(0); // (the frames' ring, some 25 MB, made here too, clear of the dumps' place)
 
-	if (kept_free != nullptr)
-		VirtualFree(kept_free, 0, MEM_RELEASE);
+	// (and kept free while each dump is tested: what's around it stays reserved, so the threads WARP and the decoders
+	// start meanwhile don't put their stacks where the next dump goes)
+	void *around[2] = {};
+	const auto release_around = [&]() {
+		for (void *&p : around)
+			if (p != nullptr)
+			{
+				VirtualFree(p, 0, MEM_RELEASE);
+				p = nullptr;
+			}
+	};
 	for (const char *path : dump::kDumps)
 	{
+		if (kept_free != nullptr)
+			VirtualFree(kept_free, 0, MEM_RELEASE);
+		kept_free = nullptr;
+		release_around();
 		uintptr_t base = 0;
 		const size_t size = dump::map(path, base);
 		const std::string name = std::string(path).substr(std::string(path).rfind('\\') + 1);
@@ -223,6 +239,11 @@ int main()
 			check(false, "mapped " + name);
 			continue;
 		}
+		const uintptr_t end = (base + size + 0xFFFF) & ~uintptr_t(0xFFFF);
+		if (base > kDumpsFrom)
+			around[0] = VirtualAlloc(reinterpret_cast<void *>(kDumpsFrom), base - kDumpsFrom, MEM_RESERVE, PAGE_NOACCESS);
+		if (end < kDumpsTo)
+			around[1] = VirtualAlloc(reinterpret_cast<void *>(end), kDumpsTo - end, MEM_RESERVE, PAGE_NOACCESS);
 		fd::set_sink(&sink);
 		const bool started = fd::start(why);
 		check(started && fd::in(), name + ": start()" + (why.empty() ? "" : ": " + why));
@@ -600,6 +621,240 @@ int main()
 			check(ok, name + ": an untextured kind-6 D3M drawn, its first vertex's y from its DAT (every vertex as the chunk has it)");
 		}
 
+		// MMB effect meshes (+0x179: 040C20 -> 183760): the zone's own model, drawn from the native zone renderer's data
+		// (a made-up map's on WARP: one model of two pieces, the first textured); the mesh as the zone builds it (16FCD0:
+		// its name +8, the 4-character one +0x18, FVF +0x20, stride +0x24, strips +0x2C, groups +0x60 / +0x44, the
+		// offset +0xE0 added to the draw matrix's last row)
+		{
+			namespace zm = hifi::bake::zonemesh;
+			zm::zone zd;
+			zd.map = 1;
+			for (int i = 0; i < 6; ++i)
+			{
+				zm::vertex v = {};
+				v.pos[0] = float(i);
+				v.colour = 0x80808080u;
+				zd.vertices.push_back(v);
+				zd.indices.push_back(uint32_t(i));
+			}
+			zm::piece p0, p1;
+			p0.first_index = 0;
+			p0.triangles = 1;
+			p0.texture = 0;
+			p1.first_index = 3;
+			p1.triangles = 1;
+			zd.pieces = { p0, p1 };
+			zm::model mo;
+			std::memcpy(mo.name, "fxtest_sheet    ", 16);
+			mo.kind = 1;
+			mo.first_piece = 0;
+			mo.pieces = 2;
+			mo.vertices = 6;
+			mo.raw_pieces = 2;
+			zd.models.push_back(mo);
+			zm::texture tx;
+			std::memcpy(tx.name, "fxtest  sheet   ", 16);
+			tx.w = tx.h = 2;
+			tx.format = zm::kBGRA8;
+			tx.data.assign(16, 0x80);
+			zd.textures.push_back(std::move(tx));
+			hifi::zone::gpu_zone gz;
+			const bool up = gz.upload(device, queue, std::move(zd), why) && gz.wait(10000);
+			check(up, name + ": a made-up map's data on the GPU" + (why.empty() ? "" : ": " + why));
+			fd::set_zones(&gz, nullptr);
+			// (the live mesh: one group of two parts, the first with a texture object whose Direct3D texture is made)
+			const auto mesh_of = [&](const char *full, const char *four) {
+				const uintptr_t mesh = take(0x100), groups = take(0x24), parts = take(2 * 0xC0), object = take(0x50);
+				std::memcpy(reinterpret_cast<void *>(mesh + 8), full, 16);
+				std::memcpy(reinterpret_cast<void *>(mesh + 0x18), four, 4);
+				put<uint32_t>(mesh + 0x20, 0x152);
+				put<uint32_t>(mesh + 0x24, 0x24);
+				put<uint32_t>(mesh + 0x2C, 5);
+				put<int32_t>(mesh + 0x44, 1);
+				put<uint32_t>(mesh + 0x60, uint32_t(groups));
+				put<float>(mesh + 0xE0, 1.0f);
+				put<float>(mesh + 0xE4, 2.0f);
+				put<float>(mesh + 0xE8, 3.0f);
+				put<int32_t>(groups, 2);
+				put<uint32_t>(groups + 4, uint32_t(parts));
+				put<uint32_t>(object + 0x40, 0x5678);
+				put<uint32_t>(parts + 4, uint32_t(object));
+				put<uint32_t>(parts + 0x28, 0x1234);
+				put<uint32_t>(parts + 0xC0 + 0x28, 0x1234);
+				return mesh;
+			};
+			const uintptr_t sheet = mesh_of("fxtest_sheet    ", "shet"), other = mesh_of("fxtest_other    ", "othr");
+			const auto mmb = [&](uintptr_t mesh, uint16_t letter, uint32_t flags, float z) {
+				const uintptr_t e = element(vt_d3m, 0, letter, flags, 0x80808080, z);
+				put<uint32_t>(e + 0x104, uint32_t(mesh));
+				put<uint8_t>(e + 0x179, 1);
+				return e;
+			};
+			const uintptr_t m1 = mmb(sheet, 0x48, 0, -12.0f), m2 = mmb(sheet, 0x64 | 0x40 << 8, 0, -11.0f), m3 = mmb(other, 0x48, 0, -10.5f);
+			const uintptr_t list5 = take(16), nodes5 = take(32 * 3);
+			const uintptr_t order5[] = { m1, m2, m3 };
+			for (size_t i = 0; i < 3; ++i)
+			{
+				const uintptr_t n = nodes5 + 32 * i;
+				put<uint32_t>(n + 4, i + 1 < 3 ? uint32_t(n + 32) : 0);
+				put<uint32_t>(n + 8, uint32_t(s.element_cb));
+				put<uint32_t>(n + 0xC, uint32_t(order5[i]));
+			}
+			put<uint32_t>(list5 + 4, uint32_t(nodes5));
+			put<uint32_t>(list5 + 8, 0);
+			const fd::counts before = fd::get_counts();
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list5, 0);
+			const fx::frame *f5 = fx::published(g_last_seq);
+			const fd::counts after = fd::get_counts();
+			check(s.mmb_draw == base + 0x040C20, name + ": the MMB draw 040C20 (040BA0's jump)");
+			check(g_markers == 1 && f5 != nullptr && f5->element_count == 2 && after.mesh == before.mesh + 1 && g_seen.setups == 1,
+				name + ": two MMB meshes taken, one run; a mesh not in the zone's data the game's (" + order_seen() + ")");
+			if (f5 != nullptr && f5->element_count == 2)
+			{
+				const fx::element &a = f5->elements[0], &b = f5->elements[1];
+				const fx::draw *ad = f5->draws + a.first_draw, *bd = f5->draws + b.first_draw;
+				check(a.cls == fx::class_mmb && a.zone == &gz && a.draws == 2 && ad[0].first == 0 && ad[0].count == 3 && ad[0].texture == 0 &&
+						ad[0].stages == (fx::stage_zone_mesh | fx::stage_mmb_textured) && ad[1].first == 3 && ad[1].count == 3 && ad[1].texture == fx::kNone &&
+						ad[1].stages == fx::stage_zone_mesh,
+					name + ": the first: its two pieces from the zone's indices, the textured one by 183760's plain table, the other untextured");
+				check(b.draws == 2 && bd[0].stages == (fx::stage_zone_mesh | fx::stage_mmb_textured_d) && b.blend == fx::blend_alpha && b.tfactor == 0x80808080,
+					name + ": letter d: the textured mode, SRCALPHA / INVSRCALPHA, the colour's alpha the letter's high byte x 2");
+				check(std::fabs(a.world[12] - 1.5f) < 1e-5f && std::fabs(a.world[13] - 1.75f) < 1e-5f && std::fabs(a.world[14] + 9.0f) < 1e-5f && a.world[15] == 1.0f,
+					name + ": the draw matrix's last row plus the mesh's +0xE0 (1, 2, 3, 0)");
+			}
+			// World FX's gamewater list: a mesh on it is taken with nothing drawn (its routine routed on this dump only
+			// where the dump has the game's own bytes there)
+			std::string gw_why;
+			if (hifi::game::gamewater::route(true, gw_why))
+			{
+				const uintptr_t gw = hifi::game::gamewater::where().memory;
+				put<uint32_t>(gw + 0x10, hifi::game::name_value("shet"));
+				put<uint32_t>(gw, 1);
+				const fd::counts c5 = fd::get_counts();
+				g_seen = seen();
+				g_markers = 0;
+				reinterpret_cast<flush_fn>(s.code)(list5, 0);
+				const fd::counts c6 = fd::get_counts();
+				check(g_markers == 0 && c6.taken[fx::class_mmb] == c5.taken[fx::class_mmb] && c6.water == c5.water + 2 && get<uint32_t>(gw + 4) >= 2,
+					name + ": gamewater's list: both 'shet' meshes taken with nothing drawn, counted as its routine counts them");
+				put<uint32_t>(gw, 0);
+				check(hifi::game::gamewater::stop(gw_why), name + ": gamewater put back" + (gw_why.empty() ? "" : ": " + gw_why));
+			}
+			else
+				std::printf("      (%s: gamewater not routed here: %s)\n", name.c_str(), gw_why.c_str());
+			fd::set_zones(nullptr, nullptr);
+			gz.release();
+		}
+
+		// A morph (03FBB0 -> 03F440: ROM3/9/111 'rng ', 2 targets of 80 positions, 120 triangles): its corners blended as
+		// 03F8A0 blends them (the weights over their sum), the colours doubled; then with no weights at all the largest
+		// of the last frame's (target 1) set to 1.0 in +0x194; +0x194 copied to +0x1A8 and +0x1BC cleared each time
+		{
+			std::vector<uint8_t> mp;
+			geo::morph gm;
+			check(chunk("ROM3\\9\\111.DAT", 0x25, "rng ", mp) && geo::parse_morph(mp.data(), mp.size(), gm, why) && gm.targets == 2 && gm.triangles == 120,
+				name + ": the morph chunk read (2 targets, 120 triangles)");
+			check(s.morph_draw == base + 0x03FBB0, name + ": the morphs' draw 03FBB0");
+			const uintptr_t morph_res = resource(mp, 0x25);
+			put<uint32_t>(morph_res + 0x30 + 0x10, uint32_t(tex_object));
+			put<uint32_t>(tex_object + 0x40, 0x5678); // (its Direct3D texture made)
+			const uintptr_t vt_morph = take(0x100);
+			put<uint32_t>(vt_morph + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_morph + 0x48, uint32_t(s.morph_draw));
+			put<uint32_t>(vt_morph + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			const uintptr_t em = element(vt_morph, morph_res, 0x48, 0, 0x80808080, -6.0f);
+			const float wts[5] = { 1.0f, 3.0f, 0, 0, 0 };
+			std::memcpy(reinterpret_cast<void *>(em + 0x194), wts, 20);
+			const uintptr_t list7 = take(16), node7 = take(32);
+			put<uint32_t>(node7 + 4, 0);
+			put<uint32_t>(node7 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node7 + 0xC, uint32_t(em));
+			put<uint32_t>(list7 + 4, uint32_t(node7));
+			put<uint32_t>(list7 + 8, 0);
+			const auto morph_matches = [&](const float *weights, const fx::frame *fm) {
+				if (fm == nullptr || fm->element_count != 1 || fm->elements[0].cls != fx::class_morph)
+					return false;
+				const fx::draw &d = fm->draws[fm->elements[0].first_draw];
+				std::vector<fx::vertex> want;
+				gm.blend(weights, want);
+				bool same = d.count == want.size() && d.texture != fx::kNone && d.stages == fx::stage_texture;
+				for (size_t i = 0; same && i < want.size(); ++i)
+				{
+					const fx::vertex &v = fm->vertices[d.first + i];
+					for (int c = 0; c < 3; ++c)
+						same = same && std::fabs(v.pos[c] - want[i].pos[c]) < 1e-4f && std::fabs(v.normal[c] - want[i].normal[c]) < 1e-4f;
+					same = same && v.colour == want[i].colour && v.uv[0] == want[i].uv[0] && v.uv[1] == want[i].uv[1];
+				}
+				return same;
+			};
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list7, 0);
+			check(g_markers == 1 && morph_matches(wts, fx::published(g_last_seq)) && get<float>(em + 0x1A8) == 1.0f && get<float>(em + 0x1AC) == 3.0f,
+				name + ": a morph: its 360 corners blended 1:3 as the chunk's targets, the colours doubled; the weights kept as the last (+0x1A8)");
+			const float none[5] = {}, last[5] = { 0.2f, 0.7f, 0, 0, 0 }, target1[5] = { 0.0f, 1.0f, 0, 0, 0 };
+			std::memcpy(reinterpret_cast<void *>(em + 0x194), none, 20);
+			std::memcpy(reinterpret_cast<void *>(em + 0x1A8), last, 20);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list7, 0);
+			check(g_markers == 1 && morph_matches(target1, fx::published(g_last_seq)) && get<float>(em + 0x198) == 1.0f && get<float>(em + 0x1AC) == 1.0f &&
+					get<uint32_t>(em + 0x1BC) == 0,
+				name + ": no weights: the last frame's largest (target 1) set to 1.0 and drawn alone, as 03F8A0 does");
+			put<uint32_t>(em + 0x1BC, 0x1234); // (a blend handed in ready: the game's)
+			g_seen = seen();
+			reinterpret_cast<flush_fn>(s.code)(list7, 0);
+			check(g_seen.setups == 1, name + ": a morph with a blend handed in (+0x1BC) left to the game");
+			put<uint32_t>(tex_object + 0x40, 0);
+		}
+
+		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
+		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
+		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path
+		{
+			const uintptr_t env_block = take(0x400), env = env_block + 0x200;
+			put<uint32_t>(s.env, uint32_t(env));
+			put<uint32_t>(address(renderer) + 0x3949C, 1);
+			check(s.frame_of == base + 0x045C50 && s.light1 == base + 0x18B9A0 && s.lights2 == base + 0x18B960 && s.ambient == base + 0x18B9E0 &&
+					s.material == base + 0x47BC28,
+				name + ": the lighting's calls in 0467E0 (045C50, 18B9A0, 18B960, 18B9E0) and the material (VA +47BC28)");
+			const uintptr_t el = element(vt_d3m, textured_res, 0x48, 1u << 16 | 1u << 25, 0x80808080, -6.5f);
+			const uintptr_t list6 = take(16), node6 = take(32);
+			put<uint32_t>(node6 + 4, 0);
+			put<uint32_t>(node6 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node6 + 0xC, uint32_t(el));
+			put<uint32_t>(list6 + 4, uint32_t(node6));
+			put<uint32_t>(list6 + 8, 0);
+			const fd::counts c7 = fd::get_counts();
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list6, 0);
+			const fx::frame *f7 = fx::published(g_last_seq);
+			const fd::counts c8 = fd::get_counts();
+			bool ok = g_markers == 1 && f7 != nullptr && f7->element_count == 1 && c8.lit_taken == c7.lit_taken + 1 && f7->elements[0].light == 0 && f7->light_count == 1;
+			std::string what;
+			if (ok)
+			{
+				const fx::lighting &l = f7->lights[0];
+				const float t0 = std::sqrt(l.toward[0][0] * l.toward[0][0] + l.toward[0][1] * l.toward[0][1] + l.toward[0][2] * l.toward[0][2]);
+				char line[200];
+				std::snprintf(line, sizeof(line), " (toward %.3f %.3f %.3f, diffuse %.0f, ambient %.0f, emissive %.3f)", l.toward[0][0], l.toward[0][1], l.toward[0][2],
+					l.diffuse[0][0], l.ambient[0], l.emissive[0]);
+				what = line;
+				ok = std::fabs(t0 - 1.0f) < 1e-4f && l.diffuse[0][0] == 255.0f && l.diffuse[0][2] == 255.0f && l.diffuse[1][0] == 0.0f && l.ambient[0] == 256.0f &&
+					l.ambient[2] == 256.0f && l.emissive[0] == get<float>(s.material + 0x30) && l.emissive[2] == get<float>(s.material + 0x38);
+				// (WORLD the element's local matrix, its scale 1: the normals' rows its inverse transposed, nearly identity)
+				for (int i = 0; i < 3; ++i)
+					for (int j = 0; j < 3; ++j)
+						ok = ok && std::fabs(l.normal[i][j] - (i == j ? 1.0f : 0.0f)) < 1e-4f;
+			}
+			check(ok, name + ": a lit D3M taken with its lights: one white light of 255, AMBIENT + its ambient, the material's emissive, normals by WORLD" + what);
+			put<uint32_t>(s.env, 0);
+			put<uint32_t>(address(renderer) + 0x3949C, 0);
+		}
+
 		// Put back
 		fd::set_native(false);
 		fd::set_wanted(false);
@@ -615,6 +870,7 @@ int main()
 		fx::textures::stop();
 		dump::unmap(base);
 	}
+	release_around();
 	std::printf("\n%d passed, %d failed\n", passes, failures);
 	return failures == 0 ? 0 : 1;
 }
