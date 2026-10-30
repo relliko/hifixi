@@ -1,6 +1,6 @@
 /*
  * HiFi XI's stretch of the world over the screen (upscale.hpp). One root signature:
- *   0  8 constants b0  the world's size, the screen's, RCAS's stops
+ *   0  8 constants b0  the world's size, the screen's, RCAS's stops, the game's tint
  *   1  table t0        the pass's source: the world for EASU, our screen-size texture for RCAS
  *   s0  linear, clamping (EASU's gathers)
  * Its descriptors: a shader-visible heap of kSlots pairs (the world's view, our texture's), a pair a use, so one the GPU
@@ -105,6 +105,8 @@ namespace hifi::upscale
 			std::atomic<uint32_t> armed{ 0 };
 			std::atomic<bool> fsr{ true }, temporal{ true };
 			std::atomic<float> sharpen{ 0.8f };
+			std::atomic<uint32_t> tint{ 0x808080 }; // (the game's resolve's: set_tint)
+			uint64_t faded = 0;                      // (frames drawn with a tint other than 0x808080)
 			made_t made;
 			// (the compiled shaders, kept for pipelines of formats asked for later)
 			std::vector<uint8_t> vs, easu_ps, rcas_ps, copy_ps;
@@ -137,6 +139,17 @@ namespace hifi::upscale
 			UINT in_w = 0, in_h = 0, out_w = 0, out_h = 0;
 		};
 		state_t g;
+
+		// The game's tint into the last pass's constants 5-7 (it draws onto the back buffer): what its resolve multiplies the
+		// world by (MODULATE2X, 0x80 the picture as it is: x 1 here, the game's 256/255 left out). True when it changes
+		// the picture.
+		bool put_tint(float *k)
+		{
+			const uint32_t t = g.tint.load(std::memory_order_relaxed);
+			for (int c = 0; c < 3; ++c)
+				k[5 + c] = float((t >> (16 - 8 * c)) & 0xFF) / 128.0f;
+			return t != 0x808080u;
+		}
 
 		// A list's two flags, with the count of lists waiting kept (mutex held)
 		void arm(per_list &l, bool ended, bool pending)
@@ -389,7 +402,9 @@ namespace hifi::upscale
 				sd.Format = g.fsr2->output_format();
 				m.device->CreateShaderResourceView(g.fsr2->output(), &sd, { m.srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(slot * 2) * m.srv_step });
 				transition(list, l.target, l.target_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-				const float k[kConstants] = { float(in.Width), float(in.Height), float(out_w), float(out_h) };
+				float k[kConstants] = { float(in.Width), float(in.Height), float(out_w), float(out_h) };
+				const bool tinted = put_tint(k);
+				g.faded += tinted ? 1 : 0;
 				const D3D12_VIEWPORT vp = { 0.0f, 0.0f, float(out_w), float(out_h), 0.0f, 1.0f };
 				const D3D12_RECT sc = { 0, 0, LONG(out_w), LONG(out_h) };
 				const D3D12_CPU_DESCRIPTOR_HANDLE target_rtv = { SIZE_T(l.target_rtv) };
@@ -405,7 +420,8 @@ namespace hifi::upscale
 				list->DrawInstanced(3, 1, 0, 0);
 				transition(list, l.target, D3D12_RESOURCE_STATE_RENDER_TARGET, l.target_state);
 				// The frame to frame generation, when on (framegen: AMD's swap chain in dgVoodoo's), FSR 2's picture the
-				// world without the UI
+				// world without the UI. Not while the game's tint is on (a fade): the picture is the world before it, so
+				// the whole screen would differ from it as the UI does; the frame is shown twice instead.
 				framegen::frame f;
 				f.depth = g.fsr2->depth();
 				f.motion = g.fsr2->motion();
@@ -416,7 +432,8 @@ namespace hifi::upscale
 				f.dt_ms = dt;
 				f.reset = reset;
 				std::string unused;
-				framegen::prepare(list, f, unused);
+				if (!tinted)
+					framegen::prepare(list, f, unused);
 			}
 			// (FSR 2 set its own heaps, root signatures and pipelines, drawn or not)
 			list->SetDescriptorHeaps(l.heap_count, l.heaps);
@@ -495,6 +512,7 @@ namespace hifi::upscale
 			transition(list, m.mid, readable_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
 			float c[kConstants] = { float(in.Width), float(in.Height), float(out_w), float(out_h), 2.0f * (1.0f - std::clamp(g.sharpen.load(), 0.0f, 1.0f)) };
+			g.faded += put_tint(c) ? 1 : 0;
 			const D3D12_VIEWPORT vp = { 0.0f, 0.0f, float(out_w), float(out_h), 0.0f, 1.0f };
 			const D3D12_RECT sc = { 0, 0, LONG(out_w), LONG(out_h) };
 			list->SetDescriptorHeaps(1, &m.srv_heap);
@@ -542,6 +560,11 @@ namespace hifi::upscale
 		g.fsr.store(fsr, std::memory_order_relaxed);
 		g.temporal.store(temporal, std::memory_order_relaxed);
 		g.sharpen.store(sharpen, std::memory_order_relaxed);
+	}
+
+	void set_tint(uint32_t rgb)
+	{
+		g.tint.store(rgb & 0xFFFFFFu, std::memory_order_relaxed);
 	}
 
 	bool temporal_running()
@@ -752,6 +775,9 @@ namespace hifi::upscale
 				static_cast<unsigned long long>(masks::frames_with(masks::pre_air)));
 			lines.push_back(line);
 		}
+		std::snprintf(line, sizeof(line), "upscale: the game's tint %06X now (its resolve's: cutscene fades), %llu frames drawn with one", g.tint.load(),
+			static_cast<unsigned long long>(g.faded));
+		lines.push_back(line);
 		return lines;
 	}
 

@@ -465,14 +465,35 @@ int main(int argc, char **argv)
 	const std::vector<uint8_t> at_barrier = frame(A, 0, 6, after_resolve::present_barrier);
 	check(drawn() == 3 && same(at_barrier, fsr, false) == 0, "after a barrier moving the back buffer to PRESENT: the same picture");
 
+	// The game's tint (its resolve's: a cutscene fade) on FSR's picture too, the UI left as drawn
+	{
+		up::set_tint(0x404000);
+		const std::vector<uint8_t> half = frame(A, 0, 6, after_resolve::draw);
+		up::set_tint(0x000000);
+		const std::vector<uint8_t> black = frame(A, 0, 6, after_resolve::draw);
+		up::set_tint(0x808080);
+		const std::vector<uint8_t> back = frame(A, 0, 6, after_resolve::draw);
+		const uint8_t *was = &fsr[(size_t(340) * OW + 400) * 4], *now = &half[(size_t(340) * OW + 400) * 4];
+		std::printf("  the red band with the tint 404000: %u %u %u (without: %u %u %u)\n", now[0], now[1], now[2], was[0], was[1], was[2]);
+		check(std::abs(int(now[0]) - int(was[0]) / 2) <= 1 && std::abs(int(now[1]) - int(was[1]) / 2) <= 1 && now[2] == 0 && same(half, fsr, true) == 0,
+			"the tint 404000: the world's red and green halved, its blue gone, the UI as drawn");
+		uint32_t lit = 0;
+		for (UINT y = UI; y < OH; ++y)
+			for (UINT x = 0; x < OW; ++x)
+				lit += luma(black, x, y) > 0.0f ? 1 : 0;
+		check(lit == 0 && same(black, fsr, true) == 0, "the tint 000000: the world black, the UI as drawn");
+		check(same(back, fsr, false) == 0, "the tint 808080 again: the picture as before");
+		check(drawn() == 6, "drawn each of those frames");
+	}
+
 	// Not the resolve: more than 6 vertices; the world as big as the screen; FSR off again
 	const std::vector<uint8_t> many = frame(A, 0, 300, after_resolve::draw);
-	check(drawn() == 3 && same(many, stretch, false) == 0, "a first draw out of the world of 300 vertices: not taken for the resolve");
+	check(drawn() == 6 && same(many, stretch, false) == 0, "a first draw out of the world of 300 vertices: not taken for the resolve");
 	frame(big, 1, 6, after_resolve::draw);
-	check(drawn() == 3, "the world as big as the screen: the game's stretch");
+	check(drawn() == 6, "the world as big as the screen: the game's stretch");
 	up::set_options(false, false, 0.8f);
 	frame(A, 0, 6, after_resolve::draw);
-	check(drawn() == 3, "FSR off again: nothing");
+	check(drawn() == 6, "FSR off again: nothing");
 
 	// FSR 2: A's depth and the big one's (as dgVoodoo's: typeless D24S8), each frame's camera as the zone pass's
 	{
@@ -610,6 +631,17 @@ int main(int argc, char **argv)
 			finite = std::fabs(mean - want) < 6.0;
 			check(finite && fsr2_drawn() == 16, "jittered frames: drawn, the picture as bright as the world (" + std::to_string(mean) + " against " + std::to_string(want) + ")");
 		}
+		// The game's tint on FSR 2's picture (its copy onto the back buffer), the UI as drawn
+		{
+			publish(0.0f, 0.0f, IW, IH);
+			up::set_tint(0x404000);
+			const std::vector<uint8_t> half = frame(A, 0, 6, after_resolve::draw);
+			up::set_tint(0x808080);
+			const uint8_t *now = &half[(size_t(340) * OW + 400) * 4];
+			std::printf("  FSR 2's red band with the tint 404000: %u %u %u\n", now[0], now[1], now[2]);
+			check(fsr2_drawn() == 17 && std::abs(int(now[0]) - 100) <= 5 && std::abs(int(now[1]) - 15) <= 5 && now[2] == 0 && same(half, stretch, true) == 0,
+				"FSR 2 with the tint 404000: the world's red and green halved, its blue gone, the UI as drawn");
+		}
 		// The world as big as the screen: FSR 2's anti-aliasing alone (a new context for that size)
 		follow_depth(bigz);
 		publish(0.0f, 0.0f, OW, OH);
@@ -632,7 +664,7 @@ int main(int argc, char **argv)
 				}
 			diff /= double(OH - UI) * OW;
 			std::printf("  FSR 2 at the world's own size against the world: %.2f levels apart on average\n", diff);
-			check(fsr2_drawn() == 22 && diff < 4.0, "the world as big as the screen: FSR 2 drawn, close to the world itself");
+			check(fsr2_drawn() == 23 && diff < 4.0, "the world as big as the screen: FSR 2 drawn, close to the world itself");
 		}
 		// FSR 3.1's upscaler in FSR 2's place (upscale.fsr3): a context of its own for twice the world's size, its shaders
 		// built in (DXC); the same picture as FSR 2's would be, the UI on top as drawn
