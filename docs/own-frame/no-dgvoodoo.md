@@ -57,5 +57,14 @@ dgVoodoo was a closed box: HiFi XI watched its Direct3D 12 output from outside.
 
 - Step 1 (2026-10-30): ui2d's and streamlog's dgVoodoo.conf readers removed; status, menu and log text name HiFi XI's
   d3d8.dll instead of dgVoodoo's OutputAPI.
+- Step 2 (2026-10-30): the direct channel. src/host/frameapi.hpp; d3d8.dll exports HifiFrameSetHandler and HifiFrameMark
+  (device.cpp: targets bound, barriers flushed, the handler called with the list, A and its depth, views, formats and
+  exact states; after it the bound state forgotten, heaps and root signature set again); the backend registers
+  `on_frame_mark` (into the same `on_mark` dispatch); the five game-side senders (zoneslot, charslot, fxdraw, uidraw,
+  worldmark) call src/game/directmark.hpp first and send the stencil pixel only when that answers 0. d3d8_hooks checks
+  the channel (plain and debug layer). Every plugin suite green.
+- Found: tests\ui2d_dgv crashes on our d3d8.dll in `replay_d12` (it reaches into dgVoodoo itself), with the d3d8.dll
+  from before step 2 too: it was only ever run against dgVoodoo. build.cmd now copies our d3d8.dll into build\dgv (was:
+  whatever the game folder had). To be rewritten in step 5.
 
 Each step lands with every suite green and is installed only after an in-game look.

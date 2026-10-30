@@ -30,6 +30,7 @@
 #include "../src/host/hooks.hpp"
 #include "../src/host/events.hpp"
 #include "../src/game/slotmark.hpp"
+#include "../src/host/frameapi.hpp"
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <d3d8.h>
@@ -290,6 +291,30 @@ namespace
 		const LONG x = LONG(hifi::slotmark::x_of(kind, seq));
 		const D3DRECT r = { x, 0, x + 1, 1 };
 		dev->Clear(1, &r, D3DCLEAR_STENCIL, 0, 1.0f, 0);
+	}
+
+	// The direct channel's handler (src/host/frameapi.hpp): what it was handed; it clears an 8x8 corner of the target
+	// white, then binds nothing and a 1x1 viewport (the draw after must bind the game's again)
+	struct direct_seen
+	{
+		uint32_t calls = 0, kind = 0, seq = 0;
+		hifi_frame_mark m = {};
+	} g_direct;
+	void __cdecl direct_handler(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *m)
+	{
+		g_direct.calls++;
+		g_direct.kind = kind;
+		g_direct.seq = seq;
+		g_direct.m = *m;
+		if (m->rt != nullptr && m->rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET)
+		{
+			const float white[4] = { 1, 1, 1, 1 };
+			const D3D12_RECT corner = { 0, 0, 8, 8 };
+			m->list->ClearRenderTargetView(m->rtv, white, 1, &corner);
+		}
+		m->list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+		const D3D12_VIEWPORT one = { 0, 0, 1, 1, 0, 1 };
+		m->list->RSSetViewports(1, &one);
 	}
 
 	void tri_strip_band(float y0, float y1, float z, DWORD c, int n)
@@ -592,6 +617,52 @@ int main(int argc, char **argv)
 		same += plain[i] == injected_px[i] ? 1 : 0;
 	std::snprintf(line, sizeof(line), "the frame drawn after HiFi XI's state was put back is the same, pixel for pixel (%zu of %zu)", same, plain.size());
 	check(!plain.empty() && same == plain.size(), line);
+	// The direct channel: HifiFrameMark answers 0 without a handler; with one, it's called on the list with A and its
+	// depth in their states (A a target, the depth's planes as drawn), and the game's next draw lands where it should
+	{
+		const auto set = reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(m, kHifiFrameSetHandler));
+		const auto mark = reinterpret_cast<hifi_frame_mark_fn>(GetProcAddress(m, kHifiFrameMark));
+		check(set != nullptr && mark != nullptr, "the d3d8.dll exports HifiFrameSetHandler and HifiFrameMark");
+		if (set != nullptr && mark != nullptr)
+		{
+			check(mark(hifi::slotmark::zone_end, 1) == 0, "HifiFrameMark without a handler: 0 (the game side sends its stencil marker then)");
+			set(&direct_handler, nullptr);
+			dev->BeginScene();
+			dev->SetRenderTarget(A, Az);
+			D3DVIEWPORT8 vp = { 0, 0, AW, AH, 0.0f, 1.0f };
+			dev->SetViewport(&vp);
+			dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF000000, 1.0f, 0);
+			dev->SetTexture(0, nullptr);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+			dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+			tri_strip_band(0.5f, 0.75f, 0.5f, 0xFF404040, 4);
+			const int answered = mark(hifi::slotmark::zone_end, 7);
+			tri_strip_band(-0.5f, 0.0f, 0.5f, 0xFF808080, 4);
+			const RECT whole = { 0, 0, LONG(AW), LONG(AH) };
+			const POINT p0 = { 0, 0 };
+			dev->CopyRects(A, &whole, 1, out, &p0);
+			D3DLOCKED_RECT o;
+			out->LockRect(&o, nullptr, D3DLOCK_READONLY);
+			const auto at = [&](UINT x, UINT y) { return *reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(o.pBits) + size_t(y) * o.Pitch + x * 4) & 0xFFFFFFu; };
+			const uint32_t corner = at(2, 2), band = at(AW / 2, AH * 5 / 8), past = at(AW / 2, AH * 7 / 8);
+			out->UnlockRect();
+			dev->EndScene();
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+			set(nullptr, nullptr);
+			const hifi_frame_mark &fm = g_direct.m;
+			check(answered == 1 && g_direct.calls == 1 && g_direct.kind == hifi::slotmark::zone_end && g_direct.seq == 7,
+				"HifiFrameMark: the handler called once, with the kind and seq");
+			check(fm.list != nullptr && fm.rt == world_rt && fm.ds == world_ds && fm.width == AW && fm.height == AH && fm.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET &&
+					fm.rt_format == DXGI_FORMAT_R8G8B8A8_UNORM && fm.ds_format == DXGI_FORMAT_D24_UNORM_S8_UINT && fm.ds_plane_count == 2 &&
+					fm.ds_planes[0] == D3D12_RESOURCE_STATE_DEPTH_WRITE,
+				"... handed A and its depth, their views' formats, A a target and the depth's plane 0 in DEPTH_WRITE");
+			std::snprintf(line, sizeof(line), "... what it drew stays (corner %06X), and the game's next draw binds A, its viewport and pipeline again "
+				"(band %06X, below it %06X)", corner, band, past);
+			check(corner == 0xFFFFFF && band == 0x808080 && past == 0, line);
+		}
+	}
 	std::printf("%s (%d failed)\n", failures == 0 ? "all passed" : "FAILED", failures);
 	std::fflush(stdout);
 	ExitProcess(failures == 0 ? 0 : 1);

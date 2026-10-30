@@ -57,6 +57,7 @@
 #include "fxdraw.hpp"
 #include "gamewater.hpp"
 #include "slotmark.hpp"
+#include "directmark.hpp"
 #include "../fx/fxframe.hpp"
 #include "../fx/fxtextures.hpp"
 #include "../bake/dat.hpp"
@@ -297,6 +298,12 @@ namespace hifi::game::fxdraw
 			if (g.sink != nullptr)
 			{
 				g.sink(slotmark::fx_run, g.seq);
+				g.n.markers++;
+				return;
+			}
+			// (our own d3d8.dll: a call, no stencil pixel)
+			if (hifi::game::direct_mark(slotmark::fx_run, g.seq))
+			{
 				g.n.markers++;
 				return;
 			}

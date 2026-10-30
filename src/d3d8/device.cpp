@@ -3,6 +3,7 @@
 
 #include "device.hpp"
 #include "present.hpp"
+#include "../host/frameapi.hpp"
 #include <algorithm>
 
 namespace hifi::d3d8
@@ -105,13 +106,21 @@ namespace hifi::d3d8
 		}
 	}
 
+	// (the device HiFi XI's marks go to: the last made, src/host/frameapi.hpp)
+	static device *g_mark_device = nullptr;
+	static hifi_frame_handler g_mark_handler = nullptr;
+	static void *g_mark_context = nullptr;
+
 	device::device(direct3d *p, UINT a, HWND f, DWORD b) : parent(p), adapter(a), focus(f), behaviour(b)
 	{
 		interface_of(parent)->AddRef();
+		g_mark_device = this;
 	}
 
 	device::~device()
 	{
+		if (g_mark_device == this)
+			g_mark_device = nullptr;
 		for (auto &b : blocks)
 			if (b != nullptr)
 				b->let_go();
@@ -1957,4 +1966,49 @@ namespace hifi::d3d8
 		*token = DWORD(blocks.size());
 		return D3D_OK;
 	}
+}
+
+// The direct channel (src/host/frameapi.hpp): HiFi XI's handler called on the list at the game side's mark
+extern "C" void __cdecl HifiFrameSetHandler(hifi_frame_handler handler, void *context)
+{
+	hifi::d3d8::g_mark_handler = handler;
+	hifi::d3d8::g_mark_context = context;
+}
+
+extern "C" int __cdecl HifiFrameMark(uint32_t kind, uint32_t seq)
+{
+	using namespace hifi::d3d8;
+	device *const d = g_mark_device;
+	if (d == nullptr || g_mark_handler == nullptr || d->g.list() == nullptr)
+		return 0;
+	// (the targets bound and every barrier on the list, so the states handed over are the list's own at this point)
+	d->bind_targets();
+	d->g.flush_barriers();
+	hifi_frame_mark m = {};
+	m.list = d->g.list();
+	if (d->rt != nullptr && d->rt->img != nullptr)
+	{
+		m.rt = d->rt->img->gpu.res;
+		m.rtv = d->rt->rtv();
+		m.rt_format = d->rt->img->gpu_format;
+		m.rt_state = d->rt->img->gpu.state;
+		m.width = d->rt->width();
+		m.height = d->rt->height();
+	}
+	if (d->ds != nullptr && d->ds->img != nullptr)
+	{
+		m.ds = d->ds->img->gpu.res;
+		m.dsv = d->ds->dsv();
+		m.ds_format = d->ds->img->gpu_format;
+		m.ds_plane_count = d->ds->img->gpu.planes;
+		m.ds_planes[0] = d->ds->img->gpu.plane[0];
+		m.ds_planes[1] = d->ds->img->gpu.plane[1];
+	}
+	g_mark_handler(g_mark_context, kind, seq, &m);
+	// (whatever the handler bound is forgotten: the next draw binds everything again; the heaps and root signature now)
+	d->bound.epoch = 0;
+	ID3D12DescriptorHeap *heaps[2] = { d->g.srv_heap, d->g.sampler_heap };
+	m.list->SetDescriptorHeaps(2, heaps);
+	m.list->SetGraphicsRootSignature(d->g.root);
+	return 1;
 }

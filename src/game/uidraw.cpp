@@ -28,6 +28,7 @@
 
 #include "uidraw.hpp"
 #include "slotmark.hpp"
+#include "directmark.hpp"
 #include "../ui2d/fonthigh.hpp"
 #include "../ui2d/frame2d.hpp"
 #include "../ui2d/render2d.hpp"
@@ -480,6 +481,9 @@ namespace hifi::game::uidraw
 				g.sink(kind, g.seq & 15u);
 				return true;
 			}
+			// (our own d3d8.dll: a call, no stencil pixel)
+			if (hifi::game::direct_mark(kind, g.seq))
+				return true;
 			const int32_t x = int32_t(slotmark::x_of(kind, g.seq));
 			const int32_t rect[4] = { x, 0, x + 1, 1 };
 			return orig<clear_fn>(kClear)(g.dev, 1, rect, 4, 0, 1.0f, 0) >= 0; // (D3DCLEAR_STENCIL)

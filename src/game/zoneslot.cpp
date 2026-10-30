@@ -20,6 +20,7 @@
 
 #include "zoneslot.hpp"
 #include "slotmark.hpp"
+#include "directmark.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -97,6 +98,12 @@ namespace hifi::game::zoneslot
 			if (g.sink != nullptr)
 			{
 				g.sink(kind, g.n.seq);
+				g.n.sent[kind]++;
+				return;
+			}
+			// (our own d3d8.dll: a call, no stencil pixel)
+			if (hifi::game::direct_mark(kind, g.n.seq))
+			{
 				g.n.sent[kind]++;
 				return;
 			}

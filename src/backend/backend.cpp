@@ -14,6 +14,7 @@
 #include "../framegen/framegen.hpp"
 #include "../host/events.hpp"
 #include "../host/passes.hpp"
+#include "../host/frameapi.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
 #include <algorithm>
@@ -842,6 +843,36 @@ namespace hifi::backend
 		}
 	}
 
+	namespace
+	{
+		// The direct channel's marks (src/host/frameapi.hpp): our d3d8.dll calls this on its list where the game side
+		// marks one of its passes; the same dispatch as a stencil marker's, with no pixel to spot
+		void __cdecl on_frame_mark(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *fm)
+		{
+			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || fm->dsv.ptr == 0)
+				return;
+			worldfx::list_data *const d = live(fm->list);
+			if (d == nullptr)
+				return;
+			host::quiet q;
+			slotmark::mark m;
+			m.kind = kind;
+			m.seq = seq & 15;
+			on_mark(fm->list, *d, uint64_t(fm->dsv.ptr), m);
+		}
+
+		// Our d3d8.dll told where to call (nullptr: let go, at stop); false when it isn't the one loaded
+		bool direct_channel(bool on)
+		{
+			HMODULE d3d8 = GetModuleHandleW(L"d3d8.dll");
+			const auto set = d3d8 != nullptr ? reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(d3d8, kHifiFrameSetHandler)) : nullptr;
+			if (set == nullptr)
+				return false;
+			set(on ? &on_frame_mark : nullptr, nullptr);
+			return true;
+		}
+	}
+
 	bool early_start(void *create_factory1)
 	{
 		if (g_started.load())
@@ -870,6 +901,9 @@ namespace hifi::backend
 		g_early = true;
 		g_started = true;
 		write_log(0, "HiFi XI: Direct3D 12 hooks in, before the game's device: its lists and views followed from their making");
+		const bool direct = direct_channel(true);
+		write_log(direct ? 0 : 1, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
+			"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: the passes are found by their stencil markers");
 		// (frame generation: dgVoodoo's swap chain made as AMD's, when the setting's on as the game starts)
 		{
 			std::string on;
@@ -899,6 +933,7 @@ namespace hifi::backend
 		host::set_events(&events_table());
 		g_early = false;
 		g_started = true;
+		direct_channel(true);
 		write_log(1, "HiFi XI: Direct3D 12 hooks in after the game's device was made (no starter, bootloader\\dxgi.dll): the views it made before aren't known, so its world isn't found");
 		return true;
 	}
@@ -908,6 +943,7 @@ namespace hifi::backend
 
 	void stop()
 	{
+		direct_channel(false);
 		host::uninstall();
 	}
 

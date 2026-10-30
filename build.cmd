@@ -196,10 +196,9 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\uidraw_test.exe
 if not exist build\dgv mkdir build\dgv
-if exist "C:\Games\PhoenixXI\bootloader\d3d8.dll" (
-  copy /y "C:\Games\PhoenixXI\bootloader\d3d8.dll" build\dgv\ >nul || exit /b 1
-  python tests\ui2d_conf.py "C:\Games\PhoenixXI\bootloader\dgVoodoo.conf" build\dgv\dgVoodoo.conf || exit /b 1
-)
+rem (HiFi XI's own d3d8.dll, from build_d3d8.cmd: docs\own-frame\no-dgvoodoo.md; no dgVoodoo.conf)
+if exist build\d3d8\d3d8.dll copy /y build\d3d8\d3d8.dll build\dgv\ >nul
+if exist build\dgv\dgVoodoo.conf del build\dgv\dgVoodoo.conf
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
   /I deps\ashita\plugins\sdk\d3d8\includes tests\ui2d_dgv.cpp %UI2D% src\ui2d\ui2d.cpp src\host\passes.cpp build\engine\worldfx_engine.lib ^
   /Fo"build\test\\" /Fe"build\dgv\ui2d_dgv.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib d3dcompiler.lib || exit /b 1

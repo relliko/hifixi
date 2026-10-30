@@ -6,6 +6,7 @@
 
 #include "worldmark.hpp"
 #include "slotmark.hpp"
+#include "directmark.hpp"
 
 namespace hifi::game::worldmark
 {
@@ -84,6 +85,12 @@ namespace hifi::game::worldmark
 		}
 		if (!g.wanted)
 			return false;
+		// (our own d3d8.dll: a call, no stencil pixel)
+		if (hifi::game::direct_mark(kind, seq))
+		{
+			g.n.sent[kind]++;
+			return true;
+		}
 		const uintptr_t dev = client_device();
 		if (dev == 0 || !depth_has_stencil(dev))
 		{
