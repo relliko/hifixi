@@ -29,6 +29,8 @@
 namespace hifi::ui2d::render
 {
 	constexpr uint32_t kMaxTextures = 4096;
+	constexpr uint32_t kPrivateTargets = 8;
+	constexpr DXGI_FORMAT kPrivateFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 	// The device's objects (root signature, shaders, heaps, the vertex ring, the upload queue). False and why when they
 	// can't be made. Again with another device: everything made again there.
@@ -67,19 +69,37 @@ namespace hifi::ui2d::render
 	// Each present (the game's thread): what was dropped long enough ago let go
 	void collect(double now);
 
+	// HiFi XI's own render targets (the game's thread), standing in for the game's render-target textures other than A:
+	// a slot of w x h (kPrivateFormat, cleared to transparent black, left readable), kNoTexture and why when there's
+	// none; let go a few seconds after drop_target. Their pixels stay from frame to frame, as the game's do.
+	uint32_t add_target(uint32_t w, uint32_t h, std::string &why);
+	void drop_target(uint32_t slot);
+
 	// The target the segments are drawn into, as record() last found it (its view's format, its samples); pipeline():
 	// the pipeline for a blend made for it, now (the game's thread, before the marker that needs it). False when the
 	// target isn't known yet or it couldn't be made.
 	bool target_known(DXGI_FORMAT &format, uint32_t &samples);
 	void note_target(DXGI_FORMAT format, uint32_t samples); // (record() does; tests)
 	bool pipeline(const blend_key &k);
+	bool pipeline(const blend_key &k, DXGI_FORMAT format, uint32_t samples); // (for a target of its own format)
 
-	// dgVoodoo's list (its thread, at a marker): segment s of frame f drawn into target (view format: dgVoodoo's; in
-	// target_state there, made a render target for the draws and put back), with dgVoodoo's heaps and state put back
-	// after; or, when !draw, only checked. Null when it was (or could be) drawn, else why not.
+	// The world's target A as dgVoodoo has it on the list at the marker (for draws that read it: kTextureWorld), its
+	// view's format and its state there; none: no draw may read it
+	struct world_source
+	{
+		ID3D12Resource *rt = nullptr;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	};
+
+	// dgVoodoo's list (its thread, at a marker): segment s of frame f drawn, each draw into target (view format:
+	// dgVoodoo's; in target_state there, made a render target for the draws and put back) or one of our own targets,
+	// reading the store's textures, our own targets or the world (made readable for those draws and put back), with
+	// dgVoodoo's heaps and state put back after; or, when !draw, only checked. Null when it was (or could be) drawn, else
+	// why not.
 	const char *record(ID3D12GraphicsCommandList *list, const frame &f, const segment &s, ID3D12Resource *target, DXGI_FORMAT format,
 		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw,
-		D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET);
+		D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET, const world_source &world = world_source());
 
 	struct stats
 	{

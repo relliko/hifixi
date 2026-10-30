@@ -23,6 +23,12 @@ namespace hifi::ui2d
 	constexpr uint32_t kMaxVertices = 6 * kMaxDraws;
 	constexpr uint32_t kMaxSegments = 64;
 	constexpr uint32_t kNoTexture = 0xFFFFFFFFu;
+	// Render-target textures: the world's target A (dgVoodoo's own: the frozen-frame crossfade's and afterimage's copies
+	// of it, the UI-size target's), or one of HiFi XI's own targets standing in for the game's other render-target
+	// textures (the crossfade's, the afterimage's history, the UI-size target); as a draw's texture or its target
+	constexpr uint32_t kTextureWorld = 0xFFFFFFFEu;
+	constexpr uint32_t kPrivate = 0x80000000u;      // | the own target's slot (render2d::kPrivateTargets)
+	constexpr uint32_t kTargetMarker = 0;           // a draw's target: the one bound with the marker's depth
 
 	struct vertex
 	{
@@ -57,7 +63,8 @@ namespace hifi::ui2d
 	struct draw
 	{
 		uint32_t first = 0, count = 0;     // the frame's vertices (a triangle list)
-		uint32_t texture = kNoTexture;     // the texture store's slot (render2d), stage 0
+		uint32_t texture = kNoTexture;     // the texture store's slot (render2d), kTextureWorld or kPrivate | slot; stage 0
+		uint32_t target = kTargetMarker;   // kTargetMarker, or kPrivate | slot
 		blend_key blend;
 		stage_op colour, alpha;            // stage 0 (COLOROP DISABLE: the diffuse colour as it is)
 		uint8_t alpha_test = 0;            // ALPHATESTENABLE
@@ -73,7 +80,7 @@ namespace hifi::ui2d
 		// Whether a following draw goes in the same Direct3D 12 draw
 		bool same_state(const draw &o) const
 		{
-			return texture == o.texture && blend == o.blend && colour.packed() == o.colour.packed() && alpha.packed() == o.alpha.packed() &&
+			return texture == o.texture && target == o.target && blend == o.blend && colour.packed() == o.colour.packed() && alpha.packed() == o.alpha.packed() &&
 				alpha_test == o.alpha_test && alpha_func == o.alpha_func && alpha_ref == o.alpha_ref && flat == o.flat && min_filter == o.min_filter &&
 				mag_filter == o.mag_filter && mip_filter == o.mip_filter && address_u == o.address_u && address_v == o.address_v && tfactor == o.tfactor &&
 				clip[0] == o.clip[0] && clip[1] == o.clip[1] && clip[2] == o.clip[2] && clip[3] == o.clip[3] && target_w == o.target_w && target_h == o.target_h;

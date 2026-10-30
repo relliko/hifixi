@@ -131,7 +131,13 @@ namespace hifi::ui2d
 			}
 			// (the world's target as its barriers left it on this list; the back buffer is a target throughout)
 			const D3D12_RESOURCE_STATES state = target == w.rt ? w.rt_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
-			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native, state))
+			// (the world, for the draws that copy it: A itself in A's window, else as the world's markers found it)
+			render::world_source world;
+			if (s.kind == slotmark::screen)
+				world = { target, format, state };
+			else
+				world = { w.rt, w.rt_format, w.rt_state };
+			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native, state, world))
 			{
 				fail(why);
 				return;

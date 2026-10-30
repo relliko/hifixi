@@ -29,6 +29,8 @@ namespace hifi::ui2d::render
 		constexpr uint32_t kPipelines = 256;
 		constexpr uint32_t kConstants = 10;
 		constexpr uint32_t kTargetViews = 8;
+		constexpr uint32_t kWorldViews = 4;
+		constexpr uint32_t kPrivateSrv = kMaxTextures + 1, kWorldSrv = kPrivateSrv + kPrivateTargets, kSrvs = kWorldSrv + kWorldViews;
 		constexpr uint64_t kRingBytes = 16ull << 20;             // (the vertices of about 25 frames of 2,000 quads)
 		constexpr double kDropDelay = 5.0;                       // seconds a dropped texture stays (dgVoodoo's lists in flight)
 
@@ -134,6 +136,16 @@ float4 ps(O i) : SV_Target
 		};
 		enum : uint8_t { kFree, kPending, kReady, kFailed, kDropped };
 
+		// One of our own render targets
+		struct own_target
+		{
+			std::atomic<ID3D12Resource *> res { nullptr };
+			std::atomic<uint8_t> state { 0 }; // kFree, kReady, kDropped
+			uint32_t w = 0, h = 0;
+			double drop_at = 0.0;
+			D3D12_RESOURCE_STATES gpu = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; // (as recorded: dgVoodoo's thread)
+		};
+
 		struct pending_tex
 		{
 			uint32_t slot = 0;
@@ -169,6 +181,10 @@ float4 ps(O i) : SV_Target
 			uint64_t fence_value = 0;
 			HANDLE event = nullptr;
 			tex_slot tex[kMaxTextures + 1];
+			own_target own[kPrivateTargets];
+			ID3D12Resource *world_res[kWorldViews] = {};
+			DXGI_FORMAT world_format[kWorldViews] = {};
+			uint32_t world_next = 0;
 			uint32_t next_free = 0;
 			std::vector<pending_tex> pending;
 			uint8_t null_texel[4] = { 0, 0, 0, 255 };
@@ -230,6 +246,14 @@ float4 ps(O i) : SV_Target
 			drop(g.root);
 			drop(g.vs);
 			drop(g.ps);
+			for (own_target &t : g.own)
+			{
+				if (ID3D12Resource *r = t.res.exchange(nullptr))
+					r->Release();
+				t.state.store(kFree);
+			}
+			for (ID3D12Resource *&r : g.world_res)
+				r = nullptr;
 			for (ID3D12Resource *&r : g.rtv_res)
 				r = nullptr;
 			g.device = nullptr;
@@ -534,6 +558,40 @@ float4 ps(O i) : SV_Target
 			return ok;
 		}
 
+		// Our view of the world to read (made again when it changes: a ring, so a list in flight keeps the one it used)
+		D3D12_GPU_DESCRIPTOR_HANDLE world_view(ID3D12Resource *world, DXGI_FORMAT format)
+		{
+			std::lock_guard<std::mutex> lock(g.rtv_mutex);
+			uint32_t at = kWorldViews;
+			for (uint32_t i = 0; i < kWorldViews; ++i)
+				if (g.world_res[i] == world && g.world_format[i] == format)
+					at = i;
+			if (at == kWorldViews)
+			{
+				at = g.world_next++ % kWorldViews;
+				D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+				sv.Format = format;
+				sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				sv.Texture2D.MipLevels = 1;
+				D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.srv_heap->GetCPUDescriptorHandleForHeapStart();
+				cpu.ptr += SIZE_T(kWorldSrv + at) * g.srv_inc;
+				g.device->CreateShaderResourceView(world, &sv, cpu);
+				g.world_res[at] = world;
+				g.world_format[at] = format;
+			}
+			D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.srv_heap->GetGPUDescriptorHandleForHeapStart();
+			gpu.ptr += UINT64(kWorldSrv + at) * g.srv_inc;
+			return gpu;
+		}
+
+		D3D12_CPU_DESCRIPTOR_HANDLE own_rtv(uint32_t slot)
+		{
+			D3D12_CPU_DESCRIPTOR_HANDLE at = g.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+			at.ptr += SIZE_T(kTargetViews + slot) * g.rtv_inc;
+			return at;
+		}
+
 		// Our view of the target (made again when it changes)
 		bool target_view(ID3D12Resource *target, DXGI_FORMAT format, D3D12_CPU_DESCRIPTOR_HANDLE &out)
 		{
@@ -623,9 +681,9 @@ float4 ps(O i) : SV_Target
 			return false;
 		}
 
-		D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kMaxTextures + 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+		D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvs, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
 		D3D12_DESCRIPTOR_HEAP_DESC sd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplers, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
-		D3D12_DESCRIPTOR_HEAP_DESC td = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kTargetViews };
+		D3D12_DESCRIPTOR_HEAP_DESC td = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kTargetViews + kPrivateTargets };
 		if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.srv_heap))) || FAILED(device->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&g.sampler_heap))) ||
 			FAILED(device->CreateDescriptorHeap(&td, IID_PPV_ARGS(&g.rtv_heap))))
 		{
@@ -852,6 +910,21 @@ float4 ps(O i) : SV_Target
 
 	void collect(double now)
 	{
+		for (own_target &t : g.own)
+		{
+			if (t.state.load(std::memory_order_relaxed) != kDropped)
+				continue;
+			if (t.drop_at < 0.0)
+			{
+				t.drop_at = now;
+				continue;
+			}
+			if (now - t.drop_at < kDropDelay)
+				continue;
+			if (ID3D12Resource *r = t.res.exchange(nullptr))
+				r->Release();
+			t.state.store(kFree, std::memory_order_release);
+		}
 		for (uint32_t i = 0; i < kMaxTextures; ++i)
 		{
 			tex_slot &t = g.tex[i];
@@ -886,6 +959,100 @@ float4 ps(O i) : SV_Target
 		g.target_samples.store(samples, std::memory_order_release);
 	}
 
+	uint32_t add_target(uint32_t w, uint32_t h, std::string &why)
+	{
+		if (!ready())
+		{
+			why = "the renderer isn't made";
+			return kNoTexture;
+		}
+		uint32_t slot = kNoTexture;
+		for (uint32_t i = 0; i < kPrivateTargets && slot == kNoTexture; ++i)
+			if (g.own[i].state.load() == kFree)
+				slot = i;
+		if (slot == kNoTexture || w == 0 || h == 0 || w > 16384 || h > 16384)
+		{
+			why = slot == kNoTexture ? "no room for another target of ours" : "a target's size";
+			return kNoTexture;
+		}
+		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_RESOURCE_DESC rd = {};
+		rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		rd.Width = w;
+		rd.Height = h;
+		rd.DepthOrArraySize = 1;
+		rd.MipLevels = 1;
+		rd.Format = kPrivateFormat;
+		rd.SampleDesc.Count = 1;
+		rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		D3D12_CLEAR_VALUE clear = { kPrivateFormat, { 0.0f, 0.0f, 0.0f, 0.0f } };
+		ID3D12Resource *r = nullptr;
+		if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&r))))
+		{
+			why = "a target couldn't be made";
+			return kNoTexture;
+		}
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = kPrivateFormat;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+		g.device->CreateRenderTargetView(r, &rv, own_rtv(slot));
+		write_srv(kPrivateSrv + slot, r, kPrivateFormat, 1);
+		// (cleared and left readable, on our queue)
+		bool ok = SUCCEEDED(g.allocator->Reset()) && SUCCEEDED(g.list->Reset(g.allocator, nullptr));
+		if (ok)
+		{
+			const float black[4] = {};
+			g.list->ClearRenderTargetView(own_rtv(slot), black, 0, nullptr);
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = r;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			g.list->ResourceBarrier(1, &b);
+			ok = SUCCEEDED(g.list->Close());
+		}
+		if (ok)
+		{
+			ID3D12CommandList *const lists[] = { g.list };
+			g.queue->ExecuteCommandLists(1, lists);
+			const uint64_t value = ++g.fence_value;
+			g.queue->Signal(g.fence, value);
+			if (g.fence->GetCompletedValue() < value)
+			{
+				g.fence->SetEventOnCompletion(value, g.event);
+				WaitForSingleObject(g.event, 10000);
+			}
+			ok = g.fence->GetCompletedValue() >= value;
+		}
+		if (!ok)
+		{
+			r->Release();
+			why = "a target couldn't be cleared";
+			return kNoTexture;
+		}
+		own_target &t = g.own[slot];
+		t.w = w;
+		t.h = h;
+		t.gpu = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		t.res.store(r, std::memory_order_release);
+		t.state.store(kReady, std::memory_order_release);
+		return slot;
+	}
+
+	void drop_target(uint32_t slot)
+	{
+		if (slot >= kPrivateTargets || g.own[slot].state.load() != kReady)
+			return;
+		g.own[slot].drop_at = -1.0;
+		g.own[slot].state.store(kDropped, std::memory_order_release);
+	}
+
+	bool pipeline(const blend_key &k, DXGI_FORMAT format, uint32_t samples)
+	{
+		return ready() && get_pso(k, format, samples) != nullptr;
+	}
+
 	bool pipeline(const blend_key &k)
 	{
 		DXGI_FORMAT format;
@@ -896,7 +1063,8 @@ float4 ps(O i) : SV_Target
 	}
 
 	const char *record(ID3D12GraphicsCommandList *list, const frame &f, const segment &s, ID3D12Resource *target, DXGI_FORMAT format,
-		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw, D3D12_RESOURCE_STATES target_state)
+		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw, D3D12_RESOURCE_STATES target_state,
+		const world_source &world)
 	{
 		if (!ready())
 			return "the renderer isn't made";
@@ -914,14 +1082,34 @@ float4 ps(O i) : SV_Target
 			return "the segment isn't in its frame";
 		if (s.count == 0)
 			return nullptr;
+		const bool world_is_target = world.rt == target;
 		// Everything it needs there first: nothing is drawn of a segment that can't be drawn whole
 		uint32_t v_first = f.draws[s.first].first, v_end = v_first;
 		for (uint32_t i = s.first; i < s.first + s.count; ++i)
 		{
 			const ui2d::draw &d = f.draws[i];
-			if (d.texture != kNoTexture && (d.texture >= kMaxTextures || g.tex[d.texture].state.load(std::memory_order_acquire) != kReady))
+			const bool into_own = (d.target & kPrivate) != 0;
+			const uint32_t ts = d.target & ~kPrivate;
+			if (into_own && (ts >= kPrivateTargets || g.own[ts].state.load(std::memory_order_acquire) != kReady))
+				return "a target of ours isn't there";
+			if (d.texture == kTextureWorld)
+			{
+				if (world.rt == nullptr || world.format == DXGI_FORMAT_UNKNOWN)
+					return "a draw reads the world, which isn't known here";
+				if (!into_own && world_is_target)
+					return "a draw reads the target it draws into";
+			}
+			else if (d.texture != kNoTexture && (d.texture & kPrivate) != 0)
+			{
+				const uint32_t ss = d.texture & ~kPrivate;
+				if (ss >= kPrivateTargets || g.own[ss].state.load(std::memory_order_acquire) != kReady)
+					return "a target of ours read isn't there";
+				if (into_own && ss == ts)
+					return "a draw reads the target it draws into";
+			}
+			else if (d.texture != kNoTexture && (d.texture >= kMaxTextures || g.tex[d.texture].state.load(std::memory_order_acquire) != kReady))
 				return "a texture isn't on the GPU";
-			if (get_pso(d.blend, format, samples) == nullptr)
+			if (get_pso(d.blend, into_own ? kPrivateFormat : format, into_own ? 1 : samples) == nullptr)
 				return "a pipeline couldn't be made";
 			if (d.target_w == 0 || d.target_h == 0)
 				return "a draw has no target size";
@@ -937,6 +1125,7 @@ float4 ps(O i) : SV_Target
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv;
 		if (!target_view(target, format, rtv))
 			return "no view of the target";
+		const D3D12_GPU_DESCRIPTOR_HANDLE world_srv = world.rt != nullptr && world.format != DXGI_FORMAT_UNKNOWN ? world_view(world.rt, world.format) : D3D12_GPU_DESCRIPTOR_HANDLE {};
 		if (g.ring_at + bytes > kRingBytes)
 			g.ring_at = 0;
 		const uint64_t at = g.ring_at;
@@ -948,23 +1137,27 @@ float4 ps(O i) : SV_Target
 		list->SetGraphicsRootSignature(g.root);
 		list->SetGraphicsRootShaderResourceView(1, g.ring_gpu + at);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		const float tw = float(td.Width), th = float(td.Height);
-		const D3D12_RECT whole = { 0, 0, LONG(td.Width), LONG(td.Height) };
-		list->RSSetScissorRects(1, &whole);
-		// (A between dgVoodoo's draws may still be in the state its last read left it: a render target for ours)
-		D3D12_RESOURCE_BARRIER to_target = {};
-		to_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		to_target.Transition.pResource = target;
-		to_target.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		to_target.Transition.StateBefore = target_state;
-		to_target.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
-			list->ResourceBarrier(1, &to_target);
-		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 		const D3D12_GPU_DESCRIPTOR_HANDLE srv0 = g.srv_heap->GetGPUDescriptorHandleForHeapStart(), smp0 = g.sampler_heap->GetGPUDescriptorHandleForHeapStart();
+
+		// The states as the segment goes: the marker's target, the world (when it's another resource) and our targets
+		const auto move = [&](ID3D12Resource *r, D3D12_RESOURCE_STATES &now, D3D12_RESOURCE_STATES want) {
+			if (r == nullptr || now == want)
+				return;
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = r;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = now;
+			b.Transition.StateAfter = want;
+			list->ResourceBarrier(1, &b);
+			now = want;
+		};
+		D3D12_RESOURCE_STATES target_now = target_state, world_now = world.state;
+		constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kTarget = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
 		ID3D12PipelineState *last_pso = nullptr;
 		D3D12_VIEWPORT last_vp = { -1.0f, -1.0f, -1.0f, -1.0f, 0.0f, 1.0f };
+		uint32_t bound_target = 0xFFFFFFFFu;
 		uint64_t batches = 0;
 		for (uint32_t i = s.first; i < s.first + s.count;)
 		{
@@ -973,6 +1166,39 @@ float4 ps(O i) : SV_Target
 			while (j < s.first + s.count && f.draws[j].first == d.first + count && f.draws[j].same_state(d))
 				count += f.draws[j++].count;
 			i = j;
+			const bool into_own = (d.target & kPrivate) != 0;
+			ID3D12Resource *const into = into_own ? g.own[d.target & ~kPrivate].res.load(std::memory_order_acquire) : target;
+			const float tw = into_own ? float(g.own[d.target & ~kPrivate].w) : float(td.Width), th = into_own ? float(g.own[d.target & ~kPrivate].h) : float(td.Height);
+			// The read texture readable, the target a target
+			if (d.texture == kTextureWorld)
+			{
+				if (world_is_target)
+					move(target, target_now, kRead);
+				else
+					move(world.rt, world_now, kRead);
+			}
+			else if (d.texture != kNoTexture && (d.texture & kPrivate) != 0)
+			{
+				own_target &src = g.own[d.texture & ~kPrivate];
+				move(src.res.load(std::memory_order_acquire), src.gpu, kRead);
+			}
+			if (into_own)
+				move(into, g.own[d.target & ~kPrivate].gpu, kTarget);
+			else
+			{
+				move(target, target_now, kTarget);
+				if (world_is_target)
+					world_now = target_now;
+			}
+			if (d.target != bound_target)
+			{
+				const D3D12_CPU_DESCRIPTOR_HANDLE to = into_own ? own_rtv(d.target & ~kPrivate) : rtv;
+				list->OMSetRenderTargets(1, &to, FALSE, nullptr);
+				const D3D12_RECT whole = { 0, 0, LONG(tw), LONG(th) };
+				list->RSSetScissorRects(1, &whole);
+				bound_target = d.target;
+				last_vp.Width = -1.0f;
+			}
 			// The Direct3D 8 viewport as dgVoodoo sets it (moved by half a pixel: Direct3D 8's pixel centres), the
 			// vertices placed in it: they're clipped to it as Direct3D 8 clips pre-transformed vertices
 			const float sx = tw / float(d.target_w), sy = th / float(d.target_h);
@@ -985,7 +1211,7 @@ float4 ps(O i) : SV_Target
 				list->RSSetViewports(1, &vp);
 				last_vp = vp;
 			}
-			ID3D12PipelineState *const pso = find_pso(d.blend.value(), format, samples);
+			ID3D12PipelineState *const pso = find_pso(d.blend.value(), into_own ? kPrivateFormat : format, into_own ? 1 : samples);
 			if (pso != last_pso)
 			{
 				list->SetPipelineState(pso);
@@ -997,7 +1223,10 @@ float4 ps(O i) : SV_Target
 			std::memcpy(&c[6], place, 16);
 			list->SetGraphicsRoot32BitConstants(0, kConstants, c, 0);
 			D3D12_GPU_DESCRIPTOR_HANDLE srv = srv0, smp = smp0;
-			srv.ptr += UINT64(d.texture == kNoTexture ? kNullSlot : d.texture) * g.srv_inc;
+			if (d.texture == kTextureWorld)
+				srv = world_srv;
+			else
+				srv.ptr += UINT64(d.texture == kNoTexture ? kNullSlot : (d.texture & kPrivate) != 0 ? kPrivateSrv + (d.texture & ~kPrivate) : d.texture) * g.srv_inc;
 			smp.ptr += UINT64(sampler_index(d)) * g.sampler_inc;
 			list->SetGraphicsRootDescriptorTable(2, srv);
 			list->SetGraphicsRootDescriptorTable(3, smp);
@@ -1005,11 +1234,13 @@ float4 ps(O i) : SV_Target
 			batches++;
 		}
 
-		if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
-		{
-			std::swap(to_target.Transition.StateBefore, to_target.Transition.StateAfter);
-			list->ResourceBarrier(1, &to_target);
-		}
+		// Everything back as it was found (our own targets left readable)
+		for (own_target &t : g.own)
+			if (t.state.load(std::memory_order_relaxed) != kFree)
+				move(t.res.load(std::memory_order_acquire), t.gpu, kRead);
+		move(target, target_now, target_state);
+		if (!world_is_target)
+			move(world.rt, world_now, world.state);
 		// dgVoodoo's heaps, then its state (a table must be in the heaps bound when it's set)
 		list->SetDescriptorHeaps(heap_count, heaps);
 		bound.restore(list);

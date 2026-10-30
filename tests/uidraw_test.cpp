@@ -77,7 +77,9 @@ namespace
 	{
 		const uint32_t *vt;
 		uint32_t format, w, h;
+		uintptr_t container = 0; // (the texture it belongs to: GetContainer)
 	};
+	void tex_addref_any(uintptr_t t);
 	long __stdcall surf_desc(surface *s, uint32_t d[8])
 	{
 		std::memset(d, 0, 32);
@@ -87,6 +89,13 @@ namespace
 		return 0;
 	}
 	unsigned long __stdcall surf_release(surface *) { return 0; }
+	long __stdcall surf_container(surface *s, const GUID &, uintptr_t *out)
+	{
+		*out = s->container;
+		if (s->container != 0)
+			tex_addref_any(s->container);
+		return s->container != 0 ? 0 : -1;
+	}
 
 	struct texture
 	{
@@ -117,6 +126,10 @@ namespace
 	long __stdcall tex_unlock(texture *, uint32_t) { return 0; }
 
 	uint32_t g_surf_vt[16], g_tex_vt[20];
+	void tex_addref_any(uintptr_t t)
+	{
+		tex_addref(reinterpret_cast<texture *>(t));
+	}
 
 	texture *make_texture(uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t pool, uint8_t fill)
 	{
@@ -212,7 +225,7 @@ namespace
 		put(dv, 40, &d_set_vp), put(dv, 41, &d_get_vp), put(dv, 76, &d_set_vs), put(dv, 77, &d_get_vs), put(dv, 88, &d_set_ps), put(dv, 89, &d_get_ps);
 		put(dv, 32, &d_get_rt), put(dv, 33, &d_get_ds), put(dv, 31, &d_set_rt), put(dv, 54, &d_apply), put(dv, 36, &d_clear), put(dv, 70, &d_dp);
 		put(dv, 71, &d_dip), put(dv, 72, &d_dpup), put(dv, 73, &d_dipup), put(dv, 35, &d_end_scene);
-		put(g_surf_vt, 2, &surf_release), put(g_surf_vt, 8, &surf_desc);
+		put(g_surf_vt, 2, &surf_release), put(g_surf_vt, 7, &surf_container), put(g_surf_vt, 8, &surf_desc);
 		put(g_tex_vt, 1, &tex_addref), put(g_tex_vt, 2, &tex_release), put(g_tex_vt, 10, &tex_type), put(g_tex_vt, 13, &tex_levels);
 		put(g_tex_vt, 14, &tex_desc), put(g_tex_vt, 16, &tex_lock), put(g_tex_vt, 17, &tex_unlock);
 	}
@@ -346,6 +359,7 @@ struct ranges
 
 int main()
 {
+	setvbuf(stdout, nullptr, _IONBF, 0);
 	make_vtables();
 	ranges keep;
 	keep.lo = 0x041C0000;

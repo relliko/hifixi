@@ -26,6 +26,12 @@
 // window's start, 10 at each cut and just before the fade after the menus (0129EA: the interface's end), 11 at its
 // end; each 10 or 11 names the next segment of the window. A window opens only while the bound depth has a stencil.
 //
+// Render targets: A (the world's, dgVoodoo's own resource) is read by the draws that copy it (the crossfade's, the
+// afterimage's, the UI-size target's); the game's other render-target textures (the crossfade's frozen frame, the
+// afterimage's history, the UI-size target) get targets of HiFi XI's own, drawn into and read by the recorded draws,
+// so a switch to one of them doesn't cut: the whole sequence is HiFi XI's. The UI-size target's is the screen's size:
+// the interface is drawn sharp there and stretched 1:1.
+//
 // Textures: taken from the game's own (LockRect, read only, every level) the first time a draw uses one, held
 // (AddRef) while in use so it can't be freed and another made at its address, checked again for new pixels (small
 // ones each frame they're used, large ones every few seconds), and let go after a few seconds unused. Render targets
@@ -72,6 +78,7 @@ namespace hifi::game::uidraw
 		uint64_t markers = 0, not_marked = 0;
 		uint64_t textures = 0;         // taken from the game
 		uint64_t texture_changes = 0;  // ... taken again: their pixels changed
+		uint64_t targets = 0;          // the game's render-target textures given targets of ours
 		uint64_t upload_failures = 0;
 		uint32_t frame_draws = 0, frame_segments = 0; // the last window's
 		uint32_t held = 0;             // textures held now
@@ -93,6 +100,8 @@ namespace hifi::game::uidraw
 		uintptr_t screen_call = 0, screen_target = 0, pop_call = 0, pop_target = 0, movie = 0, code = 0;
 	};
 	sites where();
+	// Which of the game's textures are A and the UI-size target (tests: the game's from the wrapper, +0x194 and +0x1E0)
+	void set_render_targets(uintptr_t world, uintptr_t ui_target);
 	// Markers handed to sink instead of the device's Clear (tests)
 	void set_sink(void (*sink)(uint32_t kind, uint32_t seq));
 	// The device the stubs use instead of the wrapper's (tests; 0: the wrapper's)

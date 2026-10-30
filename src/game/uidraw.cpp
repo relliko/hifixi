@@ -114,6 +114,7 @@ namespace hifi::game::uidraw
 			uint32_t vp[4] = {}; // (X, Y, Width, Height)
 			uint32_t vs = 0, ps = 0;
 			uint32_t target_w = 0, target_h = 0;
+			uintptr_t target = 0;  // the bound target's surface (a pointer to compare: no reference held)
 			bool markable = false; // the bound depth has a stencil
 		};
 
@@ -136,6 +137,18 @@ namespace hifi::game::uidraw
 			uint32_t seg_first = 0;
 			device_state st;
 			std::unordered_map<uintptr_t, held> textures;
+			// The game's render-target textures other than A, each drawn by HiFi XI into a target of its own
+			struct own
+			{
+				uint32_t slot = 0;
+				uint32_t used = 0;
+			};
+			std::unordered_map<uintptr_t, own> owned;
+			uintptr_t wrapper = 0;          // (the window's: A's texture at +0x194, the UI-size target's at +0x1E0)
+			uintptr_t world_override = 0, ui_override = 0; // (tests)
+			uintptr_t main_target = 0;      // the surface bound when the window opened: the markers' target
+			uint32_t main_w = 0, main_h = 0;
+			uint32_t current = u2::kTargetMarker; // where draws go now: the markers' target, kPrivate | slot, or kUnknown
 			counts n;
 			std::string last_why;
 		};
@@ -189,6 +202,7 @@ namespace hifi::game::uidraw
 				return false;
 			g.st.target_w = d[6];
 			g.st.target_h = d[7];
+			g.st.target = rt;
 			g.st.markable = false;
 			if (orig<getp_fn>(kGetDepthStencilSurface)(dev, &ds) >= 0 && ds != 0)
 			{
@@ -308,11 +322,80 @@ namespace hifi::game::uidraw
 			release(tex);
 		}
 
-		// The store's slot for the texture a draw uses (taken now when it's new, or when its pixels changed)
+		constexpr uint32_t kUnknown = 0xFFFFFFFFu; // (g.current: a target neither the markers' nor one of ours)
+
+		uintptr_t world_texture()
+		{
+			if (g.world_override != 0)
+				return g.world_override;
+			return g.wrapper != 0 ? word(g.wrapper + 0x194) : 0;
+		}
+		uintptr_t ui_target_texture()
+		{
+			if (g.ui_override != 0)
+				return g.ui_override;
+			return g.wrapper != 0 ? word(g.wrapper + 0x1E0) : 0;
+		}
+
+		bool is_render_target(uintptr_t tex)
+		{
+			uint32_t d[8] = {};
+			return method<level_desc_fn>(tex, kTexLevelDesc)(tex, 0, d) >= 0 && (d[2] & 1) != 0; // (D3DUSAGE_RENDERTARGET)
+		}
+
+		// Our own target for one of the game's render-target textures (made the first time it's drawn into): the UI-size
+		// target's at the screen's size (the interface drawn sharp), the rest at the game's size. kUnknown: none.
+		uint32_t own_target(uintptr_t tex, bool make)
+		{
+			const auto at = g.owned.find(tex);
+			if (at != g.owned.end())
+			{
+				at->second.used = g.seq;
+				return u2::kPrivate | at->second.slot;
+			}
+			if (!make || tex == 0 || tex == world_texture() || !is_render_target(tex))
+				return kUnknown;
+			uint32_t d[8] = {};
+			if (method<level_desc_fn>(tex, kTexLevelDesc)(tex, 0, d) < 0)
+				return kUnknown;
+			const bool ui = tex == ui_target_texture();
+			std::string why;
+			const uint32_t slot = u2::render::add_target(ui ? g.main_w : d[6], ui ? g.main_h : d[7], why);
+			if (slot == u2::kNoTexture)
+			{
+				g.last_why = "target: " + why;
+				return kUnknown;
+			}
+			method<release_fn>(tex, 1)(tex); // (AddRef: held while ours stands in for it)
+			g.owned[tex] = { slot, g.seq };
+			g.n.targets++;
+			return u2::kPrivate | slot;
+		}
+
+		// The texture a surface belongs to (GetContainer), 0 when it's none's
+		uintptr_t container(uintptr_t surface)
+		{
+			static const GUID kTexture = { 0xe4cdd575, 0x2866, 0x4f01, { 0xb1, 0x2e, 0x7e, 0xec, 0xe1, 0xec, 0x93, 0x58 } }; // IID_IDirect3DTexture8
+			using container_fn = long(__stdcall *)(uintptr_t, const GUID &, uintptr_t *);
+			uintptr_t tex = 0;
+			if (surface == 0 || method<container_fn>(surface, 7)(surface, kTexture, &tex) < 0 || tex == 0)
+				return 0;
+			release(tex);
+			return tex;
+		}
+
+		// The store's slot for the texture a draw uses (taken now when it's new, or when its pixels changed); a render
+		// target: the world, or ours standing in for it
 		uint32_t texture_slot(uintptr_t tex, bool &ok)
 		{
 			ok = true;
 			const uint32_t window = g.seq;
+			if (is_render_target(tex))
+			{
+				const uint32_t own = tex == world_texture() ? u2::kTextureWorld : own_target(tex, false);
+				ok = own != kUnknown;
+				return ok ? own : u2::kNoTexture;
+			}
 			const auto at = g.textures.find(tex);
 			if (at != g.textures.end())
 			{
@@ -359,6 +442,15 @@ namespace hifi::game::uidraw
 
 		void forget_unused()
 		{
+			for (auto it = g.owned.begin(); it != g.owned.end();)
+				if (g.seq - it->second.used > kUnused)
+				{
+					u2::render::drop_target(it->second.slot);
+					release(it->first);
+					it = g.owned.erase(it);
+				}
+				else
+					++it;
 			for (auto it = g.textures.begin(); it != g.textures.end();)
 				if (g.seq - it->second.used > kUnused)
 				{
@@ -485,7 +577,8 @@ namespace hifi::game::uidraw
 		// A DrawPrimitiveUP recorded into the window's frame: rOk, or why it's the game's
 		reason record(uint32_t type, uint32_t count, const void *data, uint32_t stride)
 		{
-			if (!g.open || g.f == nullptr || !sends_marks())
+			// (a target of ours needs no marker while it's bound: the markers' target's comes after it)
+			if (!g.open || g.f == nullptr || g.current == kUnknown || (g.current == u2::kTargetMarker && !sends_marks()))
 				return rFull;
 			const reason r = check_state(type);
 			if (r != rOk)
@@ -530,6 +623,7 @@ namespace hifi::game::uidraw
 			d.clip[3] = int32_t(s.vp[1] + s.vp[3]);
 			d.target_w = s.target_w;
 			d.target_h = s.target_h;
+			d.target = g.current;
 			const bool textured = uses_texture(d.colour.op, d.colour.arg1, d.colour.arg2) ||
 				(d.colour.op != 1 && uses_texture(d.alpha.op, d.alpha.arg1, d.alpha.arg2));
 			if (textured && s.tex[0] != 0)
@@ -547,7 +641,7 @@ namespace hifi::game::uidraw
 				d.alpha.op = 1;
 			}
 			// (the pipeline now, on this thread: dgVoodoo's never has to make one while it records)
-			if (g.native && !u2::render::pipeline(d.blend))
+			if (g.native && !(g.current == u2::kTargetMarker ? u2::render::pipeline(d.blend) : u2::render::pipeline(d.blend, u2::render::kPrivateFormat, 1)))
 				return rPipeline;
 			// The vertices, a triangle list with each triangle's first vertex first (the flat-shaded colour)
 			d.first = f.vertex_count;
@@ -633,19 +727,59 @@ namespace hifi::game::uidraw
 			}
 			return r;
 		}
+		// A switch of target: to the markers' or one of ours, the segment goes on (none of it is drawn before the next
+		// marker on the markers' target); to anything else, cut first
 		long __stdcall h_set_render_target(uintptr_t dev, uintptr_t rt, uintptr_t ds)
 		{
-			cut();
+			uint32_t to = g.current;
+			if (rt != 0)
+				to = rt == g.main_target ? u2::kTargetMarker : own_target(container(rt), true);
+			if (to == kUnknown)
+				cut();
 			const long r = orig<long(__stdcall *)(uintptr_t, uintptr_t, uintptr_t)>(kSetRenderTarget)(dev, rt, ds);
 			uint32_t vp[6] = {};
 			if (!query_target(dev) || orig<getv_fn>(kGetViewport)(dev, vp) < 0)
+			{
 				g.st.markable = false;
+				to = kUnknown;
+			}
 			else
 				std::memcpy(g.st.vp, vp, 16);
+			g.current = to;
 			return r;
 		}
+		// A colour clear of one of our targets is one of our draws (a quad over the viewport, blending off); anything
+		// else cuts
 		long __stdcall h_clear(uintptr_t dev, uint32_t count, const int32_t *rects, uint32_t flags, uint32_t colour, float z, uint32_t stencil)
 		{
+			if (g.open && (g.current & u2::kPrivate) != 0 && g.current != kUnknown && count == 0 && (flags & 1) != 0 && g.f != nullptr &&
+				g.f->draw_count < u2::kMaxDraws && g.f->vertex_count + 6 <= u2::kMaxVertices)
+			{
+				u2::draw d;
+				d.target = g.current;
+				d.blend.write_mask = 0xF;
+				d.colour.op = d.alpha.op = 1; // (the diffuse colour as it is)
+				d.clip[0] = int32_t(g.st.vp[0]), d.clip[1] = int32_t(g.st.vp[1]);
+				d.clip[2] = int32_t(g.st.vp[0] + g.st.vp[2]), d.clip[3] = int32_t(g.st.vp[1] + g.st.vp[3]);
+				d.target_w = g.st.target_w, d.target_h = g.st.target_h;
+				if (!g.native || u2::render::pipeline(d.blend, u2::render::kPrivateFormat, 1))
+				{
+					const float x0 = float(d.clip[0]) - 0.5f, y0 = float(d.clip[1]) - 0.5f, x1 = float(d.clip[2]) - 0.5f, y1 = float(d.clip[3]) - 0.5f;
+					const float corners[6][2] = { { x0, y0 }, { x1, y0 }, { x0, y1 }, { x1, y0 }, { x1, y1 }, { x0, y1 } };
+					d.first = g.f->vertex_count;
+					d.count = 6;
+					for (const auto &c : corners)
+						g.f->vertices[g.f->vertex_count++] = { c[0], c[1], 0.0f, 1.0f, colour, 0.0f, 0.0f };
+					g.f->draws[g.f->draw_count++] = d;
+					g.n.recorded++;
+					if (g.native)
+					{
+						g.n.native++;
+						return 0;
+					}
+					return orig<clear_fn>(kClear)(dev, count, rects, flags, colour, z, stencil);
+				}
+			}
 			cut();
 			return orig<clear_fn>(kClear)(dev, count, rects, flags, colour, z, stencil);
 		}
@@ -743,10 +877,12 @@ namespace hifi::game::uidraw
 
 		void __cdecl on_begin(uintptr_t wrapper)
 		{
+			g.wrapper = wrapper;
 			window_begin(device_of(wrapper));
 		}
 		void __cdecl on_screen(uintptr_t wrapper)
 		{
+			g.wrapper = wrapper;
 			window_begin(device_of(wrapper), true);
 		}
 		void __cdecl on_flush(uint32_t kind, uintptr_t)
@@ -788,6 +924,10 @@ namespace hifi::game::uidraw
 			return;
 		}
 		g.source_vt = vt;
+		g.main_target = g.st.target;
+		g.main_w = g.st.target_w;
+		g.main_h = g.st.target_h;
+		g.current = u2::kTargetMarker;
 		g.dev = dev;
 		g.seq++;
 		if (g.seq == 0)
@@ -993,8 +1133,9 @@ namespace hifi::game::uidraw
 				why += (why.empty() ? "" : ", ") + std::string(kReasonNames[r]) + " " + std::to_string(g.n.why[r]);
 		if (!why.empty())
 			lines.push_back("  left to the game: " + why);
-		std::snprintf(line, sizeof(line), "  textures: %u held, %llu taken, %llu taken again (new pixels)%s", g.n.held, static_cast<unsigned long long>(g.n.textures),
-			static_cast<unsigned long long>(g.n.texture_changes),
+		std::snprintf(line, sizeof(line), "  textures: %u held, %llu taken, %llu taken again (new pixels); %zu render targets of the game's drawn into ours%s",
+			g.n.held, static_cast<unsigned long long>(g.n.textures),
+			static_cast<unsigned long long>(g.n.texture_changes), g.owned.size(),
 			g.n.upload_failures != 0 ? (", " + std::to_string(g.n.upload_failures) + " uploads failed").c_str() : "");
 		lines.push_back(line);
 		if (!g.last_why.empty())
@@ -1004,6 +1145,12 @@ namespace hifi::game::uidraw
 
 	void drop_textures()
 	{
+		for (auto &t : g.owned)
+		{
+			u2::render::drop_target(t.second.slot);
+			release(t.first);
+		}
+		g.owned.clear();
 		for (auto &t : g.textures)
 			let_go(t.first, t.second);
 		g.textures.clear();
@@ -1019,6 +1166,12 @@ namespace hifi::game::uidraw
 	void set_sink(void (*sink)(uint32_t, uint32_t))
 	{
 		g.sink = sink;
+	}
+
+	void set_render_targets(uintptr_t world, uintptr_t ui_target)
+	{
+		g.world_override = world;
+		g.ui_override = ui_target;
 	}
 
 	void set_device(uintptr_t device)
