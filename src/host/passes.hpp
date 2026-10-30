@@ -33,6 +33,10 @@ namespace hifi::passes
 		// The depth's two planes' states as dgVoodoo's barriers left them (the zone renderer follows them), when known
 		bool planes_known = false;
 		D3D12_RESOURCE_STATES ds_planes[2] = {};
+		// What dgVoodoo last bound on the list (its OMSetRenderTargets: bound lazily, so it may be older than the marker),
+		// the target's view's format; the back buffer for the kinds slotmark::on_back_buffer names
+		ID3D12Resource *bound_rt = nullptr, *bound_ds = nullptr;
+		DXGI_FORMAT bound_rt_format = DXGI_FORMAT_UNKNOWN;
 		// The list's descriptor heaps as dgVoodoo last set them (heap_count 0: not known yet): bound again after a pass
 		// binds its own, before grass::list_state::restore (a root table must be in the heaps bound when it's set)
 		UINT heap_count = 0;

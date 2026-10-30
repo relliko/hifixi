@@ -606,8 +606,16 @@ namespace hifi::backend
 			if (m.kind >= slotmark::first_pass)
 			{
 				ID3D12Resource *const depth = port_resource_of_view(dsv);
-				zone::inject::on_marker(depth);
-				chars::inject::on_marker(depth);
+				// (the back buffer's own markers leave the world's depth tracking alone)
+				if (!slotmark::on_back_buffer(m.kind))
+				{
+					zone::inject::on_marker(depth);
+					chars::inject::on_marker(depth);
+				}
+				// (and the upscaled world, when it waits for the next call after the resolve, goes in before what they
+				// draw: a marker isn't a clear to it)
+				else
+					upscale::before_other(list, d.state);
 				if (depth == nullptr)
 					return;
 				passes::world w;
@@ -617,6 +625,9 @@ namespace hifi::backend
 				w.ds_format = port_format_of_view(dsv);
 				w.rt_state = d.world_rt_state;
 				w.planes_known = zone::inject::depth_planes(depth, w.ds_planes);
+				w.bound_rt = d.rt0;
+				w.bound_ds = d.ds;
+				w.bound_rt_format = d.state.rtv_count != 0 ? port_format_of_view(uint64_t(d.state.rtvs[0].ptr)) : DXGI_FORMAT_UNKNOWN;
 				passes::dispatch(m.kind, list, d.state, w, m.seq);
 				return;
 			}

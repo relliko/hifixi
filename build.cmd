@@ -71,7 +71,7 @@ rem (fx: every effect element of the priority-12 flush drawn natively: src\fx, i
 set "PASSES_FX=src\fx\fxframe.cpp src\fx\fxtextures.cpp src\fx\fxrender.cpp src\fx\fxinject.cpp src\fx\fxmodule.cpp src\game\fxdraw.cpp"
 set "PASSES_WORLD=src\world\world_frames.cpp src\world\world_dome.cpp src\world\world_render.cpp src\world\world_font.cpp src\world\world_module.cpp src\game\worldmark.cpp src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp"
 set "PASSES_ACTORS="
-set "PASSES_2D="
+set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
@@ -179,6 +179,25 @@ cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN
   tests\fx_render_test.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxinject.cpp src\fx\fxrender.cpp src\fx\fxtextures.cpp src\chars\tex.cpp ^
   build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\fx_render_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\fx_render_test.exe
+rem The screen's 2D (src\game\uidraw, src\ui2d; docs\own-frame\2d.md): the loop tail's calls, the recorder on a stand-in
+rem device and the gate on both dumps (build\uidraw_test.exe); the recorder on dgVoodoo's own d3d8.dll (the game's, with
+rem its dgVoodoo.conf drawn by WARP: tests\ui2d_conf.py) against the 2D renderer on Direct3D 12 WARP at the pass markers,
+rem the d3dlog captures' interface replayed (build\dgv\ui2d_dgv.exe, run from build\dgv)
+set "UI2D=src\ui2d\frame2d.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\game\uidraw.cpp src\game\game.cpp"
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\uidraw_test.cpp %UI2D% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\uidraw_test.exe" ^
+  /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\uidraw_test.exe
+if not exist build\dgv mkdir build\dgv
+if exist "C:\Games\PhoenixXI\bootloader\d3d8.dll" (
+  copy /y "C:\Games\PhoenixXI\bootloader\d3d8.dll" build\dgv\ >nul || exit /b 1
+  python tests\ui2d_conf.py "C:\Games\PhoenixXI\bootloader\dgVoodoo.conf" build\dgv\dgVoodoo.conf || exit /b 1
+)
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
+  /I deps\ashita\plugins\sdk\d3d8\includes tests\ui2d_dgv.cpp %UI2D% src\ui2d\ui2d.cpp src\host\passes.cpp build\engine\worldfx_engine.lib ^
+  /Fo"build\test\\" /Fe"build\dgv\ui2d_dgv.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib d3dcompiler.lib || exit /b 1
+echo Built build\dgv\ui2d_dgv.exe
+
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
