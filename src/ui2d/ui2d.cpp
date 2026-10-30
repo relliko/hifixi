@@ -11,6 +11,7 @@
  */
 
 #include <windows.h>
+#include "fonthigh.hpp"
 #include "frame2d.hpp"
 #include "gate.hpp"
 #include "render2d.hpp"
@@ -47,7 +48,7 @@ namespace hifi::ui2d
 
 		struct game_state
 		{
-			bool wanted = false, shadow_only = false;
+			bool wanted = false, shadow_only = false, font_high = false;
 			std::string why;
 		};
 		game_state gs;
@@ -131,7 +132,13 @@ namespace hifi::ui2d
 			}
 			// (the world's target as its barriers left it on this list; the back buffer is a target throughout)
 			const D3D12_RESOURCE_STATES state = target == w.rt ? w.rt_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
-			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native, state))
+			// (the world, for the draws that copy it: A itself in A's window, else as the world's markers found it)
+			render::world_source world;
+			if (s.kind == slotmark::screen)
+				world = { target, format, state };
+			else
+				world = { w.rt, w.rt_format, w.rt_state };
+			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native, state, world))
 			{
 				fail(why);
 				return;
@@ -147,6 +154,7 @@ namespace hifi::ui2d
 		{
 			gs.wanted = game::option_on(kSection, "native", false);
 			gs.shadow_only = game::option_on(kSection, "shadow", false);
+			gs.font_high = game::option_on(kSection, "font_high", false);
 		}
 
 		void update(double)
@@ -163,6 +171,13 @@ namespace hifi::ui2d
 				if (!game::uidraw::stop(why))
 					gs.why = why;
 			}
+			// (the 2048 x 4096 text font: read from the game's files the first time it's asked for)
+			if (gs.font_high && !fonthigh::loaded() && !fonthigh::load(why))
+			{
+				gs.why = "the 2048 x 4096 font: " + why;
+				gs.font_high = false;
+			}
+			game::uidraw::set_font_high(gs.font_high && fonthigh::loaded());
 		}
 
 		void present(double now, bool)
@@ -233,7 +248,17 @@ namespace hifi::ui2d
 					: "Screen 2D: HiFi XI draws it once its side is ready (the game until then).");
 				return true;
 			}
-			out.push_back("/hifi ui [on | off | shadow | status]");
+			if (args[1] == "font")
+			{
+				const bool on = args.size() > 2 ? args[2] == "on" : !gs.font_high;
+				game::set_option_on(kSection, "font_high", on);
+				follow_options();
+				update(0.0);
+				out.push_back(gs.font_high ? "Screen 2D: text drawn with the 2048 x 4096 font." : "Screen 2D: text drawn with the font the game set." +
+					(gs.why.empty() ? std::string() : " (" + gs.why + ")"));
+				return true;
+			}
+			out.push_back("/hifi ui [on | off | shadow | font [on | off] | status]");
 			return true;
 		}
 

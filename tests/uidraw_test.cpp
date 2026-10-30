@@ -25,8 +25,10 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include "../src/bake/dat.hpp"
 #include "../src/game/slotmark.hpp"
 #include "../src/game/uidraw.hpp"
+#include "../src/ui2d/fonthigh.hpp"
 #include "../src/ui2d/frame2d.hpp"
 #include "../src/ui2d/gate.hpp"
 #include "../src/ui2d/render2d.hpp"
@@ -34,6 +36,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -77,7 +81,9 @@ namespace
 	{
 		const uint32_t *vt;
 		uint32_t format, w, h;
+		uintptr_t container = 0; // (the texture it belongs to: GetContainer)
 	};
+	void tex_addref_any(uintptr_t t);
 	long __stdcall surf_desc(surface *s, uint32_t d[8])
 	{
 		std::memset(d, 0, 32);
@@ -87,6 +93,13 @@ namespace
 		return 0;
 	}
 	unsigned long __stdcall surf_release(surface *) { return 0; }
+	long __stdcall surf_container(surface *s, const GUID &, uintptr_t *out)
+	{
+		*out = s->container;
+		if (s->container != 0)
+			tex_addref_any(s->container);
+		return s->container != 0 ? 0 : -1;
+	}
 
 	struct texture
 	{
@@ -117,6 +130,10 @@ namespace
 	long __stdcall tex_unlock(texture *, uint32_t) { return 0; }
 
 	uint32_t g_surf_vt[16], g_tex_vt[20];
+	void tex_addref_any(uintptr_t t)
+	{
+		tex_addref(reinterpret_cast<texture *>(t));
+	}
 
 	texture *make_texture(uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t pool, uint8_t fill)
 	{
@@ -212,7 +229,7 @@ namespace
 		put(dv, 40, &d_set_vp), put(dv, 41, &d_get_vp), put(dv, 76, &d_set_vs), put(dv, 77, &d_get_vs), put(dv, 88, &d_set_ps), put(dv, 89, &d_get_ps);
 		put(dv, 32, &d_get_rt), put(dv, 33, &d_get_ds), put(dv, 31, &d_set_rt), put(dv, 54, &d_apply), put(dv, 36, &d_clear), put(dv, 70, &d_dp);
 		put(dv, 71, &d_dip), put(dv, 72, &d_dpup), put(dv, 73, &d_dipup), put(dv, 35, &d_end_scene);
-		put(g_surf_vt, 2, &surf_release), put(g_surf_vt, 8, &surf_desc);
+		put(g_surf_vt, 2, &surf_release), put(g_surf_vt, 7, &surf_container), put(g_surf_vt, 8, &surf_desc);
 		put(g_tex_vt, 1, &tex_addref), put(g_tex_vt, 2, &tex_release), put(g_tex_vt, 10, &tex_type), put(g_tex_vt, 13, &tex_levels);
 		put(g_tex_vt, 14, &tex_desc), put(g_tex_vt, 16, &tex_lock), put(g_tex_vt, 17, &tex_unlock);
 	}
@@ -344,8 +361,9 @@ struct ranges
 	}
 };
 
-int main()
+int main(int argc, char **argv)
 {
+	setvbuf(stdout, nullptr, _IONBF, 0);
 	make_vtables();
 	ranges keep;
 	keep.lo = 0x041C0000;
@@ -401,6 +419,54 @@ int main()
 			check(hifi::ui2d::next_mode(o) == gate_mode::off, std::string("gate: ") + (k == 0 ? "not wanted" : k == 1 ? "not patched" : "no renderer") + ": off");
 		}
 		static_assert(uint32_t(gate_mode::native) == uint32_t(ud::native) && uint32_t(gate_mode::shadow) == uint32_t(ud::shadow), "the gate's modes are uidraw's");
+	}
+
+	// The text fonts (src/ui2d/fonthigh) against tests/ui2d_fonts.py: the moji's DXT3 blocks from the menu DAT, the two
+	// PNGs decoded by WIC, hashed as the oracle hashes Python's own decode
+	{
+		std::ifstream oracle(argc > 1 ? argv[1] : "build\\test\\ui2d_fonts.txt");
+		std::string line;
+		uint32_t lines = 0;
+		const auto fnv64 = [](const std::vector<uint8_t> &b) {
+			uint64_t h = 1469598103934665603ull;
+			for (const uint8_t c : b)
+				h = (h ^ c) * 1099511628211ull;
+			return h;
+		};
+		while (std::getline(oracle, line))
+		{
+			std::istringstream ls(line);
+			std::string kind;
+			ls >> kind;
+			uint32_t w = 0, h = 0, gw = 0, gh = 0;
+			unsigned long long want = 0;
+			std::vector<uint8_t> got;
+			std::string err;
+			bool ok = false;
+			if (kind == "png")
+			{
+				std::string id;
+				ls >> id >> w >> h >> want;
+				std::vector<uint8_t> file;
+				const std::wstring path = hifi::bake::dat_path(uint32_t(std::stoul(id, nullptr, 16)), err);
+				ok = !path.empty() && hifi::bake::read_file(path, file) && u2::fonthigh::decode_png(file, gw, gh, got, err);
+				check(ok && gw == w && gh == h && fnv64(got) == want, "the PNG font file 0x" + id + " decoded as Python decodes it (" + std::to_string(gw) + " x " +
+					std::to_string(gh) + (err.empty() ? "" : ", " + err) + ")");
+				lines++;
+			}
+			else if (kind == "moji")
+			{
+				ls >> w >> h >> want;
+				ok = u2::fonthigh::moji_blocks(got, gw, gh, err);
+				check(ok && gw == w && gh == h && fnv64(got) == want, "'font moji' from the menu DAT as Python reads it" + (err.empty() ? "" : " (" + err + ")"));
+				lines++;
+			}
+		}
+		if (lines == 0)
+			std::printf("SKIP  the fonts' oracle (no game files)\n");
+		const bool loaded = lines != 0 && u2::fonthigh::load(why);
+		check(lines == 0 || (loaded && u2::fonthigh::high().levels.size() == 1 && u2::fonthigh::high().levels[0].w == 2048),
+			"the 2048 x 4096 font loaded" + (why.empty() ? "" : ": " + why));
 	}
 
 	// An image without the game's code
@@ -640,6 +706,37 @@ int main()
 			*reinterpret_cast<uint32_t *>(w.movie) = 0;
 			check(ud::get_counts().movie == c0.movie + 1 && ud::get_counts().windows == c0.windows && *reinterpret_cast<uint32_t *>(&dev) == own_vt,
 				tag + "the opening movie playing: no window, the game draws it all");
+		}
+		// The 2048 x 4096 font for the moji (the option on): a 1024 x 2048 DXT3 texture holding the moji's blocks is
+		// handed to the store as the big PNG; another 1024 x 2048 DXT3 isn't
+		if (u2::fonthigh::loaded() && name == dump::kDumps[0])
+		{
+			std::vector<uint8_t> blocks;
+			uint32_t mw = 0, mh = 0;
+			std::string err;
+			u2::fonthigh::moji_blocks(blocks, mw, mh, err);
+			texture *const moji = make_texture(1024, 2048, 1, 0, 1, 0), *const other_tex = make_texture(1024, 2048, 1, 0, 1, 0);
+			moji->format = other_tex->format = 0x33545844;
+			std::memcpy(moji->bits[0].data(), blocks.data(), blocks.size());
+			std::memcpy(other_tex->bits[0].data(), blocks.data(), blocks.size());
+			other_tex->bits[0][100] ^= 1;
+			ud::set_font_high(true);
+			ud::set_mode(ud::native);
+			const ud::counts c0 = ud::get_counts();
+			const uint64_t bytes0 = u2::render::get_stats().texture_bytes;
+			run_begin(w.code, reinterpret_cast<uintptr_t>(wrapper));
+			set_tex(&dev, moji);
+			dpup(&dev, 5, 2, quad, 28);
+			set_tex(&dev, other_tex);
+			dpup(&dev, 5, 2, quad, 28);
+			ud::window_flush(hifi::slotmark::frame_end);
+			const uint64_t added = u2::render::get_stats().texture_bytes - bytes0;
+			check(ud::get_counts().fonts_upgraded == c0.fonts_upgraded + 1 && added == 2048ull * 4096 * 4 + blocks.size(),
+				tag + "the font option: the moji taken as the 2048 x 4096 PNG, another DXT3 texture as it is (" + std::to_string(added) + " bytes)");
+			ud::set_font_high(false);
+			ud::set_mode(ud::native);
+			delete moji;
+			delete other_tex;
 		}
 		// No stencil on the bound depth: no window
 		{

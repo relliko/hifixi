@@ -923,6 +923,7 @@ namespace
 		ID3D12InfoQueue *info = nullptr;
 		// dgVoodoo's stand-ins: its target, root signature, pipeline, heaps
 		ID3D12Resource *target = nullptr, *depth = nullptr, *readback = nullptr, *upload = nullptr;
+		ID3D12Resource *world = nullptr; // (A as dgVoodoo has it, for the back buffer's window's copies of it: readable)
 		ID3D12DescriptorHeap *rtv_heap = nullptr, *game_heap = nullptr, *game_samplers = nullptr;
 		ID3D12RootSignature *game_root = nullptr;
 		ID3D12PipelineState *game_pso = nullptr;
@@ -1006,6 +1007,9 @@ float4 ps() : SV_Target { return colour; }
 		rd.SampleDesc.Count = 1;
 		rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 		g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&g.target));
+		D3D12_RESOURCE_DESC wd = rd;
+		wd.Flags = D3D12_RESOURCE_FLAG_NONE;
+		g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &wd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g.world));
 		// (and its depth: only named by the markers)
 		D3D12_RESOURCE_DESC dd = rd;
 		dd.Format = DXGI_FORMAT_R24G8_TYPELESS;
@@ -1070,7 +1074,44 @@ float4 ps() : SV_Target { return colour; }
 
 	// The recorded window drawn as HiFi XI draws it at its markers, onto the background; then dgVoodoo's next draw
 	// (a 24 x 24 square at the bottom left in 0x10E0F0) with nothing bound again. The pixels as R, G, B, A.
-	bool replay_d12(d12 &g, const std::vector<uint8_t> &bg_bgrx, const u2::frame &f, std::vector<uint8_t> &out, std::string &why, uint32_t &drawn)
+	// Pixels (B, G, R, X) into a texture of W x H: the target (RENDER_TARGET) or the world (PIXEL_SHADER_RESOURCE)
+	void load_pixels(d12 &g, ID3D12Resource *into, D3D12_RESOURCE_STATES state, const std::vector<uint8_t> &bgrx)
+	{
+		uint8_t *cpu = nullptr;
+		g.upload->Map(0, nullptr, reinterpret_cast<void **>(&cpu));
+		for (UINT y = 0; y < H; ++y)
+			for (UINT x = 0; x < W; ++x)
+			{
+				const uint8_t *s = bgrx.data() + (size_t(y) * W + x) * 4;
+				uint8_t *d = cpu + g.spot.Offset + size_t(y) * g.spot.Footprint.RowPitch + x * 4;
+				d[0] = s[2], d[1] = s[1], d[2] = s[0], d[3] = 255;
+			}
+		g.upload->Unmap(0, nullptr);
+		g.alloc->Reset();
+		g.list->Reset(g.alloc, nullptr);
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = into;
+		b.Transition.StateBefore = state;
+		b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		g.list->ResourceBarrier(1, &b);
+		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+		dst.pResource = into;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.pResource = g.upload;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		src.PlacedFootprint = g.spot;
+		g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+		g.list->ResourceBarrier(1, &b);
+		g.list->Close();
+		ID3D12CommandList *const lists[] = { g.list };
+		g.queue->ExecuteCommandLists(1, lists);
+		wait(g);
+	}
+
+	bool replay_d12(d12 &g, const std::vector<uint8_t> &bg_bgrx, const u2::frame &f, std::vector<uint8_t> &out, std::string &why, uint32_t &drawn,
+		bool with_world = false)
 	{
 		// The background into the target
 		uint8_t *cpu = nullptr;
@@ -1153,7 +1194,15 @@ float4 ps() : SV_Target { return colour; }
 			g.list->ResourceBarrier(1, &b);
 		}
 		else
+		{
+			if (with_world)
+			{
+				w.rt = g.world;
+				w.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				w.rt_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			}
 			hifi::passes::dispatch(hifi::slotmark::ui_begin, g.list, st, w, seq);
+		}
 		const uint64_t failed_before = ui2d_failed();
 		for (uint32_t k = 0; k < n; ++k)
 		{
@@ -1395,6 +1444,469 @@ float4 ps() : SV_Target { return colour; }
 				t->Release();
 		ud::drop_textures();
 	}
+	// ---------------------------------------------------------------- the game's render-target textures
+
+	IDirect3DSurface8 *surface_of(IDirect3DTexture8 *t)
+	{
+		IDirect3DSurface8 *s = nullptr;
+		t->GetSurfaceLevel(0, &s);
+		s->Release(); // (the texture holds it)
+		return s;
+	}
+
+	bool read_surface(dgv &d, IDirect3DSurface8 *from, std::vector<uint8_t> &out)
+	{
+		IDirect3DSurface8 *img = nullptr;
+		bool ok = SUCCEEDED(d.dev->CreateImageSurface(W, H, D3DFMT_A8R8G8B8, &img)) && SUCCEEDED(d.dev->CopyRects(from, nullptr, 0, img, nullptr));
+		D3DLOCKED_RECT lr;
+		if (ok && SUCCEEDED(img->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+		{
+			out.resize(size_t(W) * H * 4);
+			for (UINT y = 0; y < H; ++y)
+				std::memcpy(out.data() + size_t(y) * W * 4, static_cast<const uint8_t *>(lr.pBits) + size_t(y) * lr.Pitch, W * 4);
+			img->UnlockRect();
+		}
+		else
+			ok = false;
+		if (img != nullptr)
+			img->Release();
+		return ok;
+	}
+
+	struct v28
+	{
+		float x, y, z, rhw;
+		DWORD c;
+		float u, v;
+	};
+	// A quad over x0..x1 x y0..y1 (pixel edges, the game's -0.5), u0..u1 x v0..v1
+	void quad(IDirect3DDevice8 *dev, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, DWORD c)
+	{
+		const v28 q[4] = { { x0 - 0.5f, y0 - 0.5f, 0, 1, c, u0, v0 }, { x1 - 0.5f, y0 - 0.5f, 0, 1, c, u1, v0 }, { x0 - 0.5f, y1 - 0.5f, 0, 1, c, u0, v1 },
+			{ x1 - 0.5f, y1 - 0.5f, 0, 1, c, u1, v1 } };
+		dev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(v28));
+	}
+
+	// 00A4F0's copy of a texture into a target (the resolve's states: MODULATE2X, LINEAR, CLAMP, no blend), and back
+	void copy(IDirect3DDevice8 *dev, IDirect3DTexture8 *from, IDirect3DSurface8 *into, UINT w, UINT h, DWORD colour, IDirect3DSurface8 *back, IDirect3DSurface8 *back_depth,
+		float part = 1.0f)
+	{
+		dev->SetRenderTarget(into, nullptr);
+		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE2X);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+		dev->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		dev->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+		dev->SetTextureStageState(0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
+		dev->SetTextureStageState(0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+		dev->SetTexture(0, from);
+		quad(dev, 0, 0, float(w) * part, float(h), 0, 0, part, 1, colour);
+		dev->SetRenderTarget(back, back_depth);
+	}
+
+	// The screen passes on A, as 012F40 and 0132B0 draw them (notes-screen-passes 2.3, 2.4), two frames: the frozen
+	// frame's copy (frame 1, after a clear of its target) and its blend, the wash, the afterimage's zoomed history and
+	// its copy of A (the history kept from frame to frame); compared on frame 2
+	void run_screen_passes(dgv &d, d12 &g)
+	{
+		std::printf("-- the screen passes on A (render-target textures)\n");
+		IDirect3DDevice8 *dev = d.dev;
+		IDirect3DTexture8 *a = nullptr, *frozen = nullptr, *history = nullptr;
+		IDirect3DSurface8 *a_depth = nullptr, *bb = nullptr, *bb_depth = nullptr;
+		dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &a);
+		dev->CreateTexture(W / 2, H / 2, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &frozen);
+		dev->CreateTexture(W / 2, H / 2, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &history);
+		dev->CreateDepthStencilSurface(W, H, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, &a_depth);
+		dev->GetRenderTarget(&bb);
+		dev->GetDepthStencilSurface(&bb_depth);
+		if (a == nullptr || frozen == nullptr || history == nullptr || a_depth == nullptr)
+		{
+			check(false, "screen passes: the render targets made");
+			return;
+		}
+		IDirect3DSurface8 *const as = surface_of(a), *const fs = surface_of(frozen), *const hs = surface_of(history);
+		ud::set_render_targets(reinterpret_cast<uintptr_t>(a), 0);
+		std::vector<uint8_t> bg, ref, ours;
+		std::string why;
+		bool ok = true;
+		for (int frame = 1; frame <= 2 && ok; ++frame)
+		{
+			dev->BeginScene();
+			dev->SetRenderTarget(as, a_depth);
+			dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0xFF000000, 1.0f, 0);
+			background(d);
+			read_surface(d, as, bg);
+			const ud::counts c0 = ud::get_counts();
+			ud::set_mode(ud::shadow);
+			ud::window_begin(reinterpret_cast<uintptr_t>(dev), true);
+			if (frame == 1)
+			{
+				copy(dev, a, hs, W / 2, H / 2, 0x80808080, as, a_depth);
+				dev->SetRenderTarget(fs, nullptr);
+				dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0x80FF2000, 1.0f, 0);
+				copy(dev, a, fs, W / 2, H / 2, 0x80808080, as, a_depth, 0.5f);
+			}
+			// The frozen frame over A
+			dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_FLAT);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+			dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+			dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+			dev->SetTexture(0, frozen);
+			quad(dev, 0, 0, W, H, 0, 0, 1, 1, 0x60808080);
+			// The wash
+			dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			dev->SetTexture(0, nullptr);
+			{
+				struct v20
+				{
+					float x, y, z, rhw;
+					DWORD c;
+				};
+				const v20 q[4] = { { -0.5f, -0.5f, 0, 1, 0x80301008 }, { W - 0.5f, -0.5f, 0, 1, 0x80301008 }, { -0.5f, H - 0.5f, 0, 1, 0x80301008 },
+					{ W - 0.5f, H - 0.5f, 0, 1, 0x80301008 } };
+				dev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+				dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(v20));
+			}
+			// The afterimage: the history zoomed over A (f = 0.98), then A copied into it
+			dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+			dev->SetTexture(0, history);
+			quad(dev, 0, 0, W, H, 0.02f, 0.02f, 0.98f, 0.98f, 0x50808080);
+			dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+			copy(dev, a, hs, W / 2, H / 2, 0x80808080, as, a_depth);
+			ud::window_end();
+			read_surface(d, as, ref);
+			dev->SetRenderTarget(bb, bb_depth);
+			dev->EndScene();
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+			const ud::counts c = ud::get_counts();
+			const u2::frame *f = u2::published(c.seq & 15);
+			ok = f != nullptr && f->segments.load() == 1 && c.passed == c0.passed;
+			if (!ok)
+				for (const std::string &l : ud::status())
+					std::printf("     %s\n", l.c_str());
+			check(ok, "screen passes, frame " + std::to_string(frame) + ": every draw recorded, one segment (the switches to the game's targets cut nothing)");
+			if (!ok)
+				break;
+			uint32_t drawn = 0;
+			ok = replay_d12(g, bg, *f, ours, why, drawn);
+			check(ok, "screen passes, frame " + std::to_string(frame) + ": drawn on Direct3D 12 with targets of ours" + (ok ? "" : ": " + why));
+		}
+		std::string first;
+		const uint32_t messages = debug_messages(g.info, first);
+		check(messages == 0, "screen passes: the debug layer: nothing (" + std::to_string(messages) + (messages != 0 ? ": " + first : std::string()) + ")");
+		if (ok)
+		{
+			uint64_t near_ = 0, close = 0, total = 0;
+			uint32_t worst = 0;
+			for (UINT y = 0; y < H; ++y)
+				for (UINT x = 0; x < W; ++x)
+				{
+					if (x < 24 && y >= H - 24)
+						continue;
+					const uint8_t *p = ref.data() + (size_t(y) * W + x) * 4, *q = ours.data() + (size_t(y) * W + x) * 4;
+					uint32_t m = 0;
+					for (int k = 0; k < 3; ++k)
+						m = std::max<uint32_t>(m, uint32_t(std::abs(int(p[2 - k]) - int(q[k]))));
+					total++, close += m <= 1, near_ += m <= 4, worst = std::max(worst, m);
+				}
+			char line[200];
+			std::snprintf(line, sizeof(line), "screen passes, frame 2: A as dgVoodoo's: %.3f%% within 1, %.3f%% within 4, worst %u", 100.0 * close / total, 100.0 * near_ / total, worst);
+			check(close * 100 >= total * 98 && near_ * 1000 >= total * 999, line);
+			if (const char *e = std::getenv("UI2D_SAVE"); e != nullptr && *e == '1')
+			{
+				save_bmp("passes-dgv.bmp", ref, true);
+				save_bmp("passes-ours.bmp", ours, false);
+			}
+		}
+		ud::set_mode(ud::off);
+		ud::drop_textures();
+		ud::set_render_targets(0, 0);
+		a->Release(), frozen->Release(), history->Release(), a_depth->Release(), bb->Release(), bb_depth->Release();
+	}
+
+	// The UI-size target (config 0x25/0x26): A copied into it with alpha 0, the interface drawn into it, 00ABE0's
+	// stretch over the back buffer (alpha > 0 lands). With the UI at the screen's size, as dgVoodoo's; at half of it,
+	// ours drawn at the screen's size: sharper, the same once both are blurred over 4 x 4
+	void run_ui_target(dgv &d, d12 &g, UINT uw, UINT uh)
+	{
+		const std::string name = "UI-size target " + std::to_string(uw) + "x" + std::to_string(uh);
+		std::printf("-- %s\n", name.c_str());
+		IDirect3DDevice8 *dev = d.dev;
+		scenario sc = coverage();
+		std::vector<IDirect3DTexture8 *> tex = make_textures(d, sc);
+		IDirect3DTexture8 *a = nullptr, *ui = nullptr;
+		IDirect3DSurface8 *a_depth = nullptr, *ui_depth = nullptr, *bb = nullptr, *bb_depth = nullptr;
+		dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &a);
+		dev->CreateTexture(uw, uh, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &ui);
+		dev->CreateDepthStencilSurface(W, H, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, &a_depth);
+		dev->CreateDepthStencilSurface(uw, uh, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, &ui_depth);
+		dev->GetRenderTarget(&bb);
+		dev->GetDepthStencilSurface(&bb_depth);
+		IDirect3DSurface8 *const as = surface_of(a), *const us = surface_of(ui);
+		ud::set_render_targets(reinterpret_cast<uintptr_t>(a), reinterpret_cast<uintptr_t>(ui));
+		std::vector<uint8_t> world, bg, ref, ours;
+		dev->BeginScene();
+		dev->SetRenderTarget(as, a_depth);
+		dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF000000, 1.0f, 0);
+		background(d);
+		read_surface(d, as, world);
+		dev->SetRenderTarget(bb, bb_depth);
+		dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0xFF404040, 1.0f, 0);
+		D3DVIEWPORT8 full = { 0, 0, W, H, 0.0f, 1.0f };
+		dev->SetViewport(&full);
+		read_back(d, bg);
+		ud::set_mode(ud::shadow);
+		ud::window_begin(reinterpret_cast<uintptr_t>(dev));
+		// (the tail at 0127A7: into the UI target, A copied with the tint and alpha 0)
+		dev->SetRenderTarget(us, ui_depth);
+		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE2X);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+		dev->SetTexture(0, a);
+		quad(dev, 0, 0, float(uw), float(uh), 0, 0, 1, 1, 0x00808080);
+		dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+		// The interface at the UI's size: the coverage case's sprites, text and blends, its first 60 draws
+		const std::vector<op> all = sc.ops;
+		sc.ops.clear();
+		uint32_t draws = 0;
+		for (const op &o : all)
+		{
+			if (o.kind == op::draw && ++draws > 60)
+				break;
+			if (o.kind == op::rs && (o.a == 7 || o.a == 28))
+				continue; // (no Z, no fog: nothing to the game)
+			sc.ops.push_back(o);
+		}
+		const uint32_t vp_ui[4] = { 0, 0, uw, uh };
+		(void)vp_ui;
+		D3DVIEWPORT8 uiv = { 0, 0, uw, uh, 0.0f, 1.0f };
+		dev->SetViewport(&uiv);
+		run_ops(d, sc, tex);
+		// Back to the back buffer, 00ABE0's stretch
+		dev->SetRenderTarget(bb, bb_depth);
+		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+		dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+		dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		dev->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		dev->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+		dev->SetTextureStageState(0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
+		dev->SetTextureStageState(0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+		dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+		dev->SetRenderState(D3DRS_ALPHAREF, 0);
+		dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_FLAT);
+		dev->SetTexture(0, ui);
+		quad(dev, 0, 0, W, H, 0, 0, 1, 1, 0x80808080);
+		dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+		ud::window_flush(hifi::slotmark::ui_end);
+		ud::window_flush(hifi::slotmark::frame_end);
+		read_back(d, ref);
+		dev->EndScene();
+		dev->Present(nullptr, nullptr, nullptr, nullptr);
+		const ud::counts c = ud::get_counts();
+		const u2::frame *f = u2::published(c.seq & 15);
+		check(f != nullptr && f->segments.load() == 1, name + ": the copy, the interface and the stretch recorded, one segment (" +
+			std::to_string(f != nullptr ? f->segments.load() : 0) + ")");
+		if (f == nullptr)
+			return;
+		load_pixels(g, g.world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, world);
+		uint32_t drawn = 0;
+		std::string why;
+		const bool ok = replay_d12(g, bg, *f, ours, why, drawn, true);
+		check(ok, name + ": drawn on Direct3D 12 (the world read, the UI-size target ours)" + (ok ? "" : ": " + why));
+		if (!ok)
+			for (const hifi::passes::module &m : hifi::passes::modules())
+				if (m.status != nullptr && std::strcmp(m.name, "ui") == 0)
+					for (const std::string &l : m.status())
+						std::printf("     %s\n", l.c_str());
+		std::string first;
+		const uint32_t messages = debug_messages(g.info, first);
+		check(messages == 0, name + ": the debug layer: nothing (" + std::to_string(messages) + (messages != 0 ? ": " + first : std::string()) + ")");
+		if (ok)
+		{
+			// (blurred over 9 x 9 when the UI's size is the screen's half: ours is drawn at the screen's size, sharper)
+			const int r = uw == W ? 0 : 4;
+			uint64_t near_ = 0, total = 0, changed = 0;
+			uint32_t worst = 0;
+			for (UINT y = 8; y + 8 < H; y += r != 0 ? 3 : 1)
+				for (UINT x = 8; x + 8 < W; x += r != 0 ? 3 : 1)
+				{
+					if (x < 32 && y >= H - 32)
+						continue;
+					int sa[3] = {}, sb[3] = {}, n = 0;
+					for (int dy = -r; dy <= r; ++dy)
+						for (int dx = -r; dx <= r; ++dx, ++n)
+						{
+							const uint8_t *p = ref.data() + (size_t(y + dy) * W + x + dx) * 4, *q = ours.data() + (size_t(y + dy) * W + x + dx) * 4;
+							for (int k = 0; k < 3; ++k)
+								sa[k] += p[2 - k], sb[k] += q[k];
+						}
+					uint32_t m = 0;
+					for (int k = 0; k < 3; ++k)
+						m = std::max<uint32_t>(m, uint32_t(std::abs(sa[k] - sb[k]) / n));
+					const uint8_t *z = bg.data() + (size_t(y) * W + x) * 4, *p = ref.data() + (size_t(y) * W + x) * 4;
+					changed += z[0] != p[0] || z[1] != p[1] || z[2] != p[2];
+					total++, near_ += m <= (r != 0 ? 16u : 4u), worst = std::max(worst, m);
+				}
+			// (the sharpness: the summed horizontal steps of each picture)
+			uint64_t steps_ref = 0, steps_ours = 0;
+			for (UINT y = 0; y < H; y += 2)
+				for (UINT x = 1; x < W; ++x)
+					for (int k = 0; k < 3; ++k)
+					{
+						steps_ref += uint64_t(std::abs(int(ref[(size_t(y) * W + x) * 4 + k]) - int(ref[(size_t(y) * W + x - 1) * 4 + k])));
+						steps_ours += uint64_t(std::abs(int(ours[(size_t(y) * W + x) * 4 + k]) - int(ours[(size_t(y) * W + x - 1) * 4 + k])));
+					}
+			if (r != 0)
+				check(steps_ours * 100 > steps_ref * 105, name + ": ours sharper than the game's stretch (steps " + std::to_string(steps_ours) + " against " + std::to_string(steps_ref) + ")");
+			char line[220];
+			std::snprintf(line, sizeof(line), "%s: the back buffer as dgVoodoo's%s: %.3f%% within %u, worst %u (%llu pixels changed)", name.c_str(),
+				r != 0 ? " (both blurred)" : "", 100.0 * near_ / total, r != 0 ? 16u : 4u, worst, static_cast<unsigned long long>(changed));
+			// (the stress case's noise-like pictures through the alpha test of the stretch: an edge texel's alpha just
+			// above or at 0 takes its pixel whole)
+			check(changed > total / 10 && near_ * 1000 >= total * (r != 0 ? 920 : 980), line);
+			if (const char *e = std::getenv("UI2D_SAVE"); e != nullptr && *e == '1')
+			{
+				save_bmp("uitarget-" + std::to_string(uw) + "-dgv.bmp", ref, true);
+				save_bmp("uitarget-" + std::to_string(uw) + "-ours.bmp", ours, false);
+			}
+		}
+		ud::set_mode(ud::off);
+		for (IDirect3DTexture8 *t : tex)
+			if (t != nullptr)
+				t->Release();
+		ud::drop_textures();
+		ud::set_render_targets(0, 0);
+		a->Release(), ui->Release(), a_depth->Release(), ui_depth->Release(), bb->Release(), bb_depth->Release();
+	}
+	// Character creation's Dancer (notes-screen-passes 5) draws into A before the loop tail with A's stencil: its depth
+	// and stencil cleared, its scene counted into the stencil (INCR), composited where the count is above 0. The
+	// windows' markers come after it, on the same stencil: the frame must come out the same with them as without
+	// (the windows off), A and the back buffer alike; and a stencil-tested draw inside a window is the game's
+	void run_lobby(dgv &d)
+	{
+		std::printf("-- character creation: the Dancer's stencil before the windows\n");
+		IDirect3DDevice8 *dev = d.dev;
+		scenario sc = coverage();
+		std::vector<IDirect3DTexture8 *> tex = make_textures(d, sc);
+		std::vector<op> ui;
+		uint32_t draws = 0;
+		for (const op &o : sc.ops)
+		{
+			if (o.kind == op::draw && ++draws > 30)
+				break;
+			ui.push_back(o);
+		}
+		sc.ops = ui;
+		IDirect3DTexture8 *a = nullptr;
+		IDirect3DSurface8 *a_depth = nullptr, *bb = nullptr, *bb_depth = nullptr;
+		dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &a);
+		dev->CreateDepthStencilSurface(W, H, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, &a_depth);
+		dev->GetRenderTarget(&bb);
+		dev->GetDepthStencilSurface(&bb_depth);
+		IDirect3DSurface8 *const as = surface_of(a);
+		ud::set_render_targets(reinterpret_cast<uintptr_t>(a), 0);
+		struct v20
+		{
+			float x, y, z, rhw;
+			DWORD c;
+		};
+		const auto fill = [&](float x0, float y0, float x1, float y1, DWORD c) {
+			const v20 q[4] = { { x0 - 0.5f, y0 - 0.5f, 0, 1, c }, { x1 - 0.5f, y0 - 0.5f, 0, 1, c }, { x0 - 0.5f, y1 - 0.5f, 0, 1, c }, { x1 - 0.5f, y1 - 0.5f, 0, 1, c } };
+			dev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(v20));
+		};
+		std::vector<uint8_t> out[2][2];
+		uint64_t passed = 0;
+		for (int round = 0; round < 2; ++round)
+		{
+			const bool windows = round == 1;
+			dev->BeginScene();
+			dev->SetRenderTarget(as, a_depth);
+			dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0xFF000000, 1.0f, 0);
+			background(d);
+			// The Dancer: Z and stencil cleared, its model counted into the stencil (no colour), then its picture where
+			// the count is above 0; both over row 0, where the markers go
+			dev->Clear(0, nullptr, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+			dev->SetTexture(0, nullptr);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+			dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
+			dev->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_INCR);
+			dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+			fill(0, 0, 400, 300, 0xFFFFFFFF);
+			fill(100, 0, 300, 200, 0xFFFFFFFF);
+			dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+			dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_LESS);
+			dev->SetRenderState(D3DRS_STENCILREF, 0);
+			dev->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP);
+			fill(0, 0, 600, 400, 0xFFC03020);
+			dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+			// A's window: the interface's first draws, then a stencil-tested one (the game's)
+			const ud::counts c0 = ud::get_counts();
+			ud::set_mode(windows ? ud::shadow : ud::off);
+			ud::window_begin(reinterpret_cast<uintptr_t>(dev), true);
+			run_ops(d, sc, tex);
+			dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+			dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+			dev->SetRenderState(D3DRS_STENCILREF, 2);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			dev->SetTexture(0, nullptr);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			fill(250, 100, 700, 500, 0xFF20F040);
+			dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+			ud::window_end();
+			passed += ud::get_counts().passed - c0.passed;
+			read_surface(d, as, out[round][0]);
+			// The resolve onto the back buffer, then its window
+			dev->SetRenderTarget(bb, bb_depth);
+			copy(dev, a, bb, W, H, 0x80808080, bb, bb_depth);
+			ud::window_begin(reinterpret_cast<uintptr_t>(dev));
+			run_ops(d, sc, tex);
+			ud::window_flush(hifi::slotmark::ui_end);
+			ud::window_flush(hifi::slotmark::frame_end);
+			read_back(d, out[round][1]);
+			dev->EndScene();
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+		}
+		check(passed == 1, "character creation: the stencil-tested draw inside A's window left to the game (" + std::to_string(passed) + ")");
+		check(out[0][0] == out[1][0], "character creation: A the same with the windows' markers as without (the Dancer's stencil untouched)");
+		check(out[0][1] == out[1][1], "character creation: the back buffer the same with the windows' markers as without");
+		ud::set_mode(ud::off);
+		for (IDirect3DTexture8 *t : tex)
+			if (t != nullptr)
+				t->Release();
+		ud::drop_textures();
+		ud::set_render_targets(0, 0);
+		a->Release(), a_depth->Release(), bb->Release(), bb_depth->Release();
+	}
 }
 
 // (game.cpp's settings: the plugin's, not used here)
@@ -1475,6 +1987,13 @@ int main(int argc, char **argv)
 	}
 	for (scenario &sc : cases)
 		run_case(d, g, sc);
+	if (cover)
+	{
+		run_screen_passes(d, g);
+		run_ui_target(d, g, W, H);
+		run_ui_target(d, g, W / 2, H / 2);
+		run_lobby(d);
+	}
 
 	std::printf("\n%d passed, %d failed\n", passes, failures);
 	u2::render::release();
