@@ -153,8 +153,17 @@ cbuffer ps : register(b1)
 			s += has_specular ? "\to.fog = float4(v6.a, w, 0, 0);\n" : "\to.fog = float4(1, w, 0, 0);\n";
 			for (int st = 0; st < 8; ++st)
 			{
-				const int set = k.stage_index[st] & 7;
-				s += fmt("\to.t%d = v%d;\n", st, 7 + set);
+				// (through the stage's matrix as well, as dgVoodoo does with pretransformed vertices: the d3dlog replays'
+				// interface drawn after the effects left COUNT2 set)
+				const int set = k.stage_index[st] & 7, v = 7 + set;
+				const int dims = k.inputs[v] >= in_float1 && k.inputs[v] <= in_float4 ? k.inputs[v] : 2;
+				if ((k.stage_xform[st] & 7) != 0)
+				{
+					const std::string tc = dims == 1 ? fmt("float4(v%d.x, 1, 0, 0)", v) : dims == 2 ? fmt("float4(v%d.xy, 1, 0)", v) : dims == 3 ? fmt("float4(v%d.xyz, 1)", v) : fmt("v%d", v);
+					s += fmt("\to.t%d = mul(%s, texm[%d]);\n", st, tc.c_str(), st);
+				}
+				else
+					s += fmt("\to.t%d = v%d;\n", st, v);
 			}
 			s += "\treturn o;\n}\n";
 			return s;

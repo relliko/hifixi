@@ -397,6 +397,8 @@ namespace hifi::d3d8
 					coords[st] = in >= in_float1 && in <= in_float4 ? in : 2;
 					if (st < stages && (tf & D3DTTFF_PROJECTED))
 						coords[st] = uint8_t(std::max<int>(coords[st], 2));
+					if (st < stages && decl->rhw)
+						k.stage_xform[st] = uint8_t((tf & 7) | ((tf & D3DTTFF_PROJECTED) ? 0x80 : 0));
 					continue;
 				}
 				k.stage_gen[st] = uint8_t((tci >> 16) & 3);
@@ -535,7 +537,12 @@ namespace hifi::d3d8
 				continue;
 			views[st] = img->srv;
 			const DWORD *t = s.tss[st];
-			const DWORD mn = t[D3DTSS_MINFILTER], mg = t[D3DTSS_MAGFILTER], mp = t[D3DTSS_MIPFILTER];
+			DWORD mn = t[D3DTSS_MINFILTER], mg = t[D3DTSS_MAGFILTER];
+			const DWORD mp = t[D3DTSS_MIPFILTER];
+			// (a stage that isn't point sampled both ways is filtered linear both ways: dgVoodoo's with Phoenix's conf,
+			// Filtering 1 and KeepFilterIfPointSampled, seen in the d3dlog replays' interface)
+			if ((mn == D3DTEXF_LINEAR || mg == D3DTEXF_LINEAR) && mn != D3DTEXF_ANISOTROPIC && mg != D3DTEXF_ANISOTROPIC)
+				mn = mg = D3DTEXF_LINEAR;
 			if (mn == D3DTEXF_ANISOTROPIC || mg == D3DTEXF_ANISOTROPIC)
 			{
 				sd.Filter = D3D12_FILTER_ANISOTROPIC;
