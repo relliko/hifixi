@@ -13,6 +13,9 @@
 // Distortion (0426F0): a draw with a grab first copies the world as drawn so far (resolved when multisampled) and draws
 // the grab's quad of it into a 256 x 256 target of ours (the game's VA 0490BB88), which the draw then samples
 // (kDistTexture: textures' reserved descriptor 1; the world's copy is reserved descriptor 2).
+//
+// Light spots (040E70): an element into_spot draws into that same target (cleared, with a 256 x 256 depth of ours), the
+// ground after it samples it (kSpotTexture, CLAMP).
 
 #include <d3d12.h>
 #include "fxframe.hpp"
@@ -33,7 +36,7 @@ namespace hifi::fx
 
 	struct run_stats
 	{
-		uint32_t elements = 0, draws = 0, triangles = 0, grabs = 0;
+		uint32_t elements = 0, draws = 0, triangles = 0, grabs = 0, spots = 0;
 	};
 
 	class fx_renderer
@@ -52,6 +55,7 @@ namespace hifi::fx
 		// a pixel shader); the world's target bound again by the caller. False: the draw is skipped.
 		bool grab(ID3D12GraphicsCommandList *list, const target &t, const fx::grab &g);
 		bool dist_resources(const target &t);
+		bool spot_resources(const target &t);
 
 		ID3D12Device *_device = nullptr;
 		void *_vs = nullptr, *_ps = nullptr, *_vs_grab = nullptr, *_ps_grab = nullptr; // (ID3DBlob)
@@ -63,6 +67,9 @@ namespace hifi::fx
 		ID3D12Resource *_dist = nullptr, *_scene = nullptr;
 		ID3D12DescriptorHeap *_dist_rtv = nullptr;
 		ID3D12PipelineState *_grab_pso = nullptr;
+		// Light spots: their picture's depth (the target is the distortion's)
+		ID3D12Resource *_spot_depth = nullptr;
+		ID3D12DescriptorHeap *_spot_dsv = nullptr;
 		DXGI_FORMAT _dist_format = DXGI_FORMAT_UNKNOWN;
 		UINT64 _scene_width = 0;
 		UINT _scene_height = 0;

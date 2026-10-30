@@ -124,6 +124,26 @@ namespace hifi::game::fxdraw
 		constexpr const char *kGlyphBind = "0FBE14295052B9????????E8????????84C074548B5424288D8424D4000000B904000000";
 		constexpr const char *kGlyphDraw = "8D9424C40000006A1C526A026A05E8????????8B442414";
 		constexpr intptr_t kGlyphBindAt = 0xB, kGlyphDrawAt = 0xE;
+		// The light spots: 040E70 (vtable 0x32B3B8's class draw), its calls of 054D70 (the 256 x 256 target and the
+		// look-at), 044C40 (the element's point) and 054F80 (-> 182700, the ground)
+		constexpr const char *kSpotDraw = "83EC28538BD98B830401000085C00F84????????A1????????5556578B88900A0000";
+		constexpr intptr_t kSpotTargetCall = 0x4C, kSpotPointCall = 0x88, kSpotGroundCall = 0x107;
+		// 054D70: mov eax, [the target VA 0490BB88] (+1); fsub [2.0] (+0x12D); the up vector's z -1 (+0xDC, mov [VA], imm);
+		// call 2D7FF9 (+0x156, D3DXMatrixLookAtRH); mov eax, 0.25 (+0x193, the scale)
+		constexpr uint8_t kSpotTargetHead[] = { 0xA1 }, kSpotScale[] = { 0xB8, 0x00, 0x00, 0x80, 0x3E };
+		constexpr intptr_t kSpotTargetLift = 0x12D, kSpotTargetUp = 0xDC, kSpotTargetLookAt = 0x156, kSpotTargetScale = 0x193;
+		// 054F80: mov ecx, [the target] (+0x12); push 10.0 (+0x1C); mov ecx, [the renderer] (+0x2B); call 182700 (+0x31)
+		constexpr intptr_t kSpotMapTarget = 0x12, kSpotMapSize = 0x1C, kSpotMapRenderer = 0x2B, kSpotMapCall = 0x31;
+		// 182700: its statics (the map's centre VA 04807338/3C/40 at +0x2C8/+0x2CE/+0x2D3, its height scale VA 04807348 at
+		// +0x22F), the cells' scale 0.25 (+0x395), lea ecx, [renderer + 0x178] (+0x36A) and call 167940 (+0x370), mov edx,
+		// [renderer + 0x17C] (+0x388), cmp eax, 1500 (+0x75E)
+		constexpr uint8_t kGroundHead[] = { 0xD9, 0x44, 0x24, 0x10, 0xD8, 0x1D };
+		constexpr uint8_t kGroundGrid[] = { 0x8D, 0x8F, 0x78, 0x01, 0x00, 0x00 }, kGroundSkip[] = { 0x8B, 0x97, 0x7C, 0x01, 0x00, 0x00 };
+		constexpr uint8_t kGroundLimit[] = { 0x3D, 0xDC, 0x05, 0x00, 0x00 };
+		constexpr uint8_t kGridOf[] = { 0x8B, 0x41, 0x60, 0x85, 0xC0, 0x75, 0x03, 0x33, 0xC0, 0xC3, 0x8D, 0x41, 0x08, 0xC3 }; // 167940
+		constexpr intptr_t kGroundCentre[3] = { 0x2C8, 0x2CE, 0x2D3 }, kGroundHeight = 0x22F, kGroundCell = 0x395, kGroundGridAt = 0x36A, kGroundGridCall = 0x370,
+			kGroundSkipAt = 0x388, kGroundLimitAt = 0x75E;
+		constexpr uint32_t kGroundMost = 1501; // (a collision mesh's triangles 182700 draws at most)
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
 		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
@@ -185,6 +205,12 @@ namespace hifi::game::fxdraw
 			uint8_t saved_bind[5] = {}, ours_bind[5] = {}, saved_glyph[5] = {}, ours_glyph[5] = {};
 			uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // (054B81 patched when all found; 03EBF0, VA 0490B970)
 			uint8_t saved_flare[5] = {}, ours_flare[5] = {};
+			// (the light spots: 040E70, 044C40, 2D7FF9, VA 0490BB88; 054D70's 2.0 and 054F80's 10.0; 182700's statics: the map's
+			// centre and height scale, the cells' scale; 0 any: the game's)
+			uintptr_t spot_draw = 0, spot_point = 0, spot_look_at = 0, spot_target = 0;
+			float spot_lift = 0.0f, spot_size = 0.0f;
+			uintptr_t spot_centre[3] = {}, spot_height = 0, spot_cell = 0;
+			uint32_t fog_raw = 0; // (common()'s fog colour before H's black: the ground's, by its own letter)
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
 			bool in = false;
@@ -433,6 +459,7 @@ namespace hifi::game::fxdraw
 					out.fog = table != 0 ? 1 : vertex != 0 ? (range != 0 ? 2 : 1) : 0;
 				}
 				out.fog_colour = (letter & 0xFF) == 0x48 ? 0 : fog_colour;
+				g.fog_raw = fog_colour;
 				out.fog_start = fog_start;
 				out.fog_end = fog_end;
 			}
@@ -882,6 +909,244 @@ namespace hifi::game::fxdraw
 			f.draw_count += count;
 			f.element_count++;
 			g.n.taken[fx::class_mmb]++;
+			return true;
+		}
+
+		// A light spot's ground (182700, R; thiscall on the zone renderer: the point, the 256 x 256 target's texture, the
+		// map's size 10.0), as the game makes it, into the frame's vertices after the ones there: a planar map M = T(-p) x
+		// S(1 / size, the static VA 04807348 (1.0), 1 / size) x T(the statics VA 04807338/3C/40: 0.5, 0, 0.5) (16C060 three
+		// times); the collision grid (167940 on renderer + 0x178: renderer + 0x180 when + 0x1D8 is set, else nothing
+		// drawn); its cells round the point: cx = int((grid + 0x38 + p.x) x 0.25), cz the same with + 0x3C and p.z, cx - 1
+		// .. cx + 1 and cz - 1 .. cz + 1 each kept in 0 .. grid + 0x40 - 1 (+ 0x44 for z); a cell's list (grid + 0x58)[W
+		// z + x] a chain of groups (a dword whose low 11 bits count the (instance, mesh) pairs after it, then the next
+		// group); a pair skipped when the instance's + 0xBC is the renderer's + 0x17C or the mesh's word + 0xE is set;
+		// WORLD the instance's matrix (its first 64 bytes), C = it x M; each triangle (mesh + 8, four words: corners in the
+		// low 15 / 14 / 14 bits, the normal's in the low 15; + 0xC of them) whose normal (mesh + 4) has (C's column 1) <= 0
+		// as three vertices (the position (mesh + 0), 0xFF808080, UV = (x, y, z, 1) by C's columns 0 and 2), at most 1501 a
+		// pair (the 1502nd is written, then the loop leaves); a mesh in two cells is drawn twice, as the game does. Each
+		// position is put through the instance's matrix here (the ground's WORLD is then the camera's VIEW); the sums in
+		// the game's order. False: no room.
+		bool spot_ground(const float p[3], uint32_t &added)
+		{
+			fx::frame &f = *g.f;
+			added = 0;
+			const uintptr_t renderer = at<uint32_t>(g.renderer);
+			if (renderer == 0 || at<uint32_t>(renderer + 0x178 + 0x60) == 0)
+				return true;
+			const uintptr_t grid = renderer + 0x178 + 8;
+			// (16C060: out = a x b, each sum from 0 in the order k = 0 .. 3)
+			const auto multiply = [](const float *a, const float *b, float *out) {
+				float r[16];
+				for (int i = 0; i < 4; ++i)
+					for (int j = 0; j < 4; ++j)
+					{
+						float s = 0.0f;
+						for (int k = 0; k < 4; ++k)
+							s += a[4 * i + k] * b[4 * k + j];
+						r[4 * i + j] = s;
+					}
+				std::memcpy(out, r, sizeof(r));
+			};
+			const float inv = g.spot_size != 0.0f ? 1.0f / g.spot_size : 1.0f;
+			float m[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+			float t[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -p[0], -p[1], -p[2], 1 };
+			multiply(m, t, m);
+			const float s[16] = { inv, 0, 0, 0, 0, at<float>(g.spot_height), 0, 0, 0, 0, inv, 0, 0, 0, 0, 1 };
+			multiply(m, s, m);
+			const float c[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, at<float>(g.spot_centre[0]), at<float>(g.spot_centre[1]), at<float>(g.spot_centre[2]), 1 };
+			multiply(m, c, m);
+			const float cell = at<float>(g.spot_cell);
+			const int32_t cx = int32_t((at<float>(grid + 0x38) + p[0]) * cell), cz = int32_t((at<float>(grid + 0x3C) + p[2]) * cell);
+			const int32_t w = at<int32_t>(grid + 0x40), h = at<int32_t>(grid + 0x44);
+			const auto keep = [](int32_t v, int32_t n) { return v < 0 ? 0 : std::min(v, n - 1); };
+			const int32_t x0 = keep(cx - 1, w), x1 = keep(cx + 1, w), z0 = keep(cz - 1, h), z1 = keep(cz + 1, h);
+			const uint32_t skip = at<uint32_t>(renderer + 0x17C);
+			const uintptr_t cells = at<uint32_t>(grid + 0x58);
+			for (int32_t z = z0; z <= z1; ++z)
+				for (int32_t x = x0; x <= x1; ++x)
+				{
+					uintptr_t group = at<uint32_t>(cells + 4 * uintptr_t(w * z + x));
+					for (int guard = 0; group != 0 && guard < 65536; ++guard)
+					{
+						const uint32_t pairs = at<uint32_t>(group) & 0x7FF;
+						for (uint32_t k = 0; k < pairs; ++k)
+						{
+							const uintptr_t inst = at<uint32_t>(group + 4 + 8 * k), mesh = at<uint32_t>(group + 8 + 8 * k);
+							if (skip == at<uint32_t>(inst + 0xBC) || at<uint16_t>(mesh + 0xE) != 0)
+								continue;
+							float W[16], C[16];
+							std::memcpy(W, reinterpret_cast<const void *>(inst), 64);
+							multiply(W, m, C);
+							const uintptr_t pos = at<uint32_t>(mesh), nrm = at<uint32_t>(mesh + 4), tri = at<uint32_t>(mesh + 8);
+							const int32_t count = at<int16_t>(mesh + 0xC);
+							uint32_t drawn = 0;
+							for (int32_t i = 0; i < count && drawn < kGroundMost; ++i)
+							{
+								const uintptr_t tw = tri + 8 * uintptr_t(i);
+								const uintptr_t n = nrm + 12 * uintptr_t(at<uint16_t>(tw + 6) & 0x7FFF);
+								const float d = (C[9] * at<float>(n + 8) + C[5] * at<float>(n + 4)) + C[1] * at<float>(n);
+								if (d > 0.0f)
+									continue;
+								if (f.vertex_count + added + 3 > fx::kMaxVertices)
+									return false;
+								const uint32_t corner[3] = { at<uint16_t>(tw) & 0x7FFFu, at<uint16_t>(tw + 2) & 0x3FFFu, at<uint16_t>(tw + 4) & 0x3FFFu };
+								for (int v = 0; v < 3; ++v)
+								{
+									const uintptr_t q = pos + 12 * uintptr_t(corner[v]);
+									const float px = at<float>(q), py = at<float>(q + 4), pz = at<float>(q + 8);
+									fx::vertex &o = f.vertices[f.vertex_count + added + uint32_t(v)];
+									o = fx::vertex();
+									for (int k2 = 0; k2 < 3; ++k2)
+										o.pos[k2] = px * W[k2] + py * W[4 + k2] + pz * W[8 + k2] + W[12 + k2];
+									o.colour = 0xFF808080u;
+									// (the first corner's sums x, z, y; the others' z, y, x: as 182700 adds them)
+									if (v == 0)
+									{
+										o.uv[0] = ((C[0] * px + C[8] * pz) + C[4] * py) + C[12];
+										o.uv[1] = ((C[2] * px + C[10] * pz) + C[6] * py) + C[14];
+									}
+									else
+									{
+										o.uv[0] = ((C[8] * pz + C[4] * py) + C[0] * px) + C[12];
+										o.uv[1] = ((C[10] * pz + C[6] * py) + C[2] * px) + C[14];
+									}
+								}
+								added += 3;
+								drawn++;
+							}
+						}
+						group = at<uint32_t>(group + 4 + 8 * uintptr_t(pairs));
+					}
+				}
+			return true;
+		}
+
+		// A light spot (vtable 0x32B3B8, its class draw 040E70; R) into the frame; false: the game's. 040E70: no model,
+		// nothing. WORLD = the local matrix +0x60 (06A480); 054D70: the 256 x 256 target (VA 0490BB88: +4 its texture, +8
+		// its surface, +0xC its own depth; none: it answers 0 and the D3M would go to the world, so the game's) made the
+		// render target and cleared (colour 0, z 1.0), VIEW and PROJECTION pushed, the viewport 256 x 256, VIEW =
+		// D3DXMatrixLookAtRH(eye = WORLD's translation moved by -2.0 in y, at = that translation, up (0, 0, -1)) (2D7FF9,
+		// called here), WORLD = scale 0.25 x WORLD (math vt+0x24, called here); then the D3M as 040220 draws it (record_d3m:
+		// its states the first 0467E0's, PROJECTION the element's own) into that target; an MMB (040C20) or a lit element
+		// (its lights would be the look-at's) left to the game. 0472F0, the transforms and the target put back, then 0467E0
+		// again with vt+0x3C's letter (+0x198: the ground's blend, fog black for H; z write and PROJECTION as before);
+		// 054F80: VIEW = the camera's (gfx +0xB50), 182700 on the element's point (044C40, called here): spot_ground. The
+		// ground's texture stages are the last the D3M left (TEXTUREFACTOR too: 0467E0 doesn't set it), stage 0 the target
+		// with ADDRESS CLAMP. Recorded as two elements: the D3M into the light-spot target (into_spot), then the ground
+		// with it (kSpotTexture). A D3M with no vertex buffer (040220 sets no states then) is the game's.
+		using letter_fn = uint32_t(__fastcall *)(uintptr_t element, uintptr_t edx);
+		using point_of_fn = float *(__fastcall *)(uintptr_t element, uintptr_t edx, float *out);
+		using look_at_fn = float *(__stdcall *)(float *out, const float *eye, const float *at, const float *up);
+
+		bool record_spot(uintptr_t e)
+		{
+			fx::frame &f = *g.f;
+			const uint32_t handle = at<uint32_t>(e + kModel);
+			if (handle == 0)
+			{
+				g.n.empty++;
+				return true;
+			}
+			const uintptr_t target = at<uint32_t>(g.spot_target), math = at<uint32_t>(g.math);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			if (target == 0 || at<uint32_t>(target + 4) == 0 || math == 0 || at<uint8_t>(e + kMmb) != 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			if ((flags & (1u << 16)) != 0)
+			{
+				g.n.lit++;
+				return false;
+			}
+			const uint32_t resource = at<uint32_t>(handle);
+			if (resource == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// (the ground's letter: vt+0x3C, the class's own +0x198)
+			const uint16_t ground_letter = uint16_t(reinterpret_cast<letter_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(e) + 0x3C)))(e, 0));
+			uint32_t unused = 0;
+			uint8_t ground_blend = fx::blend_add;
+			if (!letter_blend(ground_letter, unused, ground_blend))
+			{
+				g.n.letter++;
+				return false;
+			}
+			// The D3M as 040220 draws it (its own counts moved to the spot's after)
+			const uint32_t e0 = f.element_count, d0 = f.draw_count, v0 = f.vertex_count;
+			const uint64_t empty0 = g.n.empty;
+			if (!record_d3m(e, resource))
+				return false;
+			const auto undo = [&]() {
+				f.element_count = e0;
+				f.draw_count = d0;
+				f.vertex_count = v0;
+			};
+			if (f.element_count == e0)
+			{
+				g.n.empty = empty0;
+				g.n.unsupported++;
+				return false;
+			}
+			g.n.taken[fx::class_d3m]--;
+			fx::element &src = f.elements[e0];
+			if (src.draws == 0)
+			{
+				// (a D3M with nothing in it: nothing in the picture, so nothing on the ground)
+				undo();
+				g.n.empty++;
+				return true;
+			}
+			// 054D70's look-at from WORLD = +0x60, and the scale
+			float local[16], scale[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }, scaled[16], view[16];
+			std::memcpy(local, reinterpret_cast<const void *>(e + 0x60), 64);
+			const float eye[3] = { local[12], local[13] - g.spot_lift, local[14] }, to[3] = { local[12], local[13], local[14] }, up[3] = { 0.0f, 0.0f, -1.0f };
+			reinterpret_cast<look_at_fn>(g.spot_look_at)(view, eye, to, up);
+			scale[0] = scale[5] = scale[10] = 0.25f;
+			const uintptr_t mvt = at<uint32_t>(math);
+			reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(mvt + kProductB)))(math, 0, scaled, scale, local);
+			// (WORLD x VIEW in one: the shader's world is the view space's)
+			for (int i = 0; i < 4; ++i)
+				for (int j = 0; j < 4; ++j)
+					src.world[4 * i + j] = scaled[4 * i] * view[j] + scaled[4 * i + 1] * view[4 + j] + scaled[4 * i + 2] * view[8 + j] + scaled[4 * i + 3] * view[12 + j];
+			src.into_spot = 1;
+			src.cls = fx::class_spot;
+			const uint32_t ground_stages = f.draws[src.first_draw + src.draws - 1].stages | fx::stage_clamp;
+			// The ground: 182700 on the element's point
+			float point[3] = {};
+			reinterpret_cast<point_of_fn>(g.spot_point)(e, 0, point);
+			uint32_t added = 0;
+			if (!spot_ground(point, added) || f.element_count + 2 > fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws)
+			{
+				undo();
+				g.n.full++;
+				return false;
+			}
+			if (added == 0)
+			{
+				// (nothing under it: the game draws the D3M into its target and nothing more)
+				undo();
+				g.n.empty++;
+				return true;
+			}
+			fx::element &out = f.elements[e0 + 1];
+			out = src;
+			std::memcpy(out.world, f.view, 64);
+			out.into_spot = 0;
+			out.blend = ground_blend;
+			out.fog_colour = (ground_letter & 0xFF) == 0x48 ? 0 : g.fog_raw;
+			out.uv[0] = out.uv[1] = 0.0f;
+			out.light = out.env = out.spec = fx::kNone;
+			out.zone = nullptr;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			f.draws[f.draw_count++] = { f.vertex_count, added, fx::kSpotTexture, ground_stages };
+			f.vertex_count += added;
+			f.element_count = e0 + 2;
+			g.n.taken[fx::class_spot]++;
+			g.n.spot_triangles += added / 3;
 			return true;
 		}
 
@@ -2413,6 +2678,8 @@ namespace hifi::game::fxdraw
 			}
 			if (cls == g.distring_draw && g.distring_draw != 0)
 				return record_dist_ring(e);
+			if (cls == g.spot_draw && g.spot_draw != 0)
+				return record_spot(e);
 			if ((cls == g.distmodel_draw && g.distmodel_draw != 0) || (cls == g.distmorph_draw && g.distmorph_draw != 0))
 			{
 				// (043320: a weather element 002D80 hides: nothing drawn; 043590 has no such check. Without a model 043590 draws
@@ -2761,6 +3028,45 @@ namespace hifi::game::fxdraw
 			n.spec_draw = sp;
 			n.spec_cubemap = word(cube + kSpecCubemapAt);
 		}
+		if (const uintptr_t sp = find(kSpotDraw); sp != 0)
+		{
+			// (040E70's three calls; 054D70's target, 2.0, up z -1, look-at call and 0.25; 054F80's target, 10.0, renderer
+			// and call of 182700; 182700's statics, grid call, skip and limit: each by its opcode, else the game's)
+			uint8_t b[10] = {};
+			const auto call_at = [&](uintptr_t a) { return read(a, b, 1) && b[0] == 0xE8 ? uintptr_t(rel_target(a)) : uintptr_t(0); };
+			const uintptr_t target_fn = call_at(sp + kSpotTargetCall), point_fn = call_at(sp + kSpotPointCall), ground_fn = call_at(sp + kSpotGroundCall);
+			const uintptr_t map_fn = ground_fn != 0 ? call_at(ground_fn + kSpotMapCall) : 0;
+			bool ok = target_fn != 0 && point_fn != 0 && map_fn != 0 && code_is(target_fn, reinterpret_cast<const char *>(kSpotTargetHead), sizeof(kSpotTargetHead)) &&
+				code_is(target_fn + kSpotTargetScale, reinterpret_cast<const char *>(kSpotScale), sizeof(kSpotScale)) &&
+				read(target_fn + kSpotTargetUp, b, 10) && b[0] == 0xC7 && b[1] == 0x05 && word(target_fn + kSpotTargetUp + 6) == 0xBF800000u &&
+				read(target_fn + kSpotTargetLift, b, 2) && b[0] == 0xD8 && b[1] == 0x25 && call_at(target_fn + kSpotTargetLookAt) != 0 &&
+				read(ground_fn + kSpotMapTarget, b, 2) && b[0] == 0x8B && b[1] == 0x0D && word(ground_fn + kSpotMapTarget + 2) == word(target_fn + 1) &&
+				read(ground_fn + kSpotMapSize, b, 1) && b[0] == 0x68 && read(ground_fn + kSpotMapRenderer, b, 2) && b[0] == 0x8B && b[1] == 0x0D &&
+				word(ground_fn + kSpotMapRenderer + 2) == n.renderer && code_is(map_fn, reinterpret_cast<const char *>(kGroundHead), sizeof(kGroundHead)) &&
+				code_is(map_fn + kGroundGridAt, reinterpret_cast<const char *>(kGroundGrid), sizeof(kGroundGrid)) &&
+				code_is(map_fn + kGroundSkipAt, reinterpret_cast<const char *>(kGroundSkip), sizeof(kGroundSkip)) &&
+				code_is(map_fn + kGroundLimitAt, reinterpret_cast<const char *>(kGroundLimit), sizeof(kGroundLimit)) &&
+				code_is(call_at(map_fn + kGroundGridCall), reinterpret_cast<const char *>(kGridOf), sizeof(kGridOf));
+			// (the statics' operands: 8B 15 / A1 / 8B 0D for the centre, A1 for the height, D8 0D for the cells' scale)
+			const intptr_t centre_operand[3] = { 2, 1, 2 };
+			ok = ok && read(map_fn + kGroundHeight, b, 1) && b[0] == 0xA1 && read(map_fn + kGroundCell, b, 2) && b[0] == 0xD8 && b[1] == 0x0D;
+			for (int k = 0; ok && k < 3; ++k)
+				ok = read(map_fn + kGroundCentre[k], b, 1) && b[0] == (k == 1 ? 0xA1 : 0x8B);
+			if (ok)
+			{
+				n.spot_draw = sp;
+				n.spot_point = point_fn;
+				n.spot_look_at = call_at(target_fn + kSpotTargetLookAt);
+				n.spot_target = word(target_fn + 1);
+				const uint32_t lift = word(word(target_fn + kSpotTargetLift + 2)), size = word(ground_fn + kSpotMapSize + 1);
+				std::memcpy(&n.spot_lift, &lift, 4);
+				std::memcpy(&n.spot_size, &size, 4);
+				for (int k = 0; k < 3; ++k)
+					n.spot_centre[k] = word(map_fn + kGroundCentre[k] + centre_operand[k]);
+				n.spot_height = word(map_fn + kGroundHeight + 1);
+				n.spot_cell = word(map_fn + kGroundCell + 2);
+			}
+		}
 		if (n.dist_draw != 0)
 		{
 			n.distmodel_draw = find(kDistModelDraw);
@@ -2960,7 +3266,7 @@ namespace hifi::game::fxdraw
 			taken += t;
 		char line[1400];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), specular %llu, battle numbers %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), specular %llu, battle numbers %llu, lens flares %llu, light spots %llu on %llu ground triangles; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
@@ -2973,7 +3279,8 @@ namespace hifi::game::fxdraw
 			static_cast<unsigned long long>(g.n.taken[fx::class_dist]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_model]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_dist_morph]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_ring]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_spec]), static_cast<unsigned long long>(g.n.taken[fx::class_number]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_flare]), static_cast<unsigned long long>(g.n.taken[fx::class_spot]),
+			static_cast<unsigned long long>(g.n.spot_triangles),
 			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
@@ -3011,6 +3318,8 @@ namespace hifi::game::fxdraw
 		s.distring_draw = g.distring_draw;
 		s.spec_draw = g.spec_draw;
 		s.spec_cubemap = g.spec_cubemap;
+		s.spot_draw = g.spot_draw;
+		s.spot_target = g.spot_target;
 		s.number_draw = g.number_draw;
 		s.glyph_bind_call = g.glyph_bind_call;
 		s.glyph_bind = g.glyph_bind;

@@ -30,6 +30,7 @@ namespace hifi::fx
 	constexpr uint32_t kMaxGrabs = 256;       // distortion grabs a flush (the world copied into the 256 x 256 target)
 	constexpr uint32_t kNone = 0xFFFFFFFFu;
 	constexpr uint32_t kDistTexture = 0xFFFFFFFEu; // a draw's texture: the distortion target its grab filled
+	constexpr uint32_t kSpotTexture = 0xFFFFFFFDu; // a draw's texture: the light-spot target the element before drew
 
 	// A vertex as the game's FVF 0x152 has it: position, normal, D3DCOLOR (0xAARRGGBB), one UV
 	struct vertex
@@ -94,6 +95,7 @@ namespace hifi::fx
 		stage_spec_keep = 1u << 17,     // the alpha after the texture stage kept (SELECTARG1: letter d, flags bit 28)
 		stage_spec_clamp = 1u << 18,    // the environment sampled CLAMP (+0x198 bit 3), else WRAP
 		stage_spec_tint = 1u << 19,     // the environment tinted (0759C0's copy: x the tint x 2)
+		stage_clamp = 1u << 20,         // stage 0's texture sampled CLAMP (a light spot's ground: 182700's ADDRESSU / V)
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -164,6 +166,9 @@ namespace hifi::fx
 		// and 1 (its rows 0-3), diffuse[0] the tint)
 		uint32_t env = kNone;
 		uint32_t spec = kNone;
+		// A light spot's picture (040E70 -> 054D70): drawn into the 256 x 256 light-spot target (cleared first: colour 0,
+		// depth 1.0) instead of the world, WORLD then the look-at's whole matrix (the scale, +0x60 and the look-at VIEW)
+		uint8_t into_spot = 0;
 	};
 
 	enum element_class : uint32_t
@@ -182,7 +187,9 @@ namespace hifi::fx
 		class_dist_ring = 11,  // rings as distortion (CMoDistRingElem 043720 -> 042D00)
 		class_spec = 12,       // the specular D3M (CMoD3mSpecularElem 0412B0)
 		class_number = 13,     // a battle number (kind 0x5C, 041AF0 -> 041C20): its glyphs' quads as the game places them
-		classes = 14,
+		class_spot = 14,       // a light spot (0x32B3B8 040E70): its D3M into the light-spot target, then the ground under it
+		                       // (182700: the collision map's cells) with that picture
+		classes = 15,
 	};
 
 	struct run
