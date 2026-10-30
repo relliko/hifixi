@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace grass
 {
@@ -2017,9 +2018,31 @@ namespace grass
 		shader_code code;
 		code.key = key;
 		code.blobs.resize(kShaderEntryCount);
-		for (size_t i = 0; i < kShaderEntryCount; ++i)
-			if (!compile(source, kShaderEntries[i].entry, kShaderEntries[i].target, code.blobs[i], error))
-				return false;
+		// Each entry on a thread of its own, as many at once as the CPU has cores but two (one after the other, the
+		// built-in ones took 27 s at the game's start, 2026-10-29): the first that fails, in kShaderEntries' order, is
+		// the one reported, as before
+		{
+			std::vector<std::string> errors(kShaderEntryCount);
+			std::vector<char> failed(kShaderEntryCount, 0);
+			std::atomic<size_t> next{ 0 };
+			const auto work = [&] {
+				for (size_t i; (i = next.fetch_add(1)) < kShaderEntryCount;)
+					failed[i] = !compile(source, kShaderEntries[i].entry, kShaderEntries[i].target, code.blobs[i], errors[i]);
+			};
+			const size_t cores = std::thread::hardware_concurrency();
+			std::vector<std::thread> threads;
+			for (size_t t = 1; t < std::min(kShaderEntryCount, cores > 3 ? cores - 2 : size_t(1)); ++t)
+				threads.emplace_back(work);
+			work();
+			for (std::thread &t : threads)
+				t.join();
+			for (size_t i = 0; i < kShaderEntryCount; ++i)
+				if (failed[i])
+				{
+					error = std::move(errors[i]);
+					return false;
+				}
+		}
 		if (cached)
 			write_shader_cache(cache_folder, code);
 		out = std::move(code);
