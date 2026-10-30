@@ -7,7 +7,10 @@
  *   - the same meshes as the game holds them loaded (section offsets made pointers, a drawn texture command rewritten
  *     0x8000 -> 0x8001 with the texture object in the name's first dword): the same mesh, the object read;
  *   - every texture: its size and an FNV-1a hash of its RGBA rows; the mips: 6 levels down by halves (1 under 32);
- *   - the hide groups a header byte 3 switches on.
+ *   - the hide groups a header byte 3 switches on;
+ *   - every cloth (type-1) mesh in the game's DATs (52): decoded as cloth, its counts and pinned counts, one vertex a
+ *     work vertex (bone i alone, its normal (1, 0, 0)), its triangles, UVs, textures and materials as the oracle walks
+ *     0224D0's commands; the same as the game holds it loaded; the pole beside the banner's cloth decoded as before.
  *
  *   build\chars_data_test.exe <oracle.txt>
  */
@@ -209,12 +212,26 @@ int main(int argc, char **argv)
 	}
 	std::ifstream in(argv[1]);
 	std::string line;
-	std::vector<oracle_mesh> meshes;
+	std::vector<oracle_mesh> meshes, cloths;
 	std::vector<std::string> textures;
+	bool in_cloth = false;
 	while (std::getline(in, line))
 	{
-		if (line.rfind("mesh ", 0) == 0)
+		if (line.rfind("cloth ", 0) == 0)
 		{
+			oracle_mesh m;
+			std::istringstream s(line.substr(6));
+			uint32_t p1 = 0, p2 = 0;
+			s >> m.dat >> m.index >> m.name >> m.n1 >> m.n2 >> p1 >> p2 >> m.tris;
+			m.v.push_back(std::to_string(p1) + " " + std::to_string(p2)); // (its pinned counts)
+			cloths.push_back(m);
+			in_cloth = true;
+		}
+		else if (line.rfind("t ", 0) == 0 && in_cloth)
+			cloths.back().t.push_back(line);
+		else if (line.rfind("mesh ", 0) == 0)
+		{
+			in_cloth = false;
 			oracle_mesh m;
 			std::istringstream s(line.substr(5));
 			std::string rest;
@@ -235,7 +252,10 @@ int main(int argc, char **argv)
 		else if (line.rfind("t ", 0) == 0 && !meshes.empty())
 			meshes.back().t.push_back(line);
 		else if (line.rfind("tex ", 0) == 0)
+		{
+			in_cloth = false;
 			textures.push_back(line);
+		}
 	}
 	check(meshes.size() > 20 && textures.size() > 10, "oracle read: " + std::to_string(meshes.size()) + " meshes, " + std::to_string(textures.size()) + " textures");
 
@@ -366,29 +386,62 @@ int main(int argc, char **argv)
 			os2::hidden_by(0x32) == 64u && os2::hidden_by(0x11) == 0u && os2::hidden_by(1) == 0u,
 		"hide groups: 2 -> 1; 5 -> 1-4, 8; 0x12 -> 5; 0x22 -> 7; 0x32 -> 6; 0x11, 1 -> none");
 
-	// A type-1 mesh (header byte 2 low bits 1: 12-byte vertices, a draw of its own) refused, its model left to the game:
-	// the San d'Orian banner's cloth (NPC model 814, ROM/7/95.DAT 'hf_f'; read as an ordinary mesh it came out in shards),
-	// its pole ('hf_b', an ordinary mesh) decoded
+	// Cloth (type-1) meshes (header byte 2 low bits 1: 12-byte vertices, a draw of its own, 0224D0; read as ordinary
+	// meshes they came out in shards: the San d'Orian banner, NPC model 814, ROM/7/95.DAT 'hf_f'): decoded as cloth, each
+	// vertex the game's work vertex i as "bone i" (os2.hpp mesh::cloth), the triangles as the oracle walks the commands
 	{
-		bool cloth_refused = false, pole_ok = false;
-		std::string cloth_why;
-		for (const chunk &c : chunks_of("ROM/7/95.DAT"))
+		int cloth_ok = 0, cloth_live = 0;
+		for (const oracle_mesh &om : cloths)
 		{
-			if (c.kind != 0x2A)
+			const auto &chs = chunks_of(om.dat);
+			const std::string what = om.dat + " #" + std::to_string(om.index) + " " + om.name;
+			if (om.index >= int(chs.size()))
+			{
+				check(false, what + ": no such chunk");
 				continue;
+			}
+			const chunk &c = chs[om.index];
 			os2::sections s;
 			os2::mesh m;
 			std::string why;
 			const bool ok = os2::sections_of_chunk(c.data.data(), c.data.size(), s) && os2::decode(c.data.data(), c.data.size(), s, m, why);
-			if (std::memcmp(c.name, "hf_f", 4) == 0)
+			bool good = ok && m.cloth && m.one_bone == om.n1 && m.two_bone == om.n2 && !m.mirrored &&
+				om.v.size() == 1 && om.v[0] == std::to_string(m.pinned[0]) + " " + std::to_string(m.pinned[1]) && m.vertices.size() == om.n1 + om.n2 &&
+				m.max_bone == om.n1 + om.n2 - 1;
+			for (uint32_t i = 0; good && i < m.vertices.size(); ++i)
 			{
-				cloth_refused = !ok && why.find("type-1") != std::string::npos;
-				cloth_why = why;
+				const os2::vertex &v = m.vertices[i];
+				good = v.bone[0] == i && v.bone[1] == i && v.w0 == 1.0f && v.w1 == 0.0f && v.p0[0] == 0.0f && v.p0[1] == 0.0f && v.p0[2] == 0.0f && v.n0[0] == 1.0f &&
+					v.n0[1] == 0.0f && v.n0[2] == 0.0f && v.n1[0] == 0.0f;
 			}
-			else if (std::memcmp(c.name, "hf_b", 4) == 0)
-				pole_ok = ok && m.vertices.size() == 432;
+			const std::string dt = ok ? first_difference(triangles_of(m), om.t) : why;
+			check(good && dt.empty() && om.t.size() == om.tris, "  " + what + ": cloth, " + std::to_string(om.n1) + "+" + std::to_string(om.n2) + " vertices (pinned " +
+				(om.v.empty() ? "?" : om.v[0]) + "), " + std::to_string(om.tris) + " triangles" + (dt.empty() ? "" : "; " + dt));
+			cloth_ok += good && dt.empty();
+			// (as the game holds it loaded: the six sections made pointers, the first texture command drawn)
+			std::vector<uint8_t> live = c.data;
+			const uint32_t base = 0x2A000030, object = 0x0BADF00D;
+			make_live(live, base, object);
+			os2::sections ls;
+			os2::mesh lm;
+			const bool lok = os2::sections_of_live(live.data(), live.size(), base, ls) && os2::decode(live.data(), live.size(), ls, lm, why);
+			const bool lsame = lok && lm.cloth && lm.vertices.size() == m.vertices.size() && triangles_of(lm).size() == triangles_of(m).size() && !lm.textures.empty() &&
+				lm.textures[0].cached && lm.textures[0].object == object;
+			cloth_live += lsame;
 		}
-		check(cloth_refused && pole_ok, "a type-1 mesh refused (the banner's cloth: " + cloth_why + "), the pole beside it decoded");
+		check(cloths.size() == 52 && cloth_ok == 52, "cloth meshes decoded as cloth, as the oracle walks them: " + std::to_string(cloth_ok) + " of " + std::to_string(cloths.size()) +
+			" (the game has 52)");
+		check(cloth_live == int(cloths.size()), "the same cloth meshes as the game holds them loaded: " + std::to_string(cloth_live));
+		bool pole_ok = false;
+		for (const chunk &c : chunks_of("ROM/7/95.DAT"))
+			if (c.kind == 0x2A && std::memcmp(c.name, "hf_b", 4) == 0)
+			{
+				os2::sections s;
+				os2::mesh m;
+				std::string why;
+				pole_ok = os2::sections_of_chunk(c.data.data(), c.data.size(), s) && os2::decode(c.data.data(), c.data.size(), s, m, why) && !m.cloth && m.vertices.size() == 432;
+			}
+		check(pole_ok, "the banner's pole beside its cloth: an ordinary mesh");
 	}
 
 	if (failures == 0)

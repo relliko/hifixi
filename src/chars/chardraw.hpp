@@ -42,6 +42,20 @@
 // time and its number, so nothing is kept between frames. Premultiplied onto the world's target (ONE, INVSRCALPHA,
 // colour only: glows add, smoke and stone cover), depth tested against it, nothing written to depth.
 //
+// Cloth (type-1 meshes, os2.hpp mesh::cloth): drawn as any mesh, its own instance's rows being the game's simulated
+// vertices that frame (charmodel hands them over), so it is lit, fogged, shadowed and moves (FSR) as the rest.
+//
+// Extra passes (research/ffxi-re/notes-actor-extras.md 2; model_entry::passes, set from actor +0x734 by the game's
+// effect schedulers): each of the model's meshes drawn again, added (SRCALPHA, ONE, alpha too), depth tested, none
+// written, no alpha test, fogged:
+//   overlay  (025C40) a texture of the effect's mapped by the normal (the world normal's x, y x 0.5 + 0.5, plus a
+//            scrolling offset), x2, then x2 by its factor: the glow of two-hour abilities, songs, level-ups
+//   cloak    (025330, see-through models only: record_model with the scene's copy) the scene as it was before the
+//            model, sampled at the pixel's own screen place shifted through PROJECTION, x the factor whose alpha is
+//            0x80 less the actor's: a shimmer of what's behind over a fading body (warp-outs, summonings)
+// Both are drawn after the model's meshes (the game draws them mesh by mesh: with the depth test and nothing written
+// it comes to the same).
+//
 // Vertices, corners and palette rows are read in the vertex shader (descriptor table, root SRV), so nothing of the
 // input assembler's is touched. record_*() set the targets, viewport, heaps, root signature and pipelines and leave
 // them so (putting the list's own back is the caller's).
@@ -90,6 +104,7 @@ namespace hifi::chars
 	{
 		uint32_t models = 0, draws = 0, triangles = 0;
 		uint32_t not_ready = 0, hidden = 0, untextured = 0; // groups (or models, not ready) left out
+		uint32_t overlays = 0, cloaks = 0;                  // models drawn with their extra passes
 	};
 
 	class char_renderer
@@ -108,8 +123,10 @@ namespace hifi::chars
 		// constants go into the upload ring's slot for the frame's seq.
 		char_stats record_opaque(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o);
 		// One model into `t` as it is (the see-through path's first half: the caller has bound T's view as t.rtv and
-		// cleared it)
-		char_stats record_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, const char_options &o);
+		// cleared it), its extra passes after it; `scene` a view (the cache's heap) of the scene's copy for its cloak (none:
+		// no cloak drawn)
+		char_stats record_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, const char_options &o,
+			D3D12_GPU_DESCRIPTOR_HANDLE scene = {});
 		// The frame's models HiFi XI draws (kNative, opaque and see-through), depth only, into a sun shadow map (`dsv`, D32,
 		// size texels square, already cleared) seen through world_to_clip: the same skinning and alpha test, no colour.
 		// Its constants and models go into the slot's second half (the frame's own draw may still read the first).
@@ -123,7 +140,10 @@ namespace hifi::chars
 	private:
 		bool begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o);
 		D3D12_GPU_VIRTUAL_ADDRESS write_frame(const frame &f, const char_options &o, const float view_proj[16], uint32_t part);
-		void draw_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, char_stats &st, const frame *last = nullptr);
+		void draw_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, char_stats &st, const frame *last = nullptr,
+			int pass = 0, D3D12_GPU_DESCRIPTOR_HANDLE texture = {});
+		// The extra passes of models [from, to) (opaque: overlays; one see-through model: its overlay and cloak), RT 0 alone
+		void draw_passes(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t from, uint32_t to, D3D12_GPU_DESCRIPTOR_HANDLE scene, char_stats &st);
 		ID3D12PipelineState *pipeline(const char_target &t, int kind);
 
 		ID3D12Device *_device = nullptr;
@@ -131,6 +151,7 @@ namespace hifi::chars
 		void *_vs = nullptr, *_ps = nullptr, *_cvs = nullptr, *_cps = nullptr, *_cps_ms = nullptr, *_sps = nullptr; // (ID3DBlob)
 		void *_ps_motion = nullptr; // (ID3DBlob: the model's pixel shader with its motion as well)
 		void *_ps_light = nullptr, *_ps_light_motion = nullptr; // (... with the light split; with both)
+		void *_ps_overlay = nullptr, *_ps_cloak = nullptr; // (ID3DBlob: the extra passes)
 		ID3D12RootSignature *_en_root = nullptr; // (the en-spells': 32 constants, the palette, the mesh)
 		void *_en_svs = nullptr, *_en_sps = nullptr, *_en_pvs = nullptr, *_en_pps = nullptr; // (ID3DBlob: shell, sprites)
 		ID3D12PipelineState *_shadow_pso = nullptr; // (depth only, D32: made in init, not under the injection's mutex)

@@ -6,6 +6,9 @@ textures (0x20), written as text for tests/chars_data_test.cpp to compare src/ch
 Per mesh: 'mesh <dat> <chunk index> <name hex> n1 n2 mirrored'; its vertices 'v <bones...> <float32 bits...>'; its
 triangles 't i0 i1 i2 <uv bits x6> <texture name hex or -> <material colour, kind, light bits or ->'.
 Per texture: 'tex <dat> <chunk index> <name hex> w h <fnv1a-64 of the RGBA rows> ' or 'tex ... none'.
+Per cloth (type-1) mesh of the 35 DATs that have one (research/ffxi-re/notes-actor-extras.md 1, tools/type1_meshes.py):
+'cloth <dat> <chunk index> <name hex> n1 n2 p1 p2 triangles', then its triangles as above (a strip's odd ones with
+their first two corners swapped, as src/chars/os2 lists them).
 """
 import os
 import random
@@ -18,6 +21,11 @@ import chars  # noqa: E402
 import chartex  # noqa: E402
 
 FIXED = ['ROM2/0/52.DAT', 'ROM/148/92.DAT', 'ROM/310/0.DAT']
+# Every DAT with a cloth mesh (type1_meshes.py over all of them: 52 meshes in these 35)
+CLOTH = (['ROM/7/%d.DAT' % i for i in (95, 96, 97, 98, 51, 52, 53, 55, 56, 57, 58, 59, 60, 61, 62, 63)] +
+         ['ROM4/6/51.DAT', 'ROM/97/85.DAT', 'ROM/372/98.DAT', 'ROM/203/121.DAT', 'ROM/203/122.DAT', 'ROM/203/123.DAT',
+          'ROM/5/46.DAT', 'ROM/5/47.DAT', 'ROM/306/51.DAT', 'ROM/306/68.DAT', 'ROM9/1/110.DAT', 'ROM9/2/85.DAT'] +
+         ['ROM/3/%d.DAT' % i for i in (40, 41, 42, 44, 45, 47, 52)])
 # Textures of every layout and bit depth found in the DATs (a scan of every third folder): (DAT, chunk index)
 EXTRA_TEX = [('ROM/0/36.DAT', 13), ('ROM/24/99.DAT', 0), ('ROM/288/36.DAT', 0), ('ROM/0/54.DAT', 5), ('ROM/0/18.DAT', 1),
              ('ROM/0/0.DAT', 2), ('ROM/0/0.DAT', 4), ('ROM/0/0.DAT', 106), ('ROM/177/18.DAT', 0), ('ROM/180/0.DAT', 1),
@@ -67,6 +75,60 @@ def texture_line(rel, i, data):
     return 'tex %s %d %s %d %d %016X' % (rel, i, data[1:17].hex(), img.shape[1], img.shape[0], fnv(img.tobytes()))
 
 
+def cloth_lines(rel, i, name, d):
+    """A cloth mesh's header and triangles (0224D0's command walk: 0x8000 texture, 0x8010 material, 0x0054 triangles,
+    0x5453 a strip, bare ones skipped)"""
+    at = [struct.unpack_from('<IH', d, o)[0] * 2 for o in (6, 0xC, 0x12, 0x18, 0x1E, 0x24)]
+    n1, n2 = struct.unpack_from('<2H', d, at[2])
+    p1, p2 = struct.unpack_from('<2H', d, 0x2A)
+    tris, o, tex, mat = [], at[0], None, None
+    while True:
+        op = struct.unpack_from('<H', d, o)[0]
+        if op == 0xFFFF:
+            break
+        if op & 0x8000:
+            if (op >> 4) & 0xF == 0:
+                tex = d[o + 2:o + 18]
+                o += 18
+            else:
+                w = struct.unpack_from('<11I', d, o + 2)
+                mat = '%08X %d %s' % (w[0], (w[3] >> 8) & 0xF, '%08X' % w[4])
+                o += 46
+            continue
+        cnt = struct.unpack_from('<H', d, o + 2)[0]
+        if op == 0x0054:
+            for t in range(cnt):
+                p = o + 4 + 30 * t
+                idx = struct.unpack_from('<3H', d, p)
+                uv = struct.unpack_from('<6f', d, p + 6)
+                tris.append((idx, uv, tex, mat))
+            o += (2 + 15 * cnt) * 2
+        elif op == 0x5453:
+            idx = list(struct.unpack_from('<3H', d, o + 4))
+            uv = list(struct.unpack_from('<6f', d, o + 10))
+            for t in range(cnt):
+                if t > 0:
+                    p = o + 4 + 30 + 10 * (t - 1)
+                    idx = [idx[1], idx[2], struct.unpack_from('<H', d, p)[0]]
+                    uv = uv[2:] + list(struct.unpack_from('<2f', d, p + 2))
+                if t % 2 == 0:
+                    tris.append((tuple(idx), tuple(uv), tex, mat))
+                else:
+                    tris.append(((idx[1], idx[0], idx[2]), (uv[2], uv[3], uv[0], uv[1], uv[4], uv[5]), tex, mat))
+            o += (5 * cnt + 12) * 2
+        elif op == 0x0043:
+            o += (2 + 5 * cnt) * 2
+        elif op == 0x4353:
+            o += (cnt + 6) * 2
+        else:
+            break
+    out = ['cloth %s %d %s %d %d %d %d %d' % (rel, i, name.encode('latin1').hex(), n1, n2, p1, p2, len(tris))]
+    for idx, uv, tn, mt in tris:
+        out.append('t %d %d %d %s %s %s' % (idx[0], idx[1], idx[2], ' '.join(fbits(x) for x in uv),
+                                            tn.hex() if tn is not None else '-', mt if mt else '-'))
+    return out
+
+
 def main():
     lines = []
     for rel in FIXED + sampled(60):
@@ -94,6 +156,10 @@ def main():
                 lines.append(texture_line(rel, i, data))
     for rel, i in EXTRA_TEX:
         lines.append(texture_line(rel, i, chars.read_chunks(rel)[i][2]))
+    for rel in CLOTH:
+        for i, (name, kind, data, folder) in enumerate(chars.read_chunks(rel)):
+            if kind == 0x2A and data[2] & 0x7F == 1:
+                lines += cloth_lines(rel, i, name, data)
     open(sys.argv[1], 'w').write('\n'.join(lines) + '\n')
     print('%d lines -> %s' % (len(lines), sys.argv[1]))
 

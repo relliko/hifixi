@@ -157,88 +157,129 @@ namespace hifi::chars::os2
 		out.hides = data[3];
 		out.mirrored = (data[4] & 1) != 0;
 		const bool uses_table = (out.flags & 0x80) != 0;
-		// (byte 2's low 7 bits 1: a type-1 mesh, 52 in the game, the outposts' nation banners among them: 12-byte vertices
-		// and a draw of its own (02D7F0 -> 022470, drawn by 0224D0), not this. Read as one of these it came out in shards
-		// (West Ronfaure's San d'Orian banner, 2026-10-27); refused, its model stays the game's)
-		if ((out.flags & 0x7F) != 0)
+		// (byte 2's low 7 bits 1: a type-1 mesh, cloth, 52 in the game, the outposts' nation banners among them: 12-byte
+		// vertices and a draw of its own (02D7F0 -> 022470, drawn by 0224D0). Read as an ordinary one it came out in
+		// shards (West Ronfaure's San d'Orian banner, 2026-10-27). No other kind is in the game's data (02D7F0 prepares
+		// none either).)
+		if ((out.flags & 0x7F) > 1)
 		{
-			why = "a type-1 mesh (its own vertices and draw): the game draws it";
+			why = "a mesh of an unknown type";
 			return false;
 		}
-
-		// The bone table, the counts, the references
-		if (!r.has(s.at[1], s.size[1]) || !r.has(s.at[2], 4))
+		out.cloth = (out.flags & 0x7F) == 1;
+		uint32_t n = 0;
+		if (out.cloth)
 		{
-			why = "the bone table or the counts are outside the data";
-			return false;
-		}
-		std::vector<uint16_t> table(s.size[1] / 2);
-		for (size_t i = 0; i < table.size(); ++i)
-			table[i] = u16(data + s.at[1] + 2 * i);
-		out.one_bone = u16(data + s.at[2]);
-		out.two_bone = u16(data + s.at[2] + 2);
-		const uint32_t n = out.one_bone + out.two_bone;
-		if (!r.has(s.at[3], size_t(n) * 4) || !r.has(s.at[4], size_t(out.one_bone) * 24 + size_t(out.two_bone) * 56))
-		{
-			why = "the vertices or their bone references are outside the data";
-			return false;
-		}
-
-		// The vertices
-		out.vertices.resize(n);
-		const uint8_t *v = data + s.at[4];
-		for (uint32_t i = 0; i < n; ++i)
-		{
-			vertex &o = out.vertices[i];
-			std::memset(&o, 0, sizeof(o));
-			const uint8_t *ref = data + s.at[3] + 4 * i;
-			if (!bone_of(u16(ref), table, uses_table, o.bone[0], o.mirror_bone[0], o.axis[0]))
+			// (a mirrored one would draw stale ring contents in the game, 023010 writing none of its triangles: none is)
+			if (out.mirrored)
 			{
-				why = "a bone reference past the bone table";
+				why = "a mirrored cloth mesh (the game draws it from stale vertices)";
 				return false;
 			}
-			if (i < out.one_bone)
+			if (size < 0x52 || !r.has(s.at[2], 4))
 			{
-				const uint8_t *p = v + 24 * i;
-				for (int k = 0; k < 3; ++k)
-				{
-					o.p0[k] = f32(p + 4 * k);
-					o.n0[k] = f32(p + 12 + 4 * k);
-				}
-				o.w0 = 1.0f;
-				o.bone[1] = o.bone[0];
-				o.mirror_bone[1] = o.mirror_bone[0];
-				o.axis[1] = o.axis[0];
+				why = "the cloth's header or counts are outside the data";
+				return false;
 			}
-			else
+			out.one_bone = u16(data + s.at[2]);
+			out.two_bone = u16(data + s.at[2] + 2);
+			out.pinned[0] = u16(data + 0x2A);
+			out.pinned[1] = u16(data + 0x2C);
+			n = out.one_bone + out.two_bone;
+			if (n == 0 || n > 0x7FFF || !r.has(s.at[3], size_t(n) * 4) || !r.has(s.at[4], size_t(out.one_bone) * 12 + size_t(out.two_bone) * 32) ||
+				out.pinned[0] > out.one_bone || out.pinned[1] > out.two_bone)
 			{
-				if (!bone_of(u16(ref + 2), table, uses_table, o.bone[1], o.mirror_bone[1], o.axis[1]))
+				why = "the cloth's vertices are outside the data";
+				return false;
+			}
+			// (each vertex its own "bone": the game's work vertex i, handed over as palette row i)
+			out.vertices.resize(n);
+			for (uint32_t i = 0; i < n; ++i)
+			{
+				vertex &o = out.vertices[i];
+				std::memset(&o, 0, sizeof(o));
+				o.w0 = 1.0f;
+				o.n0[0] = 1.0f;
+				o.bone[0] = o.bone[1] = o.mirror_bone[0] = o.mirror_bone[1] = uint16_t(i);
+			}
+			out.max_bone = uint16_t(n - 1);
+		}
+		else
+		{
+			// The bone table, the counts, the references
+			if (!r.has(s.at[1], s.size[1]) || !r.has(s.at[2], 4))
+			{
+				why = "the bone table or the counts are outside the data";
+				return false;
+			}
+			std::vector<uint16_t> table(s.size[1] / 2);
+			for (size_t i = 0; i < table.size(); ++i)
+				table[i] = u16(data + s.at[1] + 2 * i);
+			out.one_bone = u16(data + s.at[2]);
+			out.two_bone = u16(data + s.at[2] + 2);
+			n = out.one_bone + out.two_bone;
+			if (!r.has(s.at[3], size_t(n) * 4) || !r.has(s.at[4], size_t(out.one_bone) * 24 + size_t(out.two_bone) * 56))
+			{
+				why = "the vertices or their bone references are outside the data";
+				return false;
+			}
+
+			// The vertices
+			out.vertices.resize(n);
+			const uint8_t *v = data + s.at[4];
+			for (uint32_t i = 0; i < n; ++i)
+			{
+				vertex &o = out.vertices[i];
+				std::memset(&o, 0, sizeof(o));
+				const uint8_t *ref = data + s.at[3] + 4 * i;
+				if (!bone_of(u16(ref), table, uses_table, o.bone[0], o.mirror_bone[0], o.axis[0]))
 				{
 					why = "a bone reference past the bone table";
 					return false;
 				}
-				// (x1 x2 y1 y2 z1 z2 w1 w2, then n1x n2x n1y n2y n1z n2z)
-				const uint8_t *p = v + 24 * out.one_bone + 56 * (i - out.one_bone);
-				for (int k = 0; k < 3; ++k)
+				if (i < out.one_bone)
 				{
-					o.p0[k] = f32(p + 8 * k);
-					o.p1[k] = f32(p + 8 * k + 4);
-					o.n0[k] = f32(p + 32 + 8 * k);
-					o.n1[k] = f32(p + 32 + 8 * k + 4);
+					const uint8_t *p = v + 24 * i;
+					for (int k = 0; k < 3; ++k)
+					{
+						o.p0[k] = f32(p + 4 * k);
+						o.n0[k] = f32(p + 12 + 4 * k);
+					}
+					o.w0 = 1.0f;
+					o.bone[1] = o.bone[0];
+					o.mirror_bone[1] = o.mirror_bone[0];
+					o.axis[1] = o.axis[0];
 				}
-				o.w0 = f32(p + 24);
-				o.w1 = f32(p + 28);
-			}
-			for (int k = 0; k < 2; ++k)
-			{
-				if (o.bone[k] > out.max_bone)
-					out.max_bone = o.bone[k];
-				if (out.mirrored && o.mirror_bone[k] > out.max_bone)
-					out.max_bone = o.mirror_bone[k];
+				else
+				{
+					if (!bone_of(u16(ref + 2), table, uses_table, o.bone[1], o.mirror_bone[1], o.axis[1]))
+					{
+						why = "a bone reference past the bone table";
+						return false;
+					}
+					// (x1 x2 y1 y2 z1 z2 w1 w2, then n1x n2x n1y n2y n1z n2z)
+					const uint8_t *p = v + 24 * out.one_bone + 56 * (i - out.one_bone);
+					for (int k = 0; k < 3; ++k)
+					{
+						o.p0[k] = f32(p + 8 * k);
+						o.p1[k] = f32(p + 8 * k + 4);
+						o.n0[k] = f32(p + 32 + 8 * k);
+						o.n1[k] = f32(p + 32 + 8 * k + 4);
+					}
+					o.w0 = f32(p + 24);
+					o.w1 = f32(p + 28);
+				}
+				for (int k = 0; k < 2; ++k)
+				{
+					if (o.bone[k] > out.max_bone)
+						out.max_bone = o.bone[k];
+					if (out.mirrored && o.mirror_bone[k] > out.max_bone)
+						out.max_bone = o.mirror_bone[k];
+				}
 			}
 		}
 
-		// The draw commands (02CB80): triangles into corners, in groups by texture and material
+		// The draw commands (02CB80; a cloth's the same, 0224D0): triangles into corners, in groups by texture and material
 		size_t o = s.at[0];
 		int32_t texture = -1;
 		uint32_t material[11] = { 0x80808080u };

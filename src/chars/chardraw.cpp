@@ -62,6 +62,10 @@ struct model_t
 	float4 fog_end;          // x: end
 	float4 lamp_pos[4];      // the zone's lamps near it (chardraw.hpp "Lamps"): where, w the range (0: none)
 	float4 lamp_colour[4];   // ... their colour, w the attenuation (a2)
+	float4 overlay;          // the overlay pass (chardraw.hpp "Extra passes"): xy its texture's offset
+	float4 overlay_colour;   // ... its TEXTUREFACTOR
+	float4 cloak;            // the cloak pass: xy the shift in clip space (the offsets through PROJECTION)
+	float4 cloak_colour;     // ... its TEXTUREFACTOR (alpha 0x80 less the actor's)
 };
 StructuredBuffer<vertex_t> vertices : register(t0);
 StructuredBuffer<corner_t> corners : register(t1);
@@ -70,6 +74,7 @@ StructuredBuffer<bone_t> palette : register(t3);
 StructuredBuffer<model_t> models : register(t4);
 StructuredBuffer<bone_t> last_palette : register(t5);
 SamplerState clamp_linear : register(s0);
+SamplerState wrap_linear : register(s1);   // (the extra passes: WRAP addressing)
 
 static const float kMaterialDiffuse = 0.5;
 // HiFi XI's own look per pixel (hemi_spec.hpp). The ambient from a sky as the zone's, x kSkyAbove on what faces up,
@@ -169,6 +174,7 @@ struct v2p
 	float share : TEXCOORD4;    // the sun's share of colour (lit)
 	float4 motion : TEXCOORD3; // xyz the move since the last frame (world), w the view depth
 	float3 world : TEXCOORD5;  // (for the lamps per pixel and the sun's highlight)
+	float4 clip : TEXCOORD6;   // (the clip position: the cloak's screen place)
 };
 
 v2p vs(uint vid : SV_VertexID)
@@ -194,6 +200,7 @@ v2p vs(uint vid : SV_VertexID)
 	r.uv = c.uv;
 	r.normal = nn;
 	r.world = world;
+	r.clip = r.pos;
 	r.colour = lit(models[min(model_index, (uint)options.y - 1)], nn, world, r.share);
 	return r;
 }
@@ -274,6 +281,38 @@ light_motion_out ps_light_motion(v2p i)
 	o.light = light_word(i.motion.w, i.normal, share);
 	o.motion = i.motion;
 	return o;
+}
+
+// The extra passes (chardraw.hpp "Extra passes"), each the mesh again, added (SRCALPHA, ONE: alpha too), no depth
+// written, no alpha test, fogged as the mesh. The fog as Direct3D 8 fogs a pixel before it's blended.
+float4 fogged(model_t m, v2p i, float3 rgb, float a)
+{
+	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb, i.fog), a);
+}
+// The overlay (025C40): its texture at the normal's place (TCI CAMERASPACENORMAL through gGame +0x294, the camera's own
+// rotation: the world normal), x 0.5 + 0.5, + the offset; stage 0 MODULATE2X(texture, diffuse: lighting off and no
+// vertex colour, white), stage 1 MODULATE2X(current, TFACTOR), alpha alike; each clamped
+float4 ps_overlay(v2p i) : SV_Target
+{
+	const model_t m = models[min(model_index, (uint)options.y - 1)];
+	const float3 n = normalize(i.normal);
+	const float4 t = colour_map.Sample(wrap_linear, 0.5 * n.xy + 0.5 + m.overlay.xy);
+	const float3 c0 = saturate(2 * t.rgb);
+	const float a0 = saturate(2 * t.a);
+	return fogged(m, i, saturate(2 * c0 * m.overlay_colour.rgb), saturate(2 * a0 * m.overlay_colour.a));
+}
+// The cloak (025330): the scene's copy (t2) at the pixel's own screen place (TCI CAMERASPACEPOSITION through
+// PROJECTION x the NDC-to-UV bias, projected), shifted by the offsets through PROJECTION (over w); stage 0
+// SELECTARG1(texture), its alpha the mesh's MODULATE2X(texture, TFACTOR) with the copy's alpha opaque; stage 1
+// MODULATE2X(current, TFACTOR), alpha MODULATE4X(current, TFACTOR); each clamped
+float4 ps_cloak(v2p i) : SV_Target
+{
+	const model_t m = models[min(model_index, (uint)options.y - 1)];
+	const float w = abs(i.clip.w) > 1e-6 ? i.clip.w : 1e-6;
+	const float2 uv = float2(0.5 * i.clip.x / w + 0.5, -0.5 * i.clip.y / w + 0.5) + m.cloak.xy / w;
+	const float4 t = colour_map.Sample(wrap_linear, uv);
+	const float a0 = saturate(2 * m.cloak_colour.a);
+	return fogged(m, i, saturate(2 * t.rgb * m.cloak_colour.rgb), saturate(4 * a0 * m.cloak_colour.a));
 }
 
 // Depth only into a sun shadow map (record_casters): the model draw's alpha test, nothing written but depth
@@ -1054,8 +1093,12 @@ float4 pps(p2p i) : SV_Target
 			float fog_end[4];
 			float lamp_pos[kModelLamps][4];    // (model_lamps)
 			float lamp_colour[kModelLamps][4];
+			float overlay[4];          // (the extra passes: model_constants)
+			float overlay_colour[4];
+			float cloak[4];
+			float cloak_colour[4];
 		};
-		static_assert(sizeof(gpu_model) == 400 && kModelLamps == 4, "the shader's model_t");
+		static_assert(sizeof(gpu_model) == 464 && kModelLamps == 4, "the shader's model_t");
 		struct gpu_constants
 		{
 			float view_proj[16];
@@ -1119,7 +1162,7 @@ float4 pps(p2p i) : SV_Target
 			out[3] = float(c >> 24) / 255.0f;
 		}
 
-		void model_constants(const model_entry &m, gpu_model &g)
+		void model_constants(const frame &f, const model_entry &m, gpu_model &g)
 		{
 			std::memset(&g, 0, sizeof(g));
 			for (int k = 0; k < 4; ++k)
@@ -1156,6 +1199,22 @@ float4 pps(p2p i) : SV_Target
 			}
 			else
 				g.fog[3] = -1.0f; // (the frame's)
+			// The extra passes: the overlay's offset and factor; the cloak's offsets through PROJECTION (02BA57: (a, b, 0)
+			// through it, its x and y added to the texture matrix's translation; a perspective one's _31 _32 _41 _42 are
+			// 0 as the game makes it, and kept here as it has them) and factor
+			if (m.passes & kPassOverlay)
+			{
+				g.overlay[0] = m.overlay_offset[0];
+				g.overlay[1] = m.overlay_offset[1];
+				colour_of(m.overlay_colour, g.overlay_colour);
+			}
+			if ((m.passes & kPassCloak) && f.projection_read)
+			{
+				const float *p = f.projection;
+				g.cloak[0] = m.cloak_offset[0] * p[0] + m.cloak_offset[1] * p[4] + p[12];
+				g.cloak[1] = m.cloak_offset[0] * p[1] + m.cloak_offset[1] * p[5] + p[13];
+				colour_of(m.cloak_factor, g.cloak_colour);
+			}
 		}
 
 		// The zone's lamps whose range reaches the model's bones' box (its instances' palette rows' places, half a yalm
@@ -1250,6 +1309,8 @@ float4 pps(p2p i) : SV_Target
 			kModelMotion = 4, // (the model with the motion target)
 			kModelLight = 5,  // (... with the light split's: light_split.hpp)
 			kModelLightMotion = 6, // (... with both: the light split second, the motion third)
+			kOverlay = 7, // (the extra passes: chardraw.hpp)
+			kCloak = 8,
 		};
 
 		struct en_constants
@@ -1284,7 +1345,7 @@ float4 pps(p2p i) : SV_Target
 		drop(_ring);
 		drop(_root);
 		drop(_en_root);
-		for (void **b : { &_vs, &_ps, &_ps_motion, &_ps_light, &_ps_light_motion, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps })
+		for (void **b : { &_vs, &_ps, &_ps_motion, &_ps_light, &_ps_light_motion, &_cvs, &_cps, &_cps_ms, &_sps, &_en_svs, &_en_sps, &_en_pvs, &_en_pps, &_ps_overlay, &_ps_cloak })
 		{
 			if (*b != nullptr)
 				static_cast<ID3DBlob *>(*b)->Release();
@@ -1311,6 +1372,7 @@ float4 pps(p2p i) : SV_Target
 			void **out;
 		};
 		const entry entries[] = { { "vs", "vs_5_0", &_vs }, { "ps", "ps_5_0", &_ps }, { "ps_motion", "ps_5_0", &_ps_motion }, { "ps_light", "ps_5_0", &_ps_light }, { "ps_light_motion", "ps_5_0", &_ps_light_motion }, { "cvs", "vs_5_0", &_cvs }, { "cps", "ps_5_0", &_cps }, { "cps_ms", "ps_5_0", &_cps_ms }, { "sps", "ps_5_0", &_sps },
+			{ "ps_overlay", "ps_5_0", &_ps_overlay }, { "ps_cloak", "ps_5_0", &_ps_cloak },
 			{ "svs", "vs_5_0", &_en_svs }, { "sps", "ps_5_0", &_en_sps }, { "pvs", "vs_5_0", &_en_pvs }, { "pps", "ps_5_0", &_en_pps } };
 		for (const entry &e : entries)
 		{
@@ -1349,12 +1411,16 @@ float4 pps(p2p i) : SV_Target
 		}
 		p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // (the last frame's palette rows for the instance: t5)
 		p[6].Descriptor.ShaderRegister = 5;
-		D3D12_STATIC_SAMPLER_DESC s = {};
-		s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-		s.MaxLOD = D3D12_FLOAT32_MAX;
-		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 7, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		D3D12_STATIC_SAMPLER_DESC s[2] = {};
+		s[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		s[0].AddressU = s[0].AddressV = s[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		s[0].MaxLOD = D3D12_FLOAT32_MAX;
+		s[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		// (s1: the extra passes', WRAP as 025C40 and 025330 set it)
+		s[1] = s[0];
+		s[1].ShaderRegister = 1;
+		s[1].AddressU = s[1].AddressV = s[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 7, p, 2, s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -1452,11 +1518,11 @@ float4 pps(p2p i) : SV_Target
 		if (known != _pipelines.end())
 			return known->second;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
-		const bool en = k == kEnShell || k == kEnSprites;
+		const bool en = k == kEnShell || k == kEnSprites, extra = k == kOverlay || k == kCloak;
 		d.pRootSignature = en ? _en_root : _root;
-		ID3DBlob *const vs = static_cast<ID3DBlob *>(model ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
+		ID3DBlob *const vs = static_cast<ID3DBlob *>(model || extra ? _vs : k == kEnShell ? _en_svs : k == kEnSprites ? _en_pvs : _cvs);
 		ID3DBlob *const ps = static_cast<ID3DBlob *>(k == kModel ? _ps : k == kModelMotion ? _ps_motion : k == kModelLight ? _ps_light : k == kModelLightMotion ? _ps_light_motion :
-			k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps : t.samples > 1 ? _cps_ms : _cps);
+			k == kOverlay ? _ps_overlay : k == kCloak ? _ps_cloak : k == kEnShell ? _en_sps : k == kEnSprites ? _en_pps : t.samples > 1 ? _cps_ms : _cps);
 		d.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
 		d.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
 		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -1482,6 +1548,19 @@ float4 pps(p2p i) : SV_Target
 			d.DepthStencilState.DepthEnable = TRUE;
 			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
 			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		}
+		else if (extra)
+		{
+			// (the extra passes: added, alpha too (Direct3D 8 blends it with the same factors); tested against the
+			// depth, none written)
+			d.DSVFormat = t.dsv_format;
+			d.DepthStencilState.DepthEnable = TRUE;
+			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			b.BlendEnable = TRUE;
+			b.SrcBlend = b.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
+			b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_ONE;
+			b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 		}
 		else if (en)
 		{
@@ -1540,7 +1619,7 @@ float4 pps(p2p i) : SV_Target
 		gpu_model *gm = reinterpret_cast<gpu_model *>(_mapped + slot + kModelsAt);
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
 		{
-			model_constants(f.model[i], gm[i]);
+			model_constants(f, f.model[i], gm[i]);
 			model_lamps(f, f.model[i], o, gm[i]);
 		}
 		return _ring->GetGPUVirtualAddress() + slot;
@@ -1571,13 +1650,17 @@ float4 pps(p2p i) : SV_Target
 		return true;
 	}
 
-	void char_renderer::draw_model(ID3D12GraphicsCommandList *list, const char_target &, const frame &f, uint32_t mi, char_stats &st, const frame *last)
+	void char_renderer::draw_model(ID3D12GraphicsCommandList *list, const char_target &, const frame &f, uint32_t mi, char_stats &st, const frame *last, int pass,
+		D3D12_GPU_DESCRIPTOR_HANDLE pass_texture)
 	{
 		const model_entry &m = f.model[mi];
 		const D3D12_GPU_VIRTUAL_ADDRESS palettes = cache::palettes(f.seq.load(std::memory_order_relaxed));
 		if (palettes == 0)
 			return;
-		st.models++;
+		if (pass == 0)
+			st.models++;
+		else
+			list->SetGraphicsRootDescriptorTable(5, pass_texture);
 		// (the same actor's same model in the last frame, its skeleton as now: its palette rows, still in the ring, give
 		// each point's place then)
 		const model_entry *was = nullptr;
@@ -1637,7 +1720,8 @@ float4 pps(p2p i) : SV_Target
 						if (tid != cache::kNone && cache::texture_view_of(tid, h))
 						{
 							bound = h;
-							list->SetGraphicsRootDescriptorTable(5, h);
+							if (pass == 0)
+								list->SetGraphicsRootDescriptorTable(5, h);
 						}
 						bound_texture = gr.texture;
 					}
@@ -1658,7 +1742,8 @@ float4 pps(p2p i) : SV_Target
 					list->SetGraphicsRoot32BitConstants(1, 9, dc, 0);
 					list->DrawInstanced(gr.count, 1, 0, 0);
 					st.draws++;
-					st.triangles += gr.count / 3;
+					if (pass == 0)
+						st.triangles += gr.count / 3;
 				}
 			}
 		}
@@ -1685,16 +1770,63 @@ float4 pps(p2p i) : SV_Target
 		for (uint32_t i = 0; i < opaque; ++i)
 			if ((f.model[i].flags & kNative) != 0 && (f.model[i].colour >> 24) != 0)
 				draw_model(list, t, f, i, st, last);
+		draw_passes(list, t, f, 0, opaque, {}, st);
 		return st;
 	}
 
-	char_stats char_renderer::record_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, const char_options &o)
+	char_stats char_renderer::record_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, const char_options &o,
+		D3D12_GPU_DESCRIPTOR_HANDLE scene)
 	{
 		char_stats st;
 		if (model >= std::min(f.models, kMaxModels) || !begin(list, t, f, o))
 			return st;
 		draw_model(list, t, f, model, st);
+		draw_passes(list, t, f, model, model + 1, scene, st);
 		return st;
+	}
+
+	void char_renderer::draw_passes(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t from, uint32_t to, D3D12_GPU_DESCRIPTOR_HANDLE scene,
+		char_stats &st)
+	{
+		bool bound = false;
+		for (int pass = 1; pass <= 2; ++pass)
+		{
+			ID3D12PipelineState *pso = nullptr;
+			for (uint32_t i = from; i < to && i < kMaxModels; ++i)
+			{
+				const model_entry &m = f.model[i];
+				if ((m.flags & kNative) == 0 || (m.colour >> 24) == 0)
+					continue;
+				D3D12_GPU_DESCRIPTOR_HANDLE tex = {};
+				if (pass == 1)
+				{
+					if ((m.passes & kPassOverlay) == 0 || !cache::texture_view_of(m.overlay_texture, tex))
+						continue;
+				}
+				else
+				{
+					if ((m.passes & kPassCloak) == 0 || scene.ptr == 0 || !f.projection_read)
+						continue;
+					tex = scene;
+				}
+				if (pso == nullptr)
+				{
+					pso = pipeline(t, pass == 1 ? kOverlay : kCloak);
+					if (pso == nullptr)
+						break;
+					// (the world's target alone: the motion and the light split stay as the meshes left them)
+					if (!bound)
+						list->OMSetRenderTargets(1, &t.rtv, FALSE, &t.dsv);
+					bound = true;
+					list->SetPipelineState(pso);
+				}
+				draw_model(list, t, f, i, st, nullptr, pass, tex);
+				if (pass == 1)
+					st.overlays++;
+				else
+					st.cloaks++;
+			}
+		}
 	}
 
 	char_stats char_renderer::record_casters(ID3D12GraphicsCommandList *list, const frame &f, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size)

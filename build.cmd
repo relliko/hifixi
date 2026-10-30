@@ -127,6 +127,20 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEA
   tests\shade_bench.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\shade_bench.exe" /link /NOLOGO || exit /b 1
 echo Built build\shade_bench.exe
 
+rem The actors' part of owning the frame (docs\own-frame\actors.md): the cloth (type-1) meshes stepped by the game's own
+rem 023290 through the model stub on both dumps, against tests\cloth_oracle.py, the cache uploading to WARP:
+rem build\cloth_test.exe build\test\cloth_oracle.bin
+python tests\cloth_oracle.py build\test\cloth_oracle.bin || exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\cloth_test.cpp %CHARS% src\game\game.cpp /Fo"build\test\\" /Fe"build\cloth_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\cloth_test.exe
+rem ... and drawn (WARP, debug layer): the banner's cloth as the oracle steps it, the overlay and cloak passes, the scene's
+rem copy at the see-through marker: build\actors_draw_test.exe build\test\cloth_oracle.bin
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
+  tests\actors_draw_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
+  /Fo"build\test\\" /Fe"build\actors_draw_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\actors_draw_test.exe
+
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
