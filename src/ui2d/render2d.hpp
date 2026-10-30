@@ -2,8 +2,8 @@
 
 // HiFi XI's own 2D renderer (docs/own-frame/2d.md): the game's screen-space draws (frame2d.hpp) drawn on dgVoodoo's
 // Direct3D 12 list at their slot markers, the way dgVoodoo draws them from Direct3D 8:
-//   - pre-transformed vertices: a pixel centre at x + 0.5, w = 1 / rhw (perspective-correct, as Direct3D 8), clipped
-//     to the Direct3D 8 viewport (a scissor of it: dgVoodoo clips them to a viewport moved by half a pixel);
+//   - pre-transformed vertices placed in the Direct3D 8 viewport moved by half a pixel, as dgVoodoo sets it (a pixel
+//     centre at x + 0.5), w = 1 / rhw (perspective-correct, as Direct3D 8), clipped by that viewport;
 //   - stage 0 of the fixed-function combiner, every D3DTOP through BLENDCURRENTALPHA with its arguments (DIFFUSE,
 //     CURRENT, TEXTURE, TFACTOR, SPECULAR, COMPLEMENT, ALPHAREPLICATE): MODULATE2X is the PS2's "0x80 = 1";
 //   - the alpha test (D3DCMP against ALPHAREF), flat or Gouraud colour, the cull mode, the colour write mask;

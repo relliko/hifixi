@@ -9,6 +9,11 @@
 // after the menus (00A820), the movie (21D4C0), the screen-text queue (038520); and, with a UI-size target, the world's
 // copy into it and its stretch over the back buffer (00ABE0).
 //
+// A second window, the screen passes on A: from the frozen-frame crossfade (012465: call 012F40) to A's pop (0126A1:
+// call 00A1D0): the wash and the screenshot's copyright text recorded, the crossfade's and afterimage's copies of A the
+// game's; its cuts and end marked with kind 8 on A's depth, no begin marker. No window opens while the opening movie's
+// player exists ([0x456D1C]): the game draws it all.
+//
 // While the window is open the client device (Ashita's object, [[0x45666C]+0xC]) wears a copy of its own vtable whose
 // state and draw slots are ours: every state call is followed (then made), every DrawPrimitiveUP of pre-transformed
 // vertices with a state the 2D renderer draws as dgVoodoo does is recorded into the frame (src/ui2d/frame2d.hpp), and,
