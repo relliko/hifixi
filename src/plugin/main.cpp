@@ -953,6 +953,8 @@ public:
 		worldfx::set_blade_motion(hifi::upscale::temporal_running()); // (the grass's own motion for FSR 2)
 		hifi::game::jitter::set_phases(hifi::upscale::jitter_phases());
 		hifi::game::jitter::next_frame();
+		// (the tint this frame's resolve was drawn with: FSR's picture takes it too)
+		hifi::upscale::set_tint(hifi::game::resolve_tint());
 		hifi::framegen::present(); // (frame generation on or off as FSR 2 runs and the setting says)
 		if (now >= m_next_update)
 		{

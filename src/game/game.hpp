@@ -33,6 +33,12 @@ namespace hifi::game
 	inline bool pointer(uint32_t a) { return a >= 0x10000 && a < 0xFFFF0000u && a % 4 == 0; }
 	// A float from its bits; false for a NaN or an infinity
 	bool float_of(uint32_t bits, float &out);
+	// gGame (the camera's object, [0x4568FC] in FFXiMain): the object now, 0 when there's none (yet)
+	uint32_t game_object();
+	// The colour the game's resolve (00C0B0) multiplies the world by as it stretches it over the screen: gGame+0x320 as
+	// 0xRRGGBB (0x80 each the picture as it is, 0 black; research/ffxi-re/notes-screen-passes.md 2.1). Every cutscene
+	// fade to black is this. 0x808080 without a gGame.
+	uint32_t resolve_tint();
 
 	// The game's code written (unprotected, written, protection put back, the instruction cache told); false when it
 	// couldn't be

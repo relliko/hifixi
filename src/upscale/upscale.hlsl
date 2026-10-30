@@ -2,7 +2,9 @@
 // 32-bit pixel shader paths. Two passes, each one full-screen triangle:
 //   easu_ps  the world (t0, the background resolution) up to the screen's size, along its edges, into a texture of ours
 //   rcas_ps  that texture (t0) sharpened into the screen's back buffer
-// Constants (b0): the world's size, the screen's, and RCAS's sharpness in stops (0 the sharpest; each stop halves it).
+// Constants (b0): the world's size, the screen's, RCAS's sharpness in stops (0 the sharpest; each stop halves it), and
+// the game's tint on the world (its resolve's, 1 the picture as it is: cutscene fades), put on by the pass into the back
+// buffer.
 #define A_GPU 1
 #define A_HLSL 1
 #include "ffx_a.h"
@@ -12,7 +14,7 @@ cbuffer pass_constants : register(b0)
 	float2 in_size;
 	float2 out_size;
 	float stops;
-	float3 unused;
+	float3 tint;
 };
 Texture2D<float4> source : register(t0);
 SamplerState bilinear : register(s0);
@@ -44,10 +46,10 @@ float4 easu_ps(float4 pos : SV_Position) : SV_Target
 	return float4(c, 1.0);
 }
 
-// FSR 2's picture (t0, the screen's size) onto the back buffer as it is
+// FSR 2's picture (t0, the screen's size) onto the back buffer as it is, but for the tint
 float4 copy_ps(float4 pos : SV_Position) : SV_Target
 {
-	return float4(source.Load(int3(pos.xy, 0)).rgb, 1.0);
+	return float4(source.Load(int3(pos.xy, 0)).rgb * tint, 1.0);
 }
 
 float4 rcas_ps(float4 pos : SV_Position) : SV_Target
@@ -56,5 +58,5 @@ float4 rcas_ps(float4 pos : SV_Position) : SV_Target
 	FsrRcasCon(con, stops);
 	AF1 r, g, b;
 	FsrRcasF(r, g, b, AU2(pos.xy), con);
-	return float4(r, g, b, 1.0);
+	return float4(float3(r, g, b) * tint, 1.0);
 }

@@ -13,6 +13,10 @@ namespace hifi::game
 		size_t g_size = 0;
 		bool g_image_set = false;
 		uintptr_t g_alloc_at = 0;
+		// gGame's global, from the camera reader (mov eax, [gGame]; add eax, 0x94; ret), looked for once in an image
+		constexpr const char *kGamePat = "A1????????0594000000C3";
+		uintptr_t g_game_at = 0;
+		bool g_game_looked = false;
 
 		std::mutex g_image_mutex; // (the zone bakers' thread looks for the game's key tables too)
 
@@ -38,6 +42,7 @@ namespace hifi::game
 		g_base = base;
 		g_size = size;
 		g_image_set = true;
+		g_game_looked = false;
 	}
 
 	bool image_known()
@@ -72,6 +77,26 @@ namespace hifi::game
 			return false;
 		std::memcpy(&out, &bits, 4);
 		return true;
+	}
+
+	uint32_t game_object()
+	{
+		if (!g_game_looked && image_known())
+		{
+			g_game_looked = true;
+			const uintptr_t p = find(kGamePat);
+			const uint32_t global = p != 0 ? word(p + 1) : 0;
+			g_game_at = pointer(global) ? global : 0;
+		}
+		const uint32_t game = g_game_at != 0 ? word(g_game_at) : 0;
+		return pointer(game) ? game : 0;
+	}
+
+	uint32_t resolve_tint()
+	{
+		const uint32_t game = game_object();
+		uint32_t tint = 0;
+		return game != 0 && read(game + 0x320, tint) ? tint & 0xFFFFFFu : 0x808080u;
 	}
 
 	bool write_code(uintptr_t at, const void *bytes, size_t size)

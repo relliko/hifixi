@@ -26,6 +26,9 @@ namespace hifi::upscale
 	// and how many frames it's been drawn in
 	using chars_motion_fn = bool (*)(ID3D12Resource *&texture, uint64_t &frames);
 	void set_chars_motion_source(chars_motion_fn fn);
+	// The colour the game's resolve multiplies the world by (0xRRGGBB, 0x80 each the picture as it is: game::resolve_tint),
+	// put on ours as well: every cutscene fade is it. Each present, from the game's thread.
+	void set_tint(uint32_t rgb);
 	// Whether FSR 2 drew in the last quarter second (the world's jitter goes with it: game/jitter), and the length of its
 	// jitter sequence for A's size and the screen's
 	bool temporal_running();
