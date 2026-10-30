@@ -38,7 +38,8 @@ cbuffer element : register(b0)
 	float4 tfactor;           // TEXTUREFACTOR
 	float4 fog_colour;        // rgb; a: 0 no fog, 1 by the view depth, 2 by the distance
 	float4 misc;              // fog start, fog end, TEXTURE0's offset u, v
-	uint4 flags;              // x the stage bits, y the first vertex, z the element's light (0xFFFFFFFF: unlit)
+	uint4 flags;              // x the stage bits, y the first vertex, z the element's light (0xFFFFFFFF: unlit), w a
+	                          // specular D3M's environment record (in the lights)
 };
 struct vtx
 {
@@ -68,8 +69,10 @@ struct lit
 	float4 emissive;
 };
 StructuredBuffer<lit> lits : register(t4);
+Texture2D env : register(t5);
 SamplerState smp : register(s0);
 SamplerState smp_mirror : register(s1);
+SamplerState smp_clamp : register(s2);
 
 struct v2p
 {
@@ -77,6 +80,8 @@ struct v2p
 	float4 col : COLOR0;
 	float2 uv : TEXCOORD0;
 	float fog : TEXCOORD1;
+	float2 uv1 : TEXCOORD2;              // (a specular D3M's environment)
+	nointerpolation float4 tint : TEXCOORD3;
 };
 
 v2p vs(uint id : SV_VertexID)
@@ -106,6 +111,16 @@ v2p vs(uint id : SV_VertexID)
 		o.col.rgb = saturate(o.col.rgb * light + l.emissive.rgb);
 	}
 	o.uv = v.uv + misc.zw;
+	o.uv1 = float2(0.0, 0.0);
+	o.tint = float4(0.0, 0.0, 0.0, 0.0);
+	if (flags.x & 32768)
+	{
+		// (D3D8's CAMERASPACENORMAL with NORMALIZENORMALS, through the texture matrix: (n, 1) by its columns 0 and 1)
+		lit e = lits[flags.w];
+		float3 n = normalize(v.normal.x * e.n0.xyz + v.normal.y * e.n1.xyz + v.normal.z * e.n2.xyz);
+		o.uv1 = float2(dot(float4(n, 1.0), e.toward0), dot(float4(n, 1.0), e.toward1));
+		o.tint = e.diffuse0;
+	}
 	float d = fog_colour.a > 1.5 ? length(vp) : -vp.z;
 	o.fog = fog_colour.a > 0.5 ? saturate((misc.y - d) / max(misc.y - misc.x, 1e-6)) : 1.0;
 	return o;
@@ -117,7 +132,32 @@ float4 ps(v2p i) : SV_Target
 	float4 d = i.col;
 	float3 c;
 	float a;
-	if (s & 128)
+	if (s & 32768)
+	{
+		// (a specular D3M: the base stages, then CURRENT + CURRENT's alpha x the environment, alpha CURRENT)
+		float3 e = ((s & 262144) ? env.SampleLevel(smp_clamp, i.uv1, 0) : env.SampleLevel(smp, i.uv1, 0)).rgb;
+		if (s & 524288)
+			e = saturate(e * i.tint.rgb * 2.0);
+		float add;
+		if (s & 1)
+		{
+			float4 t = tex.SampleLevel(smp, i.uv, 0);
+			c = saturate(t.rgb * d.rgb * 2.0);
+			float a0 = saturate(t.a * d.a * ((s & 65536) ? 2.0 : 4.0));
+			a = (s & 131072) ? a0 : saturate(a0 * tfactor.a * 4.0);
+			if (s & 65536)
+				c = saturate(c * tfactor.rgb * 2.0);
+			add = (s & 65536) ? a : a0;
+		}
+		else
+		{
+			c = saturate(d.rgb * tfactor.rgb * 2.0);
+			a = saturate(d.a * tfactor.a * 4.0);
+			add = a;
+		}
+		c = saturate(c + add * e);
+	}
+	else if (s & 128)
 	{
 		c = d.rgb;
 		a = d.a;
@@ -322,8 +362,8 @@ float4 ps_grab(g2p i) : SV_Target
 			*e.out = code;
 		}
 
-		D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1 };
-		D3D12_ROOT_PARAMETER p[6] = {};
+		D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1 }, env_range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5 };
+		D3D12_ROOT_PARAMETER p[7] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		p[0].Constants.ShaderRegister = 0;
 		p[0].Constants.Num32BitValues = kConstants;
@@ -334,13 +374,17 @@ float4 ps_grab(g2p i) : SV_Target
 		p[2].DescriptorTable.NumDescriptorRanges = 1;
 		p[2].DescriptorTable.pDescriptorRanges = &range;
 		p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		p[6].DescriptorTable.NumDescriptorRanges = 1;
+		p[6].DescriptorTable.pDescriptorRanges = &env_range;
+		p[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		for (UINT k = 3; k < 6; ++k)
 		{
 			p[k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
 			p[k].Descriptor.ShaderRegister = k - 1;
 			p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 		}
-		D3D12_STATIC_SAMPLER_DESC s[2] = {};
+		D3D12_STATIC_SAMPLER_DESC s[3] = {};
 		s[0].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
 		s[0].AddressU = s[0].AddressV = s[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
 		s[0].MaxLOD = 0.0f;
@@ -348,7 +392,10 @@ float4 ps_grab(g2p i) : SV_Target
 		s[1] = s[0];
 		s[1].AddressU = s[1].AddressV = s[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
 		s[1].ShaderRegister = 1;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 6, p, 2, s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		s[2] = s[0];
+		s[2].AddressU = s[2].AddressV = s[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		s[2].ShaderRegister = 2;
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 7, p, 3, s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -604,11 +651,12 @@ float4 ps_grab(g2p i) : SV_Target
 		// (the lit elements' lights after them: the run's, at the frame's own indices)
 		uint32_t llo = kMaxLit, lhi = 0;
 		for (uint32_t i = r.first; i < r.first + r.count && i < kMaxElements; ++i)
-			if (f.elements[i].light < kMaxLit)
-			{
-				llo = std::min(llo, f.elements[i].light);
-				lhi = std::max(lhi, f.elements[i].light + 1);
-			}
+			for (const uint32_t k : { f.elements[i].light, f.elements[i].spec })
+				if (k < kMaxLit)
+				{
+					llo = std::min(llo, k);
+					lhi = std::max(lhi, k + 1);
+				}
 		if (lhi > llo)
 			std::memcpy(_mapped + slot + kVertexBytes + UINT64(llo) * sizeof(lighting), f.lights + llo, size_t(lhi - llo) * sizeof(lighting));
 
@@ -624,6 +672,7 @@ float4 ps_grab(g2p i) : SV_Target
 		list->SetGraphicsRootShaderResourceView(3, _ring->GetGPUVirtualAddress());
 		list->SetGraphicsRootShaderResourceView(4, _ring->GetGPUVirtualAddress());
 		list->SetGraphicsRootShaderResourceView(5, _ring->GetGPUVirtualAddress() + slot + kVertexBytes);
+		list->SetGraphicsRootDescriptorTable(6, textures::view(textures::kNone)); // (the environment: white till a specular D3M)
 		ID3D12DescriptorHeap *const ours = textures::heap();
 		ID3D12DescriptorHeap *heap_bound = ours;
 		const zone::gpu_zone *zone_bound = nullptr;
@@ -656,7 +705,11 @@ float4 ps_grab(g2p i) : SV_Target
 			{
 				list->SetDescriptorHeaps(1, &want);
 				heap_bound = want;
+				// (the environment's table from the heap now bound: the zone's untextured view under an MMB mesh)
+				list->SetGraphicsRootDescriptorTable(6, z != nullptr ? z->texture_srv(textures::kNone) : textures::view(textures::kNone));
 			}
+			if (e.env != kNone && z == nullptr)
+				list->SetGraphicsRootDescriptorTable(6, textures::view(e.env));
 			if (z != nullptr && z != zone_bound)
 			{
 				list->SetGraphicsRootShaderResourceView(3, z->vertices()->GetGPUVirtualAddress());
@@ -682,8 +735,8 @@ float4 ps_grab(g2p i) : SV_Target
 					bound = pso;
 					list->SetGraphicsRoot32BitConstants(0, 44, c, 0);
 				}
-				const uint32_t fl[3] = { dr.stages, dr.first, e.light < kMaxLit ? e.light : kNone };
-				list->SetGraphicsRoot32BitConstants(0, 3, fl, 44);
+				const uint32_t fl[4] = { dr.stages, dr.first, e.light < kMaxLit ? e.light : kNone, e.spec < kMaxLit ? e.spec : 0u };
+				list->SetGraphicsRoot32BitConstants(0, 4, fl, 44);
 				D3D12_CPU_DESCRIPTOR_HANDLE dist_cpu;
 				D3D12_GPU_DESCRIPTOR_HANDLE dist_gpu;
 				if (dr.texture == kDistTexture)

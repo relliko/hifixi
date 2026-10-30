@@ -1225,6 +1225,91 @@ int main()
 			put<uint32_t>(s.colour, colour_kept);
 		}
 
+		// A specular D3M (0412B0, its pre-draw's fields set by hand): Fire's 'fa04' with the global environment (VA
+		// 0490BB90: the same texture object): the two-stage table, the environment's id, its record (the normals' rows
+		// WORLD's inverse transposed, the texture matrix's columns 0 and 1 from the game's math vt+0x58 of (0, -pi/2, 0));
+		// then +0x198 bits 0 and 3 (its own angles, CLAMP) and +0x1AC 0xC0FF8040 (x 0x80808080 / 128: a tint); with three
+		// stages but the environment at stage 1, the game's
+		{
+			check(s.spec_draw == base + 0x0412B0 && s.spec_cubemap == base + 0x47BB90, name + ": the specular D3M 0412B0, the global environment VA +47BB90");
+			const uintptr_t vt_spec = take(0x100);
+			put<uint32_t>(vt_spec + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_spec + 0x48, uint32_t(s.spec_draw));
+			put<uint32_t>(vt_spec + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			// (math vt+0x58 06DCF0 builds its three rotations in statics, each made the first time with the game's own atexit:
+			// not up here, so they're made by hand as 06DCF0 makes them, identity, and their guard set; put back after)
+			std::vector<uint8_t> statics(0x47CE60 - 0x47CBB0);
+			std::memcpy(statics.data(), reinterpret_cast<const void *>(base + 0x47CBB0), statics.size());
+			for (const uintptr_t rot : { 0x47CBB0u, 0x47CBF0u, 0x47CE20u })
+				identity(base + rot);
+			put<uint8_t>(base + 0x47CCC0, uint8_t(get<uint8_t>(base + 0x47CCC0) | 7));
+			const uint32_t cube_kept = get<uint32_t>(s.spec_cubemap);
+			put<uint32_t>(s.spec_cubemap, uint32_t(tex_object));
+			put<uint32_t>(tex_object + 0x40, 0x5678);
+			const uintptr_t es = element(vt_spec, textured_res, 0x48, 1u << 25, 0x80808080, -5.0f);
+			put<uint8_t>(es + 0x1BD, 1);
+			put<uint32_t>(es + 0x1AC, 0x80808080u);
+			const uintptr_t list_s = take(16), node_s = take(32);
+			put<uint32_t>(node_s + 4, 0);
+			put<uint32_t>(node_s + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node_s + 0xC, uint32_t(es));
+			put<uint32_t>(list_s + 4, uint32_t(node_s));
+			put<uint32_t>(list_s + 8, 0);
+			const auto run_spec = [&]() {
+				g_seen = seen();
+				g_markers = 0;
+				reinterpret_cast<flush_fn>(s.code)(list_s, 0);
+				return fx::published(g_last_seq);
+			};
+			using euler_fn = void(__fastcall *)(uintptr_t, uintptr_t, float *, float, float, float);
+			const auto euler = reinterpret_cast<euler_fn>(uintptr_t(get<uint32_t>(get<uint32_t>(address(math)) + 0x58)));
+			const auto columns_are = [&](const fx::lighting &l, const float *tm) {
+				bool same = true;
+				for (int r = 0; r < 4; ++r)
+					same = same && std::fabs(l.toward[0][r] - tm[4 * r]) < 1e-6f && std::fabs(l.toward[1][r] - tm[4 * r + 1]) < 1e-6f;
+				return same;
+			};
+			const fx::frame *fs = run_spec();
+			bool ok = g_markers == 1 && g_seen.setups == 0 && fs != nullptr && fs->element_count == 1;
+			if (ok)
+			{
+				const fx::element &d = fs->elements[0];
+				const fx::draw &dr = fs->draws[d.first_draw];
+				alignas(16) float tm[16];
+				euler(address(math), 0, tm, 0.0f, -1.5707964f, 0.0f);
+				const fx::lighting &l = fs->lights[d.spec];
+				ok = d.cls == fx::class_spec && d.env != fx::kNone && d.env == dr.texture && dr.stages == (fx::stage_spec | fx::stage_texture) && dr.count == 6 &&
+					d.tfactor == 0x80808080u && d.light == fx::kNone && d.fog == 0 && columns_are(l, tm) && std::fabs(l.normal[0][0] - 1.0f) < 1e-4f &&
+					std::fabs(l.normal[1][1] - 1.0f) < 1e-4f && std::fabs(tm[0] * tm[0] + tm[1] * tm[1] + tm[2] * tm[2] - 1.0f) < 1e-4f;
+			}
+			check(ok, name + ": a specular D3M: two stages, the environment's texture and record (the normals' rows, the texture matrix's columns), unlit, no fog");
+			put<uint8_t>(es + 0x198, 1 | 8);
+			put<float>(es + 0x19C, 0.25f);
+			put<float>(es + 0x1A0, 0.5f);
+			put<float>(es + 0x1A4, -0.75f);
+			put<uint32_t>(es + 0x1AC, 0xC0FF8040u);
+			put<uint32_t>(es + 0x1A8, 0);
+			const fx::frame *ft = run_spec();
+			ok = g_markers == 1 && ft != nullptr && ft->element_count == 1;
+			if (ok)
+			{
+				const fx::element &d = ft->elements[0];
+				alignas(16) float tm[16];
+				euler(address(math), 0, tm, -0.25f, -(0.5f + 1.5707964f), 0.75f);
+				const fx::lighting &l = ft->lights[d.spec];
+				ok = ft->draws[d.first_draw].stages == (fx::stage_spec | fx::stage_texture | fx::stage_spec_clamp | fx::stage_spec_tint) && columns_are(l, tm) &&
+					l.diffuse[0][0] == 1.0f && std::fabs(l.diffuse[0][1] - 128.0f / 255.0f) < 1e-6f && std::fabs(l.diffuse[0][2] - 64.0f / 255.0f) < 1e-6f &&
+					std::fabs(l.diffuse[0][3] - 192.0f / 255.0f) < 1e-6f;
+			}
+			check(ok, name + ": a specular D3M with its own angles, CLAMP and a tint (0xC0FF8040 x 0x80808080 / 128)");
+			put<uint8_t>(es + 0x1B8, 2);
+			run_spec();
+			check(g_seen.setups == 1, name + ": a three-stage specular D3M with its environment at stage 1 left to the game");
+			put<uint32_t>(s.spec_cubemap, cube_kept);
+			std::memcpy(reinterpret_cast<void *>(base + 0x47CBB0), statics.data(), statics.size());
+			put<uint32_t>(tex_object + 0x40, 0);
+		}
+
 		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
 		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
 		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path

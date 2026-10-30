@@ -114,6 +114,10 @@ namespace hifi::game::fxdraw
 		constexpr const char *kDistModelDraw = "83EC1C535556578BF9897C24148B87FC00000085C074048B00EB0233C08A88DE00000084C97916E8";
 		constexpr const char *kDistMorphDraw = "83EC08558BE9568B850401000085C00F84????????85C07408";
 		constexpr const char *kDistRingDraw = "83EC2C53558BE956570FBE85B40100008D4C00020FBE85B5010000";
+		// The specular D3M 0412B0; 044250 (mov ecx, the global environment 'cubemap spec' VA 0490BB90 at +0xB)
+		constexpr const char *kSpecDraw = "83EC1053558BE95733FF39BD040100000F84????????8A857901000084C0";
+		constexpr const char *kSpecCubemap = "8B4424088B4C24045051B9????????E8????????C3";
+		constexpr intptr_t kSpecCubemapAt = 0xB;
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
 		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
@@ -169,6 +173,7 @@ namespace hifi::game::fxdraw
 			uintptr_t vuanm_draw = 0, vu_walk = 0, vu_callback = 0, vu_table = 0, vu_attach = 0, vu_cursor = 0; // (03F130's; 0 any: VuAnm the game's)
 			uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // (0426F0, 043110, VA 048E666C)
 			uintptr_t distmodel_draw = 0, distmorph_draw = 0, distring_draw = 0; // (043320, 043590, 043720; 0 without 0426F0's)
+			uintptr_t spec_draw = 0, spec_cubemap = 0; // (0412B0, VA 0490BB90)
 			uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // (054B81 patched when all found; 03EBF0, VA 0490B970)
 			uint8_t saved_flare[5] = {}, ours_flare[5] = {};
 			uintptr_t code = 0;
@@ -868,6 +873,209 @@ namespace hifi::game::fxdraw
 			f.draw_count += count;
 			f.element_count++;
 			g.n.taken[fx::class_mmb]++;
+			return true;
+		}
+
+		// A specular D3M (CMoD3mSpecularElem, 0412B0) into the frame; false: the game's. Its pre-draw (vt+0x4C 041160, run
+		// before the setup, so before this) clears flags bit 16 (unlit) and sets bit 25 (no fog), sets the stages +0x1BC 0
+		// and +0x1BD 1 when the D3M has no textures, and binds the environment at stage +0x1BD with 0759C0: the element's
+		// own (+0x1A8's resource +0x30, when its first dword is set) else the global 'cubemap spec' (VA 0490BB90, 044250),
+		// tinted by +0x1AC (unless +0x198 bit 0, its R G B x VA 0490BC0C's / 128, truncated to their low bytes): 0x80808080
+		// binds it as it is, anything else a copy of it x the tint x 2 (0755A0's target): done here in the shader. 0412B0
+		// (R): an MMB goes to 040C20 (record_mmb); no vertex buffer: nothing; ZENABLE 1, TEXTUREFACTOR VA 0490BC0C as it
+		// is; the texture matrix of stage +0x1BD: math vt+0x58 of (0, -pi/2, 0), or with +0x198 bit 0 of (-+0x19C,
+		// -(+0x1A0 + pi/2), -+0x1A4), times (with bit 1 too) the camera's matrix (015230: [VA 048E68FC] +0xD4) without its
+		// translation; no textures: 3529B0 / 3528F0 (NORMALIZENORMALS 1; stage 0 CURRENT x TFACTOR x 2, alpha x 4; stage 1
+		// the camera-space normal through it, COUNT3, colour CURRENT + CURRENT's alpha x TEXTURE, alpha CURRENT), ADDRESS
+		// of stage 1 CLAMP with +0x198 bit 3, else WRAP; the triangles in one draw. Textures: +0x1B8 bit 1 352B24 /
+		// 3529C8 (three stages, the environment at 2) else 352C60 / 352B40 (two), the alpha of the stage after the
+		// texture's SELECTARG1 with letter d or flags bit 28, else MODULATE4X with TFACTOR; the UV scroll of stage +0x1BC
+		// (+0x17B: the TEXTURE0 offset); each texture run (075700 at stage +0x1BC: a wave of it when +0x148, the game's)
+		// and the rest with 352C78 (the untextured table, no environment) when +5. Taken only when the stages are where
+		// the tables put them (+0x1BC 0, +0x1BD 1, or 2 with three stages).
+		using euler_fn = void(__fastcall *)(uintptr_t math, uintptr_t edx, float *out, float x, float y, float z);
+
+		bool record_spec(uintptr_t e, uintptr_t handle)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t math = at<uint32_t>(g.math), camera = at<uint32_t>(g.camera);
+			if (g.spec_cubemap == 0 || math == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uintptr_t resource = at<uint32_t>(handle);
+			if (resource == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uintptr_t data = resource + 0x30;
+			const uint32_t textures = at<uint8_t>(data + 4), tail = at<uint8_t>(data + 5), triangles = at<uint16_t>(data + 6);
+			const uintptr_t names = d3m_names(data), vertices = d3m_vertices(data);
+			if (at<uint32_t>(names + 4) == 0)
+			{
+				g.n.empty++;
+				return true; // (no vertex buffer: 0412B0 draws nothing)
+			}
+			const uint8_t mode = at<uint8_t>(e + 0x198);
+			const bool three = textures != 0 && (at<uint8_t>(e + 0x1B8) & 2) != 0;
+			const uint8_t stage0 = at<uint8_t>(e + 0x1BC), stage_env = at<uint8_t>(e + 0x1BD);
+			if (textures > 13 || (textures != 0 && (stage0 != 0 || stage_env != (three ? 2 : 1) || at<float>(e + 0x148) != 0.0f)) || (textures == 0 && stage_env != 1))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// The environment and its tint, as the pre-draw bound them
+			uintptr_t entry = g.spec_cubemap;
+			if (const uint32_t h = at<uint32_t>(e + 0x1A8); h != 0)
+				if (const uint32_t r = at<uint32_t>(h); r != 0 && at<uint32_t>(r + 0x30) != 0)
+					entry = r + 0x30;
+			const uint32_t object = at<uint32_t>(entry);
+			if (object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			uint32_t tint = at<uint32_t>(e + 0x1AC);
+			if ((mode & 1) == 0)
+			{
+				const uint32_t colour = at<uint32_t>(g.colour);
+				for (int k = 0; k < 3; ++k)
+				{
+					const uint32_t p = uint32_t(float(int32_t((colour >> (8 * k)) & 0xFF) * int32_t((tint >> (8 * k)) & 0xFF)) * 0.0078125f) & 0xFF;
+					tint = (tint & ~(0xFFu << (8 * k))) | p << (8 * k);
+				}
+			}
+			const uint32_t env = texture_of(object);
+			if (env == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			// The draws, as 0412B0 makes them
+			const uint16_t letter = at<uint16_t>(e + kLetter);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			uint32_t stages = fx::stage_spec | ((mode & 8) != 0 ? fx::stage_spec_clamp : 0u) | (tint != 0x80808080u ? fx::stage_spec_tint : 0u);
+			fx::draw draws[16];
+			uint32_t count = 0, used = 0;
+			bool patch_y = false;
+			float first_y_value = 0.0f;
+			if (textures == 0)
+			{
+				const uint32_t kind = at<uint8_t>(data) & 0xF;
+				if (kind >= 5 && kind <= 7)
+				{
+					if (!dat_first_y(resource, first_y_value))
+					{
+						g.n.overwritten++;
+						return false;
+					}
+					patch_y = true;
+				}
+				draws[count++] = { 0, triangles * 3, fx::kNone, stages };
+				used = triangles * 3;
+			}
+			else
+			{
+				stages |= fx::stage_texture | (three ? fx::stage_spec_three : 0u) | ((letter & 0xFF) == 0x64 || (flags & (1u << 28)) != 0 ? fx::stage_spec_keep : 0u);
+				uint32_t first = 0;
+				for (uint32_t i = 0; i < textures; ++i)
+				{
+					const uint32_t id = texture_of(at<uint32_t>(names + 16 * i));
+					if (id == fx::kNone)
+					{
+						g.n.texture++;
+						return false;
+					}
+					const uint32_t n = uint32_t(at<uint16_t>(data + 8 + 2 * i)) * 3;
+					draws[count++] = { first, n, id, stages };
+					first += n;
+				}
+				used = first;
+				if (tail != 0)
+				{
+					const uint32_t rest = first / 3 <= triangles ? (triangles - first / 3) * 3 : 0;
+					draws[count++] = { first, rest, fx::kNone, 0 };
+					used = first + rest;
+				}
+			}
+			if (used > triangles * 3)
+				used = triangles * 3;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + count > fx::kMaxDraws || f.vertex_count + used > fx::kMaxVertices || f.light_count >= fx::kMaxLit)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out) || !lit_ok(e, out))
+				return false;
+			// The texture matrix (math vt+0x58, vt+0x24 as 0412B0 calls them)
+			alignas(16) float tm[16];
+			const auto euler = reinterpret_cast<euler_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(math) + 0x58)));
+			if ((mode & 1) != 0)
+			{
+				euler(math, 0, tm, -at<float>(e + 0x19C), -(at<float>(e + 0x1A0) + 1.5707964f), -at<float>(e + 0x1A4));
+				if ((mode & 2) != 0)
+				{
+					if (camera == 0)
+					{
+						g.n.unsupported++;
+						return false;
+					}
+					alignas(16) float cm[16];
+					std::memcpy(cm, reinterpret_cast<const void *>(camera + 0xD4), 64);
+					cm[12] = cm[13] = cm[14] = 0.0f;
+					cm[15] = 1.0f;
+					reinterpret_cast<product_fn>(uintptr_t(at<uint32_t>(at<uint32_t>(math) + kProductB)))(math, 0, tm, tm, cm);
+				}
+			}
+			else
+				euler(math, 0, tm, 0.0f, -1.5707964f, 0.0f);
+			// The camera-space normals: WORLD's 3x3 inverted and transposed (VIEW is identity)
+			const float *w = out.world;
+			const float det = w[0] * (w[5] * w[10] - w[6] * w[9]) - w[1] * (w[4] * w[10] - w[6] * w[8]) + w[2] * (w[4] * w[9] - w[5] * w[8]);
+			if (!std::isfinite(det) || std::fabs(det) < 1e-20f)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const float inv[9] = { (w[5] * w[10] - w[6] * w[9]) / det, (w[2] * w[9] - w[1] * w[10]) / det, (w[1] * w[6] - w[2] * w[5]) / det,
+				(w[6] * w[8] - w[4] * w[10]) / det, (w[0] * w[10] - w[2] * w[8]) / det, (w[2] * w[4] - w[0] * w[6]) / det,
+				(w[4] * w[9] - w[5] * w[8]) / det, (w[1] * w[8] - w[0] * w[9]) / det, (w[0] * w[5] - w[1] * w[4]) / det };
+			fx::lighting &l = f.lights[f.light_count];
+			l = fx::lighting();
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					l.normal[i][j] = inv[j * 3 + i];
+			for (int r = 0; r < 4; ++r)
+			{
+				l.toward[0][r] = tm[4 * r + 0];
+				l.toward[1][r] = tm[4 * r + 1];
+			}
+			for (int c = 0; c < 4; ++c)
+				l.diffuse[0][c] = float((tint >> (c == 3 ? 24 : 16 - 8 * c)) & 0xFF) / 255.0f;
+			out.spec = f.light_count++;
+			out.env = env;
+			out.tfactor = at<uint32_t>(g.colour);
+			std::memcpy(f.vertices + f.vertex_count, reinterpret_cast<const void *>(vertices), size_t(used) * sizeof(fx::vertex));
+			if (patch_y && used != 0)
+				f.vertices[f.vertex_count].pos[1] = first_y_value;
+			out.first_draw = f.draw_count;
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				fx::draw d = draws[i];
+				if (d.first + d.count > used)
+					d.count = d.first < used ? used - d.first : 0;
+				d.first += f.vertex_count;
+				f.draws[f.draw_count++] = d;
+			}
+			out.draws = count;
+			out.cls = fx::class_spec;
+			f.vertex_count += used;
+			f.element_count++;
+			g.n.taken[fx::class_spec]++;
 			return true;
 		}
 
@@ -2021,6 +2229,17 @@ namespace hifi::game::fxdraw
 				return record_dist(e, 1);
 			if (cls == g.vudist_draw && g.vudist_draw != 0)
 				return record_vudist(e);
+			if (cls == g.spec_draw && g.spec_draw != 0)
+			{
+				// (0412B0: no model, nothing; an MMB, 040C20 as the plain D3M's)
+				const uint32_t handle = at<uint32_t>(e + kModel);
+				if (handle == 0)
+				{
+					g.n.empty++;
+					return true;
+				}
+				return at<uint8_t>(e + kMmb) != 0 ? record_mmb(e, handle) : record_spec(e, handle);
+			}
 			if (cls == g.distring_draw && g.distring_draw != 0)
 				return record_dist_ring(e);
 			if ((cls == g.distmodel_draw && g.distmodel_draw != 0) || (cls == g.distmorph_draw && g.distmorph_draw != 0))
@@ -2317,6 +2536,11 @@ namespace hifi::game::fxdraw
 		}
 		if (const uintptr_t v = find(kVuDistDraw); v != 0 && n.dist_draw != 0)
 			n.vudist_draw = v;
+		if (const uintptr_t sp = find(kSpecDraw), cube = find(kSpecCubemap); sp != 0 && cube != 0)
+		{
+			n.spec_draw = sp;
+			n.spec_cubemap = word(cube + kSpecCubemapAt);
+		}
 		if (n.dist_draw != 0)
 		{
 			n.distmodel_draw = find(kDistModelDraw);
@@ -2490,7 +2714,7 @@ namespace hifi::game::fxdraw
 			taken += t;
 		char line[1000];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), lens flares %llu; %llu lit), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), specular %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
@@ -2502,7 +2726,7 @@ namespace hifi::game::fxdraw
 			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_dist]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_model]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_dist_morph]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_ring]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_spec]), static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
 			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
@@ -2538,6 +2762,8 @@ namespace hifi::game::fxdraw
 		s.distmodel_draw = g.distmodel_draw;
 		s.distmorph_draw = g.distmorph_draw;
 		s.distring_draw = g.distring_draw;
+		s.spec_draw = g.spec_draw;
+		s.spec_cubemap = g.spec_cubemap;
 		s.flare_call = g.flare_call;
 		s.flare_pieces = g.flare_pieces;
 		s.flare_textures = g.flare_textures;

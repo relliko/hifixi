@@ -1024,6 +1024,103 @@ int main(int argc, char **argv)
 			da->Release();
 		}
 
+		// A specular D3M's stages by value (3528F0, untextured): two quads facing the camera (camera-space normal (0, 0,
+		// 1)), the environment the white 1x1 (no texture of its own), ONE / ZERO: vertex 0x40202020, TFACTOR 0x80808080:
+		// CURRENT x TFACTOR x 2 = 0x20 x 1.004, alpha 0x40 x 0x80 x 4 = 0.502; + 0.502 x the environment: 160 on the left;
+		// the right with the tint 0x80404040 (the environment x 0x40 x 2 = 0.502): 96
+		{
+			fx::frame &fs = fx::frame_slot(++seq);
+			fs.seq.store(0);
+			fs.element_count = fs.draw_count = fs.vertex_count = fs.light_count = fs.grab_count = 0;
+			std::memcpy(fs.proj, id, 64);
+			for (int k = 0; k < 2; ++k)
+			{
+				fx::element e;
+				std::memcpy(e.world, id, 64);
+				e.tfactor = 0x80808080u;
+				e.blend = fx::blend_one_zero;
+				e.cls = fx::class_spec;
+				e.first_draw = fs.draw_count;
+				e.draws = 1;
+				fx::lighting &l = fs.lights[fs.light_count];
+				l = fx::lighting();
+				for (int i = 0; i < 3; ++i)
+					l.normal[i][i] = 1.0f;
+				l.toward[0][0] = 1.0f; // (u = n.x, v = n.y: the middle of the white texel)
+				l.toward[1][1] = 1.0f;
+				l.diffuse[0][0] = l.diffuse[0][1] = l.diffuse[0][2] = 64.0f / 255.0f;
+				l.diffuse[0][3] = 128.0f / 255.0f;
+				e.spec = fs.light_count++;
+				const float x0 = k == 0 ? -1.0f : 0.0f, x1 = k == 0 ? 0.0f : 1.0f;
+				const float c[6][2] = { { x0, -1 }, { x1, -1 }, { x0, 1 }, { x0, 1 }, { x1, -1 }, { x1, 1 } };
+				fs.draws[fs.draw_count++] = { fs.vertex_count, 6, fx::kNone, fx::stage_spec | (k == 1 ? fx::stage_spec_tint : 0u) };
+				for (const auto &p : c)
+				{
+					fx::vertex v = {};
+					v.pos[0] = p[0];
+					v.pos[1] = p[1];
+					v.pos[2] = 0.5f;
+					v.normal[2] = 1.0f;
+					v.colour = 0x40202020u;
+					fs.vertices[fs.vertex_count++] = v;
+				}
+				fs.elements[fs.element_count++] = e;
+			}
+			fs.run_list[0] = { 0, 2 };
+			fs.runs.store(1);
+			fs.seq.store(seq);
+			ID3D12CommandAllocator *sa = nullptr;
+			ID3D12GraphicsCommandList *sl = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&sa));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sa, nullptr, IID_PPV_ARGS(&sl));
+			barrier(sl, A, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const float none[4] = { 0, 0, 0, 0 };
+			sl->ClearRenderTargetView(rtv, none, 0, nullptr);
+			sl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			sl->SetDescriptorHeaps(1, &game_heap);
+			grass::list_state sbound;
+			hifi::passes::world sw;
+			sw.rt = A;
+			sw.ds = Az;
+			sw.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sw.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			sw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			sw.planes_known = true;
+			sw.ds_planes[0] = sw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			sw.heap_count = 1;
+			sw.heaps[0] = game_heap;
+			fx::inject::on_run(sl, sbound, sw, seq & 15);
+			barrier(sl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION sdst = {}, ssrc = {};
+			sdst.pResource = back;
+			sdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			sdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+			ssrc.pResource = A;
+			ssrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			sl->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
+			sl->Close();
+			ID3D12CommandList *sls[] = { sl };
+			queue->ExecuteCommandLists(1, sls);
+			queue->Signal(fence, ++fence_value);
+			HANDLE sev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			fence->SetEventOnCompletion(fence_value, sev);
+			WaitForSingleObject(sev, 60000);
+			CloseHandle(sev);
+			uint8_t *sp = nullptr;
+			back->Map(0, nullptr, reinterpret_cast<void **>(&sp));
+			const uint8_t *lft = sp + 32 * 256 + 10 * 4, *rgt = sp + 32 * 256 + 50 * 4;
+			char sline[200];
+			std::snprintf(sline, sizeof(sline), "a specular D3M's stages: %d %d %d on the left (want 160, within 2), %d %d %d tinted on the right (want 96)", lft[0], lft[1], lft[2], rgt[0],
+				rgt[1], rgt[2]);
+			check(std::abs(lft[0] - 160) <= 2 && std::abs(lft[2] - 160) <= 2 && std::abs(rgt[0] - 96) <= 2 && std::abs(rgt[2] - 96) <= 2, sline);
+			back->Unmap(0, nullptr);
+			std::string sfirst;
+			const uint32_t smessages = debug_messages(info, sfirst);
+			check(smessages == 0, "a specular D3M's stages: the debug layer: nothing (" + std::to_string(smessages) + (smessages != 0 ? ": " + sfirst : std::string()) + ")");
+			sl->Release();
+			sa->Release();
+		}
+
 		// A lens flare's pieces by value (3520A8, pre-transformed): a quad over the left half in the game's pixels (WORLD
 		// pixels to clip space, PROJECTION identity), untextured (white), vertex colour 0x40804020, TFACTOR alpha 0x80,
 		// SRCALPHA / ONE on black: colour 0x80 0x40 0x20 x 2, alpha 0x40 x 2 x 0x80 x 2 (0.504): 128 64 32; the right half

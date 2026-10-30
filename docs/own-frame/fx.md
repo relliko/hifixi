@@ -57,6 +57,7 @@ Classes taken (by the vtable's class draw, vt+0x48):
 | CMoDistModelElem (0x32B418) | 043320 | the D3M's vertices, their UVs by 042D00 through the draw matrix moved by +0x194, the whole world grabbed, one draw with 352740's stages (below) | - |
 | CMoDistMorphElem (0x32B358) | 043590 | the morph blended (03F8A0), its positions' UVs by 042D00, the whole world grabbed, WORLD moved by +0x1C0, 352258's stages (below) | a blend handed in (+0x1BC); 042D00 answering 0 (it keeps the blend then) |
 | CMoDistRingElem (0x32B4D8) | 043720 | its bands (angles 0, d .. (n-1)d, 0), the colours x the element's >> 7, UVs by 042D00, the whole world grabbed, 353378's stages (below) | lit (its normals aren't written), more than 4 rings |
+| CMoD3mSpecularElem (0x32AD20) | 0412B0 | the D3M with an environment stage: its texture matrix by the game's math vt+0x58, the camera-space normals, the tint (below) | the stages elsewhere than the tables' (+0x1BC, +0x1BD), a texture wave (+0x148), the environment not to be had |
 | lens flares (CMoLfdElem 0x32B538) | its own vt+0x2C 0548D0, its call of 03EBF0 at 054B81 | the pieces of the flare D3A pre-transformed as 03EBF0 places them (below); 0548D0 itself (the visibility test, the glare colour 014F70) still runs | a texture not found or not up |
 | morphs (0x32AC90) | 03FBB0 -> 03F440 | T x 3 corners: positions and normals blended as 03F8A0 does (below), colours doubled, the UVs; table 352258 (as the D3M's 3524A8), the header's bit 7 the alpha test GREATER 0x60; 03FBB0's side effects done (+0x194 -> +0x1A8, +0x1BC cleared) | a blend handed in (+0x1BC), the texture wave (+0x148), a texture not up |
 | rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | more than 4 rings |
@@ -149,6 +150,27 @@ the vertices it records (`dist_uvs`), and the grab is `fx::grab` as for CMoDist 
   again (unlike 0565A0's 0, 0, d ..); normals not written (lit: the game's). 042D00 on all of them with the plain draw
   matrix (no shift: the world under the ring through the 256 x 256 copy), 353378 (colour CURRENT x TEXTURE x 2, alpha
   DIFFUSE x TEXTURE x 4, MIRROR, stage 1 off; `stage_dist_ring`), a DrawPrimitiveUP strip of 2n triangles per band.
+
+**The specular D3M (0412B0).** Its pre-draw (vt+0x4C 041160, run by 046070 before the setup, so before fxdraw sees
+it) clears flags bit 16 (unlit) and sets bit 25 (no fog), sets the stages +0x1BC 0 and +0x1BD 1 for a D3M without
+textures, and binds the environment at stage +0x1BD with 0759C0: the element's own (+0x1A8's resource +0x30 when
+its first dword is set) or the global 'cubemap spec' (VA 0490BB90, 044250); its tint +0x1AC, unless +0x198 bit 0
+its R G B x VA 0490BC0C's / 128, truncated to the low byte: 0x80808080 binds the texture as it is, anything else a
+copy of it x the tint x 2 (`stage_spec_tint`). 0412B0 (R): an MMB goes to 040C20 (record_mmb, as the plain D3M);
+ZENABLE 1, TEXTUREFACTOR VA 0490BC0C as it is (no D change); stage +0x1BD's texture matrix: math vt+0x58 of (0, -pi/2,
+0), or with +0x198 bit 0 of (-+0x19C, -(+0x1A0 + pi/2), -+0x1A4) times (bit 1 too) the camera's matrix ([VA
+048E68FC] +0xD4, 015230) without its translation (math vt+0x24); fxdraw calls the game's own. Without textures:
+3529B0 / 3528F0 (NORMALIZENORMALS 1; stage 0 CURRENT x TFACTOR x 2, alpha x 4; stage 1 TEXCOORDINDEX
+CAMERASPACENORMAL, COUNT3, colour MODULATEALPHA_ADDCOLOR (CURRENT + CURRENT's alpha x the environment), alpha
+CURRENT), stage 1 ADDRESS CLAMP with +0x198 bit 3, else WRAP. With textures: +0x1B8 bit 1 352B24 / 3529C8 (TEXTURE x
+DIFFUSE x 2, alpha x 2; x TFACTOR x 2; the environment at stage 2) else 352C60 / 352B40 (TEXTURE x DIFFUSE x 2,
+alpha x 4; the environment at stage 1), the alpha after the texture's stage SELECTARG1 with letter d or flags bit
+28, else MODULATE4X with TFACTOR; the UV scroll at stage +0x1BC; each texture run (075700: a wave when +0x148, the
+game's), the rest with 352C78 (the untextured table, no environment). On the Direct3D 12 side the vertex shader
+makes the environment's coordinates from the element's record in the frame's lights (`element::spec`: WORLD's 3x3
+inverted and transposed, the texture matrix's columns 0 and 1, the tint) and the pixel shader samples it (root
+table t5, `element::env`; static sampler s2 CLAMP). Taken only with the stages where the tables put them (+0x1BC 0;
++0x1BD 1, or 2 with three stages). Kinds 5-7 without textures take the first vertex's y from the DAT as the D3M does.
 
 **Lens flares (0548D0 -> 03EBF0).** The flare's own draw (vt+0x2C, so the run is closed before it as before) works
 out the light's screen point, runs its visibility test (06C280 at 054AE2: the game's readback, or World FX's VisTest
@@ -263,7 +285,10 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   the side effects; rings of 8 segments and 3 rings: the bands, the colours x the element's >> 7, the UVs; a lit one
   left to the game; the whole-world grab each time); a lens flare (ROM/0/40 'lf01', 17 pieces: on_flare from a flush, its 108 vertices placed
   as 03EBF0 places them, alpha x visibility, its texture found by name in a made-up texture manager; the call at 054B81
-  patched and put back). 147 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
+  patched and put back); a specular D3M (Fire's 'fa04' with the pre-draw's fields set by hand: the two-stage table, the
+  environment's id and record, the texture matrix's columns from the game's vt+0x58; its own angles, CLAMP and a tint;
+  three stages with the environment elsewhere left to the game; 06DCF0's rotation statics made by hand: their first use
+  registers with the game's atexit, not up offline). 155 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
   threads put their stacks there otherwise).
 - `build\fx_render_test.exe build\test\fx_fire.bin build\test\fx_cure.bin build\test\fx_fastblade.bin`: the D3D12 side
   at its marker on WARP with the debug layer, on a list recorded as dgVoodoo records (its own heap and targets),
@@ -276,7 +301,8 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   blue, the fan shifted 8 pixels shows red where the world is blue: the grab, the copy and the 256 x 256 target), the
   042D00 distortions by value (the whole world grabbed flipped; the mesh's stages sampling 16 pixels left and up, WRAP;
   the ring's sampling 16 pixels left, MIRROR) and a
-  lens flare's stage pre-transformed (a quad over the screen's left half: 128 64 32, the right half untouched). 43
+  lens flare's stage pre-transformed (a quad over the screen's left half: 128 64 32, the right half untouched), a
+  specular D3M's stages (untextured, the environment white: 160; tinted 0x40: 96). 45
   checks (with the fountain's DAT).
 - `hook_test` (plain and --debug) and `menu_test` pass.
 The oracles are made when missing (`build.cmd`), about a minute.
@@ -297,23 +323,33 @@ The oracles are made when missing (`build.cmd`), about a minute.
    Each 042D00 element copies the whole world target and draws it into the 256 x 256 target, as the game does; a
    busy scene with many of them costs a full copy each (the game's own cost too). The half-pixel of D3D9's pixel
    centres in 042D00's UVs is kept as the game computes it (the world's geometry isn't shifted by it either).
-7. **Specular D3M** (0412B0) stays the game's. Read so far (R, 2026-10-30): an MMB model goes to 040C20 as the plain
-   D3M; else ZENABLE 1 and TEXTUREFACTOR VA 0490BC0C, then a texture matrix: math vt+0x58 (rotation) of (0, -pi/2, 0),
-   or with +0x198 bit 0 of (-+0x19C, -(+0x1A0 + pi/2), -+0x1A4), times 015230's matrix without its translation when
-   bit 1 also is set, set as TEXTURE0 + (+0x1BD) (SetTransform 0x10 + n); ADDRESS U/V of stage 1 (or 2) WRAP, or CLAMP
-   with +0x198 bit 3. The D3M's byte +4 (data +0x34) 0: one pass with 3529B0 / 3528F0 (stage 1's coordinates the
-   environment's); else two or three passes (352C60 / 352B40, or with +0x1B8 bit 1 352B24 / 3529C8 and stage 2), stage
-   1's ALPHAARG1 by letter d / flags bit 28 (2, else 6), the environment texture +0x140 (075700, stage +0x1BC) and the
-   UV scroll (+0x17B: a TEXTURE transform of its own, TEXCOORDINDEX 0, COUNT2) or math +0x204; TEXCOORDINDEX /
-   TEXTURETRANSFORMFLAGS reset after (0417CE on). Next: read those tables (render-state pairs, then texture-stage triples, each ended by
-   0x7FFFFFFF, as 06AE30 applies them) for the TEXCOORDINDEX texgen they set (camera-space reflection or normal) and write the
-   texgen in the vertex shader; the cube map's faces from `cubemap` (044270 loads it into VA 0490BB90).
-8. **Light spots** (0x32B3B8 040E70, CMoD3aLightmapElem 03EE70) stay the game's. Read (R): 040E70 sets WORLD to the
-   local matrix +0x60, 054D70 makes the 256 x 256 target (VA 0490BB88) the render target, the D3M (040220) or MMB
-   (040C20) is drawn into it, 0472F0 puts the states back, 06A0E0 the target, and 054F80 calls 182700 (the point, the
-   256 x 256 target's texture, 10.0): the spot projected onto the zone's triangles around the point. Next: the element
-   drawn into a 256 x 256 target of ours (the distortion target's resources can be shared: it's the same game target),
-   then 182700's projection over the native zone renderer's triangles within 10 of the point.
+7. (Done: the specular D3M, 0412B0.) The global environment is the texture named 'cubemap spec' (a 2D picture, sampled
+   by the camera-space normal through the texture matrix: D3D8 takes (u, v) of the 3-vector for a 2D texture); its
+   decode isn't checked on real data (should it fail, the element stays the game's). The tinted copy 0759C0 makes
+   (0755A0, the source's size) is done as a tint in the shader: a filtered sample x the tint rather than the filtered
+   tinted texture (the same up to the saturation at 1).
+8. **Light spots** (0x32B3B8 040E70, CMoD3aLightmapElem 03EE70) stay the game's (not started this round: two new
+   pieces of plumbing, below). Read (R, 2026-10-30): 040E70 pushes WORLD = the local matrix +0x60 (06A480), 054D70
+   makes the 256 x 256 target (VA 0490BB88) the render target, clears it (Clear flags 3: colour and depth, 0, z 1),
+   pushes VIEW and PROJECTION (06A420, 06A4C0), sets the viewport 256 x 256, VIEW = a look-at from WORLD's translation
+   to 2 yalms below it, up (0, 0, -1) (2D7FF9 with VA 0490BC7C), and WORLD = scale 0.25 x WORLD (math vt+0x24); then
+   the D3M (040220) or the MMB (040C20) is drawn into it as usual (the 03EE70 kind: the D3A 03EB30, then the point
+   from the draw matrix +0xD0..+0xD8); 0472F0 puts the states back, 06A450 / 06A4F0 the transforms, 06A0E0 the
+   target; 0467E0 runs again (the element's states for what follows), and 054F80 sets VIEW = the camera's (gfx +0xB50,
+   06A520) and calls 182700 (thiscall on the zone renderer [VA 04AC1F24]; the point, the 256 x 256 target's texture,
+   10.0): texture 0 the target, ADDRESS CLAMP, FVF 0x142; a planar map (1 / 10 a yalm, the point at the middle:
+   VA 04807338 / 04807340 / 04807344 / 0480734C) composed through 16C060; then **the collision map's** cells (renderer
+   +0x178, 167940; cell = int((x + map +0x38) x scale), the 3 x 3 cells round the point, clamped to the map's +0x40 x
+   +0x44; cell lists at +0x58) walked: for each entry (mesh +0 positions, +4 normals, +8 triangles of 4 words, +0xC
+   count; instance +0x100 its WORLD, skipped when its +0xBC is the renderer's +0x17C or the mesh's +0xE is set),
+   WORLD = the instance's matrix (00BD50 0x100), and each triangle whose normal faces the map's down (dot <= 0) as 3
+   vertices (position, 0xFF808080, UV = the map of the position) into VA 04AC9088 (at most 1500 a mesh), one
+   DrawPrimitiveUP list a mesh. Blend, z and fog are 0467E0's. Next: (a) a run drawn into a 256 x 256 target of ours
+   (the distortion target's resources: it is the same game target) with the look-at VIEW and the element's
+   PROJECTION, the element's own draws as now; (b) 182700 done on the game side over the same collision cells in
+   memory (pure reads, as faithful as the game), its triangles recorded as a draw with that target as texture, WORLD
+   the instance's matrix through the camera's VIEW; the element's blend letter. The game's own 054D70 and 182700
+   can't be called for us (they draw).
 9. (Done: lens flares, their pieces.) Their occlusion stays where it is: the game's readback at 054AE2, or World FX's
    VisTest answer (src/render/vistest, kind flare) when that setting is on; HideFlare (on by default) still hides
    them, so they're drawn natively only with it off. Not checked: the flare's texture lookup on real data (the name's
@@ -341,6 +377,8 @@ The oracles are made when missing (`build.cmd`), about a minute.
   in the game; they move on as before.
 - Heat haze (CMoDist, VuDist: fire spells, some abilities): the world under a diamond shown shifted and fading to its
   edges, as before; with MSAA on in dgVoodoo the world is resolved for it. `/hifi status`: "distortion grabs".
+- Shiny effect pieces (the specular D3M: an environment picture that turns with the camera added over them, as
+  before; `/hifi status` "specular").
 - Distortion meshes, morphs and rings (the 042D00 kinds: shock waves, ripples, see-through shapes): the world seen
   through them low-resolution (256 x 256) and shifted, as before; `/hifi status` counts them under "distortion (meshes,
   morphs, rings)".
