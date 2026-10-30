@@ -38,6 +38,7 @@ namespace hifi::chars
 		f.see_through.store(0, std::memory_order_relaxed);
 		f.models = f.instances = f.meshes = f.bones = f.dropped = 0;
 		f.camera = false;
+		f.projection_read = false;
 		f.seq.store(seq, std::memory_order_release);
 		return f;
 	}

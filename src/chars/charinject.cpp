@@ -59,6 +59,10 @@ namespace hifi::chars::inject
 			// T: as big as the world's target, its format and samples
 			ID3D12Resource *t = nullptr;
 			D3D12_RESOURCE_STATES t_state = D3D12_RESOURCE_STATE_COMMON;
+			// The scene's copy for a see-through model's cloak (025870's T2): the world's target's size and format, one
+			// sample; its view the cache's reserved descriptor 1
+			ID3D12Resource *scene = nullptr;
+			D3D12_RESOURCE_STATES scene_state = D3D12_RESOURCE_STATE_COMMON;
 			// The frame being drawn: its seq, the see-through markers seen of it
 			uint32_t seq = 0, see_through = 0;
 			counts n;
@@ -159,7 +163,8 @@ namespace hifi::chars::inject
 			g.view_ds = w.ds;
 			g.view_rt_format = w.rt_format;
 			g.view_ds_format = w.ds_format;
-			drop(g.t); // (T follows the world's target)
+			drop(g.t); // (T follows the world's target, and so does the scene's copy)
+			drop(g.scene);
 			return true;
 		}
 
@@ -200,6 +205,56 @@ namespace hifi::chars::inject
 				sv.Texture2D.MipLevels = 1;
 			}
 			g.device->CreateShaderResourceView(g.t, &sv, srv_cpu);
+			return true;
+		}
+
+		// (under the lock, the world's target in w.rt_state) The scene as drawn so far copied (resolved when multisampled)
+		// into the scene's copy, left readable by a pixel shader (025870: a full-viewport copy of A before a cloaked
+		// model); its view. False when it can't be made.
+		bool copy_scene(ID3D12GraphicsCommandList *list, const world &w, D3D12_GPU_DESCRIPTOR_HANDLE &srv)
+		{
+			D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
+			if (!cache::reserved(1, srv_cpu, srv))
+				return false;
+			const D3D12_RESOURCE_DESC rd = w.rt->GetDesc();
+			if (g.scene == nullptr)
+			{
+				D3D12_RESOURCE_DESC d = rd;
+				d.Format = w.rt_format;
+				d.MipLevels = 1;
+				d.DepthOrArraySize = 1;
+				d.SampleDesc.Count = 1;
+				d.SampleDesc.Quality = 0;
+				d.Flags = D3D12_RESOURCE_FLAG_NONE;
+				d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+				d.Alignment = 0;
+				D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+				if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g.scene))))
+				{
+					g.scene = nullptr;
+					return false;
+				}
+				g.scene->SetName(L"hifixi: the scene's copy (the cloak)");
+				g.scene_state = D3D12_RESOURCE_STATE_COMMON;
+				D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+				sv.Format = w.rt_format;
+				sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				sv.Texture2D.MipLevels = 1;
+				g.device->CreateShaderResourceView(g.scene, &sv, srv_cpu);
+			}
+			const bool resolve = rd.SampleDesc.Count > 1;
+			const D3D12_RESOURCE_STATES from = resolve ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+			const D3D12_RESOURCE_STATES to = resolve ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST;
+			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, w.rt_state, from);
+			barrier(list, g.scene, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, g.scene_state, to);
+			if (resolve)
+				list->ResolveSubresource(g.scene, 0, w.rt, 0, w.rt_format);
+			else
+				list->CopyResource(g.scene, w.rt);
+			barrier(list, g.scene, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, to, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			g.scene_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, w.rt_state);
 			return true;
 		}
 
@@ -348,7 +403,7 @@ namespace hifi::chars::inject
 			return false;
 		std::unique_ptr<char_renderer> old;
 		ID3D12DescriptorHeap *rtv = nullptr, *dsv = nullptr;
-		ID3D12Resource *t = nullptr;
+		ID3D12Resource *t = nullptr, *scene = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			old = std::move(g.renderer);
@@ -356,14 +411,16 @@ namespace hifi::chars::inject
 			rtv = g.rtv_heap;
 			dsv = g.dsv_heap;
 			t = g.t;
+			scene = g.scene;
 			g.rtv_heap = g.dsv_heap = nullptr;
-			g.t = nullptr;
+			g.t = g.scene = nullptr;
 			g.view_rt = g.view_ds = nullptr;
 			g.device = device;
 		}
 		drop(rtv);
 		drop(dsv);
 		drop(t);
+		drop(scene);
 		return true;
 	}
 
@@ -372,7 +429,7 @@ namespace hifi::chars::inject
 		light::release(); // (both passes' target: let go with either)
 		std::unique_ptr<char_renderer> old;
 		ID3D12DescriptorHeap *rtv = nullptr, *dsv = nullptr;
-		ID3D12Resource *t = nullptr;
+		ID3D12Resource *t = nullptr, *scene = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			drop(g.motion);
@@ -385,8 +442,9 @@ namespace hifi::chars::inject
 			rtv = g.rtv_heap;
 			dsv = g.dsv_heap;
 			t = g.t;
+			scene = g.scene;
 			g.rtv_heap = g.dsv_heap = nullptr;
-			g.t = nullptr;
+			g.t = g.scene = nullptr;
 			g.view_rt = g.view_ds = nullptr;
 			g.device = nullptr;
 			g.lists.clear();
@@ -396,6 +454,7 @@ namespace hifi::chars::inject
 		drop(rtv);
 		drop(dsv);
 		drop(t);
+		drop(scene);
 	}
 
 	void set_options(bool per_pixel)
@@ -428,6 +487,9 @@ namespace hifi::chars::inject
 		std::snprintf(line, sizeof(line), "native character renderer: sun shadows from their meshes: %llu frames, %llu models%s",
 			static_cast<unsigned long long>(g.n.caster_frames), static_cast<unsigned long long>(g.n.caster_models),
 			g.n.caster_frames == 0 ? " (none yet: needs World FX's sun shadow map and Characters cast sun shadows)" : "");
+		lines.push_back(line);
+		std::snprintf(line, sizeof(line), "native character renderer: extra passes: %llu overlays, %llu cloaks drawn (%llu scene copies couldn't be made)",
+			static_cast<unsigned long long>(g.n.overlays), static_cast<unsigned long long>(g.n.cloaks), static_cast<unsigned long long>(g.n.cloak_failed));
 		lines.push_back(line);
 		return lines;
 	}
@@ -558,6 +620,7 @@ namespace hifi::chars::inject
 		put_back(list, bound);
 		g.n.frames++;
 		g.n.models += g.last.models;
+		g.n.overlays += g.last.overlays;
 	}
 
 	void set_sun(const float *toward)
@@ -656,6 +719,13 @@ namespace hifi::chars::inject
 			o.lamp_count = g.lamp_count;
 			std::memcpy(o.lamps, g.lamps, sizeof(char_lamp) * g.lamp_count);
 		}
+		// (a cloaked model: the scene as it is now copied first, for its cloak pass to sample)
+		D3D12_GPU_DESCRIPTOR_HANDLE scene = {};
+		if ((m.passes & kPassCloak) != 0 && !copy_scene(list, w, scene))
+		{
+			scene = {};
+			g.n.cloak_failed++;
+		}
 		const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
 		barrier(list, w.ds, 0, p0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, w.ds, 1, p1, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -664,7 +734,9 @@ namespace hifi::chars::inject
 		const float zero[4] = { 0, 0, 0, 0 };
 		list->ClearRenderTargetView(t_rtv, zero, 0, nullptr);
 		char_target tt = target_of(w, t_rtv, dsv);
-		g.last = g.renderer->record_model(list, tt, *f, mi, o);
+		g.last = g.renderer->record_model(list, tt, *f, mi, o, scene);
+		g.n.overlays += g.last.overlays;
+		g.n.cloaks += g.last.cloaks;
 		// T over the world
 		barrier(list, g.t, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		g.t_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;

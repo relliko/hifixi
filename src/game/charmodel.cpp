@@ -28,6 +28,7 @@
 #include "../chars/cache.hpp"
 #include "../chars/charframe.hpp"
 #include "../chars/os2.hpp"
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -51,16 +52,46 @@ namespace hifi::game::charmodel
 		constexpr uint32_t kGetRenderState = 51, kFogColour = 34, kFogStart = 36, kFogEnd = 37;
 		using get_state_fn = long(__stdcall *)(uintptr_t self, uint32_t state, uint32_t *value);
 
+		// Cloth (research/ffxi-re/notes-actor-extras.md 1). 0224D0, a cloth mesh's draw, at 02251C: the work buffer
+		// aligned into its global (+9), the model's posed-once bit, the pose frame's flag (+0x1B), then the step 023290
+		// called (+0x31) as (ecx the resource; the actor, the model, the instance, the buffer, the node)
+		constexpr const char *kClothDraw = "8B464083C00F24F0A3????????8A5130F6C2100F84????????803D????????01751F8B54242C56508B44242C5251508BCFE8";
+		constexpr intptr_t kClothBufferAt = 9, kClothFlagAt = 0x1B, kClothStepAt = 0x31, kClothDrawAt = 0x4C;
+		// 023290's start (sub esp, 2Ch; push ebx, ebp, esi; mov esi, ecx; xor eax, eax; mov ebx, [the palette pointer]): the
+		// pointer it skins with at +0xC ([0x48EEC20], the posed instance's palette, set by 034330)
+		constexpr uint8_t kClothStep[12] = { 0x83, 0xEC, 0x2C, 0x53, 0x55, 0x56, 0x8B, 0xF1, 0x33, 0xC0, 0x8B, 0x1D };
+		constexpr intptr_t kClothPaletteAt = 0xC;
+		// 025030, the cloth node's draw (its vtable +0x1C), its call of 0224D0 at +0x26
+		constexpr const char *kClothNode = "8B41088B54240C518B4C2414518B4C2410528B542410518B0D????????5250E8????????8BC8E8????????C21800";
+		constexpr intptr_t kClothNodeCallAt = 0x26;
+		// (023290 is thiscall with 5 arguments, ret 14h: as fastcall with edx unused)
+		using step_fn = void(__fastcall *)(uintptr_t resource, uintptr_t edx, uintptr_t actor, uintptr_t model, uintptr_t instance, uintptr_t buffer, uintptr_t node);
+		constexpr uint32_t kClothStride = 60; // (a work vertex: +0x0C position, +0x18 the last, +0x24 scratch, +0x30 normal)
+
+		// The actor's extra passes (research/ffxi-re/notes-actor-extras.md 2), as 0D6D30 sets them up before 02B6E0 and
+		// 02B6E0 reads them. 02B955: the overlay's flag ([0x48E70FC], +2); 02B9E8: its v offset ([0x48E70F8], +2), u
+		// offset ([0x48E7100], +7), the texture's handle ([0x48E7268], +0xD), its TEXTUREFACTOR ([0x48E74B0], +0x14);
+		// 02BA17: the cloak's flag ([0x48E72B0], +2), PROJECTION ([0x48E7468], +0xD), its offsets ([0x48E726C] +0x1D,
+		// [0x48E7458] +0x22: both actor +0x744); 02BAEB: its TEXTUREFACTOR ([0x48E74B4], +0xF)
+		constexpr const char *kOverlayFlag = "381D????????0F84????????B9????????E8????????E8????????50B9";
+		constexpr const char *kOverlaySetup = "8B15????????A1????????8B0D????????528B15????????5051528D8D8C000000E8";
+		constexpr const char *kCloakSetup = "381D????????0F84????????68????????B9????????E8????????8B0D????????A1????????";
+		constexpr const char *kCloakFactor = "8B15????????8B0D????????528B15????????5150528D8D90000000E8";
+
 		constexpr uint32_t kColourAt = 0xA8; // (argument 7 at the site's esp)
 		constexpr uint32_t kMaxInstancesPerModel = 8, kMaxMeshesPerInstance = 32, kMaxBonesPerInstance = 255;
+		constexpr uint32_t kMaxClothPerModel = 8, kMaxClothVertices = 1024;
 		constexpr size_t kStubSize = 0x30;
 		constexpr size_t kCallAt = 0x08, kMovAt = 0x15, kGoOnAt = 0x1A, kLeaveAt = 0x1F;
 
 		struct raw_instance
 		{
 			uint32_t bones = 0, first_bone = 0, meshes = 0;
+			uintptr_t self = 0; // (the instance)
 			uint32_t mesh[kMaxMeshesPerInstance];
 			ch::cache::key key[kMaxMeshesPerInstance];
+			uintptr_t node[kMaxMeshesPerInstance];   // (each mesh's node)
+			uint32_t cloth[kMaxMeshesPerInstance];   // a cloth mesh's vertex count (a node the game made for it), else 0
 		};
 		struct raw_model
 		{
@@ -72,6 +103,12 @@ namespace hifi::game::charmodel
 		struct state
 		{
 			uintptr_t site = 0, early_return = 0, stub = 0, lights = 0, ambient = 0, tfactor = 0, renderer = 0, device = 0;
+			// The cloth's (0: not found, a model with cloth is the game's): 023290, the cloth node's draw 025030, the
+			// globals 0224D0 and the posing leave for it (the aligned buffer, the pose frame's flag, the palette pointer)
+			uintptr_t cloth_step = 0, cloth_node = 0, cloth_buffer = 0, cloth_flag = 0, cloth_palette = 0;
+			// The extra passes' globals (0: not found, a model with one of them is the game's)
+			uintptr_t overlay_flag = 0, overlay_u = 0, overlay_v = 0, overlay_handle = 0, overlay_colour = 0;
+			uintptr_t cloak_flag = 0, cloak_projection = 0, cloak_a = 0, cloak_b = 0, cloak_factor = 0;
 			uintptr_t go_on = 0, leave = 0; // (the tests' exits; 0: the game's)
 			uint8_t saved[5] = {}, ours[5] = {};
 			bool in = false;
@@ -98,6 +135,101 @@ namespace hifi::game::charmodel
 		uint32_t kind_of_header(uint32_t header) { return header & 0x7F; }
 		uint32_t data_size(uint32_t header) { const uint32_t s = ((header >> 7) & 0x7FFFF) * 16; return s > 16 ? s - 16 : 0; }
 
+		// A cloth mesh's vertex count, or kBadCloth when this one can't be drawn here (the cloth's sites not found, the
+		// node not the game's cloth node, its work buffer not as big as the mesh). The node (029F70: 0x1C8 bytes,
+		// vtable 0x32A430): +0x3C the reset flag, +0x40 the work buffer (60 bytes a vertex, aligned to 16 when used), +0x44
+		// the vertices + 1. The live resource's counts: section 2, a pointer at data + 0x12. Inside gather's __try.
+		constexpr uint32_t kBadCloth = 0x80000000u;
+		uint32_t cloth_vertices(uintptr_t node, uintptr_t res)
+		{
+			if (g.cloth_step == 0)
+				return kBadCloth;
+			const uintptr_t vtable = *reinterpret_cast<const uint32_t *>(node);
+			if (vtable < 0x10000 || *reinterpret_cast<const uint32_t *>(vtable + 0x1C) != g.cloth_node)
+				return kBadCloth;
+			const uintptr_t counts = *reinterpret_cast<const uint32_t *>(res + 0x30 + 0x12);
+			if (counts < 0x10000)
+				return kBadCloth;
+			const uint32_t n = uint32_t(*reinterpret_cast<const uint16_t *>(counts)) + *reinterpret_cast<const uint16_t *>(counts + 2);
+			if (n == 0 || n > kMaxClothVertices || *reinterpret_cast<const uint32_t *>(node + 0x44) != n + 1 || *reinterpret_cast<const uint32_t *>(node + 0x40) < 0x10000)
+				return kBadCloth;
+			return n;
+		}
+
+		// The game's own cloth step for one mesh, as 0224D0 runs it on a pose frame ([pose flag] = 1, the model posed
+		// once: model +0x30 bit 4): the aligned work buffer into its global, the palette pointer the instance's
+		// (023290 skins the pinned vertices with it; the posing left it at the last instance posed: put back after),
+		// then 023290 (pinned skinned, the free ones moved with the model, damped, gravity, the environment's wind, the
+		// constraints 4 times, the bone spheres, the normals from the triangles), then the reset flag cleared. The
+		// game draws a model it leaves through the early return no more, so the step is ours to run, once a pose frame
+		// as its draw would. False when it faulted.
+		bool step_cloth(uintptr_t res, uintptr_t actor, uintptr_t model, uintptr_t instance, uintptr_t node)
+		{
+			uint32_t *const palette = reinterpret_cast<uint32_t *>(g.cloth_palette);
+			uint32_t was = 0;
+			bool set = false;
+			__try
+			{
+				const uintptr_t buffer = (*reinterpret_cast<const uint32_t *>(node + 0x40) + 15u) & ~uintptr_t(15);
+				was = *palette;
+				*palette = *reinterpret_cast<const uint32_t *>(instance + 0x14);
+				set = true;
+				*reinterpret_cast<uint32_t *>(g.cloth_buffer) = uint32_t(buffer);
+				reinterpret_cast<step_fn>(g.cloth_step)(res, 0, actor, model, instance, buffer, node);
+				*palette = was;
+				if (*reinterpret_cast<const uint8_t *>(node + 0x3C) != 0)
+					*reinterpret_cast<uint8_t *>(node + 0x3C) = 0;
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				if (set)
+					*palette = was;
+				return false;
+			}
+		}
+
+		// A cloth mesh's work vertices as palette rows (os2.hpp mesh::cloth): row 0 the normal, the translation the
+		// position, the rest 0. False when it faulted, or the step never ran on it (the reset flag still set: the
+		// buffer holds nothing yet).
+		bool cloth_rows(uintptr_t node, uint32_t n, ch::bone *out)
+		{
+			__try
+			{
+				if (*reinterpret_cast<const uint8_t *>(node + 0x3C) != 0)
+					return false;
+				const float *w = reinterpret_cast<const float *>((*reinterpret_cast<const uint32_t *>(node + 0x40) + 15u) & ~uintptr_t(15));
+				for (uint32_t i = 0; i < n; ++i, w += kClothStride / 4)
+				{
+					float *m = out[i].m;
+					m[0] = w[12], m[1] = w[13], m[2] = w[14];
+					m[3] = m[4] = m[5] = m[6] = m[7] = m[8] = 0.0f;
+					m[9] = w[3], m[10] = w[4], m[11] = w[5];
+				}
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				return false;
+			}
+		}
+
+		// Whether this is a pose frame for the actor being drawn ([0x48E7460]: 1 set per actor at 0CBEBF, 0 by the pose
+		// throttle) and the model was posed once (model +0x30 bit 4: 0224D0 draws nothing of a cloth before)
+		bool pose_frame(uintptr_t model, bool &posed)
+		{
+			__try
+			{
+				posed = (*reinterpret_cast<const uint8_t *>(model + 0x30) & 0x10) != 0;
+				return *reinterpret_cast<const uint8_t *>(g.cloth_flag) == 1;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				posed = false;
+				return false;
+			}
+		}
+
 		// The hot path, no C++ objects (SEH): the lights, the instances' palettes into the frame, their meshes' keys.
 		// False when the game's memory faulted (nothing of the model kept then).
 		bool gather(uintptr_t model, uintptr_t esp, ch::frame &f, raw_model &r)
@@ -114,6 +246,7 @@ namespace hifi::game::charmodel
 				{
 					raw_instance &ri = r.instance[r.instances];
 					ri.bones = ri.meshes = 0;
+					ri.self = node;
 					const uintptr_t handle = *reinterpret_cast<const uint32_t *>(node + 0xC);
 					const uintptr_t sk2 = handle >= 0x10000 ? *reinterpret_cast<const uint32_t *>(handle) : 0;
 					const uintptr_t palette = *reinterpret_cast<const uint32_t *>(node + 0x14);
@@ -144,6 +277,8 @@ namespace hifi::game::charmodel
 							if (res >= 0x10000 && kind_of_header(*reinterpret_cast<const uint32_t *>(res + 0x24)) == 0x2A)
 							{
 								key_of(res, ri.key[ri.meshes]);
+								ri.node[ri.meshes] = mesh;
+								ri.cloth[ri.meshes] = (*reinterpret_cast<const uint8_t *>(res + 0x32) & 0x7F) == 1 ? cloth_vertices(mesh, res) : 0;
 								ri.meshes++;
 							}
 							mesh = *reinterpret_cast<const uint32_t *>(mesh + 4);
@@ -285,6 +420,14 @@ namespace hifi::game::charmodel
 				f.fog_start = s;
 			}
 			f.camera = true;
+			// (PROJECTION as the character pass keeps it: the cloak's)
+			if (g.cloak_projection != 0 && read(g.cloak_projection, f.projection, 64))
+			{
+				bool ok = true;
+				for (float x : f.projection)
+					ok = ok && std::isfinite(x);
+				f.projection_read = ok;
+			}
 		}
 
 		// The actor's fog as 0CB4E0 just set it on the device (the proxies forward every setter at once and pass
@@ -318,6 +461,63 @@ namespace hifi::game::charmodel
 			m.fog_read = true;
 		}
 
+		// The actor's extra passes as 0D6D30 set them up for this draw (model_entry::passes): the overlay with its
+		// texture (handle [0x48E7268] -> its kind-10 reference -> +0x30 the texture object -> +8 its resource, 025C85 /
+		// 075960), offsets and factor; the cloak with its offsets and factor. A pass that adds nothing isn't kept (the
+		// overlay's factor alpha 0, its default till ops 46/47 raise it; the cloak's on an opaque actor: 0x80 less 0x80).
+		// False when one that adds something can't be drawn here (its texture not there or not on the GPU yet,
+		// PROJECTION not read, a global that can't be read): the model is then the game's. (With the globals not found
+		// at all, as on a client this doesn't know, none is seen: the models are drawn without them, as before.)
+		bool read_passes(ch::model_entry &m, const ch::frame &f)
+		{
+			m.passes = 0;
+			if (g.overlay_flag == 0)
+				return true;
+			uint8_t on = 0;
+			if (!read(g.overlay_flag, on))
+				return false;
+			if (on != 0)
+			{
+				const uint32_t colour = word(g.overlay_colour), handle = word(g.overlay_handle);
+				// (no handle: 025C40 draws no overlay at all)
+				if (handle != 0 && (colour >> 24) != 0)
+				{
+					const uint32_t ref = pointer(handle) ? word(handle) : 0;
+					const uint32_t object = pointer(ref) ? word(ref + 0x30) : 0;
+					const uint32_t res = pointer(object) ? word(object + 8) : 0;
+					const uint32_t id = pointer(res) ? texture_id(res) : ch::cache::kNone;
+					D3D12_GPU_DESCRIPTOR_HANDLE h;
+					if (id == ch::cache::kNone || !ch::cache::texture_view_of(id, h))
+						return false;
+					float u = 0.0f, v = 0.0f;
+					if (!float_of(word(g.overlay_u), u) || !float_of(word(g.overlay_v), v))
+						return false;
+					m.passes |= ch::kPassOverlay;
+					m.overlay_texture = id;
+					m.overlay_offset[0] = u;
+					m.overlay_offset[1] = v;
+					m.overlay_colour = colour;
+				}
+			}
+			if (!read(g.cloak_flag, on))
+				return false;
+			if (on != 0)
+			{
+				const uint32_t factor = word(g.cloak_factor);
+				if ((factor >> 24) != 0)
+				{
+					float a = 0.0f, b = 0.0f;
+					if (!f.projection_read || !float_of(word(g.cloak_a), a) || !float_of(word(g.cloak_b), b))
+						return false;
+					m.passes |= ch::kPassCloak;
+					m.cloak_offset[0] = a;
+					m.cloak_offset[1] = b;
+					m.cloak_factor = factor;
+				}
+			}
+			return true;
+		}
+
 		// From the stub: 1 = leave through the early return (the game doesn't draw it)
 		uint32_t __cdecl on_model(uintptr_t model, uintptr_t actor, uintptr_t esp)
 		{
@@ -334,7 +534,7 @@ namespace hifi::game::charmodel
 				g.n.outside++;
 				return leave;
 			}
-			if (f->models >= ch::kMaxModels || f->instances + kMaxInstancesPerModel > ch::kMaxInstances ||
+			if (f->models >= ch::kMaxModels || f->instances + kMaxInstancesPerModel + kMaxClothPerModel > ch::kMaxInstances ||
 				f->meshes + kMaxInstancesPerModel * kMaxMeshesPerInstance > ch::kMaxMeshes)
 			{
 				f->dropped++;
@@ -362,6 +562,15 @@ namespace hifi::game::charmodel
 			m.instances = r.instances;
 			m.hidden = 0;
 			m.enspell = actor != 0 && actor == g.enspell_actor ? g.enspell : ch::kEnNone;
+			// (each cloth mesh is drawn as an instance of its own after the skeletons', its vertices its rows: os2.hpp
+			// mesh::cloth)
+			struct cloth_ref
+			{
+				uint32_t instance, k, id;
+			};
+			cloth_ref cloth[kMaxClothPerModel];
+			uint32_t cloths = 0, cloth_bones = 0;
+			bool cloth_ok = true;
 			for (uint32_t i = 0; i < r.instances; ++i)
 			{
 				const raw_instance &ri = r.instance[i];
@@ -369,36 +578,103 @@ namespace hifi::game::charmodel
 				ie.first_bone = ri.first_bone;
 				ie.bones = ri.bones;
 				ie.first_mesh = f->meshes;
-				ie.meshes = ri.meshes;
+				ie.meshes = 0;
 				for (uint32_t k = 0; k < ri.meshes; ++k)
 				{
 					const uint32_t id = mesh_id(ri.key[k]);
-					f->mesh[f->meshes + k].mesh = id;
 					if (id != ch::cache::kNone)
 						m.hidden |= ch::os2::hidden_by(ch::cache::mesh_hides(id));
+					if (ri.cloth[k] != 0)
+					{
+						if (ri.cloth[k] == kBadCloth || cloths == kMaxClothPerModel)
+							cloth_ok = false;
+						else
+						{
+							cloth[cloths++] = { i, k, id };
+							cloth_bones += ri.cloth[k];
+						}
+						continue;
+					}
+					f->mesh[f->meshes++].mesh = id;
+					ie.meshes++;
 				}
-				f->meshes += ri.meshes;
 			}
-			// HiFi XI draws it when it can: its meshes and their textures all on the GPU (and something to draw)
+			// HiFi XI draws it when it can: its meshes and their textures all on the GPU (and something to draw); its
+			// cloth stepped as the game's draw would have (its vertices drawn from the game's own work buffer)
+			bool posed = false;
+			const bool pose = cloths != 0 && pose_frame(model, posed);
+			// (a cloak that adds something on a model of the opaque walk: drawn at the walk's end in one batch here, with
+			// no scene copy of its own: the game's)
+			const bool passes_ok = read_passes(m, *f) && ((m.passes & ch::kPassCloak) == 0 || flush);
+			if (m.passes & ch::kPassOverlay)
+				g.n.overlays++;
+			if (m.passes & ch::kPassCloak)
+				g.n.cloaks++;
 			if (g.native && f->camera && (r.colour >> 24) != 0)
 			{
 				bool ready = r.instances != 0;
+				if (!passes_ok)
+				{
+					if (ready)
+						g.n.passes_refused++;
+					ready = false;
+				}
 				for (uint32_t i = 0; i < r.instances && ready; ++i)
 				{
 					const ch::instance_entry &ie = f->instance[f->instances + i];
 					for (uint32_t k = 0; k < ie.meshes && ready; ++k)
 						ready = ch::cache::mesh_ready(f->mesh[ie.first_mesh + k].mesh);
 				}
+				for (uint32_t c = 0; c < cloths && ready; ++c)
+					ready = ch::cache::mesh_ready(cloth[c].id);
+				if (!cloth_ok || f->bones + cloth_bones > ch::kMaxBones)
+				{
+					if (ready)
+						g.n.cloth_refused++;
+					ready = false;
+				}
+				for (uint32_t c = 0; c < cloths && ready && pose && posed; ++c)
+				{
+					const raw_instance &ri = r.instance[cloth[c].instance];
+					const uint32_t k = cloth[c].k;
+					if (step_cloth(ri.key[k].resource, actor, model, ri.self, ri.node[k]))
+						g.n.cloth_steps++;
+					else
+					{
+						// (left to the game, which steps it again in its own draw)
+						g.n.cloth_faults++;
+						ready = false;
+					}
+				}
 				if (ready)
 				{
 					m.flags |= ch::kNative;
 					leave = 1;
 					g.n.native++;
+					g.n.cloth += cloths;
 				}
 				else
 					g.n.not_ready++;
 			}
-			f->instances += r.instances;
+			for (uint32_t c = 0; c < cloths; ++c)
+			{
+				const raw_instance &ri = r.instance[cloth[c].instance];
+				const uint32_t k = cloth[c].k, n = ri.cloth[k];
+				ch::instance_entry &ce = f->instance[f->instances + r.instances + c];
+				ce.first_mesh = f->meshes;
+				ce.meshes = 1;
+				f->mesh[f->meshes++].mesh = cloth[c].id;
+				ce.first_bone = f->bones;
+				ce.bones = 0;
+				// (none before the model was posed once: 0224D0 draws nothing of it then; none for a model the game draws)
+				if ((m.flags & ch::kNative) != 0 && posed && f->bones + n <= ch::kMaxBones && cloth_rows(ri.node[k], n, &f->palette[f->bones]))
+				{
+					ce.bones = n;
+					f->bones += n;
+				}
+			}
+			m.instances = r.instances + cloths;
+			f->instances += r.instances + cloths;
 			f->models++;
 			g.n.models++;
 			if (flush)
@@ -410,6 +686,44 @@ namespace hifi::game::charmodel
 				charslot::mark_see_through(actor);
 			}
 			return leave;
+		}
+
+		// The cloth's sites, each checked against the others (0224D0's call of 023290, 025030's call of 0224D0); left 0
+		// when any isn't as expected: models with cloth are then the game's, as before
+		// The extra passes' globals, each read out of 02B6E0's code (left 0 when any isn't found)
+		void find_passes()
+		{
+			g.overlay_flag = g.overlay_u = g.overlay_v = g.overlay_handle = g.overlay_colour = 0;
+			g.cloak_flag = g.cloak_projection = g.cloak_a = g.cloak_b = g.cloak_factor = 0;
+			const uintptr_t flag = find(kOverlayFlag), setup = find(kOverlaySetup), cloak = find(kCloakSetup), factor = find(kCloakFactor);
+			if (flag == 0 || setup == 0 || cloak == 0 || factor == 0)
+				return;
+			g.overlay_flag = word(flag + 2);
+			g.overlay_v = word(setup + 2);
+			g.overlay_u = word(setup + 7);
+			g.overlay_handle = word(setup + 0xD);
+			g.overlay_colour = word(setup + 0x14);
+			g.cloak_flag = word(cloak + 2);
+			g.cloak_projection = word(cloak + 0xD);
+			g.cloak_b = word(cloak + 0x1D);
+			g.cloak_a = word(cloak + 0x22);
+			g.cloak_factor = word(factor + 0xF);
+		}
+
+		void find_cloth()
+		{
+			g.cloth_step = g.cloth_node = g.cloth_buffer = g.cloth_flag = g.cloth_palette = 0;
+			const uintptr_t at = find(kClothDraw), node = find(kClothNode);
+			if (at == 0 || node == 0)
+				return;
+			const uintptr_t step = rel_target(at + kClothStepAt);
+			if (rel_target(node + kClothNodeCallAt) != at - kClothDrawAt || !code_is(step, kClothStep, sizeof(kClothStep)))
+				return;
+			g.cloth_step = step;
+			g.cloth_node = node;
+			g.cloth_buffer = word(at + kClothBufferAt);
+			g.cloth_flag = word(at + kClothFlagAt);
+			g.cloth_palette = word(step + kClothPaletteAt);
 		}
 
 		void put_rel(uint8_t *at, uint8_t op, uintptr_t from, uintptr_t to)
@@ -471,6 +785,8 @@ namespace hifi::game::charmodel
 		g.tfactor = word(factor + 7);
 		g.renderer = word(renderer + 2);
 		g.device = word(device + 2);
+		find_cloth();
+		find_passes();
 		std::memcpy(g.saved, now, 5);
 		if (g.stub == 0)
 		{
@@ -584,22 +900,30 @@ namespace hifi::game::charmodel
 	{
 		if (!g.in)
 			return "character models: not recorded";
-		char line[600];
+		char line[1000];
 		std::snprintf(line, sizeof(line),
 			"character models: %llu recorded (%llu see-through; %llu left to HiFi XI's draw, %llu to the game's as their data wasn't up), the last frame %u models and %u bones; "
 			"%llu new meshes, %llu new textures (%llu not found); "
-			"%llu couldn't be read, %llu didn't fit, %llu drawn outside the world's passes%s",
+			"%llu couldn't be read, %llu didn't fit, %llu drawn outside the world's passes; "
+			"cloth: %llu meshes in HiFi XI's models, %llu steps, %llu faulted, %llu models left to the game for theirs%s; "
+			"extra passes: %llu overlays, %llu cloaks seen, %llu models left to the game for theirs%s%s",
 			static_cast<unsigned long long>(g.n.models), static_cast<unsigned long long>(g.n.see_through), static_cast<unsigned long long>(g.n.native),
 			static_cast<unsigned long long>(g.n.not_ready), g.n.last_models, g.n.last_bones,
 			static_cast<unsigned long long>(g.n.new_meshes), static_cast<unsigned long long>(g.n.new_textures), static_cast<unsigned long long>(g.n.textures_missing),
 			static_cast<unsigned long long>(g.n.faults), static_cast<unsigned long long>(g.n.dropped), static_cast<unsigned long long>(g.n.outside),
+			static_cast<unsigned long long>(g.n.cloth), static_cast<unsigned long long>(g.n.cloth_steps), static_cast<unsigned long long>(g.n.cloth_faults),
+			static_cast<unsigned long long>(g.n.cloth_refused), g.cloth_step != 0 ? "" : " (its sites not found: the game's)",
+			static_cast<unsigned long long>(g.n.overlays), static_cast<unsigned long long>(g.n.cloaks), static_cast<unsigned long long>(g.n.passes_refused),
+			g.overlay_flag != 0 ? "" : " (their globals not found: not drawn)",
 			g.game_draws ? "" : "; the game's own character drawing OFF");
 		return line;
 	}
 
 	sites where()
 	{
-		return { g.site, g.early_return, g.in ? g.stub : 0, g.lights, g.ambient, g.tfactor, g.renderer, g.device };
+		return { g.site, g.early_return, g.in ? g.stub : 0, g.lights, g.ambient, g.tfactor, g.renderer, g.device,
+			g.cloth_step, g.cloth_node, g.cloth_buffer, g.cloth_flag, g.cloth_palette,
+			g.overlay_flag, g.overlay_u, g.overlay_v, g.overlay_handle, g.overlay_colour, g.cloak_flag, g.cloak_projection, g.cloak_a, g.cloak_b, g.cloak_factor };
 	}
 
 	void set_exits(uintptr_t go_on, uintptr_t leave)

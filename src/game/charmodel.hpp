@@ -13,6 +13,17 @@
 // copied out of the game's memory there and then (its texture found as the game finds it: the command's cached object,
 // else 03AF10's search of the mesh's folder by name).
 //
+// Cloth (type-1 meshes, research/ffxi-re/notes-actor-extras.md 1): a model HiFi XI draws leaves through the early
+// return, so the game's own cloth step (023290: Verlet, constraints, bone spheres, wind), which lives in its cloth draw
+// 0224D0, is run here for each of its cloth nodes as 0224D0 would (pose frames only, the model posed once), and the
+// node's work vertices are handed over as an instance of their own (one palette row a vertex: os2.hpp mesh::cloth).
+// A cloth that can't be (its sites not found, a node not the game's cloth node, a step that faults) leaves the whole
+// model to the game, as before.
+//
+// The actor's extra passes (notes-actor-extras.md 2: overlay and cloak, from actor +0x734) are read from the globals
+// 0D6D30 sets for the draw (charframe.hpp model_entry::passes); a model with one HiFi XI can't draw yet (its texture
+// not on the GPU, a cloak in the opaque walk) is the game's.
+//
 // The game's thread only.
 
 #include "game.hpp"
@@ -49,6 +60,12 @@ namespace hifi::game::charmodel
 		uint64_t outside = 0;             // drawn outside the walk and the flush (not recorded)
 		uint64_t new_meshes = 0, new_textures = 0, textures_missing = 0;
 		uint64_t native = 0, not_ready = 0; // models left to HiFi XI's draw; models the game drew as their data wasn't up yet
+		// Cloth: meshes drawn in HiFi XI's models; the game's steps run for them; steps that faulted (that model the
+		// game's); models the game drew for their cloth (its sites not found, a node not as expected, no room)
+		uint64_t cloth = 0, cloth_steps = 0, cloth_faults = 0, cloth_refused = 0;
+		// The extra passes (charframe.hpp model_entry::passes): models seen with an overlay, with a cloak that adds
+		// something; models the game drew for theirs (a texture not on the GPU yet)
+		uint64_t overlays = 0, cloaks = 0, passes_refused = 0;
 		uint32_t last_models = 0, last_bones = 0; // the last published frame's
 	};
 	counts get_counts();
@@ -58,6 +75,12 @@ namespace hifi::game::charmodel
 	struct sites
 	{
 		uintptr_t site = 0, early_return = 0, stub = 0, lights = 0, ambient = 0, tfactor = 0, renderer = 0, device = 0;
+		// The cloth's: 023290, the cloth node's draw 025030, the globals (aligned buffer, pose frame flag, palette pointer)
+		uintptr_t cloth_step = 0, cloth_node = 0, cloth_buffer = 0, cloth_flag = 0, cloth_palette = 0;
+		// The extra passes' globals: the overlay's flag, offsets, texture handle, factor; the cloak's flag, PROJECTION,
+		// offsets, factor
+		uintptr_t overlay_flag = 0, overlay_u = 0, overlay_v = 0, overlay_handle = 0, overlay_colour = 0;
+		uintptr_t cloak_flag = 0, cloak_projection = 0, cloak_a = 0, cloak_b = 0, cloak_factor = 0;
 	};
 	sites where();
 	void set_exits(uintptr_t go_on, uintptr_t leave);

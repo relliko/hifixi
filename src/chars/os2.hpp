@@ -70,9 +70,18 @@ namespace hifi::chars::os2
 	struct mesh
 	{
 		uint16_t version = 0;
-		uint8_t flags = 0;       // data + 2 (bit 0x80: bone numbers through the bone table)
+		uint8_t flags = 0;       // data + 2 (bit 0x80: bone numbers through the bone table; low 7 bits 1: cloth)
 		uint8_t hides = 0;       // data + 3: the hide groups this mesh switches on (notes "Hide groups")
 		bool mirrored = false;   // data + 4 bit 0
+		// A type-1 mesh: cloth (research/ffxi-re/notes-actor-extras.md 1). The game skins and simulates its vertices on
+		// the CPU every pose frame (023290: Verlet, constraints, bone spheres, the wind) into a work buffer of its own,
+		// 60 bytes a vertex in command numbering (one-bone ones first), and draws them from there: positions in world
+		// space, normals rebuilt from the triangles. Here vertex i is "bone i" alone at its bone's origin with the normal
+		// (1, 0, 0): charmodel hands each frame's work vertex i over as palette row i (its normal as row 0, its
+		// position as the translation), so the skinning above draws it as the game has it, and its last frame's row
+		// gives its motion. one_bone / two_bone are the cloth's counts, pinned its pinned ones (+0x2A, +0x2C).
+		bool cloth = false;
+		uint16_t pinned[2] = {};
 		uint32_t one_bone = 0, two_bone = 0;
 		uint16_t max_bone = 0;   // the highest bone any vertex names (either half)
 		std::vector<vertex> vertices;
@@ -91,7 +100,8 @@ namespace hifi::chars::os2
 	bool sections_of_chunk(const uint8_t *data, size_t size, sections &out);
 	bool sections_of_live(const uint8_t *data, size_t size, uint32_t base, sections &out);
 
-	// The mesh; false and why when it isn't one this can read (nothing kept then)
+	// The mesh (an Os2 mesh, or a cloth one: mesh::cloth); false and why when it isn't one this can read (nothing kept
+	// then)
 	bool decode(const uint8_t *data, size_t size, const sections &s, mesh &out, std::string &why);
 
 	// Only the texture commands, in order (cheap: the game's thread reads them to find a new mesh's textures); false

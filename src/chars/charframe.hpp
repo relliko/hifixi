@@ -73,7 +73,23 @@ namespace hifi::chars
 		bool fog_read = false;
 		uint32_t fog_colour = 0;
 		float fog_start = 0.0f, fog_end = 0.0f;
+		// The actor's extra passes over each of its meshes (research/ffxi-re/notes-actor-extras.md 2), as 0D6D30 set
+		// them up for this draw from actor +0x734 (passes: kPass*):
+		//   overlay  (bit 0; scheduler ops 40/41/54/55, scrolled by 42-45, tinted by 46/47) the mesh again with a
+		//            texture mapped by its normals, added: overlay_texture (the cache's), its offset (+0x73C, +0x740),
+		//            its TEXTUREFACTOR (+0x74C)
+		//   cloak    (bit 1; ops 48/49) the mesh again sampling a copy of the scene behind it at its own screen place
+		//            shifted by +0x744 (twice: x and y) through the projection, added with weight cloak_factor's alpha
+		//            (0x80 less the actor's alpha: nothing on an opaque actor)
+		uint8_t passes = 0;
+		uint32_t overlay_texture = 0xFFFFFFFFu;
+		float overlay_offset[2] = {};
+		uint32_t overlay_colour = 0;
+		float cloak_offset[2] = {};
+		uint32_t cloak_factor = 0;
 	};
+
+	constexpr uint8_t kPassOverlay = 1u << 0, kPassCloak = 1u << 1;
 
 	struct frame
 	{
@@ -88,6 +104,9 @@ namespace hifi::chars
 		float fog[3] = {};                        // FOGCOLOR +0x39254 (rgb 0..1)
 		float fog_start = 0.0f, fog_end = 0.0f;   // +0x3925C, +0x39258
 		bool camera = false;                      // (those were read)
+		// PROJECTION as the character pass keeps it ([0x48E7468]: the cloak's texture matrix is made from it), row vectors
+		float projection[16] = {};
+		bool projection_read = false;
 		model_entry model[kMaxModels];
 		instance_entry instance[kMaxInstances];
 		mesh_entry mesh[kMaxMeshes];
