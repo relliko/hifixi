@@ -88,6 +88,7 @@ cl /nologo /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMA
   /LD src\starter\starter.cpp /Fo"build\obj\\" /Fe"build\starter\dxgi.dll" /link /NOLOGO /DEF:src\starter\dxgi.def || exit /b 1
 del /q build\starter\dxgi.exp build\starter\dxgi.lib 2>nul
 echo Built build\starter\dxgi.dll
+call "%~dp0build_d3d8.cmd" %1 || exit /b 1
 
 rem The hooks' offline test (WARP): build\hook_test.exe [--debug]
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
