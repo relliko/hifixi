@@ -92,6 +92,12 @@ namespace hifi::game::fxdraw
 		constexpr const char *kTrailCallback = "8B4C240485C97405E903000000C3"; // 01C930 (-> 01C940)
 		constexpr const char *kRingDraw = "83EC40535556578BF98A87B401000084C0"; // 0565A0
 		constexpr const char *kMorphDraw = "538BD98B83FC00000085C074048B00EB0233C08A88DE000000"; // 03FBB0
+		// 03F130 (CMoVuAnmElem): movsx esi, byte [ecx + 352218] (+0xCB), call 0473F0 (+0x1DF), mov [VA 0490BF34], edi
+		// (+0x219), push 03EFC0 (+0x259), mov [VA 0490B9D4], eax (+0x264), call 063C80 (+0x269)
+		constexpr const char *kVuAnmDraw = "83EC1053558BE933DB8B85040100003BC30F84????????568B308A85DC010000";
+		constexpr intptr_t kVuTable = 0xCB, kVuAttachCall = 0x1DF, kVuAttachStore = 0x219, kVuCallback = 0x259, kVuCursorStore = 0x264, kVuWalkCall = 0x269;
+		constexpr uint8_t kVuWalk[] = { 0x81, 0xEC, 0x4C, 0x0A, 0x00, 0x00, 0x53, 0x8B, 0xD9, 0x66, 0x8B, 0x43, 0x44 }; // 063C80's first bytes
+		constexpr uint32_t kMaxVuPoints = 2048;
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
 		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
@@ -144,6 +150,7 @@ namespace hifi::game::fxdraw
 			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0, ring_draw = 0, mmb_draw = 0, morph_draw = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
 			uintptr_t frame_of = 0, attach = 0, fix = 0, light1 = 0, lights2 = 0, lights2_default = 0, ambient = 0, material = 0; // (0 any: lit elements the game's)
+			uintptr_t vuanm_draw = 0, vu_walk = 0, vu_callback = 0, vu_table = 0, vu_attach = 0, vu_cursor = 0; // (03F130's; 0 any: VuAnm the game's)
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
 			bool in = false;
@@ -938,6 +945,155 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// The point walk of a CMoVuAnmElem (063C80 as 03F130 calls it: ecx the element's +0x194, the callback 03EFC0 and
+		// the element), with what it reads set as 03F130 and 0467E0 leave it: the cached WORLD (the wrapper's +0x93C,
+		// 06A4A0's: the element's draw matrix, as 0467E0 sets it), VA 0490BF34 the attach matrix without its translation,
+		// VA 0490B9D4 where the corners go (03EFC0 writes 6 vertices a point there and moves it on). The cache and the
+		// cursor are put back after (fault or not); 063C80 clears 0490BF34 itself. The points walked (its answer).
+		using walk_fn = int32_t(__fastcall *)(uintptr_t vu, uintptr_t edx, uintptr_t callback, uintptr_t element);
+		int32_t vu_walk(uintptr_t e, uintptr_t wrapper, const float *world, const float *attach, fx::vertex *out)
+		{
+			float kept[16];
+			std::memcpy(kept, reinterpret_cast<const void *>(wrapper + 0x93C), 64);
+			const uint32_t cursor = at<uint32_t>(g.vu_cursor);
+			__try
+			{
+				std::memcpy(reinterpret_cast<void *>(wrapper + 0x93C), world, 64);
+				*reinterpret_cast<uint32_t *>(g.vu_attach) = uint32_t(reinterpret_cast<uintptr_t>(attach));
+				*reinterpret_cast<uint32_t *>(g.vu_cursor) = uint32_t(reinterpret_cast<uintptr_t>(out));
+				return reinterpret_cast<walk_fn>(g.vu_walk)(e + 0x194, 0, g.vu_callback, e);
+			}
+			__finally
+			{
+				std::memcpy(reinterpret_cast<void *>(wrapper + 0x93C), kept, 64);
+				*reinterpret_cast<uint32_t *>(g.vu_cursor) = cursor;
+			}
+		}
+
+		// A CMoVuAnmElem (03F130: a D3A frame's first quad at every point of a walk) into the frame; false: the game's.
+		// Its first draw (+0x1DC 0) makes the corner table +0x22D the walk's callback reads and a vertex buffer of frames x
+		// (points +0x1D8 x 6) vertices whose template it fills once: each point's 6 vertices take the UV and colour of the
+		// frame's first quad's vertices 0, 0, 1, 2, 5, 5 (table 352218; the D3A's own UVs, not scaled), normal (0, 0, -1):
+		// left to the game (it makes them). After: the texture (075700 on +0x140: its +0x40, else +0x44; a wave of it when
+		// +0x148: the game's), the attach matrix (0473F0, else identity) without its translation into VA 0490BF34, the frame
+		// +0x170 wrapped at the count (written back), the frame's vertices locked into VA 0490B9D4, then the walk 063C80
+		// (vu_walk: the game's own, called once as 03F130 calls it; it moves the walk's clock +0x198 on and draws its random
+		// points from a generator seeded from +0x1A4 each time), 03EFC0 writing each point's 6 vertices (the corners 0, 0,
+		// 1, 2, 3, 3 through the point's matrix). Then 03E9A0's D3A states (351FA0 / bit 28 351EC8, LIGHTING 0, FOGENABLE
+		// 0, ZWRITEENABLE 0), WORLD math +0x810, and one TRIANGLESTRIP from vertex 1 of n x 4 - 2 triangles (n the points
+		// walked: so the strip covers vertices 1 .. 4n of the 6n written, about two points in three; as the game draws it).
+		// The strip is cut into a list here, its degenerate triangles (two corners the same) left out.
+		std::vector<fx::vertex> g_vu;
+
+		bool record_vuanm(uintptr_t e, uintptr_t resource)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t data = resource + 0x30;
+			const int32_t frames = at<int16_t>(data + 2), points = at<int16_t>(e + 0x1D8);
+			const uint32_t object = at<uint32_t>(e + 0x140);
+			const uintptr_t gfx = at<uint32_t>(g.gfx), math = at<uint32_t>(g.math);
+			const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+			if (g.vu_walk == 0 || g.attach == 0 || wrapper == 0 || math == 0 || at<uint8_t>(e + 0x1DC) == 0 || frames <= 0 || points < 0 ||
+				at<int32_t>(e + 0x229) != points * 6 || object == 0 || (at<uint32_t>(object + 0x40) == 0 && at<uint32_t>(object + 0x44) == 0) || at<float>(e + 0x148) != 0.0f)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			// (the most points the walk can give: +0x1D8, or from 20 up with +0x1DA bit 0 that x 002D80's factor x 0.5)
+			uint32_t bound = uint32_t(points);
+			if (points >= 20 && (at<uint8_t>(e + 0x194 + 0x46) & 1) != 0)
+			{
+				const float k = reinterpret_cast<weather_fn>(g.weather)();
+				if (!(k >= 0.0f && k < 64.0f))
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				bound = std::max(bound, uint32_t(std::ceil(float(points) * k * 0.5f)) + 1);
+			}
+			if (bound > kMaxVuPoints)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t most = bound != 0 ? (4 * bound - 2) * 3 : 0;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + most > fx::kMaxVertices)
+			{
+				g.n.full++;
+				return false;
+			}
+			const uint32_t id = texture_of(object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			// The frame, wrapped as 03F130 wraps it, and its first quad's template
+			uint16_t frame = at<uint16_t>(e + 0x170);
+			if (int32_t(frame) >= frames)
+			{
+				frame = 0;
+				*reinterpret_cast<uint16_t *>(e + 0x170) = 0;
+			}
+			uintptr_t p = data + 0x18;
+			for (uint32_t i = 0; i < frame; ++i)
+				p += 4 + uintptr_t(at<uint8_t>(p + 2)) * 0x90;
+			fx::vertex tpl[6];
+			for (int j = 0; j < 6; ++j)
+			{
+				const uintptr_t s = p + 4 + uintptr_t(int32_t(at<int8_t>(g.vu_table + uintptr_t(j)))) * 0x18;
+				tpl[j] = fx::vertex();
+				tpl[j].normal[2] = -1.0f;
+				tpl[j].colour = at<uint32_t>(s + 12);
+				tpl[j].uv[0] = at<float>(s + 16);
+				tpl[j].uv[1] = at<float>(s + 20);
+			}
+			g_vu.resize(size_t(bound) * 6 + 6);
+			for (size_t i = 0; i < g_vu.size(); ++i)
+				g_vu[i] = tpl[i % 6];
+			// The attach matrix without its translation, the walk
+			alignas(16) float attach[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+			if (const uintptr_t a = reinterpret_cast<matrix_of_fn>(g.attach)(e, 0); a != 0)
+				std::memcpy(attach, reinterpret_cast<const void *>(a), 64);
+			attach[12] = attach[13] = attach[14] = 0.0f;
+			attach[15] = 1.0f;
+			const int32_t n = vu_walk(e, wrapper, out.world, attach, g_vu.data());
+			if (n <= 0 || uint32_t(n) > bound)
+			{
+				// (none walked: 03F130 draws nothing)
+				g.n.empty++;
+				return true;
+			}
+			// The strip from vertex 1, n x 4 - 2 triangles, as a list
+			uint32_t w = f.vertex_count;
+			const auto same = [](const fx::vertex &a, const fx::vertex &b) { return std::memcmp(a.pos, b.pos, 12) == 0; };
+			for (uint32_t k = 0; k < 4 * uint32_t(n) - 2; ++k)
+			{
+				const fx::vertex &a = g_vu[1 + k], &b = g_vu[2 + k], &c = g_vu[3 + k];
+				if (same(a, b) || same(b, c) || same(a, c))
+					continue;
+				f.vertices[w++] = a;
+				f.vertices[w++] = b;
+				f.vertices[w++] = c;
+			}
+			std::memcpy(out.world, reinterpret_cast<const void *>(math + 0x810), 64);
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			out.z_write = 0;
+			out.fog = 0;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_vuanm;
+			f.draws[f.draw_count++] = { f.vertex_count, w - f.vertex_count, id, fx::stage_texture | ((flags & (1u << 28)) != 0 ? fx::stage_alpha_diffuse : 0u) };
+			f.vertex_count = w;
+			f.element_count++;
+			g.n.taken[fx::class_vuanm]++;
+			return true;
+		}
+
 		// A morph (03FBB0 -> 03F440, chunk 0x25 at resource +0x30) into the frame; false: the game's. 03FBB0 hands
 		// 03F440 the weights +0x194, the last frame's +0x1A8 and a blend made already (+0x1BC: then the game's), then
 		// clears +0x1BC and copies +0x194 to +0x1A8 (done here too once it's taken). The blend (03F8A0): K targets
@@ -1263,6 +1419,22 @@ namespace hifi::game::fxdraw
 			}
 			if (cls == g.ring_draw && g.ring_draw != 0)
 				return record_ring(e);
+			if (cls == g.vuanm_draw && g.vuanm_draw != 0)
+			{
+				const uint32_t handle = at<uint32_t>(e + kModel);
+				if (handle == 0)
+				{
+					g.n.empty++;
+					return true; // (03F130: no model, nothing drawn)
+				}
+				const uint32_t resource = at<uint32_t>(handle);
+				if (resource == 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				return record_vuanm(e, resource);
+			}
 			if (cls == g.morph_draw && g.morph_draw != 0)
 			{
 				// (03FBB0: a weather element 002D80 hides, or no model: nothing drawn)
@@ -1480,6 +1652,23 @@ namespace hifi::game::fxdraw
 			uint8_t push = 0;
 			n.material = read(n.setup + kMaterialPush, push) && push == 0x68 ? word(n.setup + kMaterialPush + 1) : 0;
 		}
+		if (const uintptr_t v = find(kVuAnmDraw); v != 0)
+		{
+			// (03F130's table, globals, callback and walk, each by its opcode; its attach call must be 0467E0's)
+			uint8_t b[3] = {};
+			const bool ok = read(v + kVuTable, b, 3) && b[0] == 0x0F && b[1] == 0xBE && b[2] == 0xB1 && read(v + kVuAttachStore, b, 2) && b[0] == 0x89 && b[1] == 0x3D &&
+				read(v + kVuCallback, b, 1) && b[0] == 0x68 && read(v + kVuCursorStore, b, 1) && b[0] == 0xA3 && read(v + kVuWalkCall, b, 1) && b[0] == 0xE8 &&
+				read(v + kVuAttachCall, b, 1) && b[0] == 0xE8 && rel_target(v + kVuAttachCall) == n.attach && code_is(rel_target(v + kVuWalkCall), kVuWalk, sizeof(kVuWalk));
+			if (ok)
+			{
+				n.vuanm_draw = v;
+				n.vu_table = word(v + kVuTable + 3);
+				n.vu_attach = word(v + kVuAttachStore + 2);
+				n.vu_callback = word(v + kVuCallback + 1);
+				n.vu_cursor = word(v + kVuCursorStore + 1);
+				n.vu_walk = rel_target(v + kVuWalkCall);
+			}
+		}
 		if (g.code == 0)
 			g.code = alloc_code(kCodeSize);
 		if (g.code == 0)
@@ -1621,14 +1810,14 @@ namespace hifi::game::fxdraw
 			taken += t;
 		char line[800];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, morphs %llu, rings %llu, weapon trails %llu; %llu lit), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
 			"%llu markers sent%s",
 			g.native ? "HiFi XI draws what it can" : g.probe ? "the game draws them (waiting for the markers to come through)" : "the game draws them",
 			static_cast<unsigned long long>(g.n.flushes), static_cast<unsigned long long>(taken), static_cast<unsigned long long>(g.n.taken[fx::class_d3m]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_mmb]), static_cast<unsigned long long>(g.n.taken[fx::class_d3a]), static_cast<unsigned long long>(g.n.taken[fx::class_vuanm]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_morph]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
 			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
@@ -1657,6 +1846,9 @@ namespace hifi::game::fxdraw
 		s.ring_draw = g.ring_draw;
 		s.mmb_draw = g.mmb_draw;
 		s.morph_draw = g.morph_draw;
+		s.vuanm_draw = g.vuanm_draw;
+		s.vu_walk = g.vu_walk;
+		s.vu_cursor = g.vu_cursor;
 		s.frame_of = g.frame_of;
 		s.light1 = g.light1;
 		s.lights2 = g.lights2;

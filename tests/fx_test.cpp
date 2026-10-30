@@ -265,7 +265,7 @@ int main()
 		// The game's globals pointed at made-up objects (put back before the dump is compared)
 		const uint32_t kept[6] = { get<uint32_t>(s.gfx), get<uint32_t>(s.renderer), get<uint32_t>(s.camera), get<uint32_t>(s.env), get<uint32_t>(s.math), get<uint32_t>(s.colour) };
 		uint8_t *gfx = block(0x1000), *dev = block(0x400), *wrapper = block(0x1000), *renderer = block(0x40000), *camera = block(0x400), *math = block(0x1000);
-		uint8_t *scratch = block(64 * 32), *mem = block(0x10000);
+		uint8_t *scratch = block(64 * 32), *mem = block(0x40000);
 		uintptr_t *dev_vt = reinterpret_cast<uintptr_t *>(dev + 0x100);
 		dev_vt[0xC8 / 4] = address(reinterpret_cast<void *>(&set_render_state));
 		put<uint32_t>(address(dev), uint32_t(address(dev_vt)));
@@ -324,7 +324,7 @@ int main()
 				put<uint32_t>(r + 0x30 + names, uint32_t(tex_object));
 		}
 		auto element = [&](uintptr_t vt, uintptr_t res, uint16_t letter, uint32_t flags, uint32_t colour, float z) {
-			const uintptr_t e = take(0x200);
+			const uintptr_t e = take(0x240);
 			put<uint32_t>(e, uint32_t(vt));
 			put<float>(e + 0x138, 1.0f);
 			put<float>(e + 0x134, 1.0f);
@@ -807,6 +807,109 @@ int main()
 			g_seen = seen();
 			reinterpret_cast<flush_fn>(s.code)(list7, 0);
 			check(g_seen.setups == 1, name + ": a morph with a blend handed in (+0x1BC) left to the game");
+			put<uint32_t>(tex_object + 0x40, 0);
+		}
+
+		// A CMoVuAnmElem (03F130): Fire's 'fai0' frame 2 at each of 3 points, the game's own walk (063C80) and callback
+		// (03EFC0) run: each point = record + t x its velocity + t^2 / 2 x (the walk's push + scale x its push) + the point
+		// list's point (index 1), through VIEW (identity here), plus the draw matrix's translation; the frame's first quad's
+		// corners (0, 1, 2, 5) at it. The game's strip (from vertex 1, 3 x 4 - 2 triangles) draws the first two points'
+		// quads: 4 triangles. The walk's clock moved on by gfx +0xEB0; WORLD math +0x810; no z write, no fog.
+		{
+			std::vector<uint8_t> flip;
+			geo::d3a fa;
+			check(chunk("ROM\\11\\17.DAT", 0x21, "fai0", flip) && geo::parse_d3a(flip.data(), flip.size(), fa, why) && fa.frames == 16, name + ": the VuAnm's D3A read");
+			check(s.vuanm_draw == base + 0x03F130 && s.vu_walk == base + 0x063C80 && s.vu_cursor == base + 0x47B9D4, name + ": VuAnm: 03F130, its walk 063C80, VA +47B9D4");
+			const uintptr_t vres = resource(flip, 0x21);
+			const uintptr_t vt_vu = take(0x100);
+			put<uint32_t>(vt_vu + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_vu + 0x48, uint32_t(s.vuanm_draw));
+			put<uint32_t>(vt_vu + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			const uintptr_t ev = element(vt_vu, vres, 0x48, 0, 0x80808080, -5.0f);
+			put<uint32_t>(tex_object + 0x40, 0x5678);
+			put<uint32_t>(ev + 0x140, uint32_t(tex_object));
+			put<uint16_t>(ev + 0x170, 2);
+			// (the corner table 03F130's first draw makes: per frame the first quad's vertices 0, 1, 2, 5)
+			const uintptr_t corners = take(16 * 0x30);
+			for (int fr = 0; fr < 16; ++fr)
+				for (int j = 0; j < 4; ++j)
+					std::memcpy(reinterpret_cast<void *>(corners + 0x30 * fr + 12 * j), fa.frame_list[size_t(fr)].vertices[size_t(j == 3 ? 5 : j)].pos, 12);
+			put<uint32_t>(ev + 0x22D, uint32_t(corners));
+			put<uint8_t>(ev + 0x1DC, 0); // (first: the game's)
+			// The walk (+0x194): the point list handle, clock, index, scale, push, records, count
+			const uintptr_t plist = take(0x30 + 16 + 32), plist_h = take(16), recs = take(3 * 0x24);
+			put<uint32_t>(plist + 0x30, 2);
+			const float pts[8] = { 10, 20, 30, 1, -1, -2, -3, 1 };
+			std::memcpy(reinterpret_cast<void *>(plist + 0x40), pts, 32);
+			put<uint32_t>(plist_h, uint32_t(plist));
+			const float t = 2.0f, sc = 0.5f, push[3] = { 0.2f, -0.1f, 0.05f };
+			float rec[3][9];
+			for (int i = 0; i < 3; ++i)
+				for (int c = 0; c < 3; ++c)
+				{
+					rec[i][c] = float((c + 1) * i) * (c == 2 ? -1.0f : 1.0f);
+					rec[i][3 + c] = 0.1f * float(c + 1) * float(i + 1);
+					rec[i][6 + c] = c == 0 ? 0.5f : c == 1 ? 0.0f : -0.5f;
+				}
+			std::memcpy(reinterpret_cast<void *>(recs), rec, sizeof(rec));
+			put<uint32_t>(ev + 0x194, uint32_t(plist_h));
+			put<float>(ev + 0x198, t);
+			put<int32_t>(ev + 0x1A4, 7);
+			put<int32_t>(ev + 0x1A8, 1);
+			put<float>(ev + 0x1AC, sc);
+			std::memcpy(reinterpret_cast<void *>(ev + 0x1BC), push, 12);
+			put<uint32_t>(ev + 0x1D4, uint32_t(recs));
+			put<int16_t>(ev + 0x1D8, 3);
+			put<int32_t>(ev + 0x229, 18);
+			put<float>(address(gfx) + 0xEB0, 0.25f);
+			const uintptr_t list8 = take(16), node8 = take(32);
+			put<uint32_t>(node8 + 4, 0);
+			put<uint32_t>(node8 + 8, uint32_t(s.element_cb));
+			put<uint32_t>(node8 + 0xC, uint32_t(ev));
+			put<uint32_t>(list8 + 4, uint32_t(node8));
+			put<uint32_t>(list8 + 8, 0);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list8, 0);
+			check(g_seen.setups == 1 && g_markers == 0 && get<float>(ev + 0x198) == t, name + ": VuAnm's first draw (+0x1DC 0) left to the game (it makes the corner table)");
+			put<uint8_t>(ev + 0x1DC, 1);
+			const uint32_t cursor_before = get<uint32_t>(s.vu_cursor);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list8, 0);
+			const fx::frame *f8 = fx::published(g_last_seq);
+			bool ok = g_markers == 1 && g_seen.setups == 0 && f8 != nullptr && f8->element_count == 1 && f8->elements[0].cls == fx::class_vuanm;
+			std::string what;
+			if (ok)
+			{
+				const fx::element &v = f8->elements[0];
+				const fx::draw &d = f8->draws[v.first_draw];
+				ok = d.count == 12 && d.texture != fx::kNone && d.stages == fx::stage_texture && v.z_write == 0 && v.fog == 0 && v.light == fx::kNone &&
+					std::memcmp(v.world, reinterpret_cast<const void *>(address(math) + 0x810), 64) == 0;
+				const int quad[6] = { 0, 1, 2, 1, 2, 5 }; // (the corners of each triangle: c0 c1 c2, c1 c2 c3)
+				float worst = 0.0f;
+				for (int i = 0; ok && i < 2; ++i)
+				{
+					float pt[3];
+					for (int c = 0; c < 3; ++c)
+						pt[c] = rec[i][c] + t * rec[i][6 + c] + t * t * 0.5f * (push[c] + sc * rec[i][3 + c]) + pts[4 + c];
+					pt[0] += 0.5f;
+					pt[1] += -0.25f;
+					pt[2] += -5.0f;
+					for (int k = 0; k < 6; ++k)
+					{
+						const fx::vertex &gv = f8->vertices[d.first + 6 * i + k], &src = fa.frame_list[2].vertices[size_t(quad[k])];
+						for (int c = 0; c < 3; ++c)
+							worst = std::max(worst, std::fabs(gv.pos[c] - (src.pos[c] + pt[c])));
+						ok = ok && gv.colour == src.colour && gv.uv[0] == src.uv[0] && gv.uv[1] == src.uv[1] && gv.normal[2] == -1.0f;
+					}
+				}
+				ok = ok && worst < 1e-4f;
+				what = " (worst " + std::to_string(worst) + ")";
+			}
+			check(ok, name + ": VuAnm: the game's walk placed frame 2's quad at the first two of 3 points (4 triangles of the strip), its UVs and colours" + what);
+			check(std::fabs(get<float>(ev + 0x198) - (t + 0.25f)) < 1e-6f && get<uint32_t>(s.vu_cursor) == cursor_before && get<uint32_t>(base + 0x47BF34) == 0,
+				name + ": the walk's clock moved on by gfx +0xEB0; the cursor put back, the attach slot cleared (as 063C80 leaves it)");
 			put<uint32_t>(tex_object + 0x40, 0);
 		}
 

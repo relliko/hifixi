@@ -51,6 +51,7 @@ Classes taken (by the vtable's class draw, vt+0x48):
 | D3M (0x32AD80) | 040BA0 -> 040220 | vertices from the chunk in memory (03FEE0 doubled the colours in place), one draw per texture run (3524A8 / bit 28 3523D0 / I 352590), the untextured tail (352648), untextured (352348, D: alpha x 2) | untextured kinds 5-7 whose DAT chunk isn't found (below), a texture not on the GPU yet |
 | MMB meshes (D3M, +0x179) | 040BA0 -> 040C20 -> 183760 | the zone's own model (below): its pieces from the native zone renderer's data, 183760's tables, WORLD plus the mesh's +0xE0 | a model not in the zone's data on the GPU (or not as the game has it: below); kind 2, bump models |
 | D3A (CMoD3aElem) | 03EB30 -> 03E910 | the frame +0x170 (wrapped to 0 at the count and written back, as 03E910 does), its quads from the chunk, UVs x 1/(texture object +0x24, +0x26) when +0 >= 1 and +7 is 0 (as the load scales them), 351FA0 / bit 28 351EC8, no fog, no z write, unlit | a texture not up |
+| VuAnm (CMoVuAnmElem 0x32AC10) | 03F130 | the game's own point walk 063C80 run once as 03F130 runs it (below), its 6 vertices a point written by 03EFC0 into a buffer of ours, the game's strip (from vertex 1, points x 4 - 2 triangles) cut into a list; D3A stages (351FA0 / bit 28 351EC8), WORLD math +0x810, no fog, no z write, unlit | its first draw (+0x1DC 0: it makes the corner table the walk reads), a texture wave (+0x148), no texture object (+0x140), a texture not up |
 | morphs (0x32AC90) | 03FBB0 -> 03F440 | T x 3 corners: positions and normals blended as 03F8A0 does (below), colours doubled, the UVs; table 352258 (as the D3M's 3524A8), the header's bit 7 the alpha test GREATER 0x60; 03FBB0's side effects done (+0x194 -> +0x1A8, +0x1BC cleared) | a blend handed in (+0x1BC), the texture wave (+0x148), a texture not up |
 | rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | more than 4 rings |
 | weapon trails | flush callback 01C930 -> 01C940 | the 80-sample ring (newest first), one strip (tip A, base B) or two from the middle line (+0x151C), through VIEW, vertex colour only, additive, no z write, no fog | - |
@@ -73,6 +74,24 @@ x max(0, N.L)) + emissive, alpha the vertex's, N by WORLD's inverse transpose an
 A ring has no normals (FVF XYZ | DIFFUSE): N = 0, so only the ambient and emissive light it, as D3D does. The
 lights travel in the frame (`frame::lights`, after the vertices in the upload ring, a root view t4). Left to the
 game: no environment or math object, a WORLD that can't be inverted.
+
+**VuAnm (03F130): the game's own walk.** 03F130 (R) makes, at its first draw (+0x1DC 0), the corner table +0x22D
+(frames x 0x30: each D3A frame's first quad's vertices 0, 1, 2, 5, table 352219) and a vertex buffer of frames x
+(points +0x1D8 x 6) vertices whose template it fills once (each point's 6 vertices the UV and colour of quad vertices
+0, 0, 1, 2, 5, 5, table 352218, the D3A's own UVs unscaled; normal (0, 0, -1)). That first draw stays the game's.
+After it, fxdraw does what 03F130 does: the frame +0x170 wrapped (written back), the template rebuilt from the frame,
+the attach matrix (0473F0, else identity) without its translation into VA 0490BF34, VA 0490B9D4 pointed at a buffer of
+ours, then **the game's walk 063C80 called once** with 03F130's arguments (ecx the element's +0x194, the callback
+03EFC0, the element). 063C80 reads WORLD through the wrapper's cache (06A4A0: wrapper +0x93C), which 0467E0 would have
+set to the draw matrix: the cache is set to it for the call and put back after, with the cursor (`vu_walk`, also on a
+fault). The walk (R): inverse(gfx +0xB90) x the attach matrix = P; WORLD without its translation T; each point =
+record (+0x1D4, 0x24 bytes each) + t x its velocity + t^2 / 2 x (the walk's push +0x1BC + scale +0x1AC x its push)
+(+ the 0x3E point list's point: fixed index +0x1A8, or random from an MT seeded from +0x1A4 each call), through P, plus
+WORLD's translation; 03EFC0 writes corners 0, 0, 1, 2, 3, 3 through T moved to it; the walk's clock +0x198 moves on by
+gfx +0xEB0. Its count is +0x1D8, or from 20 up with +0x1DA bit 0 that x 002D80's factor x 0.5. Then 03E9A0's D3A
+states, WORLD math +0x810, and one TRIANGLESTRIP **from vertex 1 of n x 4 - 2 triangles**: it covers vertices 1 .. 4n
+of the 6n written, so the game shows about two points in three (R: 043F40's start 1 plus the lock's start, the count
+063C80's answer x 4 - 2; reproduced as it is). The strip is cut into a list, its degenerate joins left out.
 
 **Morph weights (03F8A0).** K targets (header +2's low 7 bits, signed), the weights +0x194 over their sum; when the sum
 is under FLT_MIN, the largest of the last frame's weights (+0x1A8; the first of equals) is set to 1.0 in +0x194 and
@@ -162,7 +181,9 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   object, 18B9A0, 18B9E0; one white light of 255 down +y, AMBIENT and its ambient, the material's emissive, normals by
   WORLD); a morph (ROM3/9/111 'rng ': its 360 corners against `fxgeo::morph::blend` at weights 1:3, then with no
   weights the last frame's largest set to 1.0, the side effects on +0x194/+0x1A8/+0x1BC; one handed a blend left to
-  the game). 109 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
+  the game); a VuAnm (Fire's 'fai0' frame 2 at 3 points: the game's 063C80 and 03EFC0 run, every corner against the
+  walk's formula with the point list's point, the strip's first two quads, the clock moved on, the cursor put back;
+  its first draw left to the game). 119 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
   threads put their stacks there otherwise).
 - `build\fx_render_test.exe build\test\fx_fire.bin build\test\fx_cure.bin build\test\fx_fastblade.bin`: the D3D12 side
   at its marker on WARP with the debug layer, on a list recorded as dgVoodoo records (its own heap and targets),
@@ -186,20 +207,8 @@ The oracles are made when missing (`build.cmd`), about a minute.
    until it's back).
 4. (Done: morphs.) The texture wave (+0x148 != 0: 075700 renders a wave of the texture into a 64x64 target) and a
    blend handed in ready (+0x1BC: who sets it isn't traced; I: the distortion morph) stay the game's.
-5. **VuAnm / VuDist** (03F130, 043110). 03F130 read (R): on its first draw (+0x1DC 0) it makes the corner table +0x22D
-   (frames x 0x30: each D3A frame's first quad's 4 corners by the index table 352219) and a vertex buffer of frames x
-   (points +0x1D8 x 6) vertices, the template filled once: UV and colour of each corner by 352218, normal (0, 0, -1);
-   +0x229 = points x 6, +0x225 = points x 4 - 2. Each draw: the texture (075700 +0x140..+0x148), the attach matrix
-   (0473F0, else identity 0746A0) without its translation into VA 0490BF34, the frame +0x170 wrapped, the frame's
-   vertices locked (0440A0) into VA 0490B9D4, then 063C80 (its ecx as 03F130 sets it; the arguments 03EFC0 and the
-   element): the game's point walk (the 0x3E list; its count, from 20 up scaled through 002D80; VA 0490BF34 turned into VIEW's frame and cleared;
-   random points from the instance's MT) calls 03EFC0 for each, which sets the matrix's translation to the point and
-   writes the 4 corners through math vt+0x50 into the locked vertices (the strip's 6 a point: the first and last
-   doubled for the joins). Then FOGENABLE 0, 03E9A0's D3A states, WORLD identity (math +0x810), one TRIANGLESTRIP of
-   points x 4 - 2. **Next:** in place of the lock, point VA 0490B9D4 at a buffer of ours holding the template (rebuilt
-   from the D3A frame as the first draw builds it) and call 063C80 exactly as 03F130 does (the walk and its
-   random draws then happen once a frame, as in the game), then cut the strip into a list for fxframe (WORLD
-   identity, D3A stages, no fog, no z write). VuDist: the same walk with 0426F0's quad at each point (needs 6.).
+5. (Done: VuAnm, the game's own walk.) **VuDist** (043110): the same walk 063C80 with 0426F0's distortion quad at each
+   point; needs the distortion copy (6.).
 6. **Distortion classes** (CMoDist, CMoDistModelElem, CMoDistMorphElem, CMoDistRingElem): copy the world target at the
    marker (a reserved descriptor in fxtextures' heap is ready: `textures::reserved`) and draw through the projected UVs
    (042D00, 0426F0).
