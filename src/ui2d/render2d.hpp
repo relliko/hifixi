@@ -74,11 +74,12 @@ namespace hifi::ui2d::render
 	void note_target(DXGI_FORMAT format, uint32_t samples); // (record() does; tests)
 	bool pipeline(const blend_key &k);
 
-	// dgVoodoo's list (its thread, at a marker): segment s of frame f drawn into target (view format: dgVoodoo's), with
-	// dgVoodoo's heaps and state put back after; or, when !draw, only checked. Null when it was (or could be) drawn,
-	// else why not.
+	// dgVoodoo's list (its thread, at a marker): segment s of frame f drawn into target (view format: dgVoodoo's; in
+	// target_state there, made a render target for the draws and put back), with dgVoodoo's heaps and state put back
+	// after; or, when !draw, only checked. Null when it was (or could be) drawn, else why not.
 	const char *record(ID3D12GraphicsCommandList *list, const frame &f, const segment &s, ID3D12Resource *target, DXGI_FORMAT format,
-		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw);
+		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw,
+		D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET);
 
 	struct stats
 	{

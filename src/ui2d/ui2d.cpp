@@ -1,8 +1,9 @@
 /*
  * The screen's 2D as an own-frame pass (PLAN-own-frame.md, docs/own-frame/2d.md): src/game/uidraw records it on the
  * game's thread, src/ui2d/render2d draws it on dgVoodoo's list at the markers, and this ties them together:
- *   - the markers (kinds 9, 10, 11 on the back buffer's depth): 9 starts a window's segments, each 10 or 11 draws (or,
- *     while the game still draws them, checks) the window's next one into the target bound with that depth;
+ *   - the markers (kinds 9, 10, 11 on the back buffer's depth, 8 on A's): 9 starts a window's segments, each 10, 11 or
+ *     8 draws (or, while the game still draws them, checks) the window's next one into the target bound with that depth
+ *     (A's window has no 9: its seq, new, starts its count);
  *   - the gate, each present: off unless [screen2d] native is on; shadow (the game draws, HiFi XI checks every
  *     segment) until the markers come through and 30 segments in a row could have been drawn with the target known;
  *     native (HiFi XI draws them) until a segment can't be, or the markers stop for a quarter second;
@@ -17,6 +18,7 @@
 #include "../game/slotmark.hpp"
 #include "../game/uidraw.hpp"
 #include "../host/passes.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <mutex>
@@ -127,7 +129,9 @@ namespace hifi::ui2d
 				fail("the target bound with the marker's depth isn't known yet");
 				return;
 			}
-			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native))
+			// (the world's target as its barriers left it on this list; the back buffer is a target throughout)
+			const D3D12_RESOURCE_STATES state = target == w.rt ? w.rt_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
+			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native, state))
 			{
 				fail(why);
 				return;
@@ -233,6 +237,30 @@ namespace hifi::ui2d
 			return true;
 		}
 
+		// dgVoodoo's own filtering setting (it overrides the game's filters: the 2D renderer samples as it does), from the
+		// dgVoodoo.conf beside its d3d8.dll (read only)
+		void follow_dgvoodoo()
+		{
+			wchar_t path[MAX_PATH] = {};
+			HMODULE d3d8 = GetModuleHandleW(L"d3d8.dll");
+			if (d3d8 == nullptr || GetModuleFileNameW(d3d8, path, MAX_PATH) == 0)
+				return;
+			std::wstring conf = path;
+			conf = conf.substr(0, conf.find_last_of(L"\\/") + 1) + L"dgVoodoo.conf";
+			HANDLE f = CreateFileW(conf.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+			if (f == INVALID_HANDLE_VALUE)
+				return;
+			std::string text(size_t(std::min<DWORD>(GetFileSize(f, nullptr), 1u << 20)), '\0');
+			DWORD got = 0;
+			const bool read = ReadFile(f, text.data(), DWORD(text.size()), &got, nullptr) != FALSE;
+			CloseHandle(f);
+			if (!read)
+				return;
+			text.resize(got);
+			const render::filtering::setting s = render::filtering::read(text);
+			render::set_filtering(s.forced, s.anisotropy, s.keep_point);
+		}
+
 		void device(ID3D12Device *dev)
 		{
 			// (the textures held belong to the store being let go)
@@ -241,8 +269,12 @@ namespace hifi::ui2d
 			std::string why;
 			if (dev == nullptr)
 				render::release();
-			else if (!render::make(dev, why))
-				gs.why = "the 2D renderer: " + why;
+			else
+			{
+				follow_dgvoodoo();
+				if (!render::make(dev, why))
+					gs.why = "the 2D renderer: " + why;
+			}
 		}
 
 		passes::module make_module()
@@ -262,5 +294,6 @@ namespace hifi::ui2d
 		const passes::registrar r_begin { slotmark::ui_begin, on_begin };
 		const passes::registrar r_end { slotmark::ui_end, on_segment };
 		const passes::registrar r_frame { slotmark::frame_end, on_segment };
+		const passes::registrar r_screen { slotmark::screen, on_segment };
 	}
 }

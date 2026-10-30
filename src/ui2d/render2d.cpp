@@ -896,7 +896,7 @@ float4 ps(O i) : SV_Target
 	}
 
 	const char *record(ID3D12GraphicsCommandList *list, const frame &f, const segment &s, ID3D12Resource *target, DXGI_FORMAT format,
-		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw)
+		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw, D3D12_RESOURCE_STATES target_state)
 	{
 		if (!ready())
 			return "the renderer isn't made";
@@ -951,6 +951,15 @@ float4 ps(O i) : SV_Target
 		const float tw = float(td.Width), th = float(td.Height);
 		const D3D12_RECT whole = { 0, 0, LONG(td.Width), LONG(td.Height) };
 		list->RSSetScissorRects(1, &whole);
+		// (A between dgVoodoo's draws may still be in the state its last read left it: a render target for ours)
+		D3D12_RESOURCE_BARRIER to_target = {};
+		to_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		to_target.Transition.pResource = target;
+		to_target.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		to_target.Transition.StateBefore = target_state;
+		to_target.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+			list->ResourceBarrier(1, &to_target);
 		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 		const D3D12_GPU_DESCRIPTOR_HANDLE srv0 = g.srv_heap->GetGPUDescriptorHandleForHeapStart(), smp0 = g.sampler_heap->GetGPUDescriptorHandleForHeapStart();
 
@@ -996,6 +1005,11 @@ float4 ps(O i) : SV_Target
 			batches++;
 		}
 
+		if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+		{
+			std::swap(to_target.Transition.StateBefore, to_target.Transition.StateAfter);
+			list->ResourceBarrier(1, &to_target);
+		}
 		// dgVoodoo's heaps, then its state (a table must be in the heaps bound when it's set)
 		list->SetDescriptorHeaps(heap_count, heaps);
 		bound.restore(list);

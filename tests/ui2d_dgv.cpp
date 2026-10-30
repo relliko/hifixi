@@ -94,6 +94,7 @@ namespace
 		std::vector<op> ops;
 		uint32_t draws = 0;
 		bool game_like = false; // (the vertices made up as the game's: 1:1 sprite parts and tiles; else every scale)
+		bool on_a = false;      // (in the screen passes' window on A: kind 8, no begin marker)
 	};
 
 	// ---------------------------------------------------------------- the d3dlog capture
@@ -1139,7 +1140,20 @@ float4 ps() : SV_Target { return colour; }
 		w.bound_rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 		drawn = 0;
 		const uint32_t n = f.segments.load(), seq = f.seq.load() & 15u;
-		hifi::passes::dispatch(hifi::slotmark::ui_begin, g.list, st, w, seq);
+		// (the screen passes' window on A: no begin marker; A left readable by the game's last copy of it, as its
+		// barriers say: drawn into as a target and put back)
+		const bool on_a = n != 0 && f.seg[0].kind == hifi::slotmark::screen;
+		if (on_a)
+		{
+			w.rt = g.target;
+			w.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			w.rt_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			g.list->ResourceBarrier(1, &b);
+		}
+		else
+			hifi::passes::dispatch(hifi::slotmark::ui_begin, g.list, st, w, seq);
 		const uint64_t failed_before = ui2d_failed();
 		for (uint32_t k = 0; k < n; ++k)
 		{
@@ -1151,6 +1165,12 @@ float4 ps() : SV_Target { return colour; }
 				return false;
 			}
 			drawn += f.seg[k].count;
+		}
+		if (on_a)
+		{
+			b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			g.list->ResourceBarrier(1, &b);
 		}
 		// dgVoodoo's next draw, nothing set again but its constants
 		const float c[8] = { -1.0f, -1.0f + 2.0f * 24.0f / H, -1.0f + 2.0f * 24.0f / W, -1.0f, 0x10 / 255.0f, 0xE0 / 255.0f, 0xF0 / 255.0f, 1.0f };
@@ -1226,10 +1246,15 @@ float4 ps() : SV_Target { return colour; }
 			background(d);
 			read_back(d, before);
 			ud::set_mode(m);
-			ud::window_begin(reinterpret_cast<uintptr_t>(d.dev));
+			ud::window_begin(reinterpret_cast<uintptr_t>(d.dev), sc.on_a);
 			run_ops(d, sc, tex);
-			ud::window_flush(hifi::slotmark::ui_end);
-			ud::window_flush(hifi::slotmark::frame_end);
+			if (sc.on_a)
+				ud::window_end();
+			else
+			{
+				ud::window_flush(hifi::slotmark::ui_end);
+				ud::window_flush(hifi::slotmark::frame_end);
+			}
 			read_back(d, after);
 			d.dev->EndScene();
 			d.dev->Present(nullptr, nullptr, nullptr, nullptr);
@@ -1253,7 +1278,7 @@ float4 ps() : SV_Target { return colour; }
 			std::printf("     left to the game: %s\n", reasons.c_str());
 		check(recorded + passed == sc.draws, sc.name + ": every draw recorded or left to the game (" + std::to_string(recorded + passed) + " of " + std::to_string(sc.draws) + ")");
 		check(c1.markers - c0.markers == f->segments.load() + 0 && c1.not_marked == c0.not_marked, sc.name + ": a marker for each segment");
-		check(*reinterpret_cast<uint32_t *>(d.dev) != 0 && ud::get_counts().frame_draws == recorded, sc.name + ": the device's vtable back");
+		check(*reinterpret_cast<uint32_t *>(d.dev) != 0 && (sc.on_a || ud::get_counts().frame_draws == recorded), sc.name + ": the window's draws counted");
 		// (the device's own vtable back: dgVoodoo's)
 		{
 			const uint32_t vt = *reinterpret_cast<uint32_t *>(d.dev);
@@ -1320,7 +1345,7 @@ float4 ps() : SV_Target { return colour; }
 		// about 0.006 texel off a texel corner at 2:1, so text from the 2048 x 4096 font and scaled quads of noise-like
 		// pictures differ in their last bits, and an alpha-tested edge pixel now and then. A wrong blend, op, filter or
 		// address mode differs over whole quads.)
-		const bool stress = sc.name == "coverage";
+		const bool stress = sc.name.rfind("coverage", 0) == 0;
 		check(sc.name == "probe" || (changed > 10000 && near_ * 1000 >= total * (stress ? 990 : 993) && close * 100 >= total * 95), line);
 		if (const char *s = std::getenv("UI2D_SAVE"); s != nullptr && *s == '1')
 		{
@@ -1427,7 +1452,12 @@ int main(int argc, char **argv)
 		captures.clear();
 	}
 	if (cover)
+	{
 		cases.push_back(coverage());
+		cases.push_back(coverage());
+		cases.back().name = "coverage-on-A";
+		cases.back().on_a = true;
+	}
 	if (argc < 2)
 		for (const char *n : { "menu", "day_npcs", "night", "spell", "water" })
 			captures.push_back(std::string("C:\\Games\\PhoenixXI\\d3dlog\\") + n + ".txt");

@@ -47,10 +47,10 @@ namespace hifi::game::uidraw
 	void set_mode(mode m);
 	mode current();
 
-	// The window, as the stubs call it (wrapper: the game's device wrapper, [0x45666C]; its +0xC the client device).
-	// The tests call them with a device of their own.
-	void window_begin(uintptr_t device);
-	// kind 10 (a cut, or the interface's end) or 11 (the window's end: closed after)
+	// The window, as the stubs call it (wrapper: the game's device wrapper, [0x45666C]; its +0xC the client device):
+	// on the back buffer, or (screen) the screen passes' on A. The tests call them with a device of their own.
+	void window_begin(uintptr_t device, bool screen = false);
+	// kind 10 (a cut, or the interface's end), 11 (the back buffer's window's end: closed after) or 8 (a cut on A)
 	void window_flush(uint32_t kind);
 	void window_end();
 
@@ -58,6 +58,7 @@ namespace hifi::game::uidraw
 	{
 		uint64_t windows = 0;          // opened
 		uint64_t no_window = 0;        // ... not: the device's state couldn't be read, or no stencil to mark on
+		uint64_t movie = 0;            // ... not: the opening movie plays (the game draws it all)
 		uint64_t recorded = 0;         // draws recorded
 		uint64_t native = 0;           // ... and left out of the game's stream
 		uint64_t passed = 0;           // draws in a window left to the game
@@ -79,10 +80,12 @@ namespace hifi::game::uidraw
 	// Every texture held let go (the device going, the renderer made again): taken again at their next use
 	void drop_textures();
 
-	// For the tests: the three calls, their targets, our stubs
+	// For the tests: the five calls, their targets, the movie player's global, our stubs (begin +0, end +0x20, frame
+	// +0x40, screen +0x60, pop +0x80)
 	struct sites
 	{
-		uintptr_t begin_call = 0, begin_target = 0, end_call = 0, end_target = 0, frame_call = 0, frame_target = 0, code = 0;
+		uintptr_t begin_call = 0, begin_target = 0, end_call = 0, end_target = 0, frame_call = 0, frame_target = 0;
+		uintptr_t screen_call = 0, screen_target = 0, pop_call = 0, pop_target = 0, movie = 0, code = 0;
 	};
 	sites where();
 	// Markers handed to sink instead of the device's Clear (tests)

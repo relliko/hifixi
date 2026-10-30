@@ -6,10 +6,20 @@
  *   012773: mov ecx, [wrapper]; call 00BB20 (an empty function: ret)      -> the window opens after it
  *   0129E2: mov eax, [esi+31Ch]; push eax; push ebx; call 00A820 (the fade after the menus)  -> kind 10 before it
  *   012AEF: mov ecx, [wrapper]; call 009740 (EndScene); mov ecx, [wrapper]; call 009720 (Present) -> kind 11 before it
- * Each call's rel32 is pointed at a stub of ours (ecx is the wrapper at all three):
+ * and the screen passes' window on A (before the resolve):
+ *   012452: mov ecx, [wrapper]; push eax; mov edx, [ecx+1C0h]; push edx; call 00AAB0; call 012F40 (the frozen-frame
+ *           crossfade); mov ecx, esi; call 0132B0 (the wash and afterimage)    -> the window on A opens before 012F40
+ *   012699: mov ecx, [wrapper]; call 00A1D0 (A popped: the back buffer again)  -> kind 8 and closed before it
+ * Each call's rel32 is pointed at a stub of ours (ecx is the wrapper at all but 012F40's: the stub reads it from the
+ * global 012452 loads):
  *   begin:  push ecx; call 00BB20; pop ecx; push eax/ecx/edx; push ecx; call on_begin; add esp, 4; pop; ret
  *   end:    push eax/ecx/edx; push ecx; push 10; call on_flush; add esp, 8; pop; jmp 00A820
  *   frame:  the same with 11, jmp 009740
+ *   screen: push eax/ecx/edx; push [wrapper]; call on_screen; add esp, 4; pop; jmp 012F40
+ *   pop:    push eax/ecx/edx; push ecx; push 108h (8, and close); call on_flush; add esp, 8; pop; jmp 00A1D0
+ *
+ * The opening movie (21D4C0, drawn in the window from a texture its decoder writes each frame) is left to the game: no
+ * window opens while the movie player ([0x456D1C], 01298E) exists.
  *
  * The device's vtable copy: slot -1 and the 97 methods of IDirect3DDevice8 as the device has them when the window
  * opens (Ashita's, or hifps's draw tap in front of them), ours in place of the slots below. The device's own vtable
@@ -39,8 +49,17 @@ namespace hifi::game::uidraw
 		constexpr uint8_t kEmpty[] = { 0xC3 };                                                         // 00BB20
 		constexpr uint8_t kFade[] = { 0x83, 0xEC, 0x08, 0x56, 0x57, 0x8B, 0xF1, 0xE8 };                // 00A820
 		constexpr uint8_t kEndScene[] = { 0x8B, 0x41, 0x0C, 0x50, 0x8B, 0x08, 0xFF, 0x91, 0x8C, 0x00, 0x00, 0x00, 0xC3 }; // 009740
+		constexpr const char *kScreen = "8B0D????????508B91C001000052E8????????E8????????8BCEE8????????A0????????3C80"; // 012452
+		constexpr intptr_t kScreenWrapperAt = 2, kScreenAt = 0x13;
+		constexpr const char *kPop = "E8????????33D233C0668B5610668B4612"; // 0126A1
+		constexpr uint8_t kCrossfade[] = { 0xA1, 0, 0, 0, 0, 0x85, 0xC0, 0x0F, 0x84 };                 // 012F40 (mov eax, [456910]; test; je)
+		constexpr uint8_t kPopA[] = { 0x56, 0x8B, 0xF1, 0x6A, 0x00, 0x6A, 0x00, 0x8B, 0x46, 0x0C, 0x50 }; // 00A1D0
+		constexpr const char *kMovie = "8B0D????????3BCB7405E8????????8B0D????????E8????????8B0D????????3999E0010000"; // 01298E
+		constexpr intptr_t kMovieAt = 2;
+		constexpr uint32_t kClose = 0x100; // (on_flush: close the window after)
 
-		constexpr size_t kCodeSize = 0x60, kEndStub = 0x20, kFrameStub = 0x40;
+		constexpr int kCalls = 5;
+		constexpr size_t kCodeSize = 0xA0, kEndStub = 0x20, kFrameStub = 0x40, kScreenStub = 0x60, kPopStub = 0x80;
 
 		// IDirect3DDevice8's methods
 		enum : uint32_t
@@ -100,14 +119,16 @@ namespace hifi::game::uidraw
 
 		struct state
 		{
-			uintptr_t begin_call = 0, begin_target = 0, end_call = 0, end_target = 0, frame_call = 0, frame_target = 0, code = 0;
-			uint8_t saved[3][5] = {}, ours[3][5] = {};
+			uintptr_t calls[kCalls] = {}, targets[kCalls] = {}, code = 0;
+			uint8_t saved[kCalls][5] = {}, ours[kCalls][5] = {};
+			uintptr_t movie = 0;   // (the movie player's global)
 			bool in = false;
 			mode wanted = off;
 			uintptr_t device_override = 0;
 			void (*sink)(uint32_t, uint32_t) = nullptr;
 			// The window
 			bool open = false, native = false;
+			uint32_t cut_kind = 10; // (the window's cuts: 10 on the back buffer, 8 on A)
 			uintptr_t dev = 0;
 			uint32_t source_vt = 0;
 			uint32_t seq = 0;
@@ -405,7 +426,7 @@ namespace hifi::game::uidraw
 			if (g.open && g.f != nullptr && g.f->draw_count != g.seg_first)
 			{
 				g.n.cuts++;
-				flush(slotmark::ui_end);
+				flush(g.cut_kind);
 			}
 		}
 
@@ -724,9 +745,15 @@ namespace hifi::game::uidraw
 		{
 			window_begin(device_of(wrapper));
 		}
+		void __cdecl on_screen(uintptr_t wrapper)
+		{
+			window_begin(device_of(wrapper), true);
+		}
 		void __cdecl on_flush(uint32_t kind, uintptr_t)
 		{
-			window_flush(kind);
+			window_flush(kind & 0xFF);
+			if ((kind & kClose) != 0)
+				close();
 		}
 
 		void put_rel(uint8_t *at, uintptr_t from, uint8_t opcode, uintptr_t to)
@@ -736,12 +763,17 @@ namespace hifi::game::uidraw
 		}
 	}
 
-	void window_begin(uintptr_t dev)
+	void window_begin(uintptr_t dev, bool screen)
 	{
 		if (g.open)
 			window_end(); // (one not closed: closed now)
 		if (g.wanted == off || dev == 0)
 			return;
+		if (g.movie != 0 && word(g.movie) != 0)
+		{
+			g.n.movie++;
+			return;
+		}
 		const uint32_t vt = word(dev);
 		if (!pointer(vt) || vt == copy_address())
 		{
@@ -763,12 +795,17 @@ namespace hifi::game::uidraw
 		g.f = &u2::begin(g.seq);
 		g.seg_first = 0;
 		g.native = g.wanted == native;
-		g.n.frame_draws = g.n.frame_segments = 0;
+		g.cut_kind = screen ? slotmark::screen : slotmark::ui_end;
+		if (!screen)
+			g.n.frame_draws = g.n.frame_segments = 0;
 		g.n.windows++;
 		g.n.seq = g.seq;
 		*reinterpret_cast<uint32_t *>(dev) = copy_address();
 		g.open = true;
-		mark(slotmark::ui_begin);
+		// (the back buffer's window marks its start: the Direct3D 12 side counts its segments from there; A's is named by
+		// its seq alone)
+		if (!screen)
+			mark(slotmark::ui_begin);
 	}
 
 	void window_flush(uint32_t kind)
@@ -782,7 +819,7 @@ namespace hifi::game::uidraw
 
 	void window_end()
 	{
-		window_flush(slotmark::frame_end);
+		window_flush(g.cut_kind == slotmark::screen ? slotmark::screen : slotmark::frame_end);
 		close();
 	}
 
@@ -790,16 +827,17 @@ namespace hifi::game::uidraw
 	{
 		if (g.in)
 			return true;
-		const uintptr_t b = find(kBegin), e = find(kEnd), fr = find(kFrame);
-		if (b == 0 || e == 0 || fr == 0)
+		const uintptr_t b = find(kBegin), e = find(kEnd), fr = find(kFrame), sc = find(kScreen), po = find(kPop), mo = find(kMovie);
+		if (b == 0 || e == 0 || fr == 0 || sc == 0 || po == 0 || mo == 0)
 		{
 			why = "the loop tail's calls weren't found";
 			return false;
 		}
-		const uintptr_t calls[3] = { b + kBeginAt, e + kEndAt, fr + kFrameAt };
-		uint8_t now[3][5] = {};
-		uintptr_t targets[3] = {};
-		for (int i = 0; i < 3; ++i)
+		const uintptr_t calls[kCalls] = { b + kBeginAt, e + kEndAt, fr + kFrameAt, sc + kScreenAt, po };
+		const uintptr_t wrapper_global = word(sc + kScreenWrapperAt);
+		uint8_t now[kCalls][5] = {};
+		uintptr_t targets[kCalls] = {};
+		for (int i = 0; i < kCalls; ++i)
 		{
 			if (!read(calls[i], now[i], 5) || now[i][0] != 0xE8)
 			{
@@ -808,9 +846,13 @@ namespace hifi::game::uidraw
 			}
 			targets[i] = rel_target(calls[i]);
 		}
-		if (!code_is(targets[0], kEmpty, sizeof(kEmpty)) || !code_is(targets[1], kFade, sizeof(kFade)) || !code_is(targets[2], kEndScene, sizeof(kEndScene)))
+		uint8_t crossfade[sizeof(kCrossfade)] = {};
+		read(targets[3], crossfade, sizeof(crossfade));
+		std::memset(crossfade + 1, 0, 4);
+		if (!code_is(targets[0], kEmpty, sizeof(kEmpty)) || !code_is(targets[1], kFade, sizeof(kFade)) || !code_is(targets[2], kEndScene, sizeof(kEndScene)) ||
+			std::memcmp(crossfade, kCrossfade, sizeof(kCrossfade)) != 0 || !code_is(targets[4], kPopA, sizeof(kPopA)) || !pointer(uint32_t(wrapper_global)))
 		{
-			why = "the loop tail's calls don't go where they should (00BB20, the fade 00A820, EndScene 009740)";
+			why = "the loop tail's calls don't go where they should (00BB20, the fade 00A820, EndScene 009740, the crossfade 012F40, A's pop 00A1D0)";
 			return false;
 		}
 		if (g.code == 0)
@@ -839,13 +881,25 @@ namespace hifi::game::uidraw
 			put_rel(s + at + 6, g.code + at + 6, 0xE8, reinterpret_cast<uintptr_t>(&on_flush));
 			put_rel(s + at + 0x11, g.code + at + 0x11, 0xE9, targets[1 + k]);
 		}
+		// screen: push eax; push ecx; push edx; push [wrapper]; call on_screen; add esp, 4; pop edx; pop ecx; pop eax; jmp 012F40
+		const uint8_t screen[] = { 0x50, 0x51, 0x52, 0xFF, 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x83, 0xC4, 0x04, 0x5A, 0x59, 0x58, 0, 0, 0, 0, 0 };
+		std::memcpy(s + kScreenStub, screen, sizeof(screen));
+		put32(s + kScreenStub + 5, uint32_t(wrapper_global));
+		put_rel(s + kScreenStub + 9, g.code + kScreenStub + 9, 0xE8, reinterpret_cast<uintptr_t>(&on_screen));
+		put_rel(s + kScreenStub + 0x14, g.code + kScreenStub + 0x14, 0xE9, targets[3]);
+		// pop: push eax; push ecx; push edx; push ecx; push 108h; call on_flush; add esp, 8; pop edx; pop ecx; pop eax; jmp 00A1D0
+		const uint8_t pop[] = { 0x50, 0x51, 0x52, 0x51, 0x68, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x83, 0xC4, 0x08, 0x5A, 0x59, 0x58, 0, 0, 0, 0, 0 };
+		std::memcpy(s + kPopStub, pop, sizeof(pop));
+		put32(s + kPopStub + 5, slotmark::screen | kClose);
+		put_rel(s + kPopStub + 9, g.code + kPopStub + 9, 0xE8, reinterpret_cast<uintptr_t>(&on_flush));
+		put_rel(s + kPopStub + 0x14, g.code + kPopStub + 0x14, 0xE9, targets[4]);
 		if (!write_code(g.code, s, kCodeSize))
 		{
 			why = "couldn't write the stubs";
 			return false;
 		}
-		const uintptr_t stubs[3] = { g.code, g.code + kEndStub, g.code + kFrameStub };
-		for (int i = 0; i < 3; ++i)
+		const uintptr_t stubs[kCalls] = { g.code, g.code + kEndStub, g.code + kFrameStub, g.code + kScreenStub, g.code + kPopStub };
+		for (int i = 0; i < kCalls; ++i)
 		{
 			put_rel(g.ours[i], calls[i], 0xE8, stubs[i]);
 			if (!write_code(calls[i], g.ours[i], 5))
@@ -857,9 +911,9 @@ namespace hifi::game::uidraw
 			}
 			std::memcpy(g.saved[i], now[i], 5);
 		}
-		g.begin_call = calls[0], g.begin_target = targets[0];
-		g.end_call = calls[1], g.end_target = targets[1];
-		g.frame_call = calls[2], g.frame_target = targets[2];
+		std::memcpy(g.calls, calls, sizeof(calls));
+		std::memcpy(g.targets, targets, sizeof(targets));
+		g.movie = word(mo + kMovieAt);
 		g.in = true;
 		return true;
 	}
@@ -870,15 +924,14 @@ namespace hifi::game::uidraw
 			return true;
 		if (g.open)
 			window_end();
-		const uintptr_t calls[3] = { g.begin_call, g.end_call, g.frame_call };
-		for (int i = 0; i < 3; ++i)
-			if (!code_is(calls[i], g.ours[i], 5))
+		for (int i = 0; i < kCalls; ++i)
+			if (!code_is(g.calls[i], g.ours[i], 5))
 			{
 				why = "something else has changed the loop tail's calls since: left as they are";
 				return false;
 			}
-		for (int i = 0; i < 3; ++i)
-			if (!write_code(calls[i], g.saved[i], 5))
+		for (int i = 0; i < kCalls; ++i)
+			if (!write_code(g.calls[i], g.saved[i], 5))
 			{
 				why = "couldn't write the game's code";
 				return false;
@@ -926,10 +979,10 @@ namespace hifi::game::uidraw
 			lines.push_back("screen 2D: not recorded (the loop tail's calls aren't ours)");
 			return lines;
 		}
-		std::snprintf(line, sizeof(line), "screen 2D: %s; %llu windows (%llu not opened), %llu draws recorded (%llu left out of the game's), %llu left to the game in %llu cuts; "
+		std::snprintf(line, sizeof(line), "screen 2D: %s; %llu windows (%llu not opened, %llu during the movie), %llu draws recorded (%llu left out of the game's), %llu left to the game in %llu cuts; "
 			"last window %u draws in %u segments; %llu segments, markers %llu sent%s",
 			g.wanted == off ? "off" : g.wanted == shadow ? "recorded, the game draws (shadow)" : "HiFi XI draws it", static_cast<unsigned long long>(g.n.windows),
-			static_cast<unsigned long long>(g.n.no_window), static_cast<unsigned long long>(g.n.recorded), static_cast<unsigned long long>(g.n.native),
+			static_cast<unsigned long long>(g.n.no_window), static_cast<unsigned long long>(g.n.movie), static_cast<unsigned long long>(g.n.recorded), static_cast<unsigned long long>(g.n.native),
 			static_cast<unsigned long long>(g.n.passed), static_cast<unsigned long long>(g.n.cuts), g.n.frame_draws, g.n.frame_segments,
 			static_cast<unsigned long long>(g.n.segments), static_cast<unsigned long long>(g.n.markers),
 			g.n.not_marked != 0 ? (", " + std::to_string(g.n.not_marked) + " not").c_str() : "");
@@ -959,7 +1012,8 @@ namespace hifi::game::uidraw
 
 	sites where()
 	{
-		return { g.begin_call, g.begin_target, g.end_call, g.end_target, g.frame_call, g.frame_target, g.in ? g.code : 0 };
+		return { g.calls[0], g.targets[0], g.calls[1], g.targets[1], g.calls[2], g.targets[2], g.calls[3], g.targets[3], g.calls[4], g.targets[4],
+			g.movie, g.in ? g.code : 0 };
 	}
 
 	void set_sink(void (*sink)(uint32_t, uint32_t))

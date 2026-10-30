@@ -270,6 +270,17 @@ namespace
 		return { a, b, s, d, p, before - after };
 	}
 
+	void __cdecl fake_crossfade()
+	{
+		calls += 'x';
+	}
+	uint32_t fake_pop_ecx = 0;
+	void __fastcall fake_pop(uint32_t ecx, uint32_t)
+	{
+		fake_pop_ecx = ecx;
+		calls += 'p';
+	}
+
 	uint32_t fade_args[2] = {}, fade_ecx = 0;
 	void __fastcall fake_fade(uint32_t ecx, uint32_t, uint32_t a, uint32_t b)
 	{
@@ -423,7 +434,10 @@ int main()
 		check(w.end_call - base == 0x0129EA && w.end_target - base == 0x00A820, tag + "the interface's end at 0129EA (call the fade 00A820)");
 		check(w.frame_call - base == 0x012AF5 && w.frame_target - base == 0x009740, tag + "the frame's end at 012AF5 (call EndScene 009740)");
 		const size_t changed = differences(name, base, size);
-		check(changed >= 3 && changed <= 12, tag + "only the three rel32s changed (" + std::to_string(changed) + " bytes)");
+		check(w.screen_call - base == 0x012465 && w.screen_target - base == 0x012F40, tag + "the screen passes' window at 012465 (call the crossfade 012F40)");
+		check(w.pop_call - base == 0x0126A1 && w.pop_target - base == 0x00A1D0, tag + "its end at 0126A1 (call A's pop 00A1D0)");
+		check(w.movie - base == 0x456D1C, tag + "the movie player's global at [0x456D1C]");
+		check(changed >= 5 && changed <= 20, tag + "only the five rel32s changed (" + std::to_string(changed) + " bytes)");
 
 		// The wrapper and its device
 		device dev;
@@ -564,6 +578,68 @@ int main()
 			check(ud::get_counts().texture_changes == c0.texture_changes + 1 && tex->refs == 2, tag + "a texture with new pixels taken again, still held once");
 			ud::drop_textures();
 			check(tex->refs == 1, tag + "drop_textures: let go");
+		}
+		// The screen passes' window on A (its stub reads the wrapper from the game's global; its jumps to the crossfade
+		// and A's pop stand-ins): a wash quad recorded, a DIP cut (kind 8), the window closed and marked (kind 8) before
+		// the pop, no begin marker
+		{
+			ud::set_mode(ud::native);
+			const uintptr_t sc = hifi::game::find("8B0D????????508B91C001000052E8????????E8????????8BCEE8????????A0????????3C80");
+			const uintptr_t global = hifi::game::word(sc + 2);
+			const uint32_t old_wrapper = hifi::game::word(global);
+			*reinterpret_cast<uint32_t *>(global) = uint32_t(reinterpret_cast<uintptr_t>(wrapper));
+			uint8_t saved_screen[5], saved_pop[5];
+			std::memcpy(saved_screen, reinterpret_cast<const void *>(w.code + 0x60 + 0x14), 5);
+			std::memcpy(saved_pop, reinterpret_cast<const void *>(w.code + 0x80 + 0x14), 5);
+			uint8_t j1[5] = { 0xE9 }, j2[5] = { 0xE9 };
+			hifi::game::put32(j1 + 1, uint32_t(reinterpret_cast<uintptr_t>(&fake_crossfade) - (w.code + 0x60 + 0x14 + 5)));
+			hifi::game::put32(j2 + 1, uint32_t(reinterpret_cast<uintptr_t>(&fake_pop) - (w.code + 0x80 + 0x14 + 5)));
+			hifi::game::write_code(w.code + 0x60 + 0x14, j1, 5);
+			hifi::game::write_code(w.code + 0x80 + 0x14, j2, 5);
+			calls.clear();
+			dev.marks.clear();
+			dev.dpup = 0;
+			const ud::counts c0 = ud::get_counts();
+			const regs r = run_begin(w.code + 0x60, 0x12345678);
+			check(r.esp_diff == 0 && r.ebx == 0x11111111 && r.esi == 0x22222222 && r.edi == 0x33333333 && calls.find('X') == std::string::npos,
+				tag + "A: the screen stub: the crossfade called, the stack and registers kept");
+			const uint32_t seq = ud::get_counts().seq;
+			check(ud::get_counts().windows == c0.windows + 1 && dev.marks.empty() && calls.find('x') != std::string::npos,
+				tag + "A: the window open (no begin marker), then the game's crossfade");
+			const v28 wash[4] = { { -0.5f, -0.5f, 0, 1, 0x80FFFFFF, 0, 0 }, { 2559.5f, -0.5f, 0, 1, 0x80FFFFFF, 0, 0 }, { -0.5f, 1439.5f, 0, 1, 0x80FFFFFF, 0, 0 },
+				{ 2559.5f, 1439.5f, 0, 1, 0x80FFFFFF, 0, 0 } };
+			method<long(__stdcall *)(device *, uint32_t)>(&dev, 76)(&dev, 0x44);
+			tss(&dev, 0, 1, 2), tss(&dev, 0, 2, 0), tss(&dev, 0, 4, 2), tss(&dev, 0, 5, 0);
+			dpup(&dev, 5, 2, wash, 20);
+			method<long(__stdcall *)(device *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)>(&dev, 71)(&dev, 4, 0, 3, 0, 1);
+			dpup(&dev, 5, 2, wash, 20);
+			{
+				const uintptr_t stub = w.code + 0x80, wr = reinterpret_cast<uintptr_t>(wrapper);
+				__asm {
+					mov ecx, wr
+					call dword ptr [stub]
+				}
+			}
+			const u2::frame *f = u2::published(seq & 15);
+			check(f != nullptr && f->draw_count == 2 && f->segments.load() == 2 && f->seg[0].kind == hifi::slotmark::screen && f->seg[1].kind == hifi::slotmark::screen &&
+				f->draws[0].colour.op == 2 && f->draws[0].target_w == 2560, tag + "A: the wash recorded twice, two segments of kind 8 (the DIP's cut, the pop)");
+			check(dev.dpup == 0 && dev.marks.size() == 2 && uint32_t(dev.marks[1]) == hifi::slotmark::x_of(hifi::slotmark::screen, seq) &&
+				calls.rfind("C8.") < calls.find('p') && *reinterpret_cast<uint32_t *>(&dev) == own_vt && fake_pop_ecx == uint32_t(reinterpret_cast<uintptr_t>(wrapper)),
+				tag + "A: marked before the pop, the pop called with the wrapper, the device's own vtable back");
+			hifi::game::write_code(w.code + 0x60 + 0x14, saved_screen, 5);
+			hifi::game::write_code(w.code + 0x80 + 0x14, saved_pop, 5);
+			*reinterpret_cast<uint32_t *>(global) = old_wrapper;
+			method<long(__stdcall *)(device *, uint32_t)>(&dev, 76)(&dev, 0x144);
+			tss(&dev, 0, 1, 5), tss(&dev, 0, 2, 2), tss(&dev, 0, 4, 5), tss(&dev, 0, 5, 2);
+		}
+		// The opening movie: no window while its player exists
+		{
+			const ud::counts c0 = ud::get_counts();
+			*reinterpret_cast<uint32_t *>(w.movie) = 0x1234;
+			run_begin(w.code, reinterpret_cast<uintptr_t>(wrapper));
+			*reinterpret_cast<uint32_t *>(w.movie) = 0;
+			check(ud::get_counts().movie == c0.movie + 1 && ud::get_counts().windows == c0.windows && *reinterpret_cast<uint32_t *>(&dev) == own_vt,
+				tag + "the opening movie playing: no window, the game draws it all");
 		}
 		// No stencil on the bound depth: no window
 		{
