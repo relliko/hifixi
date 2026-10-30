@@ -48,7 +48,7 @@ to the game, nothing of it kept):
 Classes taken (by the vtable's class draw, vt+0x48):
 | Class | Draw | What's recorded | Left to the game |
 |---|---|---|---|
-| D3M (0x32AD80) | 040BA0 -> 040220 | vertices from the chunk in memory (03FEE0 doubled the colours in place), one draw per texture run (3524A8 / bit 28 3523D0 / I 352590), the untextured tail (352648), untextured (352348, D: alpha x 2) | MMB models (+0x179), lit (bit 16), untextured kinds 5-7 (below), a texture not on the GPU yet |
+| D3M (0x32AD80) | 040BA0 -> 040220 | vertices from the chunk in memory (03FEE0 doubled the colours in place), one draw per texture run (3524A8 / bit 28 3523D0 / I 352590), the untextured tail (352648), untextured (352348, D: alpha x 2) | MMB models (+0x179), lit (bit 16), untextured kinds 5-7 whose DAT chunk isn't found (below), a texture not on the GPU yet |
 | D3A (CMoD3aElem) | 03EB30 -> 03E910 | the frame +0x170 (wrapped to 0 at the count and written back, as 03E910 does), its quads from the chunk, UVs x 1/(texture object +0x24, +0x26) when +0 >= 1 and +7 is 0 (as the load scales them), 351FA0 / bit 28 351EC8, no fog, no z write, unlit | a texture not up |
 | rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | lit, more than 4 rings |
 | weapon trails | flush callback 01C930 -> 01C940 | the 80-sample ring (newest first), one strip (tip A, base B) or two from the middle line (+0x151C), through VIEW, vertex colour only, additive, no z write, no fog | - |
@@ -56,10 +56,12 @@ Classes taken (by the vtable's class draw, vt+0x48):
 Elements whose class draw returns early in the game (no model, a weather element 002D80 hides, no vertex buffer, fewer
 than two trail samples, no segments) are taken with nothing drawn, as the game draws nothing.
 
-**Untextured D3M, kinds 5-7: left to the game.** For them 03FCF0's "names" begin where the vertices do, and the load
-stores the vertex buffer object at names + 4 *after* copying the vertices into the (write-only) buffer: the first
-vertex's y is overwritten in the chunk and survives only in the DAT. (Kind 3 keeps its names at +0x10, clear of the
-vertices: drawn.)
+**Untextured D3M, kinds 5-7: the first vertex's y from the DAT.** For them 03FCF0's "names" begin where the vertices
+do, and the load stores the vertex buffer object at names + 4 *after* copying the vertices into the (write-only)
+buffer: the first vertex's y is overwritten in the chunk and survives only in the DAT. `dat_first_y` finds the file id
+at the resource's root (up the parents +0x28, the root's +0x34), reads that DAT once per resource (cached, a failure
+too), and takes the chunk of the same name, type and size whose other vertex positions match memory. Not found: the
+game's. (Kind 3 keeps its names at +0x10, clear of the vertices.)
 
 ### Textures: `src/fx/fxtextures.cpp`
 Each texture a recorded element names (the texture object in the name's first dword, its resource at object +8, the
@@ -126,8 +128,9 @@ The oracles are made when missing (`build.cmd`), about a minute.
    (182070); gamewater's list honoured (read its routine's names, `gamewater::where().memory`).
 2. **Lit D3M/rings** (flags bit 16): record the area environment's lights as 0467E0 asks (`18B960`/`188B70`/`18B9A0`
    for lights 0-1, `18B9E0` AMBIENT, material VA 0490BC28) and do D3D8's fixed-function lighting in the vertex shader.
-3. **Untextured D3M kinds 5-7**: the first vertex's y from the DAT (file id from the resource root, the chunk found by
-   name, type and size), cached per resource.
+3. (Done: untextured D3M kinds 5-7, the first vertex's y from the DAT.) A DAT read on the game's thread the first time
+   such a mesh is drawn; if that shows as a hitch, move it to the textures' decoder thread (the element is the game's
+   until it's back).
 4. **Morph** (03FBB0 / 03F440): weights +0x194 (5, normalized; none: the largest of +0x1A8), the chunk in memory,
    `fxgeo::morph::blend` (already checked against effects_geo), table 352258, alpha test bit 7 (`stage_alpha_test` is in
    the shader). The texture wave (+0x148 != 0: 075700 renders into a 64x64 target) left to the game.

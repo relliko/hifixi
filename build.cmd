@@ -167,7 +167,7 @@ echo Built build\fx_geo_test.exe
 rem The game side on both dumps, the game's own walk and element draw run through our stubs (WARP for a texture's copy):
 rem build\fx_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\fx_test.cpp src\game\fxdraw.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxtextures.cpp src\chars\tex.cpp src\game\game.cpp ^
+  tests\fx_test.cpp src\game\fxdraw.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxtextures.cpp src\chars\tex.cpp src\bake\dat.cpp src\game\game.cpp ^
   /Fo"build\test\\" /Fe"build\fx_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\fx_test.exe
 rem The renderer at its marker on WARP with the debug layer against effects_play.py (tests\fx_oracle.py play: Fire, Cure,

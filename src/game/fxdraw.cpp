@@ -36,9 +36,9 @@
  *     002D80 hides: nothing drawn (taken, as the game's own early return). The model an MMB (+0x179): left to the game
  *     for now. Else the D3M (040220, the resource [[+0x104]], data at +0x30): its vertices as the load left them
  *     (03FEE0 doubled their colours in place), no vertex buffer (03FCF0 + 4): nothing; no textures: one untextured
- *     draw (352348, D: alpha x 2), but kinds 5-7 without textures are left to the game (their names begin where their
- *     vertices do, and the load stores the vertex buffer object over the first vertex's y once it has copied them;
- *     the value is only in the DAT now); else a draw per texture run (3524A8, bit 28: 3523D0; I: 352590), the texture object
+ *     draw (352348, D: alpha x 2); for kinds 5-7 without textures the first vertex's y comes from the DAT (their names
+ *     begin where their vertices do, and the load stores the vertex buffer object over it once it has copied them:
+ *     dat_first_y below; left to the game when it can't be found); else a draw per texture run (3524A8, bit 28: 3523D0; I: 352590), the texture object
  *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5. Lit (flags bit 16):
  *     left to the game for now.
  *   03EB30 (CMoD3aElem): the frame +0x170 of the D3A (record_d3a below), lit or not (03E9A0 sets LIGHTING 0).
@@ -53,10 +53,12 @@
 #include "slotmark.hpp"
 #include "../fx/fxframe.hpp"
 #include "../fx/fxtextures.hpp"
+#include "../bake/dat.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace hifi::game::fxdraw
@@ -360,6 +362,83 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// The first vertex's y of an untextured D3M of kinds 5-7 (the load wrote the vertex buffer object over it in
+		// memory; record_d3m), from its DAT: the file id at its root (up the parents +0x28, as 072240; the root's +0x34),
+		// the chunk of its name (resource +0x20), type 0x1F and size whose other vertex positions are the ones in memory.
+		// Cached per resource (a failure too); false when it can't be had.
+		struct first_y
+		{
+			uint32_t handle = 0, header = 0;
+			bool ok = false;
+			float y = 0.0f;
+		};
+		std::map<uintptr_t, first_y> g_first_y;
+
+		bool dat_first_y(uintptr_t resource, float &y)
+		{
+			const uint32_t handle = at<uint32_t>(resource + 0x14), header = at<uint32_t>(resource + 0x24);
+			const auto known = g_first_y.find(resource);
+			if (known != g_first_y.end() && known->second.handle == handle && known->second.header == header)
+			{
+				y = known->second.y;
+				return known->second.ok;
+			}
+			first_y &out = g_first_y[resource];
+			out = first_y();
+			out.handle = handle;
+			out.header = header;
+			uintptr_t r = resource;
+			for (int depth = 0; depth < 64; ++depth)
+			{
+				const uint32_t h = at<uint32_t>(r + 0x28);
+				const uint32_t parent = h != 0 ? at<uint32_t>(h) : 0;
+				if (parent == 0 || parent == r)
+					break;
+				r = parent;
+			}
+			const uint32_t file = at<uint32_t>(r + 0x34);
+			std::string why;
+			const std::wstring path = file < 0x40000 ? bake::dat_path(file, why) : std::wstring();
+			std::vector<uint8_t> dat;
+			if (path.empty() || !bake::read_file(path, dat))
+				return false;
+			const uint32_t name = at<uint32_t>(resource + 0x20);
+			const size_t size = ((header >> 7) & 0x7FFFF) * 16;
+			const uintptr_t data = resource + 0x30;
+			const uint32_t triangles = at<uint16_t>(data + 6);
+			const size_t verts = d3m_vertices(data) - data;
+			for (size_t off = 0; off + 16 <= dat.size();)
+			{
+				uint32_t w = 0, n = 0;
+				std::memcpy(&n, &dat[off], 4);
+				std::memcpy(&w, &dat[off + 4], 4);
+				const size_t s = ((w >> 7) & 0x7FFFF) * 16;
+				if (s < 16 || off + s > dat.size())
+					break;
+				if (n == name && (w & 0x7F) == 0x1F && s == size && verts + size_t(triangles) * 3 * 36 <= s - 16)
+				{
+					const uint8_t *d = &dat[off + 16];
+					bool same = std::memcmp(d + 4, reinterpret_cast<const void *>(data + 4), 4) == 0;
+					for (uint32_t i = 0; same && i < triangles * 3; ++i)
+					{
+						const uint8_t *fv = d + verts + size_t(i) * 36;
+						const uintptr_t mv = data + verts + uintptr_t(i) * 36;
+						same = i == 0 ? std::memcmp(fv, reinterpret_cast<const void *>(mv), 4) == 0 && std::memcmp(fv + 8, reinterpret_cast<const void *>(mv + 8), 4) == 0
+									  : std::memcmp(fv, reinterpret_cast<const void *>(mv), 12) == 0;
+					}
+					if (same)
+					{
+						std::memcpy(&out.y, d + verts + 4, 4);
+						out.ok = std::isfinite(out.y);
+						y = out.y;
+						return out.ok;
+					}
+				}
+				off += s;
+			}
+			return false;
+		}
+
 		// The D3M (040220) into the frame; false: the game's
 		bool record_d3m(uintptr_t e, uintptr_t resource)
 		{
@@ -377,6 +456,8 @@ namespace hifi::game::fxdraw
 			// The draws, as 040220 makes them
 			fx::draw draws[16];
 			uint32_t count = 0, used = 0;
+			bool patch_y = false;
+			float first_y_value = 0.0f;
 			if (textures == 0)
 			{
 				// (kinds 5-7 without textures: the names (03FCF0) begin where the vertices do, and the load stores the
@@ -384,8 +465,12 @@ namespace hifi::game::fxdraw
 				const uint32_t kind = at<uint8_t>(data) & 0xF;
 				if (kind >= 5 && kind <= 7)
 				{
-					g.n.overwritten++;
-					return false;
+					if (!dat_first_y(resource, first_y_value))
+					{
+						g.n.overwritten++;
+						return false;
+					}
+					patch_y = true;
 				}
 				draws[count++] = { 0, triangles * 3, fx::kNone, uint32_t((letter & 0xFF) == 0x44 ? fx::stage_alpha_2x : 0) };
 				used = triangles * 3;
@@ -442,6 +527,8 @@ namespace hifi::game::fxdraw
 				out.blend = fx::blend_multiply;
 			}
 			std::memcpy(f.vertices + f.vertex_count, reinterpret_cast<const void *>(vertices), size_t(used) * sizeof(fx::vertex));
+			if (patch_y && used != 0)
+				f.vertices[f.vertex_count].pos[1] = first_y_value;
 			out.first_draw = f.draw_count;
 			for (uint32_t i = 0; i < count; ++i)
 			{
