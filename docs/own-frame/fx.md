@@ -54,6 +54,9 @@ Classes taken (by the vtable's class draw, vt+0x48):
 | VuAnm (CMoVuAnmElem 0x32AC10) | 03F130 | the game's own point walk 063C80 run once as 03F130 runs it (below), its 6 vertices a point written by 03EFC0 into a buffer of ours, the game's strip (from vertex 1, points x 4 - 2 triangles) cut into a list; D3A stages (351FA0 / bit 28 351EC8), WORLD math +0x810, no fog, no z write, unlit | its first draw (+0x1DC 0: it makes the corner table the walk reads), a texture wave (+0x148), no texture object (+0x140), a texture not up |
 | CMoDist (0x32B298, kind 0x22) | 0426F0 | a grab (the world so far into the 256 x 256 distortion target through the unshifted diamond's screen points) and the fan drawn shifted (below) | a subtractive letter (BLENDOP stays REVSUBTRACT), no room |
 | CMoVuDist (0x32B2F8) | 043110 | the game's walk 063C80 run with a counting callback of ours, then that many CMoDist quads at the element's place (below) | more than 64 points |
+| CMoDistModelElem (0x32B418) | 043320 | the D3M's vertices, their UVs by 042D00 through the draw matrix moved by +0x194, the whole world grabbed, one draw with 352740's stages (below) | - |
+| CMoDistMorphElem (0x32B358) | 043590 | the morph blended (03F8A0), its positions' UVs by 042D00, the whole world grabbed, WORLD moved by +0x1C0, 352258's stages (below) | a blend handed in (+0x1BC); 042D00 answering 0 (it keeps the blend then) |
+| CMoDistRingElem (0x32B4D8) | 043720 | its bands (angles 0, d .. (n-1)d, 0), the colours x the element's >> 7, UVs by 042D00, the whole world grabbed, 353378's stages (below) | lit (its normals aren't written), more than 4 rings |
 | lens flares (CMoLfdElem 0x32B538) | its own vt+0x2C 0548D0, its call of 03EBF0 at 054B81 | the pieces of the flare D3A pre-transformed as 03EBF0 places them (below); 0548D0 itself (the visibility test, the glare colour 014F70) still runs | a texture not found or not up |
 | morphs (0x32AC90) | 03FBB0 -> 03F440 | T x 3 corners: positions and normals blended as 03F8A0 does (below), colours doubled, the UVs; table 352258 (as the D3M's 3524A8), the header's bit 7 the alpha test GREATER 0x60; 03FBB0's side effects done (+0x194 -> +0x1A8, +0x1BC cleared) | a blend handed in (+0x1BC), the texture wave (+0x148), a texture not up |
 | rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | more than 4 rings |
@@ -116,6 +119,36 @@ fans. On the Direct3D 12 side (`fx_renderer::grab`) a draw with a grab first cop
 multisampled) into a copy of ours, draws the grab's quad of it into a 256 x 256 target of ours (pre-transformed corners
 as D3D9 places them: + 0.5 pixel), puts the world's target back and draws with that target as its texture (textures'
 reserved descriptors 1 and 2; static sampler s1 MIRROR).
+
+**The 042D00 distortions (043320, 043590, 043720).** 042D00 (R; thiscall, (vertices, count, M, stage), ret 0x10)
+projects each 36-byte vertex with math vt+0x84 (M, gfx +0xB10, the half sizes gfx +0xDC0 / +0xDC4) into its UV slots,
+then UV = ((x + 0.5) / W, (H - 0.5 - y) / H) in the game's target (009E00); it answers 0 (nothing drawn) when W or H
+is 0 or without the world's texture ([VA 048E666C] +0x194). Then it grabs **the whole world, flipped**, into the 256 x
+256 target: the strip (0, 0) (256, 0) (0, 256) (256, 256) with UVs (-0.5/W, (H-0.5)/H), ((W-0.5)/W, (H-0.5)/H), (-0.5/W,
+-0.5/H), ((W-0.5)/W, -0.5/H) (35322C / 3531C0: no blend, no z, colour the texture, alpha TFACTOR 0x80, MIRROR), sets
+ALPHABLENDENABLE and ZENABLE 1 and binds the target at the stage handed in. fxdraw calls the game's own vt+0x84 on
+the vertices it records (`dist_uvs`), and the grab is `fx::grab` as for CMoDist (`dist_full_grab`). Per class (R):
+- **The mesh (043320):** a weather element 002D80 hides or an MMB (+0x179): nothing. The D3M's vertices (03FD70,
+  triangles x 3) copied, M = (identity moved by +0x194 in x and y) x the draw matrix (math vt+0x24 on 06A4A0's cache),
+  042D00 (the copy; from vertex 2, count - 2, when 03FCB0 answers: no textures and kinds 5-7, the first vertex
+  overwritten by the load; stage 1), WORLD the plain draw matrix again (06A480), the copy into the distortion buffer
+  (VA 0490BBB0), then 040670 (the resource, that buffer, VA 0490BC0C, the element, 0): ALPHATEST GREATER 0x60 with the
+  data's +2 bit 0, TEXTUREFACTOR the colour (D: alpha >= 0x7F full), table 352740 (stage 0 CURRENT x TFACTOR x 2,
+  colour and alpha; stage 1 TEXCOORDINDEX 0, colour TEXTURE, alpha TEXTURE x CURRENT x 4, WRAP; D: 352848, alpha x 2),
+  stage 1's UV offset (+0x120 with +0x17B bits 0-1); no texture set (its last argument 0 skips 075700): each texture
+  run, then the rest when +5; without textures only when +5, from triangle 1 when 03FCB0 answers. Drawn here as one
+  draw (`stage_dist_model`). Lit as 0467E0 lights it (lit_ok), fog and blend the letter's.
+- **The morph (043590):** the blend 03F8A0 into +0x1BC unless one's there (then the game's); the draw matrix; 042D00
+  on the blend's P positions (M the plain draw matrix; stage 0: the target is the morph's texture); when it answers 0
+  the element is the game's (it keeps +0x1BC then). WORLD = (identity moved by +0x1C0) x the draw matrix (06A480), then
+  03F440 with the blend and flag 1: no texture set, the colours as they are (not doubled), each corner's UV its
+  position's; +0x1BC cleared, +0x194 copied to +0x1A8. Table 352258 as the plain morph (sampled WRAP).
+- **The rings (043720):** n segments (+0x1B4), up to 4 rings (+0x1B5: the game's stack has room for 4); each ring's
+  colour its bytes +0x1A4 + 4i (R G B A) x VA 0490BC0C's >> 7, kept to the low byte (no clamp); per band 2n + 2 vertices:
+  at angles 0, d .. (n - 1) d (added up) the pair (sin a x r, cos a x r, 0), inner then outer, then the first pair
+  again (unlike 0565A0's 0, 0, d ..); normals not written (lit: the game's). 042D00 on all of them with the plain draw
+  matrix (no shift: the world under the ring through the 256 x 256 copy), 353378 (colour CURRENT x TEXTURE x 2, alpha
+  DIFFUSE x TEXTURE x 4, MIRROR, stage 1 off; `stage_dist_ring`), a DrawPrimitiveUP strip of 2n triangles per band.
 
 **Lens flares (0548D0 -> 03EBF0).** The flare's own draw (vt+0x2C, so the run is closed before it as before) works
 out the light's screen point, runs its visibility test (06C280 at 054AE2: the game's readback, or World FX's VisTest
@@ -224,9 +257,13 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   walk's formula with the point list's point, the strip's first two quads, the clock moved on, the cursor put back;
   its first draw left to the game); a CMoDist (the diamond by the game's vt+0x80 into 640 x 480: the grab's corners and
   UVs, the fan, WORLD shifted; nothing without the world's texture) and a CMoVuDist (the walk counting 3: three grabs and
-  quads, the clock moved on); a lens flare (ROM/0/40 'lf01', 17 pieces: on_flare from a flush, its 108 vertices placed
+  quads, the clock moved on); the 042D00 distortions (Fire's 'fa04' as a distortion mesh: its UVs by the game's
+  vt+0x84 through the draw matrix moved by +0x194, against the projection by hand; nothing without the world's texture;
+  'rng ' as a distortion morph at 1:3: the corners' UVs their positions', the colours not doubled, WORLD moved by +0x1C0,
+  the side effects; rings of 8 segments and 3 rings: the bands, the colours x the element's >> 7, the UVs; a lit one
+  left to the game; the whole-world grab each time); a lens flare (ROM/0/40 'lf01', 17 pieces: on_flare from a flush, its 108 vertices placed
   as 03EBF0 places them, alpha x visibility, its texture found by name in a made-up texture manager; the call at 054B81
-  patched and put back). 133 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
+  patched and put back). 147 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
   threads put their stacks there otherwise).
 - `build\fx_render_test.exe build\test\fx_fire.bin build\test\fx_cure.bin build\test\fx_fastblade.bin`: the D3D12 side
   at its marker on WARP with the debug layer, on a list recorded as dgVoodoo records (its own heap and targets),
@@ -236,8 +273,10 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   0.00-0.05 of 255, no pixel off by more than 24; the debug layer silent. Plus the blend table (trail colour added, B
   subtracted, F darkening), 183760's three tables (plain, the textured mode, untextured) and a lit element (vertex x
   (ambient + diffuse x N.L, N not normalized) + emissive) by value, and a distortion quad by value (the world red and
-  blue, the fan shifted 8 pixels shows red where the world is blue: the grab, the copy and the 256 x 256 target) and a
-  lens flare's stage pre-transformed (a quad over the screen's left half: 128 64 32, the right half untouched). 41
+  blue, the fan shifted 8 pixels shows red where the world is blue: the grab, the copy and the 256 x 256 target), the
+  042D00 distortions by value (the whole world grabbed flipped; the mesh's stages sampling 16 pixels left and up, WRAP;
+  the ring's sampling 16 pixels left, MIRROR) and a
+  lens flare's stage pre-transformed (a quad over the screen's left half: 128 64 32, the right half untouched). 43
   checks (with the fountain's DAT).
 - `hook_test` (plain and --debug) and `menu_test` pass.
 The oracles are made when missing (`build.cmd`), about a minute.
@@ -254,18 +293,10 @@ The oracles are made when missing (`build.cmd`), about a minute.
 4. (Done: morphs.) The texture wave (+0x148 != 0: 075700 renders a wave of the texture into a 64x64 target) and a
    blend handed in ready (+0x1BC: who sets it isn't traced; I: the distortion morph) stay the game's.
 5. (Done: VuAnm, VuDist.)
-6. (Done: CMoDist, CMoVuDist, and the grab on the Direct3D 12 side.) **The 042D00 distortions** (CMoDistModelElem
-   043320, CMoDistMorphElem 043590, CMoDistRingElem 043720) stay the game's. Read (R): 043320 copies the D3M's vertices,
-   builds M = (identity moved by +0x194 in x and y) x WORLD (06A4A0's cache: the draw matrix) through math vt+0x24, and
-   042D00 (vertices, count, M) writes each vertex's UV from math vt+0x84 (vt+0x80 for 36-byte vertices: x = (x/|w| + 1)
-   x +0xDC0, y = (1 - y/|w|) x +0xDC4): u = (x + 0.5) / W, v = (H - 0.5 - y) / H; then grabs **the whole world** into the
-   256 x 256 target, flipped (its corners (0, 0) (256, 0) (0, 256) (256, 256) with UVs (-0.5/W, (H-0.5)/H), ((W-0.5)/W,
-   (H-0.5)/H), (-0.5/W, -0.5/H), ((W-0.5)/W, -0.5/H); 35322C / 3531C0: no blend, no z, MIRROR), sets ALPHABLENDENABLE
-   and ZENABLE 1 and the 256 target as texture 0, and 040670 draws the copied vertices with WORLD the plain draw matrix
-   (043320's 03FCB0 check drops the first two vertices' worth when it answers: not followed). Next: `fx::grab` already
-   draws any quad: record the full-screen grab, compute the UVs on the game side as 042D00 does (the game's vt+0x84 can
-   be called on a copy of the vertices), and follow 040670's states (the D3M's tables, MIRROR from 3531C0); the morph
-   (043590) and ring (043720: its rings' colours x VA 0490BC0C >> 7, DrawPrimitiveUP with 353378) the same way.
+6. (Done: CMoDist, CMoVuDist, the grab on the Direct3D 12 side, and the 042D00 distortions 043320, 043590, 043720.)
+   Each 042D00 element copies the whole world target and draws it into the 256 x 256 target, as the game does; a
+   busy scene with many of them costs a full copy each (the game's own cost too). The half-pixel of D3D9's pixel
+   centres in 042D00's UVs is kept as the game computes it (the world's geometry isn't shifted by it either).
 7. **Specular D3M** (0412B0) stays the game's. Read so far (R, 2026-10-30): an MMB model goes to 040C20 as the plain
    D3M; else ZENABLE 1 and TEXTUREFACTOR VA 0490BC0C, then a texture matrix: math vt+0x58 (rotation) of (0, -pi/2, 0),
    or with +0x198 bit 0 of (-+0x19C, -(+0x1A0 + pi/2), -+0x1A4), times 015230's matrix without its translation when
@@ -310,6 +341,9 @@ The oracles are made when missing (`build.cmd`), about a minute.
   in the game; they move on as before.
 - Heat haze (CMoDist, VuDist: fire spells, some abilities): the world under a diamond shown shifted and fading to its
   edges, as before; with MSAA on in dgVoodoo the world is resolved for it. `/hifi status`: "distortion grabs".
+- Distortion meshes, morphs and rings (the 042D00 kinds: shock waves, ripples, see-through shapes): the world seen
+  through them low-resolution (256 x 256) and shifted, as before; `/hifi status` counts them under "distortion (meshes,
+  morphs, rings)".
 - With HiFi XI's "Hide the lens flare" off: the sun's lens flare, its pieces along the line through the screen's
   centre, fading as the sun is hidden (with VisTest on, a few frames late, as before).
 - Depth-pulled effects close to the camera (cures on yourself) not cut by the ground.

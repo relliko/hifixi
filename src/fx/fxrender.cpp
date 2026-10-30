@@ -9,7 +9,7 @@
  * draws read their vertices through the zone's indices), 5 the frame's lights t4 (the upload ring, after the
  * vertices: a lit element's D3D8 fixed-function lighting in the vertex shader). Static sampler s0: MIN/MAG LINEAR, no mips (the game sets no
  * MIPFILTER), WRAP (the D3M runs' and 183760's ADDRESS WRAP; D3D8's default for the rest); s1 the same, MIRROR (the
- * distortion's: 353028 sets it on stage 0 and the fan after keeps it).
+ * distortion's: 353028 sets it on stage 0 and the fan after keeps it; the distortion rings' 353378 too).
  *
  * A distortion grab (vs_grab / ps_grab, the same root signature: its quad's 4 corners in b0's first 16 constants, the
  * world's copy as the table's texture) draws into the 256 x 256 target with pre-transformed vertices as D3D9 places
@@ -145,6 +145,20 @@ float4 ps(v2p i) : SV_Target
 		float4 t = tex.SampleLevel(smp_mirror, i.uv, 0);
 		c = saturate(t.rgb * d.rgb * 2.0);
 		a = saturate(d.a * tfactor.a * 4.0);
+	}
+	else if (s & 8192)
+	{
+		// (a distortion D3M, 352740: stage 0 CURRENT x TFACTOR x 2; stage 1 colour TEXTURE, alpha TEXTURE x CURRENT x 4)
+		float4 t = tex.SampleLevel(smp, i.uv, 0);
+		c = t.rgb;
+		a = saturate(saturate(d.a * tfactor.a * 2.0) * t.a * ((s & 32) ? 2.0 : 4.0));
+	}
+	else if (s & 16384)
+	{
+		// (a distortion ring, 353378)
+		float4 t = tex.SampleLevel(smp_mirror, i.uv, 0);
+		c = saturate(d.rgb * t.rgb * 2.0);
+		a = saturate(d.a * t.a * 4.0);
 	}
 	else if (s & 1)
 	{

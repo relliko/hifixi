@@ -79,6 +79,11 @@ namespace hifi::fx
 		                                // 4, stage 1 off; the texture the distortion target, sampled MIRROR (353028's)
 		stage_flare = 1u << 12,         // a lens flare's pieces (3520A8): colour DIFFUSE x TEXTURE x 2 (stage 1 CURRENT),
 		                                // alpha DIFFUSE x TEXTURE x 2, then x TFACTOR x 2
+		stage_dist_model = 1u << 13,    // a distortion D3M (040670's 352740, the target at stage 1): colour CURRENT x TFACTOR x
+		                                // 2 then TEXTURE alone; alpha CURRENT x TFACTOR x 2, then x TEXTURE x 4 (stage_alpha_2x:
+		                                // x 2, the D's 352848); the texture the distortion target, sampled WRAP
+		stage_dist_ring = 1u << 14,     // a distortion ring (353378): colour CURRENT x TEXTURE x 2, alpha DIFFUSE x TEXTURE x 4,
+		                                // stage 1 off; the texture the distortion target, sampled MIRROR
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -157,7 +162,10 @@ namespace hifi::fx
 		class_trail = 6,   // a weapon trail (CYyAfterImage, 01C940): not an element, a flush callback of its own
 		class_dist = 7,    // a distortion quad (CMoDist 0426F0, CMoVuDist 043110)
 		class_flare = 8,   // a lens flare's pieces (CMoLfdElem 0548D0 -> 03EBF0)
-		classes = 9,
+		class_dist_model = 9,  // a D3M as distortion (CMoDistModelElem 043320 -> 042D00, 040670)
+		class_dist_morph = 10, // a morph as distortion (CMoDistMorphElem 043590 -> 042D00, 03F440)
+		class_dist_ring = 11,  // rings as distortion (CMoDistRingElem 043720 -> 042D00)
+		classes = 12,
 	};
 
 	struct run

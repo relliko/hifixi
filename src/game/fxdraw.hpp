@@ -49,7 +49,7 @@ namespace hifi::game::fxdraw
 	struct counts
 	{
 		uint64_t flushes = 0;
-		uint64_t taken[12] = {};  // (by fx::element_class)
+		uint64_t taken[16] = {};  // (by fx::element_class)
 		uint64_t empty = 0;       // taken, nothing to draw (as the game's own early returns)
 		uint64_t game = 0;        // left to the game: not taking (native off, no stencil)
 		uint64_t unsupported = 0; // ... a class not handled yet
@@ -80,6 +80,7 @@ namespace hifi::game::fxdraw
 		uintptr_t mmb_draw = 0, morph_draw = 0;     // 040C20, 03FBB0
 		uintptr_t vuanm_draw = 0, vu_walk = 0, vu_cursor = 0; // 03F130, 063C80, VA 0490B9D4
 		uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // 0426F0, 043110, VA 048E666C
+		uintptr_t distmodel_draw = 0, distmorph_draw = 0, distring_draw = 0; // 043320, 043590, 043720
 		uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // 054B81, 03EBF0, VA 0490B970
 		uintptr_t frame_of = 0, light1 = 0, lights2 = 0, ambient = 0, material = 0; // 045C50, 18B9A0, 18B960, 18B9E0, VA 0490BC28
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)

@@ -1012,6 +1012,163 @@ int main()
 			ok = g_markers == 1 && g_seen.setups == 0 && fa != nullptr && fa->element_count == 1 && fa->grab_count == 3 && fa->elements[0].draws == 3 &&
 				fa->draws[fa->elements[0].first_draw + 2].grab == 2 && get<float>(ev + 0x19C) == 1.5f;
 			check(ok, name + ": CMoVuDist: the game's walk counted 3 points: three grabs and quads, its clock moved on by gfx +0xEB0");
+
+			// The 042D00 distortions (043320, 043590, 043720): every vertex's UV its screen point by the game's math vt+0x84
+			// ((x + 0.5) / 640, (479.5 - y) / 480; checked against the projection by hand), the grab the whole world flipped
+			// (0 0 / 256 0 / 0 256 / 256 256 from (-0.5/640, 479.5/480) .. (639.5/640, -0.5/480)). The mesh (Fire's 'fa04'):
+			// its UVs from the vertices moved by +0x194 in x and y, drawn at the plain draw matrix, 352740's stages; the morph
+			// ('rng ' at 1:3): UVs from the blend's positions, the colours as they are, WORLD moved by +0x1C0, the morph's
+			// stages; the rings (8 segments, 3 rings): 2 bands of 16 triangles, the colours x VA 0490BC0C >> 7, 353378's
+			// stages; a lit ring the game's; the mesh without the world's texture taken with nothing drawn
+			{
+				check(s.distmodel_draw == base + 0x043320 && s.distmorph_draw == base + 0x043590 && s.distring_draw == base + 0x043720,
+					name + ": CMoDistModelElem 043320, CMoDistMorphElem 043590, CMoDistRingElem 043720");
+				const auto screen_uv = [](const float *wm, const float p[3], float &u, float &v) {
+					const float x = p[0] * wm[0] + p[1] * wm[4] + p[2] * wm[8] + wm[12], y = p[0] * wm[1] + p[1] * wm[5] + p[2] * wm[9] + wm[13];
+					const float z = p[0] * wm[2] + p[1] * wm[6] + p[2] * wm[10] + wm[14];
+					const float w = std::fabs(-z);
+					u = ((x * 1.5f / w + 1.0f) * 320.0f + 0.5f) / 640.0f;
+					v = (479.5f - (1.0f - y * 2.0f / w) * 240.0f) / 480.0f;
+				};
+				const auto full_grab = [](const fx::grab &gr) {
+					const float pos[4][2] = { { 0, 0 }, { 256, 0 }, { 0, 256 }, { 256, 256 } };
+					const float uv[4][2] = { { -0.5f / 640, 479.5f / 480 }, { 639.5f / 640, 479.5f / 480 }, { -0.5f / 640, -0.5f / 480 }, { 639.5f / 640, -0.5f / 480 } };
+					bool ok = true;
+					for (int k = 0; k < 4; ++k)
+						ok = ok && gr.pos[k][0] == pos[k][0] && gr.pos[k][1] == pos[k][1] && std::fabs(gr.uv[k][0] - uv[k][0]) < 1e-6f && std::fabs(gr.uv[k][1] - uv[k][1]) < 1e-6f;
+					return ok;
+				};
+				const uintptr_t vt_dm = take(0x100), vt_dmo = take(0x100), vt_dr = take(0x100);
+				for (const uintptr_t vt : { vt_dm, vt_dmo, vt_dr })
+				{
+					put<uint32_t>(vt + 0x2C, uint32_t(s.element_draw));
+					put<uint32_t>(vt + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+				}
+				put<uint32_t>(vt_dm + 0x48, uint32_t(s.distmodel_draw));
+				put<uint32_t>(vt_dmo + 0x48, uint32_t(s.distmorph_draw));
+				put<uint32_t>(vt_dr + 0x48, uint32_t(s.distring_draw));
+				const auto run_one = [&](uintptr_t e) {
+					put<uint32_t>(node9 + 0xC, uint32_t(e));
+					g_seen = seen();
+					g_markers = 0;
+					reinterpret_cast<flush_fn>(s.code)(list9, 0);
+					return fx::published(g_last_seq);
+				};
+				// The mesh
+				const uintptr_t edm = element(vt_dm, textured_res, 0x48, 0, 0x80406080, -4.0f);
+				put<float>(edm + 0x194, 0.1f);
+				put<uint32_t>(app + 0x194, 0);
+				run_one(edm);
+				check(g_markers == 0 && g_seen.setups == 0, name + ": a distortion mesh without the world's texture: taken, nothing drawn");
+				put<uint32_t>(app + 0x194, 0x1234);
+				const fx::frame *fm = run_one(edm);
+				ok = g_markers == 1 && g_seen.setups == 0 && fm != nullptr && fm->element_count == 1 && fm->grab_count == 1;
+				worst = 0.0f;
+				if (ok)
+				{
+					const fx::element &d = fm->elements[0];
+					const fx::draw &dr = fm->draws[d.first_draw];
+					const uint32_t want_stages = fx::stage_dist_model | ((textured[2] & 1) != 0 ? fx::stage_alpha_test : 0u);
+					ok = d.cls == fx::class_dist_model && d.draws == 1 && dr.count == 6 && dr.texture == fx::kDistTexture && dr.stages == want_stages && dr.grab == 0 &&
+						d.blend == fx::blend_add && d.tfactor == 0x80406080u && d.world[12] == 0.5f && full_grab(fm->grabs[0]);
+					const size_t at_vertices = geo::d3m_vertices_at(textured.data());
+					for (uint32_t i = 0; ok && i < 6; ++i)
+					{
+						const fx::vertex &v = fm->vertices[dr.first + i];
+						fx::vertex src;
+						std::memcpy(&src, textured.data() + at_vertices + 36 * i, 36);
+						const float p[3] = { src.pos[0] + 0.1f, src.pos[1] + 0.1f, src.pos[2] };
+						float u, vv;
+						screen_uv(d.world, p, u, vv);
+						ok = std::memcmp(v.pos, src.pos, 12) == 0 && v.colour == src.colour;
+						worst = std::max({ worst, std::fabs(v.uv[0] - u) * 640.0f, std::fabs(v.uv[1] - vv) * 480.0f });
+					}
+					ok = ok && worst < 0.01f;
+				}
+				check(ok, name + ": a distortion mesh: its 6 vertices' UVs from the game's vt+0x84 through the draw matrix moved by +0x194, the whole world grabbed (worst " +
+					std::to_string(worst) + " px)");
+				// The morph
+				std::vector<uint8_t> mp;
+				geo::morph gm;
+				check(chunk("ROM3\\9\\111.DAT", 0x25, "rng ", mp) && geo::parse_morph(mp.data(), mp.size(), gm, why), name + ": the morph chunk read again");
+				const uintptr_t dmorph_res = resource(mp, 0x25);
+				const uintptr_t edmo = element(vt_dmo, dmorph_res, 0x48, 0, 0x80808080, -6.0f);
+				const float wts[5] = { 1.0f, 3.0f, 0, 0, 0 };
+				std::memcpy(reinterpret_cast<void *>(edmo + 0x194), wts, 20);
+				put<float>(edmo + 0x1C0, 0.2f);
+				const fx::frame *fo = run_one(edmo);
+				ok = g_markers == 1 && g_seen.setups == 0 && fo != nullptr && fo->element_count == 1 && fo->grab_count == 1 && get<float>(edmo + 0x1AC) == 3.0f &&
+					get<uint32_t>(edmo + 0x1BC) == 0;
+				worst = 0.0f;
+				if (ok)
+				{
+					const fx::element &d = fo->elements[0];
+					const fx::draw &dr = fo->draws[d.first_draw];
+					std::vector<fx::vertex> want;
+					gm.blend(wts, want);
+					ok = d.cls == fx::class_dist_morph && dr.count == want.size() && dr.texture == fx::kDistTexture && dr.stages == fx::stage_texture && full_grab(fo->grabs[0]) &&
+						std::fabs(d.world[12] - 0.7f) < 1e-6f && std::fabs(d.world[13] + 0.05f) < 1e-6f;
+					// (the plain draw matrix: WORLD less the shift)
+					float unshifted[16];
+					std::memcpy(unshifted, d.world, 64);
+					unshifted[12] -= 0.2f;
+					unshifted[13] -= 0.2f;
+					// (each corner's colour the chunk's as it is: the doubled one halved back, as gm.blend doubles them)
+					for (size_t i = 0; ok && i < want.size(); ++i)
+					{
+						const fx::vertex &v = fo->vertices[dr.first + i];
+						float u, vv;
+						screen_uv(unshifted, v.pos, u, vv);
+						for (int c = 0; c < 3; ++c)
+							ok = ok && std::fabs(v.pos[c] - want[i].pos[c]) < 1e-4f;
+						for (int k = 0; k < 4; ++k)
+						{
+							const uint32_t raw = (v.colour >> (8 * k)) & 0xFF, doubled = (want[i].colour >> (8 * k)) & 0xFF;
+							ok = ok && std::min(raw * 2, 0xFFu) == doubled;
+						}
+						worst = std::max({ worst, std::fabs(v.uv[0] - u) * 640.0f, std::fabs(v.uv[1] - vv) * 480.0f });
+					}
+					ok = ok && worst < 0.01f;
+				}
+				check(ok, name + ": a distortion morph: its 360 corners blended 1:3, their UVs their positions' screen points, the colours not doubled, WORLD moved by +0x1C0; "
+					"the weights kept, +0x1BC cleared (worst " + std::to_string(worst) + " px)");
+				// The rings
+				const uintptr_t edr = element(vt_dr, 0, 0x48, 0, 0x80406080, -4.0f);
+				put<int8_t>(edr + 0x1B4, 8);
+				put<int8_t>(edr + 0x1B5, 3);
+				const float radii[3] = { 0.5f, 1.0f, 1.5f };
+				std::memcpy(reinterpret_cast<void *>(edr + 0x194), radii, 12);
+				const uint8_t ring_col[3][4] = { { 0xFF, 0x80, 0x40, 0xC0 }, { 0x80, 0x80, 0x80, 0x80 }, { 0x10, 0x20, 0x30, 0xFF } };
+				std::memcpy(reinterpret_cast<void *>(edr + 0x1A4), ring_col, 12);
+				const fx::frame *fr = run_one(edr);
+				ok = g_markers == 1 && g_seen.setups == 0 && fr != nullptr && fr->element_count == 1 && fr->grab_count == 1;
+				worst = 0.0f;
+				if (ok)
+				{
+					const fx::element &d = fr->elements[0];
+					const fx::draw &dr = fr->draws[d.first_draw];
+					const fx::vertex *v = fr->vertices + dr.first;
+					// (0x80406080: R 0x40, G 0x60, B 0x80, A 0x80; ring 0 R 0xFF G 0x80 B 0x40 A 0xC0 -> 0x7F 0x60 0x40 0xC0;
+					// ring 2 0x10 0x20 0x30 0xFF -> 0x08 0x18 0x30 0xFF)
+					ok = d.cls == fx::class_dist_ring && dr.count == 96 && dr.texture == fx::kDistTexture && dr.stages == fx::stage_dist_ring && full_grab(fr->grabs[0]) &&
+						v[0].colour == 0xC07F6040u && v[1].colour == 0x80406080u && v[0].pos[1] == 0.5f && v[1].pos[1] == 1.0f && v[0].pos[0] == 0.0f &&
+						v[48].colour == 0x80406080u && v[49].colour == 0xFF081830u;
+					const float s45 = std::sin(6.283184f / 8.0f);
+					ok = ok && std::fabs(v[2].pos[0] - s45 * 0.5f) < 1e-6f && v[47].pos[1] == 1.0f && v[47].pos[0] == 0.0f;
+					for (uint32_t i = 0; i < 96; ++i)
+					{
+						float u, vv;
+						screen_uv(d.world, v[i].pos, u, vv);
+						worst = std::max({ worst, std::fabs(v[i].uv[0] - u) * 640.0f, std::fabs(v[i].uv[1] - vv) * 480.0f });
+					}
+					ok = ok && worst < 0.01f;
+				}
+				check(ok, name + ": distortion rings: 2 bands of 16 triangles (angles 0 .. 7d, then 0), the colours x the element's >> 7, UVs their screen points (worst " +
+					std::to_string(worst) + " px)");
+				put<uint32_t>(edr + 0x10C, 1u << 16);
+				run_one(edr);
+				check(g_seen.setups == 1, name + ": a lit distortion ring left to the game (its normals aren't written)");
+			}
 			put<uint32_t>(s.dist_app, app_kept);
 		}
 
