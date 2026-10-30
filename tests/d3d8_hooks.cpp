@@ -525,6 +525,10 @@ int main(int argc, char **argv)
 	}
 	check(world_rt != nullptr, "A's render target view: format 28 on a resource of 27, made through the hooked device");
 	check(world_ds != nullptr, "A's depth view: format 45 on a resource of 44");
+	// (World FX reads A's depth in its shaders, as dgVoodoo lets it: an SRV of R24_UNORM_X8_TYPELESS, the resource in
+	// DEPTH_READ | PIXEL_SHADER_RESOURCE; a depth made with DENY_SHADER_RESOURCE removed the device in game, 2026-10-30)
+	check(world_ds != nullptr && (world_ds->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0,
+		"A's depth readable by shaders (no DENY_SHADER_RESOURCE): World FX's SRV of it");
 
 	// Frames: three plain, the fourth read back; then HiFi XI drawing in at the zone's end, the fifth read back
 	std::vector<uint32_t> plain, injected_px;

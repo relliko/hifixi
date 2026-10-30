@@ -161,7 +161,9 @@ namespace hifi::d3d8
 		else if (kind == image_kind::depth)
 		{
 			rd.Format = fi.resource;
-			rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+			// (readable by shaders, as dgVoodoo's: World FX samples the world's depth; with DENY_SHADER_RESOURCE its SRV
+			// removed the device)
+			rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 			if (ms > D3DMULTISAMPLE_NONE)
 				rd.SampleDesc.Count = UINT(ms);
 			rd.MipLevels = 1;
