@@ -118,6 +118,12 @@ namespace hifi::game::fxdraw
 		constexpr const char *kSpecDraw = "83EC1053558BE95733FF39BD040100000F84????????8A857901000084C0";
 		constexpr const char *kSpecCubemap = "8B4424088B4C24045051B9????????E8????????C3";
 		constexpr intptr_t kSpecCubemapAt = 0xB;
+		// The battle numbers: 041AF0; in 041C20 the glyph bind (call 1207B0 at +0xB, the font object mov ecx, imm at +6) and
+		// draw (call 00CD00 at +0xE)
+		constexpr const char *kNumberDraw = "83EC4056578BF98B87FC00000085C074048B00EB0233C08D4830E8";
+		constexpr const char *kGlyphBind = "0FBE14295052B9????????E8????????84C074548B5424288D8424D4000000B904000000";
+		constexpr const char *kGlyphDraw = "8D9424C40000006A1C526A026A05E8????????8B442414";
+		constexpr intptr_t kGlyphBindAt = 0xB, kGlyphDrawAt = 0xE;
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		constexpr intptr_t kD3mMmbJump = 0x46; // (040BE6: jmp 040C20)
 		constexpr uint8_t kMmbDraw[] = { 0x57, 0x8B, 0xF9, 0xF6, 0x87, 0x7B, 0x01, 0x00, 0x00, 0x03 }; // 040C20's first bytes
@@ -174,6 +180,9 @@ namespace hifi::game::fxdraw
 			uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // (0426F0, 043110, VA 048E666C)
 			uintptr_t distmodel_draw = 0, distmorph_draw = 0, distring_draw = 0; // (043320, 043590, 043720; 0 without 0426F0's)
 			uintptr_t spec_draw = 0, spec_cubemap = 0; // (0412B0, VA 0490BB90)
+			// (the battle numbers: 041AF0; 041C20's two calls, patched when both are as the game has them, and their targets)
+			uintptr_t number_draw = 0, glyph_bind_call = 0, glyph_bind = 0, glyph_draw_call = 0, glyph_draw = 0;
+			uint8_t saved_bind[5] = {}, ours_bind[5] = {}, saved_glyph[5] = {}, ours_glyph[5] = {};
 			uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // (054B81 patched when all found; 03EBF0, VA 0490B970)
 			uint8_t saved_flare[5] = {}, ours_flare[5] = {};
 			uintptr_t code = 0;
@@ -2195,6 +2204,168 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// Battle numbers (kind 0x5C: research/ffxi-re/notes-world-passes.md 5). Reachable on this client: 09E090 starts
+		// the 'damv' / 'misv' / 'curv' schedulers in the field for a battle message whose byte in the table VA 047ECAE0 is
+		// 1, 2 or 3 (168 messages, the melee hit 1 among them), once the chat filter lets it through (0ADE80) and config
+		// 0x13 isn't 0: conf3win's damage display ("Display damage on the game screen and in the log window." 1, "... as
+		// pop-up graphics ... only" 2; 0 "in the log window only"). 041AF0 (R): the element's source actor (03B700), its
+		// point (044C40), the name-visibility test 0830C0, TEXTUREFACTOR VA 0490BC0C, then 041C20: a frame around the point
+		// projected (0277E0 .. 027050), the string (+0x198, at most 16 characters) measured with the font object (VA
+		// 04971BF8, sprite set 'menu    dmgnum', 120730) and centred, and for each glyph: 1207B0 binds its texture (the
+		// font's +0x30 / +0x34 by the code's range +0x38 / +0x3C) and 00CD00 draws its XYZRHW quad (FVF 0x144, a strip of
+		// 2; the colour, UVs from the sprite set), stages 352D30 (DIFFUSE x TEXTURE x 2, colour and alpha; x TFACTOR x 2,
+		// alpha x 4: stage_texture), WRAP, 0467E0's blend and z. The projection is the game's, so the element isn't taken
+		// at its setup: 0467E0 and 041AF0 run as before (they set states, they don't draw), and the two calls in 041C20
+		// go to us: on_glyph notes the texture object 1207B0 binds, on_glyph_draw records the quad (pre-transformed, as
+		// the lens flares: WORLD takes the game's pixels to clip space, z as it is) into an element of the run, made at
+		// its first glyph with what common() worked out at the setup. No fog (pre-transformed: RHW 1, table fog sees w 1).
+		// A glyph whose texture isn't up, or anything not as expected: the run closed and the game draws it.
+		struct number_state
+		{
+			bool pending = false;     // a number's setup seen in this flush, its glyphs to come
+			bool made = false;        // its element made in the frame (its first glyph recorded)
+			uint32_t element = 0;     // (its index in the frame)
+			fx::element out;          // what the setup worked out (common)
+			uint32_t object = 0;      // the texture object 1207B0 bound for the glyph to be drawn
+		};
+		number_state g_number;
+
+		void end_number()
+		{
+			g_number.pending = g_number.made = false;
+			g_number.object = 0;
+		}
+
+		// At a number's setup (on_setup, before 0467E0): its states, as common() works them out; false: the game's
+		bool begin_number(uintptr_t e)
+		{
+			end_number();
+			fx::element out;
+			if (!common(e, out))
+				return false;
+			out.fog = 0;
+			out.cls = fx::class_number;
+			out.tfactor = at<uint32_t>(g.colour);
+			out.projection = fx::proj_identity;
+			g_number.out = out;
+			g_number.pending = true;
+			return true;
+		}
+
+		bool begin_number_guarded(uintptr_t e)
+		{
+			__try
+			{
+				return begin_number(e);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				g.n.faulted++;
+				end_number();
+				return false;
+			}
+		}
+
+		// A glyph's quad (00CD00's strip of 2: 4 vertices of FVF 0x144, x y z rhw, colour, u v) into the number's element
+		bool record_glyph(const uint8_t *data, uint32_t type, uint32_t count, uint32_t stride)
+		{
+			fx::frame &f = *g.f;
+			if (type != 5 || count != 2 || stride != 0x1C || g_number.object == 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const uint32_t id = texture_of(g_number.object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			if (f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + 6 > fx::kMaxVertices || (!g_number.made && f.element_count >= fx::kMaxElements) ||
+				f.runs.load(std::memory_order_relaxed) + 2 >= fx::kMaxRuns)
+			{
+				g.n.full++;
+				return false;
+			}
+			// (an element made by an earlier glyph must still be the run's last: draws stay contiguous)
+			if (g_number.made && (g_number.element + 1 != f.element_count || g_number.element < g.run_first ||
+									 f.elements[g_number.element].first_draw + f.elements[g_number.element].draws != f.draw_count))
+				g_number.made = false;
+			if (!g_number.made)
+			{
+				const uintptr_t gfx = at<uint32_t>(g.gfx);
+				const uintptr_t wrapper = gfx != 0 ? at<uint32_t>(gfx + 0xDC8) : 0;
+				if (wrapper == 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				const uintptr_t rt = wrapper + 0x98 + uintptr_t(at<uint8_t>(wrapper + 0x158)) * 0x18;
+				const int32_t W = at<int32_t>(rt + 8), H = at<int32_t>(rt + 0xC);
+				if (W <= 0 || H <= 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				fx::element &out = f.elements[f.element_count];
+				out = g_number.out;
+				const float world[16] = { 2.0f / float(W), 0, 0, 0, 0, -2.0f / float(H), 0, 0, 0, 0, 1, 0, 1.0f / float(W) - 1.0f, 1.0f - 1.0f / float(H), 0, 1 };
+				std::memcpy(out.world, world, 64);
+				out.first_draw = f.draw_count;
+				out.draws = 0;
+				g_number.element = f.element_count++;
+				g_number.made = true;
+				g.n.taken[fx::class_number]++;
+			}
+			fx::vertex q[4];
+			for (int k = 0; k < 4; ++k)
+			{
+				const uint8_t *s = data + 0x1C * k;
+				q[k] = fx::vertex();
+				std::memcpy(q[k].pos, s, 12);
+				std::memcpy(&q[k].colour, s + 0x10, 4);
+				std::memcpy(q[k].uv, s + 0x14, 8);
+			}
+			const int order[6] = { 0, 1, 2, 1, 3, 2 };
+			for (int k = 0; k < 6; ++k)
+				f.vertices[f.vertex_count + k] = q[order[k]];
+			f.draws[f.draw_count++] = { f.vertex_count, 6, id, fx::stage_texture };
+			f.vertex_count += 6;
+			f.elements[g_number.element].draws++;
+			return true;
+		}
+
+		bool record_glyph_guarded(const void *data, uint32_t type, uint32_t count, uint32_t stride)
+		{
+			__try
+			{
+				return data != nullptr && record_glyph(static_cast<const uint8_t *>(data), type, count, stride);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				g.n.faulted++;
+				return false;
+			}
+		}
+
+		// The texture object 1207B0 binds for code c (the font's +0x30 + 4 x its range: 1 from +0x3C, else 0; a negative
+		// code +0x30), after it has made them (120880)
+		uint32_t glyph_object(uintptr_t font, int32_t c)
+		{
+			__try
+			{
+				int32_t k = 0;
+				if (c >= 0 && uint32_t(c) >= at<uint32_t>(font + 0x3C))
+					k = 1;
+				const uint32_t object = at<uint32_t>(font + 0x30 + 4 * uintptr_t(k));
+				return object != 0 && (at<uint32_t>(object + 0x40) != 0 || at<uint32_t>(object + 0x44) != 0) ? object : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				return 0;
+			}
+		}
+
 		// An element into the frame: true when it's taken (the game's setup and draw skipped)
 		bool record(uintptr_t e)
 		{
@@ -2348,6 +2519,22 @@ namespace hifi::game::fxdraw
 			}
 		}
 
+		// Whether an element's class draw (its vtable's +0x48) is `draw`, under a guard
+		bool drawn_by(uintptr_t e, uintptr_t draw)
+		{
+			__try
+			{
+				if (!pointer(uint32_t(e)))
+					return false;
+				const uint32_t vt = at<uint32_t>(e);
+				return vt != 0 && at<uint32_t>(vt + 0x48) == draw;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				return false;
+			}
+		}
+
 		// Whether a queued element is drawn through 046070 (its vtable's +0x2C), under a guard
 		bool drawn_by_046070(uintptr_t e)
 		{
@@ -2402,6 +2589,7 @@ namespace hifi::game::fxdraw
 			g.n.last_elements = g.f->element_count;
 			g.n.last_runs = g.f->runs.load(std::memory_order_relaxed);
 		}
+		end_number();
 		g.in_flush = false;
 		g.taking = false;
 		g.f = nullptr;
@@ -2409,6 +2597,7 @@ namespace hifi::game::fxdraw
 
 	void __cdecl on_entry(uintptr_t callback, uintptr_t arg)
 	{
+		end_number();
 		if (g.in_flush && g.taking)
 		{
 			// (a weapon trail: drawn by HiFi XI with the run, else the game's after it)
@@ -2433,10 +2622,41 @@ namespace hifi::game::fxdraw
 		reinterpret_cast<pieces_fn>(g.flare_pieces)(resource, 0, visibility, x, y, far_x, far_y, zero);
 	}
 
+	uint32_t __fastcall on_glyph(uintptr_t font, uintptr_t, int32_t c, uint32_t *colour, uint32_t *other)
+	{
+		using bind_fn = uint32_t(__fastcall *)(uintptr_t, uintptr_t, int32_t, uint32_t *, uint32_t *);
+		const uint32_t ok = reinterpret_cast<bind_fn>(g.glyph_bind)(font, 0, c, colour, other);
+		if (g_number.pending)
+			g_number.object = (ok & 0xFF) != 0 ? glyph_object(font, c) : 0;
+		return ok;
+	}
+
+	void __fastcall on_glyph_draw(uintptr_t wrapper, uintptr_t, uint32_t type, uint32_t count, const void *data, uint32_t stride)
+	{
+		if (g.in_flush && g.taking)
+		{
+			if (g_number.pending && record_glyph_guarded(data, type, count, stride))
+				return;
+			// (the game draws this one: what was recorded so far first)
+			g_number.made = false;
+			close_run();
+		}
+		using draw_fn = void(__fastcall *)(uintptr_t, uintptr_t, uint32_t, uint32_t, const void *, uint32_t);
+		reinterpret_cast<draw_fn>(g.glyph_draw)(wrapper, 0, type, count, data, stride);
+	}
+
 	uint32_t __fastcall on_setup(uintptr_t element, uintptr_t, uint32_t arg)
 	{
 		if (g.in_flush && g.taking && arg == 0xFFFF)
 		{
+			// (a battle number: its setup and class draw run as before, its glyphs come to on_glyph_draw)
+			end_number();
+			if (g.number_draw != 0 && drawn_by(element, g.number_draw))
+			{
+				if (!begin_number_guarded(element))
+					close_run();
+				return reinterpret_cast<setup_fn>(g.setup)(element, 0, arg);
+			}
 			if (record_guarded(element))
 				return 1;
 			close_run();
@@ -2618,6 +2838,30 @@ namespace hifi::game::fxdraw
 			why = "couldn't write the game's code";
 			return false;
 		}
+		// (the battle numbers' glyph calls in 041C20: both or neither, each where the game has it)
+		if (const uintptr_t nd = find(kNumberDraw), bind = find(kGlyphBind), draw = find(kGlyphDraw); nd != 0 && bind != 0 && draw != 0)
+		{
+			uint8_t b[5] = {}, d[5] = {};
+			if (read(bind + kGlyphBindAt, b, 5) && b[0] == 0xE8 && read(draw + kGlyphDrawAt, d, 5) && d[0] == 0xE8)
+			{
+				n.number_draw = nd;
+				n.glyph_bind_call = bind + kGlyphBindAt;
+				n.glyph_draw_call = draw + kGlyphDrawAt;
+				n.glyph_bind = rel_target(n.glyph_bind_call);
+				n.glyph_draw = rel_target(n.glyph_draw_call);
+				std::memcpy(n.saved_bind, b, 5);
+				std::memcpy(n.saved_glyph, d, 5);
+				put_call(n.ours_bind, n.glyph_bind_call, reinterpret_cast<uintptr_t>(&on_glyph));
+				put_call(n.ours_glyph, n.glyph_draw_call, reinterpret_cast<uintptr_t>(&on_glyph_draw));
+				if (!write_code(n.glyph_bind_call, n.ours_bind, 5))
+					n.number_draw = n.glyph_bind_call = n.glyph_draw_call = 0;
+				else if (!write_code(n.glyph_draw_call, n.ours_glyph, 5))
+				{
+					write_code(n.glyph_bind_call, n.saved_bind, 5);
+					n.number_draw = n.glyph_bind_call = n.glyph_draw_call = 0;
+				}
+			}
+		}
 		// (the flare's pieces: only when the rest is in; without it the game draws them)
 		if (n.flare_call != 0)
 		{
@@ -2643,13 +2887,15 @@ namespace hifi::game::fxdraw
 		if (!g.in)
 			return true;
 		if (!code_is(g.setup_call, g.ours_setup, 5) || !code_is(g.flush_call, g.ours_flush, 5) || !code_is(g.entry_site, g.ours_entry, 7) ||
-			(g.flare_call != 0 && !code_is(g.flare_call, g.ours_flare, 5)))
+			(g.flare_call != 0 && !code_is(g.flare_call, g.ours_flare, 5)) ||
+			(g.glyph_bind_call != 0 && (!code_is(g.glyph_bind_call, g.ours_bind, 5) || !code_is(g.glyph_draw_call, g.ours_glyph, 5))))
 		{
 			why = "something else has changed the effects' flush or element draw since: left as they are";
 			return false;
 		}
 		if (!write_code(g.setup_call, g.saved_setup, 5) || !write_code(g.flush_call, g.saved_flush, 5) || !write_code(g.entry_site, kEntryBytes, 7) ||
-			(g.flare_call != 0 && !write_code(g.flare_call, g.saved_flare, 5)))
+			(g.flare_call != 0 && !write_code(g.flare_call, g.saved_flare, 5)) ||
+			(g.glyph_bind_call != 0 && (!write_code(g.glyph_bind_call, g.saved_bind, 5) || !write_code(g.glyph_draw_call, g.saved_glyph, 5))))
 		{
 			why = "couldn't write the game's code";
 			return false;
@@ -2712,9 +2958,9 @@ namespace hifi::game::fxdraw
 		uint64_t taken = 0;
 		for (const uint64_t t : g.n.taken)
 			taken += t;
-		char line[1000];
+		char line[1400];
 		std::snprintf(line, sizeof(line),
-			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), specular %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
+			"effects: %s; %llu flushes, %llu elements drawn by HiFi XI (D3M %llu, MMB meshes %llu, D3A %llu, VuAnm %llu, morphs %llu, rings %llu, weapon trails %llu, distortion %llu (meshes %llu, morphs %llu, rings %llu), specular %llu, battle numbers %llu, lens flares %llu; %llu lit), %llu with nothing to draw, "
 			"%llu water meshes World FX hides; the last flush %u elements in %u runs; "
 			"left to the game: %llu (not taking), %llu (class not handled), %llu (lit, its lights not to be had), %llu (blend letter), %llu (texture not up yet), %llu (no room), %llu (unreadable), "
 			"%llu (untextured D3M, its first vertex overwritten), %llu (MMB mesh not in the zone's data); "
@@ -2726,7 +2972,8 @@ namespace hifi::game::fxdraw
 			static_cast<unsigned long long>(g.n.taken[fx::class_ring]), static_cast<unsigned long long>(g.n.taken[fx::class_trail]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_dist]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_model]),
 			static_cast<unsigned long long>(g.n.taken[fx::class_dist_morph]), static_cast<unsigned long long>(g.n.taken[fx::class_dist_ring]),
-			static_cast<unsigned long long>(g.n.taken[fx::class_spec]), static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_spec]), static_cast<unsigned long long>(g.n.taken[fx::class_number]),
+			static_cast<unsigned long long>(g.n.taken[fx::class_flare]),
 			static_cast<unsigned long long>(g.n.lit_taken), static_cast<unsigned long long>(g.n.empty), static_cast<unsigned long long>(g.n.water), g.n.last_elements, g.n.last_runs, static_cast<unsigned long long>(g.n.game),
 			static_cast<unsigned long long>(g.n.unsupported), static_cast<unsigned long long>(g.n.lit), static_cast<unsigned long long>(g.n.letter),
 			static_cast<unsigned long long>(g.n.texture), static_cast<unsigned long long>(g.n.full), static_cast<unsigned long long>(g.n.faulted),
@@ -2764,6 +3011,11 @@ namespace hifi::game::fxdraw
 		s.distring_draw = g.distring_draw;
 		s.spec_draw = g.spec_draw;
 		s.spec_cubemap = g.spec_cubemap;
+		s.number_draw = g.number_draw;
+		s.glyph_bind_call = g.glyph_bind_call;
+		s.glyph_bind = g.glyph_bind;
+		s.glyph_draw_call = g.glyph_draw_call;
+		s.glyph_draw = g.glyph_draw;
 		s.flare_call = g.flare_call;
 		s.flare_pieces = g.flare_pieces;
 		s.flare_textures = g.flare_textures;
@@ -2795,5 +3047,11 @@ namespace hifi::game::fxdraw
 	void set_setup(uintptr_t setup)
 	{
 		g.setup = setup;
+	}
+
+	void set_glyph_calls(uintptr_t bind, uintptr_t draw)
+	{
+		g.glyph_bind = bind;
+		g.glyph_draw = draw;
 	}
 }

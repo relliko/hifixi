@@ -1310,6 +1310,81 @@ int main()
 			put<uint32_t>(tex_object + 0x40, 0);
 		}
 
+		// A battle number (kind 0x5C, 041AF0 -> 041C20): its setup and class draw left to run (the game's setup called),
+		// 041C20's calls of 1207B0 and 00CD00 patched to on_glyph / on_glyph_draw; two glyphs' quads (FVF 0x144 strips)
+		// recorded into one element, pre-transformed, with the texture object the font's +0x30 (its range +0x38 .. +0x3C);
+		// a glyph whose texture has no Direct3D texture: the run closed, the game's draw
+		{
+			check(s.number_draw == base + 0x041AF0 && s.glyph_bind_call == base + 0x041EBB && s.glyph_bind == base + 0x1207B0 && s.glyph_draw_call == base + 0x041F06 &&
+					s.glyph_draw == base + 0x00CD00 && calls_to(s.glyph_bind_call, address(reinterpret_cast<void *>(&fd::on_glyph))) &&
+					calls_to(s.glyph_draw_call, address(reinterpret_cast<void *>(&fd::on_glyph_draw))),
+				name + ": the battle numbers' 041AF0; 041C20's calls of 1207B0 (041EBB) and 00CD00 (041F06) go to on_glyph / on_glyph_draw");
+			static int game_glyphs = 0;
+			struct stubs
+			{
+				static uint32_t __fastcall bind(uintptr_t, uintptr_t, int32_t, uint32_t *, uint32_t *) { return 1; }
+				static void __fastcall draw(uintptr_t, uintptr_t, uint32_t, uint32_t, const void *, uint32_t) { game_glyphs++; }
+			};
+			game_glyphs = 0;
+			fd::set_glyph_calls(address(reinterpret_cast<void *>(&stubs::bind)), address(reinterpret_cast<void *>(&stubs::draw)));
+			const uintptr_t vt_num = take(0x100), font = take(0x60);
+			put<uint32_t>(vt_num + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_num + 0x48, uint32_t(s.number_draw));
+			put<uint32_t>(font + 0x30, uint32_t(tex_object));
+			put<uint32_t>(font + 0x38, 0x20);
+			put<uint32_t>(font + 0x3C, 0x100);
+			put<uint32_t>(tex_object + 0x40, 0x5678);
+			const uint32_t colour_kept = get<uint32_t>(s.colour);
+			put<uint32_t>(s.colour, 0x80FFFFFFu);
+			const uintptr_t en = element(vt_num, 0, 0x44, 0, 0x80808080, -3.0f);
+			float quad[2][28 / 4];
+			uint8_t verts[2][4 * 0x1C] = {};
+			for (int gl = 0; gl < 2; ++gl)
+				for (int k = 0; k < 4; ++k)
+				{
+					const float v[7] = { 100.0f + 10.0f * gl + 10.0f * (k & 1), 50.0f + 16.0f * (k >> 1), 0.25f, 1.0f, 0, 0.1f * (k & 1), 0.5f * (k >> 1) };
+					std::memcpy(quad[gl], v, sizeof(v));
+					std::memcpy(verts[gl] + 0x1C * k, v, 28);
+					put<uint32_t>(address(verts[gl]) + 0x1C * k + 0x10, 0xC0402010u);
+				}
+			uint32_t colour_arg = 0x80808080u, other = 0;
+			g_seen = seen();
+			g_markers = 0;
+			fd::on_flush(0);
+			fd::on_setup(en, 0, 0xFFFF);
+			for (int gl = 0; gl < 2; ++gl)
+			{
+				fd::on_glyph(font, 0, '5', &colour_arg, &other);
+				fd::on_glyph_draw(address(wrapper), 0, 5, 2, verts[gl], 0x1C);
+			}
+			fd::on_flush(1);
+			const fx::frame *fn = fx::published(g_last_seq);
+			bool ok = g_seen.setups == 1 && game_glyphs == 0 && g_markers == 1 && fn != nullptr && fn->element_count == 1;
+			if (ok)
+			{
+				const fx::element &d = fn->elements[0];
+				const fx::draw &d0 = fn->draws[d.first_draw], &d1 = fn->draws[d.first_draw + 1];
+				const fx::vertex &v0 = fn->vertices[d0.first], &v4 = fn->vertices[d0.first + 4], &w0 = fn->vertices[d1.first];
+				ok = d.cls == fx::class_number && d.draws == 2 && d0.count == 6 && d1.count == 6 && d0.texture != fx::kNone && d0.stages == fx::stage_texture &&
+					d.projection == fx::proj_identity && d.tfactor == 0x80FFFFFFu && d.blend == fx::blend_alpha && d.fog == 0 && v0.pos[0] == 100.0f && v0.pos[1] == 50.0f &&
+					v0.pos[2] == 0.25f && v0.colour == 0xC0402010u && v4.pos[0] == 110.0f && v4.pos[1] == 66.0f && v4.uv[0] == 0.1f && v4.uv[1] == 0.5f && w0.pos[0] == 110.0f &&
+					std::fabs(320.0f * d.world[0] + d.world[12] - 1.0f / 640.0f) < 1e-6f;
+			}
+			check(ok, name + ": a battle number: its setup the game's, its two glyphs' quads recorded into one element (pre-transformed, the font's texture, TEXTUREFACTOR "
+				"VA 0490BC0C, no fog)");
+			put<uint32_t>(tex_object + 0x40, 0);
+			g_seen = seen();
+			g_markers = 0;
+			fd::on_flush(0);
+			fd::on_setup(en, 0, 0xFFFF);
+			fd::on_glyph(font, 0, '5', &colour_arg, &other);
+			fd::on_glyph_draw(address(wrapper), 0, 5, 2, verts[0], 0x1C);
+			fd::on_flush(1);
+			check(game_glyphs == 1, name + ": a glyph without its Direct3D texture: the game's draw");
+			fd::set_glyph_calls(s.glyph_bind, s.glyph_draw);
+			put<uint32_t>(s.colour, colour_kept);
+		}
+
 		// A lit D3M (flags bit 16, no fog): its lights as 0467E0 works them out, the game's own calls (045C50, 0473F0,
 		// the math object, 18B9A0, 18B9E0) on a made-up environment whose record isn't loaded ([env - 0x1C] not 1: 188CA0
 		// gives a white light of 255, ambient 255, down +y; 188E00 AMBIENT 0xFFFFFFFF), the renderer's one-light path

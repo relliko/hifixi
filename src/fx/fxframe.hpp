@@ -181,7 +181,8 @@ namespace hifi::fx
 		class_dist_morph = 10, // a morph as distortion (CMoDistMorphElem 043590 -> 042D00, 03F440)
 		class_dist_ring = 11,  // rings as distortion (CMoDistRingElem 043720 -> 042D00)
 		class_spec = 12,       // the specular D3M (CMoD3mSpecularElem 0412B0)
-		classes = 13,
+		class_number = 13,     // a battle number (kind 0x5C, 041AF0 -> 041C20): its glyphs' quads as the game places them
+		classes = 14,
 	};
 
 	struct run

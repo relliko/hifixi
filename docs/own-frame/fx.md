@@ -58,6 +58,7 @@ Classes taken (by the vtable's class draw, vt+0x48):
 | CMoDistMorphElem (0x32B358) | 043590 | the morph blended (03F8A0), its positions' UVs by 042D00, the whole world grabbed, WORLD moved by +0x1C0, 352258's stages (below) | a blend handed in (+0x1BC); 042D00 answering 0 (it keeps the blend then) |
 | CMoDistRingElem (0x32B4D8) | 043720 | its bands (angles 0, d .. (n-1)d, 0), the colours x the element's >> 7, UVs by 042D00, the whole world grabbed, 353378's stages (below) | lit (its normals aren't written), more than 4 rings |
 | CMoD3mSpecularElem (0x32AD20) | 0412B0 | the D3M with an environment stage: its texture matrix by the game's math vt+0x58, the camera-space normals, the tint (below) | the stages elsewhere than the tables' (+0x1BC, +0x1BD), a texture wave (+0x148), the environment not to be had |
+| battle numbers (0x32ADE8, kind 0x5C) | 041AF0 -> 041C20 | its glyphs' quads as the game places them, at 041C20's calls of 1207B0 and 00CD00 (below); setup and class draw the game's (states only) | a glyph whose texture isn't up |
 | lens flares (CMoLfdElem 0x32B538) | its own vt+0x2C 0548D0, its call of 03EBF0 at 054B81 | the pieces of the flare D3A pre-transformed as 03EBF0 places them (below); 0548D0 itself (the visibility test, the glare colour 014F70) still runs | a texture not found or not up |
 | morphs (0x32AC90) | 03FBB0 -> 03F440 | T x 3 corners: positions and normals blended as 03F8A0 does (below), colours doubled, the UVs; table 352258 (as the D3M's 3524A8), the header's bit 7 the alpha test GREATER 0x60; 03FBB0's side effects done (+0x194 -> +0x1A8, +0x1BC cleared) | a blend handed in (+0x1BC), the texture wave (+0x148), a texture not up |
 | rings (kind 0x24) | 0565A0 | strips per band (angles 0, 0, d .. (n-2)d, 0), colours through 03E280's byte swap, TEXTUREFACTOR the element's own +0xF8 (no fade), 353810 | more than 4 rings |
@@ -172,6 +173,23 @@ inverted and transposed, the texture matrix's columns 0 and 1, the tint) and the
 table t5, `element::env`; static sampler s2 CLAMP). Taken only with the stages where the tables put them (+0x1BC 0;
 +0x1BD 1, or 2 with three stages). Kinds 5-7 without textures take the first vertex's y from the DAT as the D3M does.
 
+**Battle numbers (kind 0x5C, 041AF0 -> 041C20).** Reachable on this client (R, 2026-10-30): the battle-message
+handler 09E090 starts the 'damv' / 'misv' / 'curv' schedulers (ROM/0/27, their generators of kind 0x5C, model
+'damv') in the field ([[VA 048E6A28]] 0x60) for a message whose byte in the table VA 047ECAE0 is 1, 2 or 3 (168
+messages; the melee hit, 1, among them) when 0AD950 lets it through: the chat filter (0ADE80) and config 0x13 not 0.
+Config 0x13 is conf3win's damage display (options 1, 2, 5; help texts d_msg 0x0E 165/166/174: "Display damage in the log
+window only." 0, "... on the game screen and in the log window." 1, "... as pop-up graphics on the game screen only."
+2). 041AF0 (R): the source actor (03B700), its point (044C40), the name test 0830C0 (distance fade, hidden), TEXTUREFACTOR
+VA 0490BC0C, then 041C20: a frame round the point projected (0277E0 .. 027050), the string +0x198 (16 characters at
+most) measured (120730, the font object VA 04971BF8's sprite set 'menu    dmgnum') and centred; per glyph 1207B0 binds
+its texture (the font's +0x30, or +0x34 for codes from +0x3C) and 00CD00 draws its XYZRHW quad (FVF 0x144, a strip of
+2: the colour, the sprite's UVs, z the point's depth), table 352D30 (stage_texture), 0467E0's blend and z. The
+projection being the game's, the element isn't taken at its setup: on_setup notes it (common(): blend, z write) and
+lets 0467E0 and 041AF0 run (states only); 041C20's calls of 1207B0 (041EBB) and 00CD00 (041F06) go to `on_glyph` (the
+game's 1207B0, then the texture object it bound) and `on_glyph_draw` (the quad recorded into an element of the run made
+at its first glyph, pre-transformed as the lens flares: WORLD the game's pixels to clip space, z as it is; no fog). A
+glyph whose texture isn't up, or anything not as expected: the run closed and the game draws that glyph.
+
 **The aura ring (038A80, 038E10; on the native character renderer).** An actor with an aura (summons, some NPCs and
 monsters: a chunk 0x5E) goes into the priority-12 flush as a see-through model. Its ring is drawn by 02B6E0 at 02C19B
 after its parts, which is past charmodel's leave: for a model HiFi XI draws natively the game's ring never runs (so
@@ -262,7 +280,7 @@ probe until then; sent vs seen over a 4 s window, as the plugin's marker_flow). 
 
 ### FSR
 The reactive mask is the world at the characters' end against the world before World FX's passes: native effects are
-drawn between the two, so they count as before. No motion vectors for effects (as before).
+drawn between the two, so they count as before. No motion vectors for effects (as before; why: Open 12).
 
 ## Shared files touched (small, additive)
 - The native character renderer, for the aura ring (additive; the cloak and overlay passes and reserved descriptor 1
@@ -310,7 +328,9 @@ drawn between the two, so they count as before. No motion vectors for effects (a
   patched and put back); a specular D3M (Fire's 'fa04' with the pre-draw's fields set by hand: the two-stage table, the
   environment's id and record, the texture matrix's columns from the game's vt+0x58; its own angles, CLAMP and a tint;
   three stages with the environment elsewhere left to the game; 06DCF0's rotation statics made by hand: their first use
-  registers with the game's atexit, not up offline). 155 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
+  registers with the game's atexit, not up offline); a battle number (041C20's two calls patched and put back; two
+  glyphs recorded into one element through on_glyph / on_glyph_draw, the setup the game's; a glyph without its texture
+  the game's). 161 checks. The dumps' place is kept reserved around each dump while it's tested (WARP's and the decoders'
   threads put their stacks there otherwise).
 - `build\fx_render_test.exe build\test\fx_fire.bin build\test\fx_cure.bin build\test\fx_fastblade.bin`: the D3D12 side
   at its marker on WARP with the debug layer, on a list recorded as dgVoodoo records (its own heap and targets),
@@ -376,15 +396,26 @@ The oracles are made when missing (`build.cmd`), about a minute.
    VisTest answer (src/render/vistest, kind flare) when that setting is on; HideFlare (on by default) still hides
    them, so they're drawn natively only with it off. Not checked: the flare's texture lookup on real data (the name's
    first dword: an object, or 0 and the list).
-10. **Battle numbers** (kind 0x5C, 041AF0 -> 041C20) stay the game's: text quads from the game font (glyphs bound by
-   1207B0 from the font object [VA 04971BF8], not texture chunks, so fxtextures can't take them as they are); whether
-   Phoenix ever starts them is open (notes-world-passes 5). Next, if they show: the glyphs' Direct3D textures (the font
-   object's) copied once, 041C20's projection and centring on the game side.
+10. (Done: battle numbers.) Reachable, but only with the damage display option set to the screen (config 0x13 1 or
+   2; the default shows them in the log only): not seen in any capture. The glyphs' sprite set ('menu    dmgnum') is
+   decoded by fxtextures as any texture chunk; not checked on real data. No fog on them (pre-transformed, RHW 1: the
+   game's table fog sees w = 1, none to speak of).
 11. (Done: the aura ring, on the native character renderer.) Not run offline: the game side's read of a live aura
    actor (actor +0x710, its chunk 0x5E, config 0xC8; only its sites are checked on both dumps); a multisampled world gets
    no aura (T's view is multisampled then: counted "couldn't be").
-12. **FSR motion** for effects: none (as before); the effects stay in the reactive mask (drawn between the world before
-   World FX's passes and the characters' end). Not started.
+12. **FSR motion for effects: not done, on purpose** (looked at 2026-10-30). FSR's motion (src/upscale/temporal.cpp) is
+   made per pixel from the depth buffer through the last frame's camera, overridden where World FX's blades or the
+   native characters' own move texture (chars::inject::motion: a world-space move and the view depth, matched by
+   depth) say the surface moved. Effects don't fit that: (a) nearly all of them are blended and write no depth, and
+   motion is the surface's under the pixel: an effect's motion there would be wrong for the ground behind it (AMD's
+   guidance: transparent things go in the reactive mask, which they are: drawn between the opaque and pre_fx copies);
+   (b) their vertices move inside the element every frame (D3A frames switched, morph weights, VuAnm's random points
+   re-drawn, MMB UV scrolls), so a per-element WORLD delta (keyed by the element's address) would be wrong for most of
+   what does write depth. The few that write depth (flags bit 12, letter 0x00/ONE ZERO: some solid meshes) already get
+   the camera's motion from their depth; only their own move (following an actor) is missed. If it's ever wanted: a
+   motion target like the characters', written in the fx pass for z-writing D3M/MMB elements from (this frame's
+   WORLD - the last frame's, both through VIEW's inverse; the last kept by element address) and read by temporal.cpp
+   where its depth matches, as chars_in is.
 
 ## What needs a look in game
 - Any spell, ability, weapon skill: the effect looks as before (colour, brightness, blending, order with see-through
@@ -399,6 +430,8 @@ The oracles are made when missing (`build.cmd`), about a minute.
   in the game; they move on as before.
 - Heat haze (CMoDist, VuDist: fire spells, some abilities): the world under a diamond shown shifted and fading to its
   edges, as before; with MSAA on in dgVoodoo the world is resolved for it. `/hifi status`: "distortion grabs".
+- With the damage display set to the screen (Config, conf3win): the damage, miss and cure numbers over the targets, as
+  before; `/hifi status` "battle numbers".
 - Summons and other actors with an aura (Ifrit, Titan, Shiva...): the coloured halo round them, turning slowly, as
   before (with the native character renderer it was missing); `/hifi status` "aura rings".
 - Shiny effect pieces (the specular D3M: an environment picture that turns with the camera added over them, as

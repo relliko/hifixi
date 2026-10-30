@@ -82,6 +82,7 @@ namespace hifi::game::fxdraw
 		uintptr_t dist_draw = 0, vudist_draw = 0, dist_app = 0; // 0426F0, 043110, VA 048E666C
 		uintptr_t distmodel_draw = 0, distmorph_draw = 0, distring_draw = 0; // 043320, 043590, 043720
 		uintptr_t spec_draw = 0, spec_cubemap = 0; // 0412B0, VA 0490BB90
+		uintptr_t number_draw = 0, glyph_bind_call = 0, glyph_bind = 0, glyph_draw_call = 0, glyph_draw = 0; // 041AF0; 041EBB -> 1207B0, 041F06 -> 00CD00
 		uintptr_t flare_call = 0, flare_pieces = 0, flare_textures = 0; // 054B81, 03EBF0, VA 0490B970
 		uintptr_t frame_of = 0, light1 = 0, lights2 = 0, ambient = 0, material = 0; // 045C50, 18B9A0, 18B960, 18B9E0, VA 0490BC28
 		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
@@ -92,6 +93,8 @@ namespace hifi::game::fxdraw
 	void set_device(uintptr_t device);
 	// The setup the call goes on to for what's left to the game (start() sets 0467E0)
 	void set_setup(uintptr_t setup);
+	// ... and the battle numbers' glyph bind (1207B0) and draw (00CD00) theirs go on to (start() sets the game's)
+	void set_glyph_calls(uintptr_t bind, uintptr_t draw);
 
 	// The entries (cdecl / fastcall as the stubs and the patched call reach them)
 	void __cdecl on_flush(uint32_t end);
@@ -99,4 +102,8 @@ namespace hifi::game::fxdraw
 	uint32_t __fastcall on_setup(uintptr_t element, uintptr_t edx, uint32_t arg);
 	// A lens flare's pieces (0548D0's call of 03EBF0, thiscall on the flare's D3A resource, ret 0x18)
 	void __fastcall on_flare(uintptr_t resource, uintptr_t edx, int32_t visibility, float x, float y, float far_x, float far_y, uint32_t zero);
+	// A battle number's glyph: 041C20's call of 1207B0 (thiscall on the font object, ret 0xC) and of 00CD00 (thiscall on the
+	// device wrapper: DrawPrimitiveUP, ret 0x10)
+	uint32_t __fastcall on_glyph(uintptr_t font, uintptr_t edx, int32_t c, uint32_t *colour, uint32_t *other);
+	void __fastcall on_glyph_draw(uintptr_t wrapper, uintptr_t edx, uint32_t type, uint32_t count, const void *data, uint32_t stride);
 }
