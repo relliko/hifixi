@@ -68,7 +68,7 @@ rem The own-frame passes (PLAN-own-frame.md), each registered through src\host\p
 rem the parts built side by side merge cleanly.
 set "PASSES=src\host\passes.cpp"
 set "PASSES_FX="
-set "PASSES_WORLD="
+set "PASSES_WORLD=src\world\world_frames.cpp src\world\world_dome.cpp src\world\world_render.cpp src\world\world_font.cpp src\world\world_module.cpp src\game\worldmark.cpp src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp"
 set "PASSES_ACTORS="
 set "PASSES_2D="
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
@@ -126,6 +126,23 @@ rem The shading pass timed on the real GPU (see its header): build\shade_bench.e
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\shade_bench.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\shade_bench.exe" /link /NOLOGO || exit /b 1
 echo Built build\shade_bench.exe
+
+rem The world part of owning the frame (src\world, src\game\skydraw, namedraw, griddraw): their places on both dumps, their
+rem recording, the dome and the names' font against tests\world_oracle.py, the passes drawn on WARP with the debug layer:
+rem build\world_test.exe build\test\world_oracle.txt
+python tests\world_oracle.py build\test\world_oracle.txt || exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\world_test.cpp src\world\world_frames.cpp src\world\world_dome.cpp src\world\world_render.cpp src\world\world_font.cpp src\game\worldmark.cpp ^
+  src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp src\game\jitter.cpp src\chars\tex.cpp src\bake\dat.cpp src\game\game.cpp ^
+  build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\world_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\world_test.exe
+rem The world part's modules as the plugin and the backend drive them (the gates, the handlers into the world on WARP):
+rem build\worldpass_test.exe (based high: with the plugin's statics its image would reach up to where the system maps its
+rem early files, pushing them over the dump's base)
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen /I src\render ^
+  tests\worldpass_test.cpp src\host\passes.cpp %PASSES_WORLD% src\chars\tex.cpp %UPSCALE% %GAME% %ZONE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
+  /Fo"build\test\\" /Fe"build\worldpass_test.exe" /link /NOLOGO /DYNAMICBASE:NO /BASE:0x10000000 user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\worldpass_test.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
