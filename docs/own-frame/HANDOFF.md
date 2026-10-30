@@ -11,7 +11,6 @@ Written because the session was about to run out of usage. A new session picks u
   - An agent on frame-fx doing **light spots** (040E70 / 03EE70 -> 182700). Check `git log dev-frame..frame-fx`
     and `git -C C:\code\LSB\hifixi-fx status`. If it committed, merge frame-fx into dev-frame. If it left
     uncommitted work, read docs\own-frame\fx.md item 8 and finish or discard it.
-  - A full build + test run of b17a428 in hifixi-frame (results were not yet read). Rerun it (below).
 - Nothing pushed, nothing installed, nothing seen in game.
 
 ## How to build and test dev-frame
@@ -26,7 +25,8 @@ Written because the session was about to run out of usage. A new session picks u
   - ui2d_dgv: run from build\dgv (uses dgVoodoo's d3d8.dll copied there by build.cmd)
   - d3d8: `build_d3d8.cmd` (full, not quick) builds build\d3d8\d3d8_unit.exe, d3d8_hooks.exe, d3d8_frame.exe; run
     from build\d3d8: `d3d8_unit.exe`, `d3d8_hooks.exe .\d3d8.dll [--debug]`
-- Last fully read result (5906ee9 and 51b95a2): everything green.
+- Last result (b17a428): full build and every suite above green (fx_test 161, fx_render_test 45, actors_draw_test 21,
+  charmodel_test 92, ui2d_dgv 117, ...).
 
 ## What each part did and what's open (details in docs\own-frame\<part>.md)
 - **world** (world.md): sky dome, names (after the upscale when FSR is on; `/hifi names over off` to go back), Mog
