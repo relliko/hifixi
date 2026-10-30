@@ -595,6 +595,144 @@ int main(int argc, char **argv)
 		dsvh->Release();
 		game_heap->Release();
 	}
+	// The blend table and the trails' stage on their own: three screen-filling quads (WORLD and PROJECTION identity) on
+	// black: a weapon trail's (vertex colour only, SRCALPHA / ONE: 200 100 50), a subtractive letter's over it (B:
+	// REVSUBTRACT, the untextured stage: 0x20 x 0x80 x 2 = 0x20 each, alpha 0xFF x 0x80 x 4 = full), a darkening one's
+	// (F: ZERO / INVSRCALPHA, alpha 0x40 x 0x40 x 4 = 0x40): (200 - 32) x (1 - 0x40 / 255), ...
+	{
+		const UINT W = 64, H = 64;
+		D3D12_RESOURCE_DESC td = {};
+		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		td.Width = W;
+		td.Height = H;
+		td.DepthOrArraySize = 1;
+		td.MipLevels = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		ID3D12Resource *A = nullptr, *Az = nullptr, *back = nullptr;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = td.Format;
+		device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&A));
+		D3D12_RESOURCE_DESC dd = td;
+		dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		D3D12_CLEAR_VALUE dv = {};
+		dv.Format = dd.Format;
+		dv.DepthStencil.Depth = 1.0f;
+		device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv, IID_PPV_ARGS(&Az));
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = 256 * H;
+		bd.Height = 1;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&back));
+		ID3D12DescriptorHeap *rtvh = nullptr, *dsvh = nullptr, *game_heap = nullptr;
+		D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+		device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvh));
+		hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+		device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvh));
+		hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+		device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&game_heap));
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvh->GetCPUDescriptorHandleForHeapStart(), dsv = dsvh->GetCPUDescriptorHandleForHeapStart();
+		device->CreateRenderTargetView(A, nullptr, rtv);
+		device->CreateDepthStencilView(Az, nullptr, dsv);
+		fx::frame &f = fx::frame_slot(++seq);
+		f.seq.store(0);
+		f.element_count = f.draw_count = f.vertex_count = 0;
+		const float id[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+		std::memcpy(f.proj, id, 64);
+		struct quad
+		{
+			uint32_t colour, tfactor, stages;
+			uint8_t blend;
+		};
+		const quad quads[] = { { 0xFFC86432u, 0, fx::stage_diffuse, fx::blend_add }, { 0xFF202020u, 0x80808080u, 0, fx::blend_subtract },
+			{ 0x40000000u, 0x40808080u, 0, fx::blend_darken } };
+		for (const quad &q : quads)
+		{
+			const float c[6][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } };
+			fx::element e;
+			std::memcpy(e.world, id, 64);
+			e.tfactor = q.tfactor;
+			e.blend = q.blend;
+			e.first_draw = f.draw_count;
+			e.draws = 1;
+			f.draws[f.draw_count++] = { f.vertex_count, 6, fx::kNone, q.stages };
+			for (const auto &p : c)
+			{
+				fx::vertex v = {};
+				v.pos[0] = p[0];
+				v.pos[1] = p[1];
+				v.pos[2] = 0.5f;
+				v.colour = q.colour;
+				f.vertices[f.vertex_count++] = v;
+			}
+			f.elements[f.element_count++] = e;
+		}
+		f.run_list[0] = { 0, f.element_count };
+		f.runs.store(1);
+		f.seq.store(seq);
+		ID3D12CommandAllocator *alloc = nullptr;
+		ID3D12GraphicsCommandList *list = nullptr;
+		device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+		device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
+		const float black[4] = { 0, 0, 0, 0 };
+		list->ClearRenderTargetView(rtv, black, 0, nullptr);
+		list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+		list->SetDescriptorHeaps(1, &game_heap);
+		grass::list_state bound;
+		hifi::passes::world w;
+		w.rt = A;
+		w.ds = Az;
+		w.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		w.planes_known = true;
+		w.ds_planes[0] = w.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+		w.heap_count = 1;
+		w.heaps[0] = game_heap;
+		fx::inject::on_run(list, bound, w, seq & 15);
+		barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+		dst.pResource = back;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, 256 };
+		src.pResource = A;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		list->Close();
+		ID3D12CommandList *lists[] = { list };
+		queue->ExecuteCommandLists(1, lists);
+		queue->Signal(fence, ++fence_value);
+		HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		fence->SetEventOnCompletion(fence_value, ev);
+		WaitForSingleObject(ev, 60000);
+		CloseHandle(ev);
+		uint8_t *px = nullptr;
+		back->Map(0, nullptr, reinterpret_cast<void **>(&px));
+		const uint8_t *m = px + 32 * 256 + 32 * 4;
+		const double keep = 1.0 - 64.0 / 255.0;
+		const int want[3] = { int((200 - 32) * keep + 0.5), int((100 - 32) * keep + 0.5), int((50 - 32) * keep + 0.5) };
+		char line[200];
+		std::snprintf(line, sizeof(line), "the blend table: a trail's colour added, B subtracted, F darkening: %d %d %d (want %d %d %d, within 2)", m[0], m[1], m[2], want[0], want[1],
+			want[2]);
+		check(std::abs(m[0] - want[0]) <= 2 && std::abs(m[1] - want[1]) <= 2 && std::abs(m[2] - want[2]) <= 2, line);
+		back->Unmap(0, nullptr);
+		std::string first;
+		const uint32_t messages = debug_messages(info, first);
+		check(messages == 0, "the blend table: the debug layer: nothing (" + std::to_string(messages) + (messages != 0 ? ": " + first : std::string()) + ")");
+		list->Release();
+		alloc->Release();
+		A->Release();
+		Az->Release();
+		back->Release();
+		rtvh->Release();
+		dsvh->Release();
+		game_heap->Release();
+	}
 	fx::inject::release();
 	fx::textures::stop();
 	std::printf("\n%d passed, %d failed\n", passes, failures);

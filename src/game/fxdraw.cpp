@@ -39,7 +39,12 @@
  *     draw (352348, D: alpha x 2), but kinds 5-7 without textures are left to the game (their names begin where their
  *     vertices do, and the load stores the vertex buffer object over the first vertex's y once it has copied them;
  *     the value is only in the DAT now); else a draw per texture run (3524A8, bit 28: 3523D0; I: 352590), the texture object
- *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5.
+ *     in each name's first dword (its resource at +8), and the untextured tail (352648) when +5. Lit (flags bit 16):
+ *     left to the game for now.
+ *   03EB30 (CMoD3aElem): the frame +0x170 of the D3A (record_d3a below), lit or not (03E9A0 sets LIGHTING 0).
+ *   Anything else: left to the game.
+ * Weapon trails (CYyAfterImage) aren't elements: their flush callback 01C930 is recognised in the walk's stub and the
+ * ring of samples recorded as one more element of the run (record_trail below).
  */
 
 #include <windows.h>
@@ -73,6 +78,8 @@ namespace hifi::game::fxdraw
 		constexpr uint8_t kEntryBytes[7] = { 0x50, 0xFF, 0x56, 0x08, 0x83, 0xC4, 0x04 };
 		constexpr const char *kElementCallback = "8B4C24048B01FF602C"; // 0555A0
 		constexpr const char *kD3mDraw = "568BF18B860401000085C074688B86FC000000"; // 040BA0: push colour at +0x58, call 002D80 at +0x27
+		constexpr const char *kD3aDraw = "8B810401000085C0741E85C074048B00EB0233C0518B0D????????68????????518BC8E8"; // 03EB30
+		constexpr const char *kTrailCallback = "8B4C240485C97405E903000000C3"; // 01C930 (-> 01C940)
 		constexpr intptr_t kD3mColour = 0x58, kD3mWeatherCall = 0x27;
 		// 047018: mov ecx, [env]; push 0; push fog start; push fog end; push fog colour; call 18BA20 (at +0x17); call 0464D0
 		constexpr const char *kFog = "8B0D????????6A0068????????68????????68????????E8????????E8";
@@ -103,7 +110,7 @@ namespace hifi::game::fxdraw
 		{
 			// The sites
 			uintptr_t setup_call = 0, setup = 0, flush_call = 0, walk = 0, entry_site = 0, element_cb = 0, element_draw = 0, d3m_draw = 0;
-			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0;
+			uintptr_t draw_matrix = 0, weather = 0, fog_env = 0, d3a_draw = 0, trail_cb = 0;
 			uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0;
 			uintptr_t code = 0;
 			uint8_t saved_setup[5] = {}, ours_setup[5] = {}, saved_flush[5] = {}, ours_flush[5] = {}, ours_entry[7] = {};
@@ -450,6 +457,193 @@ namespace hifi::game::fxdraw
 			return true;
 		}
 
+		// The D3A (03EB30 -> 03E910) into the frame; false: the game's. The resource keeps the texture object in the
+		// name's first dword (data +8, 075520), the vertex buffer object at +0xC and the frame table at +0x14 (03E6C0:
+		// per frame u16 quads, s16 first vertex); the frames' vertices stay in the chunk as the DAT has them (24 bytes:
+		// x y z, D3DCOLOR, u v), the load putting them in the vertex buffer with a normal (0, 0, 1) and the UVs times 1 /
+		// the texture's width and height when +0 >= 1 and +7 is 0 (the texture object's +0x24, +0x26: 075FB0, 075FD0).
+		// The draw: the frame +0x170 (wrapped to 0 at the frame count, written back as 03E910 does), table 351FA0 (bit
+		// 28: 351EC8; @: 352084, but @ has no blend of its own in 0467E0, so never here), TEXTUREFACTOR the colour,
+		// LIGHTING 0, FOGENABLE 0, ZWRITEENABLE 0, quads x 2 triangles from the frame's first vertex.
+		bool record_d3a(uintptr_t e, uintptr_t resource)
+		{
+			fx::frame &f = *g.f;
+			const uintptr_t data = resource + 0x30;
+			if (word(data + 0xC) == 0)
+			{
+				g.n.empty++;
+				return true; // (no vertex buffer: 03E910 draws nothing)
+			}
+			const int16_t frames = at<int16_t>(data + 2), units = at<int16_t>(data);
+			uint16_t frame = at<uint16_t>(e + 0x170);
+			if (int32_t(frame) >= int32_t(frames))
+			{
+				frame = 0;
+				*reinterpret_cast<uint16_t *>(e + 0x170) = 0;
+			}
+			const uintptr_t table = word(data + 0x14);
+			if (table == 0 || frames <= 0)
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			const int32_t quads = at<int16_t>(table + 4 * uintptr_t(frame)), first = at<int16_t>(table + 4 * uintptr_t(frame) + 2);
+			const uint32_t object = word(data + 8);
+			const uint32_t id = texture_of(object);
+			if (id == fx::kNone)
+			{
+				g.n.texture++;
+				return false;
+			}
+			// (the frame's vertices in the chunk: the heads walked to it; its first vertex must be the table's)
+			uintptr_t p = data + 0x18;
+			int32_t at_vertex = 0;
+			for (uint32_t i = 0; i < frame; ++i)
+			{
+				const uint32_t q = at<uint8_t>(p + 2);
+				at_vertex += int32_t(q) * 6;
+				p += 4 + uintptr_t(q) * 6 * 24;
+			}
+			const uint32_t n = uint32_t(quads) * 6;
+			if (at_vertex != first || quads < 0 || at<uint8_t>(p + 2) != uint32_t(quads))
+			{
+				g.n.unsupported++;
+				return false;
+			}
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + n > fx::kMaxVertices)
+			{
+				g.n.full++;
+				return false;
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			if (!common(e, out))
+				return false;
+			float su = 1.0f, sv = 1.0f;
+			if (units >= 1 && at<uint8_t>(data + 7) == 0)
+			{
+				const uint16_t w = at<uint16_t>(object + 0x24), h = at<uint16_t>(object + 0x26);
+				su = w != 0 ? 1.0f / float(w) : 1.0f;
+				sv = h != 0 ? 1.0f / float(h) : 1.0f;
+			}
+			const uintptr_t v0 = p + 4;
+			for (uint32_t k = 0; k < n; ++k)
+			{
+				const uintptr_t s = v0 + uintptr_t(k) * 24;
+				fx::vertex &v = f.vertices[f.vertex_count + k];
+				std::memcpy(v.pos, reinterpret_cast<const void *>(s), 12);
+				v.normal[0] = v.normal[1] = 0.0f;
+				v.normal[2] = 1.0f;
+				v.colour = at<uint32_t>(s + 12);
+				v.uv[0] = at<float>(s + 16) * su;
+				v.uv[1] = at<float>(s + 20) * sv;
+			}
+			const uint32_t flags = at<uint32_t>(e + kFlags);
+			out.z_write = 0;
+			out.fog = 0;
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_d3a;
+			f.draws[f.draw_count++] = { f.vertex_count, n, id, fx::stage_texture | ((flags & (1u << 28)) != 0 ? fx::stage_alpha_diffuse : 0u) };
+			f.vertex_count += n;
+			f.element_count++;
+			g.n.taken[fx::class_d3a]++;
+			return true;
+		}
+
+		// A weapon trail (CYyAfterImage, its flush callback 01C930 -> 01C940) into the frame; false: the game's. Its
+		// ring of 80 samples (head +0x14A8, count +0x14AC): tip +0x40[i], base +0x540[i] (x y z w, the world's), colour
+		// A +0xA40[i] and B +0xF40[i] (r g b a floats, 0..255, truncated into a D3DCOLOR). From the newest back: +0x151C 0
+		// one strip of (tip, A), (base, B) pairs; else two from the middle line (tip + base) / 2: (mid, A), (tip, A) and
+		// (mid, A), (base, B). WORLD identity (VIEW the camera's), FVF 0x42, colour and alpha the vertex's, LIGHTING 0,
+		// FOGENABLE 0, Z test on, ZWRITEENABLE 0, SRCALPHA / ONE, CULL NONE.
+		bool record_trail(uintptr_t t)
+		{
+			fx::frame &f = *g.f;
+			const int32_t head = at<int32_t>(t + 0x14A8), count = at<int32_t>(t + 0x14AC);
+			const uint32_t mode = at<uint32_t>(t + 0x151C);
+			if (count <= 1 || count > 80 || head < 0 || head > 80)
+			{
+				g.n.empty++;
+				return true; // (fewer than two samples: no triangle; 01C940 draws 2 x count - 2 of them)
+			}
+			const uint32_t strips = mode != 0 ? 2 : 1;
+			const uint32_t n = strips * (2 * uint32_t(count) - 2) * 3;
+			if (f.element_count >= fx::kMaxElements || f.draw_count + 1 > fx::kMaxDraws || f.vertex_count + n > fx::kMaxVertices ||
+				f.runs.load(std::memory_order_relaxed) + 2 >= fx::kMaxRuns)
+			{
+				g.n.full++;
+				return false;
+			}
+			const auto colour = [&](uintptr_t c) {
+				const auto b = [&](uintptr_t o) { return uint32_t(int32_t(at<float>(c + o))); };
+				return b(0xC) << 24 | b(0) << 16 | b(4) << 8 | b(8);
+			};
+			fx::vertex strip[2][160];
+			for (int32_t k = 0, i = head - 1; k < count; ++k, --i)
+			{
+				if (i < 0)
+					i += 80;
+				const uintptr_t tip = t + 0x40 + 16 * uintptr_t(i), base = t + 0x540 + 16 * uintptr_t(i);
+				const uint32_t a = colour(t + 0xA40 + 16 * uintptr_t(i)), b = colour(t + 0xF40 + 16 * uintptr_t(i));
+				float pt[3], pb[3], mid[3];
+				std::memcpy(pt, reinterpret_cast<const void *>(tip), 12);
+				std::memcpy(pb, reinterpret_cast<const void *>(base), 12);
+				for (int c = 0; c < 3; ++c)
+					mid[c] = (pt[c] + pb[c]) * 0.5f;
+				const auto put = [](fx::vertex &v, const float *p, uint32_t col) {
+					v = fx::vertex();
+					std::memcpy(v.pos, p, 12);
+					v.colour = col;
+				};
+				if (mode == 0)
+				{
+					put(strip[0][2 * k], pt, a);
+					put(strip[0][2 * k + 1], pb, b);
+				}
+				else
+				{
+					put(strip[0][2 * k], mid, a);
+					put(strip[0][2 * k + 1], pt, a);
+					put(strip[1][2 * k], mid, a);
+					put(strip[1][2 * k + 1], pb, b);
+				}
+			}
+			fx::element &out = f.elements[f.element_count];
+			out = fx::element();
+			std::memcpy(out.world, f.view, 64);
+			out.blend = fx::blend_add;
+			out.z_write = 0;
+			out.fog = 0;
+			out.projection = fx::proj_camera;
+			uint32_t w = f.vertex_count;
+			for (uint32_t s = 0; s < strips; ++s)
+				for (int32_t k = 0; k + 2 < 2 * count; ++k)
+					for (int j = 0; j < 3; ++j)
+						f.vertices[w++] = strip[s][k + j];
+			out.first_draw = f.draw_count;
+			out.draws = 1;
+			out.cls = fx::class_trail;
+			f.draws[f.draw_count++] = { f.vertex_count, n, fx::kNone, fx::stage_diffuse };
+			f.vertex_count += n;
+			f.element_count++;
+			g.n.taken[fx::class_trail]++;
+			return true;
+		}
+
+		bool record_trail_guarded(uintptr_t t)
+		{
+			__try
+			{
+				return pointer(uint32_t(t)) && record_trail(t);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				g.n.faulted++;
+				return false;
+			}
+		}
+
 		// An element into the frame: true when it's taken (the game's setup and draw skipped)
 		bool record(uintptr_t e)
 		{
@@ -462,14 +656,30 @@ namespace hifi::game::fxdraw
 				g.n.full++;
 				return false;
 			}
-			// (lit elements: the area's lights, not reproduced yet)
-			if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
+			if (cls == g.d3a_draw && g.d3a_draw != 0)
 			{
-				g.n.lit++;
-				return false;
+				const uint32_t handle = word(e + kModel);
+				if (handle == 0)
+				{
+					g.n.empty++;
+					return true;
+				}
+				const uint32_t resource = word(handle);
+				if (resource == 0)
+				{
+					g.n.unsupported++;
+					return false;
+				}
+				return record_d3a(e, resource);
 			}
 			if (cls == g.d3m_draw)
 			{
+				// (lit elements: the area's lights, not reproduced yet)
+				if ((at<uint8_t>(e + kFlags + 2) & 1) != 0)
+				{
+					g.n.lit++;
+					return false;
+				}
 				const uint32_t handle = word(e + kModel);
 				if (handle == 0)
 				{
@@ -539,6 +749,8 @@ namespace hifi::game::fxdraw
 			g.taking = g.native && g.can_mark && renderer != 0 && word(g.camera) != 0;
 			if (renderer != 0)
 				std::memcpy(g.f->proj, reinterpret_cast<const void *>(renderer + 0x38DDC), 64);
+			if (const uintptr_t gfx = word(g.gfx); gfx != 0)
+				std::memcpy(g.f->view, reinterpret_cast<const void *>(gfx + 0xB50), 64);
 			g.f->seq.store(g.seq, std::memory_order_release);
 			return;
 		}
@@ -558,9 +770,12 @@ namespace hifi::game::fxdraw
 
 	void __cdecl on_entry(uintptr_t callback, uintptr_t arg)
 	{
-		// (anything but an element drawn through 046070 draws now: the run so far first)
 		if (g.in_flush && g.taking)
 		{
+			// (a weapon trail: drawn by HiFi XI with the run, else the game's after it)
+			if (callback == g.trail_cb && g.trail_cb != 0 && record_trail_guarded(arg))
+				return;
+			// (anything but an element drawn through 046070 draws now: the run so far first)
 			bool element = false;
 			if (callback == g.element_cb && pointer(uint32_t(arg)))
 			{
@@ -622,6 +837,8 @@ namespace hifi::game::fxdraw
 		n.element_cb = cb;
 		n.element_draw = element_draw;
 		n.d3m_draw = d3m;
+		n.d3a_draw = find(kD3aDraw);
+		n.trail_cb = find(kTrailCallback);
 		n.draw_matrix = rel_target(s + kSetupMatrixCall);
 		n.weather = rel_target(d3m + kD3mWeatherCall);
 		n.fog_env = rel_target(fog + kFogCall);
@@ -791,6 +1008,8 @@ namespace hifi::game::fxdraw
 		s.d3m_draw = g.d3m_draw;
 		s.draw_matrix = g.draw_matrix;
 		s.fog_env = g.fog_env;
+		s.d3a_draw = g.d3a_draw;
+		s.trail_cb = g.trail_cb;
 		s.colour = g.colour;
 		s.gfx = g.gfx;
 		s.renderer = g.renderer;

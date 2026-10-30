@@ -69,7 +69,12 @@ float4 ps(v2p i) : SV_Target
 	float4 d = i.col;
 	float3 c;
 	float a;
-	if (s & 1)
+	if (s & 128)
+	{
+		c = d.rgb;
+		a = d.a;
+	}
+	else if (s & 1)
 	{
 		float4 t = tex.SampleLevel(smp, i.uv, 0);
 		float3 c0 = (s & 2) ? d.rgb : saturate(d.rgb * t.rgb * 2.0);

@@ -230,6 +230,7 @@ int main()
 		check(s.setup_call == base + 0x04612E && s.setup == base + 0x0467E0, name + ": the setup's call at 04612E, to 0467E0");
 		check(s.flush_call == base + 0x05562B && s.walk == base + 0x055520, name + ": the flush's call at 05562B, to the walk 055520");
 		check(s.entry_site == base + 0x055539 && s.element_cb == base + 0x0555A0, name + ": the walk's callback call at 055539; the element callback 0555A0");
+		check(s.d3a_draw == base + 0x03EB30 && s.trail_cb == base + 0x01C930, name + ": the D3A draw 03EB30, the weapon trails' callback 01C930");
 		check(s.element_draw == base + 0x046070 && s.d3m_draw == base + 0x040BA0 && s.draw_matrix == base + 0x045D40 && s.fog_env == base + 0x18BA20,
 			name + ": 046070, 040BA0, 045D40, 18BA20");
 		check(s.colour == base + 0x47BC0C && s.gfx == base + 0x47BFA8 && s.renderer == base + 0x631F24 && s.camera == base + 0x4568FC && s.env == base + 0x65CB04 &&
@@ -445,6 +446,90 @@ int main()
 		}
 		else
 			check(false, name + ": three elements recorded (" + std::to_string(f != nullptr ? f->element_count : 0) + ")");
+
+		// A D3A (Fire's 'fai0': 16 frames of one quad) and a weapon trail, then e1: one run of three
+		{
+			std::vector<uint8_t> flip;
+			check(chunk("ROM\\11\\17.DAT", 0x21, "fai0", flip), name + ": the D3A chunk read");
+			geo::d3a fa;
+			check(geo::parse_d3a(flip.data(), flip.size(), fa, why) && fa.frames == 16 && !fa.frame_list.empty(), name + ": 'fai0': 16 frames");
+			const uintptr_t d3a_res = resource(flip, 0x21);
+			const uintptr_t table = take(4 * 16);
+			uint32_t vfirst = 0;
+			for (int i = 0; i < fa.frames; ++i)
+			{
+				const uint16_t q = uint16_t(fa.frame_list[size_t(i)].vertices.size() / 6);
+				put<uint16_t>(table + 4 * i, q);
+				put<uint16_t>(table + 4 * i + 2, uint16_t(vfirst));
+				vfirst += q * 6u;
+			}
+			put<uint32_t>(d3a_res + 0x30 + 8, uint32_t(tex_object));
+			put<uint32_t>(d3a_res + 0x30 + 0xC, 0x1234);
+			put<uint32_t>(d3a_res + 0x30 + 0x14, uint32_t(table));
+			put<uint16_t>(tex_object + 0x24, get<uint16_t>(tex_res + 0x30 + 21));
+			put<uint16_t>(tex_object + 0x26, get<uint16_t>(tex_res + 0x30 + 25));
+			const uintptr_t vt_d3a = take(0x100);
+			put<uint32_t>(vt_d3a + 0x2C, uint32_t(s.element_draw));
+			put<uint32_t>(vt_d3a + 0x48, uint32_t(s.d3a_draw));
+			put<uint32_t>(vt_d3a + 0x4C, uint32_t(address(reinterpret_cast<void *>(&pre_draw))));
+			const uintptr_t ea = element(vt_d3a, d3a_res, 0x48, 1u << 16 | 0x1000, 0x80808080, -9.0f); // (lit and z write: the D3A sets neither)
+			put<uint16_t>(ea + 0x170, 17); // (past the frames: back to 0, written back)
+			// The trail: 3 samples, the newest at index 1 (head 2), one strip
+			const uintptr_t trail = take(0x1550);
+			put<int32_t>(trail + 0x14A8, 2);
+			put<int32_t>(trail + 0x14AC, 3);
+			for (int i = 0; i < 3; ++i)
+			{
+				const int at_ = (2 - 1 - i + 80) % 80;
+				const float tip[4] = { float(i), 1.0f, 0.0f, 1.0f }, bse[4] = { float(i), 0.0f, 0.0f, 1.0f };
+				const float ca[4] = { 255.0f, 128.0f, 64.0f, 200.0f - 50.0f * i }, cb[4] = { 10.0f, 20.0f, 30.0f, 0.0f };
+				std::memcpy(reinterpret_cast<void *>(trail + 0x40 + 16 * at_), tip, 16);
+				std::memcpy(reinterpret_cast<void *>(trail + 0x540 + 16 * at_), bse, 16);
+				std::memcpy(reinterpret_cast<void *>(trail + 0xA40 + 16 * at_), ca, 16);
+				std::memcpy(reinterpret_cast<void *>(trail + 0xF40 + 16 * at_), cb, 16);
+			}
+			const uintptr_t list2 = take(16), nodes2 = take(32 * 4);
+			const uintptr_t order2[][2] = { { s.element_cb, ea }, { s.trail_cb, trail }, { s.element_cb, e1 } };
+			for (size_t i = 0; i < 3; ++i)
+			{
+				const uintptr_t n = nodes2 + 32 * i;
+				put<uint32_t>(n + 4, i + 1 < 3 ? uint32_t(n + 32) : 0);
+				put<uint32_t>(n + 8, uint32_t(order2[i][0]));
+				put<uint32_t>(n + 0xC, uint32_t(order2[i][1]));
+			}
+			put<uint32_t>(list2 + 4, uint32_t(nodes2));
+			put<uint32_t>(list2 + 8, 0);
+			g_seen = seen();
+			g_markers = 0;
+			reinterpret_cast<flush_fn>(s.code)(list2, 0);
+			const fx::frame *f2 = fx::published(g_last_seq);
+			check(g_markers == 1 && f2 != nullptr && f2->runs.load() == 1 && f2->run_list[0].count == 3, name + ": the D3A, the trail and e1: one run, one marker (" + order_seen() + ")");
+			if (f2 != nullptr && f2->element_count == 3)
+			{
+				const fx::element &a = f2->elements[0], &tr = f2->elements[1];
+				const fx::draw &ad = f2->draws[a.first_draw], &td = f2->draws[tr.first_draw];
+				check(a.cls == fx::class_d3a && ad.count == 6 && ad.texture != fx::kNone && ad.stages == fx::stage_texture && a.z_write == 0 && a.fog == 0,
+					name + ": the D3A: one quad, textured, no z write, no fog");
+				check(get<uint16_t>(ea + 0x170) == 0, name + ": its frame past the count wrapped to 0 in the element, as 03E910 does");
+				const float su = 1.0f / float(get<uint16_t>(tex_object + 0x24)), sv = 1.0f / float(get<uint16_t>(tex_object + 0x26));
+				bool same = true;
+				for (int k = 0; k < 6; ++k)
+				{
+					const fx::vertex &v = f2->vertices[ad.first + k], &w0 = fa.frame_list[0].vertices[size_t(k)];
+					const float wu = fa.units >= 1 && fa.uvs_unit == 0 ? w0.uv[0] * su : w0.uv[0], wv = fa.units >= 1 && fa.uvs_unit == 0 ? w0.uv[1] * sv : w0.uv[1];
+					same = same && std::memcmp(v.pos, w0.pos, 12) == 0 && v.colour == w0.colour && std::fabs(v.uv[0] - wu) < 1e-6f && std::fabs(v.uv[1] - wv) < 1e-6f;
+				}
+				check(same, name + ": the D3A's frame 0 vertices, the UVs as the load scales them");
+				bool trail_ok = tr.cls == fx::class_trail && td.count == 12 && td.stages == fx::stage_diffuse && tr.blend == fx::blend_add && tr.z_write == 0;
+				// (newest first: sample 0 at x 0, the tip with colour A (alpha 200), then the base with B)
+				const fx::vertex &t0 = f2->vertices[td.first], &t1 = f2->vertices[td.first + 1];
+				trail_ok = trail_ok && t0.pos[0] == 0.0f && t0.pos[1] == 1.0f && t0.colour == 0xC8FF8040u && t1.pos[1] == 0.0f && t1.colour == 0x000A141Eu;
+				check(trail_ok, name + ": the trail: one strip of 3 pairs as 4 triangles, the newest sample first, vertex colour only, additive");
+				check(std::memcmp(tr.world, reinterpret_cast<const void *>(address(gfx) + 0xB50), 64) == 0, name + ": the trail through the camera's VIEW (gfx +0xB50)");
+			}
+			else
+				check(false, name + ": the D3A, the trail and e1 recorded (" + std::to_string(f2 != nullptr ? f2->element_count : 0) + ")");
+		}
 
 		// Put back
 		fd::set_native(false);

@@ -59,6 +59,7 @@ namespace hifi::fx
 		stage_alpha_tfactor = 1u << 4,  // stage 1 alpha SELECTARG2 TFACTOR (the D3A's @, 352084)
 		stage_alpha_2x = 1u << 5,       // untextured: alpha x TFACTOR x 2, not x 4 (the D3M's D, 3523B4)
 		stage_alpha_test = 1u << 6,     // ALPHATEST GREATER 0x60 (the morph's header bit 7)
+		stage_diffuse = 1u << 7,        // colour and alpha SELECTARG1 DIFFUSE, no TEXTUREFACTOR (the weapon trails, 01C940)
 	};
 
 	// How the element's PROJECTION is set (046070)
@@ -103,7 +104,8 @@ namespace hifi::fx
 		class_vuanm = 3,
 		class_morph = 4,
 		class_ring = 5,
-		classes = 6,
+		class_trail = 6,   // a weapon trail (CYyAfterImage, 01C940): not an element, a flush callback of its own
+		classes = 7,
 	};
 
 	struct run
@@ -117,6 +119,8 @@ namespace hifi::fx
 		std::atomic<uint32_t> runs { 0 }; // runs published (each one's marker sent after)
 		// The camera's PROJECTION as the zone pass left it (renderer +0x38DDC: jitter in it); D3D's RH, row vectors
 		float proj[16];
+		// The camera's VIEW (gfx +0xB50): what the weapon trails' world-space points are drawn through (WORLD identity)
+		float view[16];
 		uint32_t element_count = 0, draw_count = 0, vertex_count = 0;
 		run run_list[kMaxRuns];
 		element elements[kMaxElements];
