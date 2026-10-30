@@ -3341,6 +3341,304 @@ int main(int argc, char **argv)
 		check(g.report_messages() == 0, "no debug-layer errors (soft by distance, and further)");
 	}
 
+	// 1o5. Still in the world as the camera moves (notes-native-shadows.md step 0; in game a wooden bridge's shadows in
+	// Windurst Woods slid as the camera moved, 2026-10-30): over the ground sheet, slats 6 yalms up (half a yalm wide, a
+	// yalm apart), a plate 40 up with square holes, and a post 3 tall; the sun 45 degrees up. The camera orbits the
+	// looked-at point as the game's does (pitch, yaw) and walks; each frame the ground's brightness at a grid of world
+	// points (a fifth of a yalm apart, 10 yalms each way) is compared with the first camera's. Without and with the light
+	// split (the native zone's words: facing up, the sun's share 0.72). Pictures: build\test\sweep_*.ppm.
+	{
+		const float plain[4] = { 0.45f, 0.42f, 0.36f, 0.5f };
+		// (the sun 45 degrees up, then 15: each caster moved toward it so its shadow falls on the grid all the same)
+		for (const float elevation : { 45.0f, 15.0f })
+		{
+		const float e = elevation * 3.14159265f / 180.0f;
+		const float lean = std::cos(e) / std::sin(e);
+		shadow_file zone;
+		zone.zone = 995;
+		auto corner = [&](const vec3 &v) {
+			uint32_t bits[3];
+			std::memcpy(bits, &v, 12);
+			zone.triangles.insert(zone.triangles.end(), { bits[0], bits[1], bits[2], 0u });
+		};
+		auto quad = [&](const vec3 &a, const vec3 &b, const vec3 &c, const vec3 &d) {
+			corner(a), corner(b), corner(c);
+			corner(a), corner(c), corner(d);
+		};
+		auto flat = [&](float x0, float z0, float x1, float z1, float up) {
+			quad({ at.x + x0, at.y - up, at.z + z0 }, { at.x + x1, at.y - up, at.z + z0 }, { at.x + x1, at.y - up, at.z + z1 }, { at.x + x0, at.y - up, at.z + z1 });
+		};
+		uint32_t cell = 0;
+		auto close_cell = [&] {
+			const uint32_t first = cell == 0 ? 0u : zone.cells.back().first + zone.cells.back().count;
+			zone.cells.push_back({ int32_t(cell), 0, first, zone.triangle_count() - first });
+			cell++;
+		};
+		flat(-400, -400, 400, 400, 0); // the ground
+		close_cell();
+		for (int i = -12; i <= 12; ++i) // the slats, across x
+			flat(-12 + 6 * 0.894f * lean, i * 1.5f + 6 * 0.447f * lean, 12 + 6 * 0.894f * lean, i * 1.5f + 0.5f + 6 * 0.447f * lean, 6);
+		close_cell();
+		for (int i = -6; i < 6; ++i) // the high plate: 4-yalm squares, every other one a hole
+			for (int j = -6; j < 6; ++j)
+				if (((i + j) & 1) == 0)
+					flat(i * 4.0f + 40 * 0.894f * lean, j * 4.0f + 40 * 0.447f * lean, i * 4.0f + 4 + 40 * 0.894f * lean, j * 4.0f + 4 + 40 * 0.447f * lean, 40);
+		close_cell();
+		quad({ at.x + 2.85f, at.y, at.z + 3 }, { at.x + 3.15f, at.y, at.z + 3 }, { at.x + 3.15f, at.y - 3, at.z + 3 }, { at.x + 2.85f, at.y - 3, at.z + 3 }); // the post
+		quad({ at.x + 3, at.y, at.z + 2.85f }, { at.x + 3, at.y, at.z + 3.15f }, { at.x + 3, at.y - 3, at.z + 3.15f }, { at.x + 3, at.y - 3, at.z + 2.85f });
+		close_cell();
+		check(r.upload_shadow(zone, error), "slats, a holed plate and a post uploaded for the shadow map");
+		const vec3 to_sun = normalize({ std::cos(e) * 0.894f, -std::sin(e), std::cos(e) * 0.447f });
+
+		// (the light split for the ground as drawn, facing up, the sun's share 0.72: as grass_test's 1k2 words)
+		const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+		const D3D12_RESOURCE_DESC sd = split->GetDesc();
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT sfp = {};
+		UINT64 stotal = 0;
+		g.device->GetCopyableFootprints(&sd, 0, 1, 0, &sfp, nullptr, nullptr, &stotal);
+		ID3D12Resource *sup = g.buffer(D3D12_HEAP_TYPE_UPLOAD, stotal, D3D12_RESOURCE_STATE_GENERIC_READ);
+		struct source
+		{
+			ID3D12Resource *texture;
+		} src_ctx = { nullptr };
+		bool split_state_read = false; // (the split texture in kRead, not COPY_DEST)
+		const uint32_t up_bits = uint32_t(std::lround(0.5 * 127.0)) << 11;
+		auto words = [&](const camera &c) {
+			barrier(g.list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			const std::vector<uint8_t> zb = g.read(depth, 4);
+			barrier(g.list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			const float lx = c.proj[11] != 0.0f ? c.proj[10] / c.proj[11] : c.proj[10], ly = c.proj[14];
+			uint32_t *w = nullptr;
+			sup->Map(0, nullptr, reinterpret_cast<void **>(&w));
+			for (UINT y = 0; y < H; ++y)
+				for (UINT x = 0; x < W; ++x)
+				{
+					uint32_t v = 0;
+					const uint32_t d24 = (zb[(size_t(y) * W + x) * 4] | zb[(size_t(y) * W + x) * 4 + 1] << 8 | zb[(size_t(y) * W + x) * 4 + 2] << 16);
+					if (d24 < 0xFFFFFF)
+					{
+						const double vd = ly / (d24 / 16777215.0 - lx);
+						const uint32_t code = uint32_t(std::clamp(std::lround((std::log2(std::max(vd, 1e-3)) + 3.0) * 128.0), 1L, 2047L));
+						v = code | up_bits | uint32_t(std::lround(0.72 * 127.0)) << 25;
+					}
+					w[size_t(y) * (sfp.Footprint.RowPitch / 4) + x] = v;
+				}
+			sup->Unmap(0, nullptr);
+			if (split_state_read)
+				barrier(g.list, split, kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+			D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, from = { sup, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+			from.PlacedFootprint = sfp;
+			g.list->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+			barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+			split_state_read = true;
+		};
+		auto frame = [&](const camera &c, bool with_split) {
+			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
+			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			ground_depth(c);
+			if (with_split)
+				words(c);
+			src_ctx.texture = with_split ? split : nullptr;
+			r.set_light_source(with_split ? [](void *s) { return static_cast<source *>(s)->texture; } : static_cast<ID3D12Resource *(*)(void *)>(nullptr),
+				with_split ? &src_ctx : nullptr);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			look l2 = l;
+			l2.grass = false;
+			l2.ao_strength = 0.0f;
+			l2.relief = 0.0f;
+			l2.water = false;
+			l2.sun[0] = to_sun.x;
+			l2.sun[1] = to_sun.y;
+			l2.sun[2] = to_sun.z;
+			l2.sun_shadow = 0.6f;
+			l2.sun_map = true;
+			const draw_stats st = r.draw(g.list, t, c, l2, error);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			std::vector<uint8_t> img = g.read(world, 4);
+			r.release_old(0);
+			(void)st;
+			return img;
+		};
+		auto save = [&](const std::vector<uint8_t> &img, const char *name) {
+			const std::string path = std::string("build\\test\\sweep") + std::to_string(int(elevation)) + "_" + name + ".ppm";
+			if (FILE *f = nullptr; fopen_s(&f, path.c_str(), "wb") == 0 && f != nullptr)
+			{
+				std::fprintf(f, "P6 %u %u 255\n", W, H);
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+					std::fwrite(&img[i * 4], 1, 3, f);
+				fclose(f);
+			}
+		};
+		// (the ground's luma at each grid point seen by c, -1 off screen or within 2 pixels of its edge)
+		constexpr int kHalf = 50;
+		constexpr int kSide = 2 * kHalf + 1;
+		auto sample = [&](const std::vector<uint8_t> &img, const camera &c) {
+			float m[16];
+			multiply(c.view, c.proj, m);
+			std::vector<float> out(size_t(kSide) * kSide, -1.0f);
+			for (int j = 0; j < kSide; ++j)
+				for (int i = 0; i < kSide; ++i)
+				{
+					const vec3 v = { at.x + (i - kHalf) * 0.2f, at.y, at.z + (j - kHalf) * 0.2f };
+					const float x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12], y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
+					const float w = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
+					if (w <= 0.2f)
+						continue;
+					const int sx = int((x / w + 1.0f) * 0.5f * W), sy = int((1.0f - y / w) * 0.5f * H);
+					if (sx < 2 || sy < 2 || sx >= int(W) - 2 || sy >= int(H) - 2)
+						continue;
+					const uint8_t *c8 = &img[(size_t(sy) * W + sx) * 4];
+					out[size_t(j) * kSide + i] = float(0.3 * c8[0] + 0.59 * c8[1] + 0.11 * c8[2]);
+				}
+			return out;
+		};
+		// The cameras: orbiting the looked-at point a yalm over the ground, 6 yalms off, as the game's
+		struct shot
+		{
+			const char *name;
+			float yaw, pitch, walk; // (degrees around, degrees down, yalms walked along +x)
+		};
+		const shot shots[] = {
+			{ "base", 200, 20, 0 }, { "pitch5", 200, 5, 0 }, { "pitch35", 200, 35, 0 }, { "pitch60", 200, 60, 0 },
+			{ "yaw215", 215, 20, 0 }, { "yaw240", 240, 20, 0 }, { "yaw290", 290, 20, 0 },
+			{ "walk05", 200, 20, 0.5f }, { "walk2", 200, 20, 2.0f }, { "walk6", 200, 20, 6.0f },
+			// (out of the near cascade's middle half and back: drawn again around 15 yalms on, then around 3)
+			{ "walk15", 200, 20, 15.0f }, { "back3", 200, 20, 3.0f } };
+		auto camera_of = [&](const shot &s) {
+			camera c = cam;
+			const float yaw = s.yaw * 3.14159265f / 180.0f, pitch = s.pitch * 3.14159265f / 180.0f;
+			const vec3 target = { at.x + s.walk, at.y - 1.0f, at.z };
+			const vec3 eye_at = { target.x + 6.0f * std::cos(pitch) * std::cos(yaw), target.y - 6.0f * std::sin(pitch), target.z + 6.0f * std::cos(pitch) * std::sin(yaw) };
+			look_at(eye_at, target, { 0.0f, -1.0f, 0.0f }, c.view);
+			return c;
+		};
+		for (int variant = 0; variant < 2; ++variant)
+		{
+			const bool with_split = variant == 1;
+			std::vector<float> base;
+			std::printf("  the sun %.0f degrees up, %s the light split: against the first camera, |luma difference| at the ground's grid points seen by both:\n", elevation, with_split ? "with" : "without");
+			for (const shot &s : shots)
+			{
+				const camera c = camera_of(s);
+				frame(c, with_split);
+				const std::vector<uint8_t> img = frame(c, with_split);
+				save(img, (std::string(s.name) + (with_split ? "_split" : "")).c_str());
+				const std::vector<float> v = sample(img, c);
+				if (base.empty())
+				{
+					base = v;
+					size_t seen = 0;
+					double lo = 1e9, hi = 0.0;
+					for (float x : v)
+						if (x >= 0.0f)
+						{
+							seen++;
+							lo = std::min(lo, double(x));
+							hi = std::max(hi, double(x));
+						}
+					std::printf("    %-8s %zu points seen, luma %.1f..%.1f\n", s.name, seen, lo, hi);
+					continue;
+				}
+				// (each point's difference, and the same averaged over the 5 x 5 points around it: a yalm square, so a band
+				// shows and a single pixel's sampling at a shadow's edge doesn't)
+				std::vector<float> d(v.size(), 0.0f);
+				std::vector<uint8_t> both(v.size(), 0);
+				size_t n = 0, over12 = 0;
+				double sum = 0.0, most = 0.0;
+				for (size_t k = 0; k < v.size(); ++k)
+					if (v[k] >= 0.0f && base[k] >= 0.0f)
+					{
+						both[k] = 1;
+						d[k] = v[k] - base[k];
+						n++;
+						sum += std::fabs(d[k]);
+						most = std::max(most, double(std::fabs(d[k])));
+						over12 += std::fabs(d[k]) > 12.0f ? 1 : 0;
+					}
+				double band = 0.0;
+				int band_i = 0, band_j = 0;
+				for (int j = 2; j < kSide - 2; ++j)
+					for (int i = 2; i < kSide - 2; ++i)
+					{
+						double s5 = 0.0;
+						int c5 = 0;
+						for (int b = -2; b <= 2; ++b)
+							for (int a = -2; a <= 2; ++a)
+								if (both[size_t(j + b) * kSide + i + a])
+								{
+									s5 += d[size_t(j + b) * kSide + i + a];
+									c5++;
+								}
+						if (c5 == 25 && std::fabs(s5 / 25.0) > band)
+						{
+							band = std::fabs(s5 / 25.0);
+							band_i = i - kHalf;
+							band_j = j - kHalf;
+						}
+					}
+				// (away from the edges: points whose first camera's brightness is the same within 0.4 yalms each way, the inside
+				// of a shadow or of the light; what changes there is a band, not an edge sampled at another pixel)
+				size_t inner = 0, inner_over6 = 0;
+				double inner_sum = 0.0, inner_most = 0.0;
+				int inner_i = 0, inner_j = 0;
+				for (int j = 2; j < kSide - 2; ++j)
+					for (int i = 2; i < kSide - 2; ++i)
+					{
+						const size_t k = size_t(j) * kSide + i;
+						bool level = both[k] != 0;
+						for (int b = -2; b <= 2 && level; ++b)
+							for (int a = -2; a <= 2 && level; ++a)
+							{
+								const float o = base[size_t(j + b) * kSide + i + a];
+								level = o >= 0.0f && std::fabs(o - base[k]) < 3.0f;
+							}
+						if (!level)
+							continue;
+						inner++;
+						inner_sum += std::fabs(d[k]);
+						inner_over6 += std::fabs(d[k]) > 6.0f ? 1 : 0;
+						if (std::fabs(d[k]) > inner_most)
+						{
+							inner_most = std::fabs(d[k]);
+							inner_i = i - kHalf;
+							inner_j = j - kHalf;
+						}
+					}
+				std::printf("    %-8s %zu points, mean %.2f, most %.1f, over 12: %.2f%%; over a yalm square at most %.2f (at %+.1f, %+.1f yalms); "
+					"away from edges %zu: mean %.2f, most %.1f (at %+.1f, %+.1f), over 6: %.2f%%\n", s.name, n,
+					n ? sum / n : 0.0, most, n ? 100.0 * over12 / n : 0.0, band, band_i * 0.2, band_j * 0.2, inner, inner ? inner_sum / inner : 0.0,
+					inner_most, inner_i * 0.2, inner_j * 0.2, inner ? 100.0 * inner_over6 / inner : 0.0);
+				// (inside the shadows and the light, the same brightness from every camera; the edges are softened on screen, so
+				// they're printed, not checked. At 15 degrees the high plate's penumbra covers nearly all of it: fewer points)
+				const double inner_mean = inner ? inner_sum / inner : 0.0, over6 = inner ? 100.0 * inner_over6 / inner : 0.0;
+				const std::string what = std::string("the ground away from shadow edges as from the first camera: ") + s.name + (with_split ? ", the split" : "") +
+					(elevation > 30.0f ? ", the sun 45 up" : ", the sun 15 up");
+				check(inner >= (elevation > 30.0f ? 300u : 10u) || std::strcmp(s.name, "walk15") == 0, ("enough of it seen: " + what).c_str());
+				check(inner_mean < (elevation > 30.0f ? 1.0 : 1.5) && over6 < (elevation > 30.0f ? 1.0 : 6.0), what.c_str());
+				// (the difference over the grid, for a look: 128 none, +-4 a level)
+				const std::string path = std::string("build\\test\\sweep") + std::to_string(int(elevation)) + "_" + s.name + (with_split ? "_split" : "") + "_diff.pgm";
+				if (FILE *f = nullptr; fopen_s(&f, path.c_str(), "wb") == 0 && f != nullptr)
+				{
+					std::fprintf(f, "P5 %d %d 255\n", kSide, kSide);
+					for (size_t k = 0; k < d.size(); ++k)
+					{
+						const uint8_t px8 = both[k] ? uint8_t(std::clamp(128.0f + 4.0f * d[k], 0.0f, 255.0f)) : 0;
+						std::fwrite(&px8, 1, 1, f);
+					}
+					fclose(f);
+				}
+			}
+		}
+		r.set_light_source(nullptr, nullptr);
+		release(split);
+		release(sup);
+		r.unload_shadow();
+		}
+		check(g.report_messages() == 0, "no debug-layer errors (still in the world as the camera moves)");
+	}
+
 	if (shadows_only)
 	{
 		r.unload();
