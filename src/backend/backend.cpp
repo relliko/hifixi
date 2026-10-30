@@ -1052,6 +1052,8 @@ namespace hifi::backend
 		std::snprintf(line, sizeof(line), "started %s; World FX %s; %llu presents", !g_started.load() ? "not yet" : g_early ? "early (the starter)" : "late (no starter)",
 			g_attached.load() ? "attached to the game's device" : "not attached yet", static_cast<unsigned long long>(g_presents.load()));
 		out.push_back(line);
+		for (const std::string &l : worldfx::frame_counts())
+			out.push_back(l);
 		size_t known = 0;
 		{
 			std::lock_guard<std::mutex> lock(views_mutex);

@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -460,6 +461,9 @@ namespace
 
 		// Status
 		const char *skip = "not tried yet";
+		// Frames in the game the world was reached (a pass drawn) or not, and why not, by reason (status: frame_counts)
+		uint64_t frames_passed = 0;
+		std::map<std::string, uint64_t> frames_skipped;
 		grass::draw_stats last;
 		// The blades at the zone's end marker (on_zone_end): drawn there this frame (the world's end draws the rest), the
 		// frame's look worked out there, what they drew, how many times
@@ -2091,9 +2095,12 @@ namespace
 			g.skip = "no blades for this zone";
 			return;
 		}
-		if (d.state.root == nullptr || d.state.pipeline == nullptr)
+		// (only the root signature is needed: our d3d8.dll sets it once a list and the restore puts it back; a list it
+		// hasn't drawn on yet has no pipeline, targets or tables of its own, and it binds them all at its next draw. Asking
+		// for a pipeline too left a twelfth of the frames unshaded on it, 2026-10-30: the sun's shadows came and went)
+		if (d.state.root == nullptr)
 		{
-			g.skip = "dgVoodoo's root signature or pipeline wasn't seen on this list";
+			g.skip = "the game's root signature wasn't seen on this list";
 			return;
 		}
 		grass::camera cam;
@@ -2239,6 +2246,7 @@ namespace
 
 	void end_frame()
 	{
+		uint32_t passes_this_frame = 0;
 		// In the game? (the Ashita addon's word: logged in, not zoning)
 		{
 			char text[8] = "";
@@ -2264,6 +2272,7 @@ namespace
 				std::snprintf(text, sizeof(text), "FFXI World FX: the world ended %u times between two presents (drawn at the first %u)", g.passes_wanted, kMaxPasses);
 				log_message(1, text);
 			}
+			passes_this_frame = g.passes;
 			g.passes = 0;
 			g.passes_wanted = 0;
 		}
@@ -2311,6 +2320,13 @@ namespace
 		{
 			g.logging_moves = true;
 			g.moves.clear();
+		}
+		if (g.in_game)
+		{
+			if (passes_this_frame != 0)
+				g.frames_passed++;
+			else if (g.frames_skipped.size() < 32 || g.frames_skipped.count(g.skip != nullptr ? g.skip : "-") != 0)
+				g.frames_skipped[g.skip != nullptr ? g.skip : "-"]++;
 		}
 		g.history[g.history_pos] = g.drew;
 		g.history_pos = (g.history_pos + 1) % kHistory;
@@ -2533,6 +2549,15 @@ namespace worldfx
 		g.casters_context = context;
 		if (g.renderer != nullptr)
 			g.renderer->set_casters(fn, context);
+	}
+
+	std::vector<std::string> frame_counts()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		std::string line = "World FX's passes: " + std::to_string(g.frames_passed) + " frames in the game drawn";
+		for (const auto &k : g.frames_skipped)
+			line += "; " + std::to_string(k.second) + " not: " + k.first;
+		return { line };
 	}
 
 	void set_camera_source(camera_source_fn source, void *context)
@@ -2912,7 +2937,7 @@ namespace worldfx
 			return;
 		// (the world the markers named, its views still its own, D24S8 as the blades' depth; dgVoodoo's state seen)
 		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || g.world_rtv == 0 || resource_of(g.world_rtv) != g.world_rt ||
-			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT || d.state.root == nullptr || d.state.pipeline == nullptr)
+			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT || d.state.root == nullptr)
 			return;
 		grass::camera cam;
 		if (read_camera(cam) != nullptr)

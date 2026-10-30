@@ -130,6 +130,8 @@ namespace worldfx
 	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called under the core's mutex.
 	using camera_source_fn = bool (*)(void *context, float view[16], float proj[16]);
 	void set_camera_source(camera_source_fn source, void *context);
+	// (status) Frames in the game World FX's pass drew, and the ones it didn't by reason
+	std::vector<std::string> frame_counts();
 	// The blades' own motion written beside them (FSR 2's: the host's upscale), and its target (grass::renderer::
 	// blade_motion: the world's size, in a shader-readable state; frames counts the frames that wrote it)
 	void set_blade_motion(bool on);
