@@ -12,7 +12,8 @@
  * - Settings in config\hifixi\settings.ini, the menu (src/ui/menu) drawn through Ashita's ImGui.
  *
  *   /hifi          the menu (presets, settings by tab, status), or closes it
- *   /hifi status   what each part is doing (the hooks' counts per frame since they went in, or /hifi reset)
+ *   /hifi status   what each part is doing (the hooks' counts per frame since they went in, or /hifi reset), written to
+ *                  Ashita's logs\hifixi-status.txt; /hifi status <word> puts the lines with a word in the chat
  *   /hifi glows    the glows lighting the scene now
  *   /hifi gpu      World FX's GPU time by section, the costliest first
  *   /hifi gamedraw [zone|chars] [on|off]   the game's own zone or character drawing switched off (a debug toggle for
@@ -84,6 +85,7 @@
 #include "../host/passes.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../ui/menu.hpp"
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -91,7 +93,9 @@
 
 namespace
 {
-	constexpr double kVersion = 0.56;
+	constexpr double kVersion = 0.57;
+	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
+	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
 	IGuiManager *g_gui = nullptr;
 	ILogManager *g_ashita_log = nullptr;
@@ -250,6 +254,7 @@ class hifixi final : public IPlugin
 	ILogManager *m_log = nullptr;
 	uint32_t m_id = 0;
 	uint64_t m_presents = 0;
+	std::string m_rate_line; // (the last status's frame-rate line: /hifi status puts it in the chat)
 	double m_since = 0.0;
 	bool m_menu = false;
 	double m_next_update = 0.0;  // (the game-side parts follow their options every half second)
@@ -321,8 +326,25 @@ class hifixi final : public IPlugin
 	{
 		if (m_core == nullptr)
 			return;
-		const std::string body = error ? Ashita::Chat::Error(text) : Ashita::Chat::Message(text);
-		m_core->GetChatManager()->Writef(0, false, "%s%s", Ashita::Chat::Header("hifi").c_str(), body.c_str());
+		// (in pieces of at most kChatLine characters, broken at a space: very long lines break the game's chat log
+		// until the client restarts)
+		size_t at = 0;
+		while (at < text.size())
+		{
+			size_t end = text.size();
+			if (end - at > kChatLine)
+			{
+				end = text.rfind(' ', at + kChatLine);
+				if (end == std::string::npos || end <= at)
+					end = at + kChatLine;
+			}
+			const std::string piece = (at == 0 ? std::string() : std::string("  ")) + text.substr(at, end - at);
+			const std::string body = error ? Ashita::Chat::Error(piece) : Ashita::Chat::Message(piece);
+			m_core->GetChatManager()->Writef(0, false, "%s%s", Ashita::Chat::Header("hifi").c_str(), body.c_str());
+			at = end;
+			while (at < text.size() && text[at] == ' ')
+				++at;
+		}
 	}
 
 	void start()
@@ -343,8 +365,12 @@ class hifixi final : public IPlugin
 		m_since = now_seconds();
 	}
 
-	void report()
+	// Everything /hifi status knows, a line each; the frame-rate line also kept in m_rate_line (blank with the hooks out)
+	std::vector<std::string> status_lines()
 	{
+		std::vector<std::string> out;
+		const auto say = [&out](const std::string &text) { out.push_back(text); };
+		m_rate_line.clear();
 		for (const std::string &line : hifi::backend::status())
 			say(line);
 		if (!worldfx::forced_weather().empty()) // (weather debug: /hifi weather)
@@ -383,8 +409,8 @@ class hifixi final : public IPlugin
 			say(line);
 		if (!hifi::host::installed())
 		{
-			say("The hooks aren't in (/hifi on).", true);
-			return;
+			say("The hooks aren't in (/hifi on).");
+			return out;
 		}
 		const hifi::host::stats s = hifi::host::get_stats();
 		const double secs = now_seconds() - m_since;
@@ -396,6 +422,7 @@ class hifixi final : public IPlugin
 			static_cast<unsigned long long>(s.vtables_refused), static_cast<unsigned long long>(s.lists_seen),
 			static_cast<unsigned long long>(s.lists_unknown_state), s.queues_seen);
 		say(line);
+		m_rate_line = line;
 		std::snprintf(line, sizeof(line), "world: %llux%u %s, its end seen %llu times (%.2f a frame); depth: %llux%u %s",
 			static_cast<unsigned long long>(s.world.width), s.world.height, format_name(s.world.format), static_cast<unsigned long long>(s.world.ends),
 			s.world.ends / frames, static_cast<unsigned long long>(s.depth.width), s.depth.height, format_name(s.depth.format));
@@ -414,6 +441,53 @@ class hifixi final : public IPlugin
 		}
 		if (calls.size() > 1)
 			say(calls);
+		return out;
+	}
+
+	// /hifi status [<word>]: the whole report to logs\hifixi-status.txt with two lines in the chat (it's a few hundred long
+	// lines: the game's chat log broke on it); with a word, only the lines that have it (at most kStatusChatLines)
+	void report(std::string rest)
+	{
+		while (!rest.empty() && rest.front() == ' ')
+			rest.erase(rest.begin());
+		const std::vector<std::string> lines = status_lines();
+		if (!rest.empty())
+		{
+			const auto lower = [](std::string t) { for (char &c : t) c = char(std::tolower(static_cast<unsigned char>(c))); return t; };
+			const std::string word = lower(rest);
+			size_t found = 0;
+			for (const std::string &line : lines)
+				if (lower(line).find(word) != std::string::npos && ++found <= kStatusChatLines)
+					say(line);
+			if (found > kStatusChatLines)
+				say(std::to_string(found - kStatusChatLines) + " more lines with \"" + rest + "\": all in the file (/hifi status).");
+			else if (found == 0)
+				say("No status line has \"" + rest + "\".");
+			return;
+		}
+		std::string path = m_core != nullptr && m_core->GetInstallPath() != nullptr ? m_core->GetInstallPath() : "";
+		if (!path.empty() && path.back() != '\\' && path.back() != '/')
+			path += '\\';
+		path += "logs\\hifixi-status.txt";
+		char head[64];
+		std::snprintf(head, sizeof(head), "HiFi XI %.2f", kVersion);
+		bool written = false;
+		if (FILE *f = std::fopen(path.c_str(), "w"))
+		{
+			std::fprintf(f, "%s\n", head);
+			for (const std::string &line : lines)
+				std::fprintf(f, "%s\n", line.c_str());
+			written = std::fclose(f) == 0;
+		}
+		say(std::string(head) + (m_rate_line.empty() ? std::string(": the hooks aren't in (/hifi on).") : ": " + m_rate_line));
+		if (written)
+			say("The whole status (" + std::to_string(lines.size()) + " lines) is in " + path + ". /hifi status <word> shows the lines with a word "
+				"(fx, names, ui, failed...).");
+		else
+		{
+			say("The status file couldn't be written (" + path + "); its lines with \"failed\" follow.", true);
+			report("failed");
+		}
 	}
 
 	// /hifi weather [<name>|off|flash]: World FX's own weather forced to a weather (debug, not saved: worldfx::force_weather),
@@ -913,8 +987,8 @@ public:
 			m_since = now_seconds();
 			say("Counts started again.");
 		}
-		else if (arg == "status")
-			report();
+		else if (arg == "status" || arg.rfind("status ", 0) == 0)
+			report(arg.substr(6));
 		else if (pass_command(arg))
 		{
 		}
