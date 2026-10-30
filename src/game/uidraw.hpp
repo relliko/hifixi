@@ -79,6 +79,7 @@ namespace hifi::game::uidraw
 		uint64_t textures = 0;         // taken from the game
 		uint64_t texture_changes = 0;  // ... taken again: their pixels changed
 		uint64_t targets = 0;          // the game's render-target textures given targets of ours
+		uint64_t fonts_upgraded = 0;   // the smaller text fonts handed to the store as the 2048 x 4096 one
 		uint64_t upload_failures = 0;
 		uint32_t frame_draws = 0, frame_segments = 0; // the last window's
 		uint32_t held = 0;             // textures held now
@@ -100,6 +101,9 @@ namespace hifi::game::uidraw
 		uintptr_t screen_call = 0, screen_target = 0, pop_call = 0, pop_target = 0, movie = 0, code = 0;
 	};
 	sites where();
+	// The smaller text fonts drawn with the 2048 x 4096 one (src/ui2d/fonthigh: loaded first); every texture held is
+	// taken again
+	void set_font_high(bool on);
 	// Which of the game's textures are A and the UI-size target (tests: the game's from the wrapper, +0x194 and +0x1E0)
 	void set_render_targets(uintptr_t world, uintptr_t ui_target);
 	// Markers handed to sink instead of the device's Clear (tests)

@@ -28,6 +28,7 @@
 
 #include "uidraw.hpp"
 #include "slotmark.hpp"
+#include "../ui2d/fonthigh.hpp"
 #include "../ui2d/frame2d.hpp"
 #include "../ui2d/render2d.hpp"
 #include <cstdio>
@@ -149,6 +150,7 @@ namespace hifi::game::uidraw
 			uintptr_t main_target = 0;      // the surface bound when the window opened: the markers' target
 			uint32_t main_w = 0, main_h = 0;
 			uint32_t current = u2::kTargetMarker; // where draws go now: the markers' target, kPrivate | slot, or kUnknown
+			bool font_high = false;         // the smaller text fonts handed to the store as the 2048 x 4096 one
 			counts n;
 			std::string last_why;
 		};
@@ -421,19 +423,22 @@ namespace hifi::game::uidraw
 				ok = false;
 				return u2::kNoTexture;
 			}
+			held h;
+			h.little = bytes <= kSmall;
+			h.hash = level0_hash(t, h.little);
+			// (the smaller text fonts as the 2048 x 4096 one, when asked for: the glyph cells are the same)
+			const bool upgrade = g.font_high && u2::fonthigh::is_smaller_font(t);
 			std::string why;
-			const uint32_t slot = u2::render::add_texture(t, why);
+			const uint32_t slot = u2::render::add_texture(upgrade ? u2::fonthigh::high() : t, why);
 			if (slot == u2::kNoTexture)
 			{
 				g.last_why = "texture: " + why;
 				ok = false;
 				return slot;
 			}
-			held h;
+			g.n.fonts_upgraded += upgrade ? 1 : 0;
 			h.slot = slot;
 			h.used = h.checked = window;
-			h.little = bytes <= kSmall;
-			h.hash = level0_hash(t, h.little);
 			method<release_fn>(tex, 1)(tex); // (AddRef: held while it's in the store)
 			g.textures[tex] = h;
 			g.n.textures++;
@@ -1166,6 +1171,13 @@ namespace hifi::game::uidraw
 	void set_sink(void (*sink)(uint32_t, uint32_t))
 	{
 		g.sink = sink;
+	}
+
+	void set_font_high(bool on)
+	{
+		if (on != g.font_high)
+			drop_textures(); // (taken again with the font as now asked for)
+		g.font_high = on;
 	}
 
 	void set_render_targets(uintptr_t world, uintptr_t ui_target)
