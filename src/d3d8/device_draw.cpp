@@ -885,12 +885,19 @@ namespace hifi::d3d8
 	{
 		chain->present(override_window);
 		stats.presents++;
+		async_index.clear();
+		if (!async_reads.empty())
+			poll_async(false);
+		// (answers not asked for in two seconds or so let go)
+		if (stats.presents % 120 == 0)
+			for (auto it = async_results.begin(); it != async_results.end();)
+				it = it->second.frame + 240 < g.frame_number ? async_results.erase(it) : std::next(it);
 		if (stats.presents == 1 || stats.presents == 100 || stats.presents % 3600 == 0)
 		{
 			const compile_stats cs = shader_stats();
-			log(0, "frame %llu: %llu draws, %llu clears, %llu readbacks, %llu pipelines, %u shaders compiled (%u from the cache folder, %u failed, %.0f ms)",
+			log(0, "frame %llu: %llu draws, %llu clears, %llu readbacks (%llu answered from an earlier frame, %llu not yet), %llu pipelines, %u shaders compiled (%u from the cache folder, %u failed, %.0f ms)",
 				static_cast<unsigned long long>(stats.presents), static_cast<unsigned long long>(stats.draws), static_cast<unsigned long long>(stats.clears),
-				static_cast<unsigned long long>(stats.readbacks), static_cast<unsigned long long>(stats.pipelines), cs.compiled, cs.from_disk, cs.failed, cs.ms);
+				static_cast<unsigned long long>(stats.readbacks), static_cast<unsigned long long>(stats.async_answered), static_cast<unsigned long long>(stats.async_unanswered), static_cast<unsigned long long>(stats.pipelines), cs.compiled, cs.from_disk, cs.failed, cs.ms);
 		}
 	}
 }

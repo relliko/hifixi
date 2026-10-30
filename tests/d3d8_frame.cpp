@@ -1527,19 +1527,24 @@ namespace
 	{
 		defaults();
 		// A world with depth, then 6 tests: a quad into a test target with the world's depth, a 16x16 downsample, read back
-		IDirect3DTexture8 *test_tex = nullptr, *tiny_tex = nullptr;
-		IDirect3DSurface8 *test = nullptr, *tiny = nullptr, *sys = nullptr;
-		dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &test_tex);
-		test_tex->GetSurfaceLevel(0, &test);
-		dev->CreateTexture(16, 16, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &tiny_tex);
-		tiny_tex->GetSurfaceLevel(0, &tiny);
-		dev->CreateImageSurface(16, 16, D3DFMT_A8R8G8B8, &sys);
+		// (made once and kept, as the game keeps its test targets: asynchronous answers are kept by the surface)
+		static IDirect3DTexture8 *test_tex = nullptr, *tiny_tex = nullptr;
+		static IDirect3DSurface8 *test = nullptr, *tiny = nullptr, *sys = nullptr;
+		if (sys == nullptr)
+		{
+			dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &test_tex);
+			test_tex->GetSurfaceLevel(0, &test);
+			dev->CreateTexture(16, 16, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &tiny_tex);
+			tiny_tex->GetSurfaceLevel(0, &tiny);
+			dev->CreateImageSurface(16, 16, D3DFMT_A8R8G8B8, &sys);
+		}
 		camera();
 		dev->SetRenderState(D3DRS_ZENABLE, TRUE);
 		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
 		draw_sphere(scale(0.8f));
 		dev->SetRenderState(D3DRS_ZENABLE, FALSE);
 		uint32_t counts[6] = {};
+		double readback_us = 0;
 		for (int k = 0; k < 6; ++k)
 		{
 			dev->SetRenderTarget(test, depth);
@@ -1562,13 +1567,18 @@ namespace
 			dev->SetVertexShader(kRhw);
 			dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(VRhw));
 			dev->SetTexture(0, nullptr);
+			LARGE_INTEGER t0, t1, qf;
+			QueryPerformanceCounter(&t0);
 			const std::vector<uint32_t> px = read_target(tiny, 16, 16, sys);
+			QueryPerformanceCounter(&t1);
+			QueryPerformanceFrequency(&qf);
+			readback_us += double(t1.QuadPart - t0.QuadPart) * 1e6 / double(qf.QuadPart);
 			for (uint32_t c : px)
 				counts[k] += (c >> 24) >= 0x80 ? 1 : 0;
 			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
 			dev->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
 		}
-		std::printf("  visibility tests' counts: %u %u %u %u %u %u\n", counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]);
+		std::printf("  visibility tests' counts: %u %u %u %u %u %u (the 6 copies and locks: %.0f us)\n", counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], readback_us);
 		// The counts drawn into the picture as bars, so the comparison sees them
 		dev->SetRenderTarget(target, depth);
 		for (int k = 0; k < 6; ++k)
@@ -1579,11 +1589,6 @@ namespace
 		}
 		D3DVIEWPORT8 vp = { 0, 0, W, H, 0.0f, 1.0f };
 		dev->SetViewport(&vp);
-		sys->Release();
-		tiny->Release();
-		tiny_tex->Release();
-		test->Release();
-		test_tex->Release();
 	}
 
 	struct scene
@@ -1602,14 +1607,17 @@ namespace
 		{
 			if (only != nullptr && std::strcmp(only, s.name) != 0)
 				continue;
-			// (three frames, the last read: anything a first frame does differently is past)
+			// (three frames, the last read: anything a first frame does differently is past; with asynchronous readbacks,
+			// D3D8_ASYNCREADBACK=1, six, read every frame: the answers are earlier frames')
 			std::vector<uint32_t> px;
-			for (int frame = 0; frame < 3; ++frame)
+			const bool async = std::getenv("D3D8_ASYNCREADBACK") != nullptr;
+			const int frames = async ? 6 : 3;
+			for (int frame = 0; frame < frames; ++frame)
 			{
 				begin_scene();
 				s.fn();
 				dev->EndScene();
-				if (frame == 2)
+				if (frame == frames - 1 || async)
 					px = read_target(target, W, H, readback_surface);
 				// (the back buffer shows the target, for a look while it runs)
 				IDirect3DSurface8 *bb = nullptr;

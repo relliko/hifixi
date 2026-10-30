@@ -167,6 +167,7 @@ namespace hifi::d3d8
 		*pp = params;
 		make_auto_depth();
 		reset_state();
+		async_readback = setting("AsyncReadback", 0) != 0;
 		for (int i = 0; i < 256; ++i)
 		{
 			gamma.red[i] = gamma.green[i] = gamma.blue[i] = WORD(i * 257);
@@ -220,8 +221,58 @@ namespace hifi::d3d8
 			s->Release();
 	}
 
+	uint64_t device::async_key(const image *img, const image::pending_read &p, uint32_t index) const
+	{
+		const uint32_t k[7] = { uint32_t(reinterpret_cast<uintptr_t>(img)), p.sub, p.x, p.y, p.w, p.h, index };
+		return hash_bytes(k, sizeof(k));
+	}
+
+	void device::poll_async(bool all_done_only)
+	{
+		(void)all_done_only;
+		size_t kept = 0;
+		for (size_t i = 0; i < async_reads.size(); ++i)
+		{
+			async_read &a = async_reads[i];
+			if (!g.done(a.read.rb.fence))
+			{
+				async_reads[kept++] = a;
+				continue;
+			}
+			// (done: its pixels in the surface's format, the answer to this copy from now on)
+			async_result &r = async_results[a.key];
+			const UINT bpp = info(a.image->format).bpp != 0 ? info(a.image->format).bpp : 4;
+			r.w = a.read.w;
+			r.h = a.read.h;
+			r.frame = g.frame_number;
+			r.pixels.assign(size_t(r.w) * r.h * bpp, 0);
+			uint8_t *mapped = nullptr;
+			const D3D12_RANGE whole = { 0, SIZE_T(a.read.rb.size) };
+			if (SUCCEEDED(a.read.rb.buffer->Map(0, &whole, reinterpret_cast<void **>(&mapped))))
+			{
+				from_target(a.image->format, mapped, a.read.row_pitch, r.pixels.data(), r.w * bpp, r.w, r.h);
+				const D3D12_RANGE none = { 0, 0 };
+				a.read.rb.buffer->Unmap(0, &none);
+			}
+			g.free_readback(a.read.rb);
+		}
+		async_reads.resize(kept);
+	}
+
 	void device::forget(image *img)
 	{
+		// (its asynchronous copies dropped, their answers too)
+		for (size_t i = 0; i < async_reads.size();)
+			if (async_reads[i].image == img)
+			{
+				g.free_readback(async_reads[i].read.rb);
+				async_reads.erase(async_reads.begin() + ptrdiff_t(i));
+			}
+			else
+				++i;
+		if (!async_results.empty() && async_index.count(img) != 0)
+			async_results.clear();
+		async_index.erase(img);
 		const auto it = std::find(images.begin(), images.end(), img);
 		if (it != images.end())
 			images.erase(it);
@@ -581,8 +632,32 @@ namespace hifi::d3d8
 			p.from = si->format;
 			p.target = true;
 			di->copy(d->sub()); // (made, and older reads done)
-			di->reads.push_back(p);
 			stats.readbacks++;
+			if (async_readback && !sync_copies)
+			{
+				// Asynchronous (AsyncReadback=1): this copy is answered later; what the game reads now is the answer to the
+				// same copy (the same surface, rect and place in the frame's order) from the newest frame the GPU has
+				// finished, so nothing waits. One to three frames old; the first time, the surface as it was.
+				async_read a;
+				a.read = p;
+				a.image = di;
+				a.key = async_key(di, p, async_index[di]++);
+				async_reads.push_back(a);
+				poll_async(false);
+				const auto it = async_results.find(a.key);
+				if (it != async_results.end())
+				{
+					std::vector<uint8_t> &c = di->cpu[p.sub];
+					const UINT pt = di->pitch(d->level), dbpp = info(di->format).bpp != 0 ? info(di->format).bpp : 4;
+					for (UINT y = 0; y < p.h && y < it->second.h; ++y)
+						std::memcpy(c.data() + size_t(p.y + y) * pt + size_t(p.x) * dbpp, it->second.pixels.data() + size_t(y) * p.w * dbpp, size_t(std::min(p.w, it->second.w)) * dbpp);
+					stats.async_answered++;
+				}
+				else
+					stats.async_unanswered++;
+				return D3D_OK;
+			}
+			di->reads.push_back(p);
 			return D3D_OK;
 		}
 		if (src_gpu && dst_gpu)
@@ -673,9 +748,11 @@ namespace hifi::d3d8
 		surface *b = chain->back.get();
 		const D3DFORMAT was = b->img->format;
 		b->img->format = D3DFMT_A8R8G8B8;
+		sync_copies = true;
 		const RECT whole = { 0, 0, LONG(b->width()), LONG(b->height()) };
 		const HRESULT hr = copy_rect(b, whole, d, POINT { 0, 0 });
 		d->img->finish_reads();
+		sync_copies = false;
 		b->img->format = was;
 		// (the X formats' alpha read as opaque)
 		std::vector<uint8_t> &c = d->img->cpu[d->sub()];

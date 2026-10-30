@@ -415,6 +415,18 @@ namespace hifi::d3d8
 	IDirect3D8 *interface_of(direct3d *d) { return d; }
 	std::wstring dll_folder() { return module_folder(); }
 	std::wstring env_value(const wchar_t *name) { return env(name); }
+
+	int setting(const char *name, int fallback)
+	{
+		// (D3D8_<NAME> in the environment first, then [d3d8] <Name> in d3d8.ini beside the DLL)
+		std::wstring wname(name, name + std::strlen(name)), upper = L"D3D8_";
+		for (wchar_t c : wname)
+			upper += wchar_t(towupper(c));
+		const std::wstring e = env(upper.c_str());
+		if (!e.empty())
+			return _wtoi(e.c_str());
+		return int(GetPrivateProfileIntW(L"d3d8", wname.c_str(), fallback, (module_folder() + L"d3d8.ini").c_str()));
+	}
 }
 
 extern "C" IDirect3D8 *WINAPI Direct3DCreate8(UINT SDKVersion)

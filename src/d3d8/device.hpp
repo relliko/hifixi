@@ -164,7 +164,30 @@ namespace hifi::d3d8
 		struct counters
 		{
 			uint64_t draws = 0, clears = 0, readbacks = 0, presents = 0, pipelines = 0, uploads = 0, upload_bytes = 0;
+			uint64_t async_answered = 0, async_unanswered = 0; // asynchronous readbacks answered from an earlier frame, or not yet
 		} stats;
+
+		// Asynchronous readbacks (AsyncReadback=1): a copy from a target into memory answered by the same copy (surface,
+		// rect, place in the frame's order) from the newest frame the GPU has finished; never waits
+		bool async_readback = false;
+		bool sync_copies = false; // (GetFrontBuffer: always this frame's)
+		struct async_read
+		{
+			image::pending_read read;
+			image *image = nullptr;
+			uint64_t key = 0;
+		};
+		struct async_result
+		{
+			std::vector<uint8_t> pixels; // the surface's format, w x h
+			UINT w = 0, h = 0;
+			uint64_t frame = 0;
+		};
+		std::vector<async_read> async_reads;
+		std::unordered_map<uint64_t, async_result> async_results;
+		std::unordered_map<const image *, uint32_t> async_index; // copies into each surface this frame
+		uint64_t async_key(const image *img, const image::pending_read &p, uint32_t index) const;
+		void poll_async(bool all_done_only);
 
 		// Binding cache: what this list has bound (valid while epoch matches the gpu's)
 		struct bound_state
