@@ -37,6 +37,12 @@ namespace hifi::slotmark
 		spare_12 = 12, spare_13 = 13, spare_14 = 14, spare_15 = 15,
 		kinds = 16,
 	};
+	// The kinds sent on the back buffer's own depth (the screen's 2D: src/game/uidraw), not the world's: the world's depth
+	// tracking leaves them alone
+	constexpr bool on_back_buffer(uint32_t k)
+	{
+		return k == ui_begin || k == ui_end || k == frame_end;
+	}
 	inline const char *kind_name(uint32_t k)
 	{
 		static const char *const names[kinds] = { "zone begin", "zone end", "characters begin", "characters end", "see-through character",

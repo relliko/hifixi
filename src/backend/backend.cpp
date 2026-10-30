@@ -469,6 +469,7 @@ namespace hifi::backend
 			zone::inject::on_reset(list);
 			chars::inject::on_reset(list); // (native characters)
 			upscale::on_reset(list);
+			passes::on_reset(list); // (the own-frame passes' copy of its heaps)
 			worldfx::list_data *const d = data_of(list, true);
 			if (!g_attached.load(std::memory_order_acquire))
 			{
@@ -605,8 +606,12 @@ namespace hifi::backend
 			if (m.kind >= slotmark::first_pass)
 			{
 				ID3D12Resource *const depth = port_resource_of_view(dsv);
-				zone::inject::on_marker(depth);
-				chars::inject::on_marker(depth);
+				// (the back buffer's own markers leave the world's depth tracking alone)
+				if (!slotmark::on_back_buffer(m.kind))
+				{
+					zone::inject::on_marker(depth);
+					chars::inject::on_marker(depth);
+				}
 				if (depth == nullptr)
 					return;
 				passes::world w;
@@ -615,6 +620,9 @@ namespace hifi::backend
 				w.rt_format = zone_rt_format;
 				w.ds_format = port_format_of_view(dsv);
 				w.rt_state = d.world_rt_state;
+				w.bound_rt = d.rt0;
+				w.bound_ds = d.ds;
+				w.bound_rt_format = d.state.rtv_count != 0 ? port_format_of_view(uint64_t(d.state.rtvs[0].ptr)) : DXGI_FORMAT_UNKNOWN;
 				passes::dispatch(m.kind, list, d.state, w, m.seq);
 				return;
 			}
@@ -722,6 +730,7 @@ namespace hifi::backend
 				zone::inject::on_heaps(list, count, heaps);
 				chars::inject::on_heaps(list, count, heaps); // (native characters)
 				upscale::on_heaps(list, count, heaps);
+				passes::on_heaps(list, count, heaps);
 			}
 		}
 		void ev_draw(ID3D12GraphicsCommandList *list, uint64_t vertices)

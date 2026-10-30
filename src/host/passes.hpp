@@ -30,6 +30,13 @@ namespace hifi::passes
 		ID3D12Resource *rt = nullptr, *ds = nullptr;
 		DXGI_FORMAT rt_format = DXGI_FORMAT_UNKNOWN, ds_format = DXGI_FORMAT_UNKNOWN;
 		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		// What dgVoodoo last bound on the list (its OMSetRenderTargets: bound lazily, so it may be older than the marker),
+		// the target's view's format; the back buffer for the kinds slotmark::on_back_buffer names
+		ID3D12Resource *bound_rt = nullptr, *bound_ds = nullptr;
+		DXGI_FORMAT bound_rt_format = DXGI_FORMAT_UNKNOWN;
+		// The list's descriptor heaps as dgVoodoo last set them (to set again after one's own); 0: not known
+		UINT heap_count = 0;
+		ID3D12DescriptorHeap *heaps[2] = {};
 	};
 
 	using marker_fn = void (*)(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
@@ -62,5 +69,9 @@ namespace hifi::passes
 
 	// The backend and the plugin
 	bool dispatch(uint32_t kind, ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	// The backend: each list's descriptor heaps as dgVoodoo sets them (after), and its resets (none set then); dispatch
+	// hands them over in world::heaps
+	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps);
+	void on_reset(ID3D12GraphicsCommandList *list);
 	const std::vector<module> &modules();
 }

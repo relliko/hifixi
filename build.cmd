@@ -70,7 +70,7 @@ set "PASSES=src\host\passes.cpp"
 set "PASSES_FX="
 set "PASSES_WORLD="
 set "PASSES_ACTORS="
-set "PASSES_2D="
+set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
@@ -126,6 +126,25 @@ rem The shading pass timed on the real GPU (see its header): build\shade_bench.e
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\shade_bench.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\shade_bench.exe" /link /NOLOGO || exit /b 1
 echo Built build\shade_bench.exe
+
+rem The screen's 2D (src\game\uidraw, src\ui2d; docs\own-frame\2d.md): the loop tail's calls, the recorder on a stand-in
+rem device and the gate on both dumps (build\uidraw_test.exe); the recorder on dgVoodoo's own d3d8.dll (the game's, with
+rem its dgVoodoo.conf drawn by WARP: tests\ui2d_conf.py) against the 2D renderer on Direct3D 12 WARP at the pass markers,
+rem the d3dlog captures' interface replayed (build\dgv\ui2d_dgv.exe, run from build\dgv)
+set "UI2D=src\ui2d\frame2d.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\game\uidraw.cpp src\game\game.cpp"
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\uidraw_test.cpp %UI2D% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\uidraw_test.exe" ^
+  /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\uidraw_test.exe
+if not exist build\dgv mkdir build\dgv
+if exist "C:\Games\PhoenixXI\bootloader\d3d8.dll" (
+  copy /y "C:\Games\PhoenixXI\bootloader\d3d8.dll" build\dgv\ >nul || exit /b 1
+  python tests\ui2d_conf.py "C:\Games\PhoenixXI\bootloader\dgVoodoo.conf" build\dgv\dgVoodoo.conf || exit /b 1
+)
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
+  /I deps\ashita\plugins\sdk\d3d8\includes tests\ui2d_dgv.cpp %UI2D% src\ui2d\ui2d.cpp src\host\passes.cpp build\engine\worldfx_engine.lib ^
+  /Fo"build\test\\" /Fe"build\dgv\ui2d_dgv.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib d3dcompiler.lib || exit /b 1
+echo Built build\dgv\ui2d_dgv.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
