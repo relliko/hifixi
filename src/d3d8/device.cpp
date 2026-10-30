@@ -759,7 +759,48 @@ namespace hifi::d3d8
 		surface *d = static_cast<surface *>(dst);
 		if (d->img->format != D3DFMT_A8R8G8B8)
 			return D3DERR_INVALIDCALL;
-		// (the last frame shown is the back buffer's picture till the next is drawn: read from it, as A8R8G8B8)
+		if (params.Windowed)
+		{
+			// Windowed, the front buffer is the screen: the adapter's monitor as it shows now (our window where it is, and
+			// whatever covers it), as dgVoodoo reads it (d3d8_frame front)
+			HMONITOR mon = MonitorFromWindow(chain->window, MONITOR_DEFAULTTOPRIMARY);
+			MONITORINFO mi = {};
+			mi.cbSize = sizeof(mi);
+			GetMonitorInfoW(mon, &mi);
+			const UINT w = d->width(), h = d->height();
+			BITMAPINFO bi = {};
+			bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+			bi.bmiHeader.biWidth = LONG(w);
+			bi.bmiHeader.biHeight = -LONG(h);
+			bi.bmiHeader.biPlanes = 1;
+			bi.bmiHeader.biBitCount = 32;
+			void *bits = nullptr;
+			HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
+			HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+			bool ok = false;
+			if (dib != nullptr && bits != nullptr)
+			{
+				HGDIOBJ old = SelectObject(mem, dib);
+				ok = BitBlt(mem, 0, 0, int(w), int(h), screen, mi.rcMonitor.left, mi.rcMonitor.top, SRCCOPY) != FALSE;
+				GdiFlush();
+				std::vector<uint8_t> &c = d->img->copy(d->sub());
+				const UINT pt = d->img->pitch(d->level);
+				for (UINT y = 0; y < h; ++y)
+				{
+					uint8_t *row = c.data() + size_t(y) * pt;
+					std::memcpy(row, static_cast<const uint8_t *>(bits) + size_t(y) * w * 4, size_t(w) * 4);
+					for (UINT x = 0; x < w; ++x)
+						row[x * 4 + 3] = 255;
+				}
+				SelectObject(mem, old);
+			}
+			if (dib != nullptr)
+				DeleteObject(dib);
+			DeleteDC(mem);
+			ReleaseDC(nullptr, screen);
+			return ok ? D3D_OK : D3DERR_INVALIDCALL;
+		}
+		// (full screen: the last frame shown is the back buffer's picture till the next is drawn: read from it, as A8R8G8B8)
 		surface *b = chain->back.get();
 		const D3DFORMAT was = b->img->format;
 		b->img->format = D3DFMT_A8R8G8B8;
