@@ -469,6 +469,7 @@ namespace hifi::backend
 			zone::inject::on_reset(list);
 			chars::inject::on_reset(list); // (native characters)
 			upscale::on_reset(list);
+			passes::on_reset(list); // (the own-frame passes' heaps)
 			worldfx::list_data *const d = data_of(list, true);
 			if (!g_attached.load(std::memory_order_acquire))
 			{
@@ -615,6 +616,7 @@ namespace hifi::backend
 				w.rt_format = zone_rt_format;
 				w.ds_format = port_format_of_view(dsv);
 				w.rt_state = d.world_rt_state;
+				w.planes_known = zone::inject::depth_planes(depth, w.ds_planes);
 				passes::dispatch(m.kind, list, d.state, w, m.seq);
 				return;
 			}
@@ -722,6 +724,7 @@ namespace hifi::backend
 				zone::inject::on_heaps(list, count, heaps);
 				chars::inject::on_heaps(list, count, heaps); // (native characters)
 				upscale::on_heaps(list, count, heaps);
+				passes::on_heaps(list, count, heaps); // (the own-frame passes)
 			}
 		}
 		void ev_draw(ID3D12GraphicsCommandList *list, uint64_t vertices)

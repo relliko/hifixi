@@ -1,0 +1,81 @@
+#pragma once
+
+// The effect elements of the priority-12 flush handed to HiFi XI's native effect renderer instead of drawn by the game
+// (research/ffxi-re/notes-effects-draw.md; PLAN-own-frame.md, part fx).
+//
+// Three sites, all on the game's thread:
+//   - the flush (055620: call 055520, the sorted list's walk, far to near) goes through a stub of ours that tells us its
+//     begin and end;
+//   - the walk's call of each queued item's callback (055539: push eax; call [esi+8]; add esp, 4) goes through a stub
+//     that tells us what it's about to call: anything that isn't an element drawn through 046070 (a see-through
+//     character, a weapon trail, a lens flare) first ends the run of elements recorded so far (an fx_run marker);
+//   - each element's setup (046070's call of 0467E0 at 04612E) goes to us: an element HiFi XI can draw as the game
+//     would is recorded into the flush's frame (src/fx/fxframe.hpp) and its setup and class draw are skipped (0467E0
+//     answering "skip"); anything else ends the run first and goes on to 0467E0 and its class draw as before.
+// The element draws before the setup (its colour into VA 0490BC0C, the hidden check that src/game/gamerain answers)
+// run as before, so what World FX's patches leave out stays out.
+//
+// The gate: elements are taken only while set_native says so (the plugin's module: the Direct3D 12 side up and its
+// markers seen), the bound depth has a stencil for the markers, and per element only what's reproduced faithfully:
+// the classes handled, every texture on the GPU, unlit (flags bit 16 left to the game for now), a blend letter
+// 0467E0 knows. Everything else is the game's, element by element: never a hole.
+
+#include "game.hpp"
+#include <string>
+
+namespace hifi::game::fxdraw
+{
+	// The stubs and the call in, or out; false and why (nothing changed then)
+	bool start(std::string &why);
+	bool stop(std::string &why);
+	bool in();
+	// Whether elements are taken (the native side ready and drawing)
+	void set_native(bool on);
+	// Whether markers are sent at all (a Direct3D 12 side to see them)
+	void set_wanted(bool wanted);
+	// While native drawing waits for proof that markers come through: an empty run sent at each flush's end
+	void set_probe(bool on);
+	// The time new textures are stamped with (the plugin's clock; the textures' forgetting)
+	void set_clock(double now);
+
+	struct counts
+	{
+		uint64_t flushes = 0;
+		uint64_t taken[8] = {};   // (by fx::element_class)
+		uint64_t empty = 0;       // taken, nothing to draw (as the game's own early returns)
+		uint64_t game = 0;        // left to the game: not taking (native off, no stencil)
+		uint64_t unsupported = 0; // ... a class not handled yet
+		uint64_t lit = 0;         // ... lit (flags bit 16)
+		uint64_t letter = 0;      // ... a blend letter 0467E0 has no case for (the blend inherited)
+		uint64_t texture = 0;     // ... a texture not on the GPU yet (or not found)
+		uint64_t full = 0;        // ... no room in the frame
+		uint64_t faulted = 0;     // ... its memory couldn't be read
+		uint64_t overwritten = 0; // ... an untextured D3M whose first vertex the load wrote over (below)
+		uint64_t runs = 0, markers = 0, not_sent = 0;
+		uint32_t last_elements = 0, last_runs = 0;
+	};
+	counts get_counts();
+	std::string status();
+
+	// For the tests: the sites and our stubs; a sink for the markers (instead of the device); the device
+	struct sites
+	{
+		uintptr_t setup_call = 0, setup = 0;        // 04612E, 0467E0
+		uintptr_t flush_call = 0, walk = 0;         // 05562B, 055520
+		uintptr_t entry_site = 0, element_cb = 0;   // 055539, 0555A0
+		uintptr_t element_draw = 0, d3m_draw = 0;   // 046070, 040BA0
+		uintptr_t draw_matrix = 0, fog_env = 0;     // 045D40, 18BA20
+		uintptr_t colour = 0, gfx = 0, renderer = 0, camera = 0, env = 0, math = 0; // (the globals' addresses)
+		uintptr_t code = 0;                         // our stubs
+	};
+	sites where();
+	void set_sink(void (*sink)(uint32_t kind, uint32_t seq));
+	void set_device(uintptr_t device);
+	// The setup the call goes on to for what's left to the game (start() sets 0467E0)
+	void set_setup(uintptr_t setup);
+
+	// The entries (cdecl / fastcall as the stubs and the patched call reach them)
+	void __cdecl on_flush(uint32_t end);
+	void __cdecl on_entry(uintptr_t callback, uintptr_t arg);
+	uint32_t __fastcall on_setup(uintptr_t element, uintptr_t edx, uint32_t arg);
+}

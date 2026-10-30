@@ -67,7 +67,8 @@ set "UPSCALE=src\upscale\upscale.cpp src\upscale\temporal.cpp src\upscale\masks.
 rem The own-frame passes (PLAN-own-frame.md), each registered through src\host\passes.cpp. One line per part, so
 rem the parts built side by side merge cleanly.
 set "PASSES=src\host\passes.cpp"
-set "PASSES_FX="
+rem (fx: every effect element of the priority-12 flush drawn natively: src\fx, its game side src\game\fxdraw)
+set "PASSES_FX=src\fx\fxframe.cpp src\fx\fxtextures.cpp src\fx\fxrender.cpp src\fx\fxinject.cpp src\fx\fxmodule.cpp src\game\fxdraw.cpp"
 set "PASSES_WORLD="
 set "PASSES_ACTORS="
 set "PASSES_2D="
@@ -127,6 +128,27 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEA
   tests\shade_bench.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\shade_bench.exe" /link /NOLOGO || exit /b 1
 echo Built build\shade_bench.exe
 
+rem The effects (fx: src\fx, src\game\fxdraw). The geometry decoders against effects_geo.py (tests\fx_oracle.py geo):
+rem build\fx_geo_test.exe build\test\fx_geo.txt
+python tests\fx_oracle.py geo build\test\fx_geo.txt ROM/11/17.DAT ROM/10/9.DAT ROM/76/30.DAT ROM/13/39.DAT ROM/0/0.DAT ROM/1/31.DAT ROM/0/120.DAT ROM3/9/111.DAT || exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\fx_geo_test.cpp src\fx\fxgeo.cpp /Fo"build\test\\" /Fe"build\fx_geo_test.exe" /link /NOLOGO || exit /b 1
+echo Built build\fx_geo_test.exe
+rem The game side on both dumps, the game's own walk and element draw run through our stubs (WARP for a texture's copy):
+rem build\fx_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\fx_test.cpp src\game\fxdraw.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxtextures.cpp src\chars\tex.cpp src\game\game.cpp ^
+  /Fo"build\test\\" /Fe"build\fx_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\fx_test.exe
+rem The renderer at its marker on WARP with the debug layer against effects_play.py (tests\fx_oracle.py play: Fire, Cure,
+rem Fast Blade, made when missing, a minute or so): build\fx_render_test.exe build\test\fx_fire.bin ...
+if not exist build\test\fx_fire.bin python tests\fx_oracle.py play build\test\fx_fire.bin 150 --action spell 144 --size 480x270 || exit /b 1
+if not exist build\test\fx_cure.bin python tests\fx_oracle.py play build\test\fx_cure.bin 60 --action spell 1 --size 480x270 || exit /b 1
+if not exist build\test\fx_fastblade.bin python tests\fx_oracle.py play build\test\fx_fastblade.bin 38 --action ws 32 --size 480x270 || exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
+  tests\fx_render_test.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxinject.cpp src\fx\fxrender.cpp src\fx\fxtextures.cpp src\chars\tex.cpp ^
+  build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\fx_render_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\fx_render_test.exe
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
