@@ -25,13 +25,13 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - Always on: the game draws only what HiFi XI can't yet.
 - **A richer world**, drawn into the game's own frame:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
-  - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone's own meshes, with characters and monsters casting their real shapes;
+  - **Light:** ambient occlusion, surface relief, and sun and moon shadows from the whole zone's own meshes, with characters and monsters casting their real shapes, swaying trees and opening doors casting theirs as they move, and shadows sharp where they touch and softer the further from what casts them, out to mountains at low sun. Shadows and occlusion fall by the light the zone and characters were actually lit with, and on their real facing. Light from the sky above and bounced up from the ground, and soft highlights on stone and shiny gear;
   - **Light in the air:** sun shafts where sunlight comes past trees, buildings and cliffs, and fog lying low, patchy and drifting, thicker at dawn, dusk and in mist, rain and snow;
   - **Water** with reflections and ripples, carried on over the game's own sea past the zone's edge, out to the horizon;
   - **Snow that settles** while it snows, deep enough near you to hide feet and the bottoms of the grass, with footprints left by whoever walks through it, filling back in as it keeps snowing;
   - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
   - **Sky:** a smooth sky with a sun, stars and a moon in the game's own phase;
-  - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn.
+  - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn, and the nearest lamps casting shadows of the zone around them.
 - **En-spell effects:** while Enfire, Enblizzard, Enaero, Enstone, Enthunder, Enwater, Enlight or Endark is on you (the IIs too), your weapons carry its element: flames, frost and ice shards, wind, circling stones, arcs of lightning, flowing water, rays of light or dark smoke. On every melee weapon of every race: along a blade, on an axe's, scythe's, staff's or spear's head, all over hand-to-hand weapons.
 
 Everything is in one menu (`/hifi`): presets in a dropdown (Off, Balanced, High, Ultra, and your own, saved by name), a search box, a tooltip on every setting and a right-click reset.
