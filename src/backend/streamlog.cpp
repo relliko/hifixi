@@ -558,43 +558,6 @@ namespace hifi::backend::streamlog
 			return out;
 		}
 
-		// dgVoodoo's settings that change what it records, from its dgVoodoo.conf beside the game's (the folder's)
-		std::string dgvoodoo_settings()
-		{
-			std::string out;
-			FILE *f = _wfsopen((folder + L"dgVoodoo.conf").c_str(), L"r", _SH_DENYNO);
-			if (f == nullptr)
-				return "  (no dgVoodoo.conf in the folder)\n";
-			static const char *const keys[] = { "Version", "OutputAPI", "Resolution", "Antialiasing", "Filtering", "Mipmapping", "FPSLimit",
-				"ForceVerticalSync", "FastVideoMemoryAccess", "DepthBuffersBitDepth", "Default3DRenderFormat", "RTTexturesForceScaleAndMSAA" };
-			std::string section;
-			char line[512];
-			while (std::fgets(line, sizeof(line), f) != nullptr)
-			{
-				std::string l = line;
-				while (!l.empty() && (l.back() == '\n' || l.back() == '\r'))
-					l.pop_back();
-				if (!l.empty() && l[0] == '[')
-				{
-					section = l;
-					continue;
-				}
-				if (section == "[Glide]" || section == "[GlideExt]")
-					continue;
-				for (const char *k : keys)
-					if (l.rfind(k, 0) == 0 && l.size() > std::strlen(k) && (l[std::strlen(k)] == ' ' || l[std::strlen(k)] == '='))
-					{
-						std::string compact;
-						for (size_t i = 0; i < l.size(); ++i)
-							if (!(l[i] == ' ' && i + 1 < l.size() && l[i + 1] == ' '))
-								compact += l[i];
-						out += "  " + (section.empty() ? std::string() : section + " ") + compact + "\n";
-					}
-			}
-			std::fclose(f);
-			return out;
-		}
-
 		std::string thousands(uint64_t v)
 		{
 			std::string s = std::to_string(v);
@@ -625,7 +588,6 @@ namespace hifi::backend::streamlog
 			h += context;
 			if (!context.empty() && context.back() != '\n')
 				h += '\n';
-			h += "dgVoodoo's settings:\n" + dgvoodoo_settings();
 			add(h, "World frames asked for: %u; logged: %u. Ended: %s.\n", frames_wanted, frames_seen, ended.c_str());
 			h += "A world frame starts at the depth clear over all of a target at least 640 wide (dgVoodoo clears the world's colour, then its\n"
 				 "depth); the colour clear before it, and anything between, comes from the calls kept while waiting.\n"

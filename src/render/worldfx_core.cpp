@@ -1055,7 +1055,7 @@ namespace
 	void log_first(const list_data &d, const grass::target &t)
 	{
 		g.logged_first = true;
-		std::string text = "FFXI World FX: first grass draw. Root parameters of dgVoodoo's root signature:";
+		std::string text = "FFXI World FX: first grass draw. Root parameters of the game's root signature:";
 		const size_t known = host.root_param_count != nullptr ? host.root_param_count(d.state.root) : 0;
 		const size_t count = known != 0 ? known : d.state.args.size();
 		for (size_t i = 0; i < count; ++i)
@@ -3832,7 +3832,7 @@ void worldfx::draw_panel(const ui &u)
 	static const float good[4] = { 0.55f, 0.85f, 0.45f, 1.0f }, warn[4] = { 0.95f, 0.75f, 0.3f, 1.0f };
 	// What stops it working goes above the settings; the rest of the status is under "Status"
 	if (g.dev == nullptr)
-		u.text_colored(warn, "Needs dgVoodoo's Direct3D 12 output (OutputAPI = d3d12_fl11_0).");
+		u.text_colored(warn, "Needs HiFi XI's own d3d8.dll in the bootloader folder (the game's Direct3D 12 device).");
 	else if (!g.error.empty())
 		text_colored(u, warn, "Renderer: %s", g.error.c_str());
 	if (g.shading_held != nullptr && shading_on())

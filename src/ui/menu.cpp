@@ -405,9 +405,9 @@ namespace hifi::ui
 			else
 				g.text_colored(kWarn, "Started late, without its starter (bootloader\\dxgi.dll): the world's views weren't seen, so nothing is drawn.");
 			if (worldfx::attached() != nullptr)
-				g.text_colored(kGood, "Drawing into the game's Direct3D 12 output (dgVoodoo).");
+				g.text_colored(kGood, "Drawing into the game's Direct3D 12 output (HiFi XI's d3d8.dll).");
 			else
-				g.text_colored(kWarn, "Waiting for the game's Direct3D 12 output (dgVoodoo's OutputAPI must be d3d12_fl11_0).");
+				g.text_colored(kWarn, "Waiting for the game's Direct3D 12 output (HiFi XI's d3d8.dll in the bootloader folder).");
 			if (GetModuleHandleW(L"ffxi_worldfx.addon32") != nullptr)
 				g.text_colored(kWarn, "The World FX ReShade add-on is loaded too: ReShade belongs out of the bootloader folder.");
 
@@ -532,7 +532,7 @@ namespace hifi::ui
 				g.text_disabled("Measuring...");
 			if (g_meter.known && host::installed())
 			{
-				textf(g, "dgVoodoo's Direct3D 12: %.1f command lists, %.0f draws and %.0f calls a frame through HiFi XI's hooks",
+				textf(g, "The game's Direct3D 12: %.1f command lists, %.0f draws and %.0f calls a frame through HiFi XI's hooks",
 					g_meter.lists, g_meter.draws, g_meter.calls);
 				const host::stats s = host::get_stats();
 				if (s.world.width != 0)

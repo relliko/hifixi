@@ -262,30 +262,6 @@ namespace hifi::ui2d
 			return true;
 		}
 
-		// dgVoodoo's own filtering setting (it overrides the game's filters: the 2D renderer samples as it does), from the
-		// dgVoodoo.conf beside its d3d8.dll (read only)
-		void follow_dgvoodoo()
-		{
-			wchar_t path[MAX_PATH] = {};
-			HMODULE d3d8 = GetModuleHandleW(L"d3d8.dll");
-			if (d3d8 == nullptr || GetModuleFileNameW(d3d8, path, MAX_PATH) == 0)
-				return;
-			std::wstring conf = path;
-			conf = conf.substr(0, conf.find_last_of(L"\\/") + 1) + L"dgVoodoo.conf";
-			HANDLE f = CreateFileW(conf.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-			if (f == INVALID_HANDLE_VALUE)
-				return;
-			std::string text(size_t(std::min<DWORD>(GetFileSize(f, nullptr), 1u << 20)), '\0');
-			DWORD got = 0;
-			const bool read = ReadFile(f, text.data(), DWORD(text.size()), &got, nullptr) != FALSE;
-			CloseHandle(f);
-			if (!read)
-				return;
-			text.resize(got);
-			const render::filtering::setting s = render::filtering::read(text);
-			render::set_filtering(s.forced, s.anisotropy, s.keep_point);
-		}
-
 		void device(ID3D12Device *dev)
 		{
 			// (the textures held belong to the store being let go)
@@ -296,7 +272,6 @@ namespace hifi::ui2d
 				render::release();
 			else
 			{
-				follow_dgvoodoo();
 				if (!render::make(dev, why))
 					gs.why = "the 2D renderer: " + why;
 			}

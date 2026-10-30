@@ -1135,7 +1135,7 @@ namespace hifi::game::feed
 		if (!g_wanted.drawing)
 		{
 			out.push_back("the game's water, weather and character shadows, and its visibility tests: its own (World FX isn't drawing "
-				"into the game's world: it needs dgVoodoo's Direct3D 12 output, OutputAPI = d3d12_fl11_0)");
+				"into the game's world: it needs HiFi XI's own d3d8.dll in the bootloader folder)");
 			return out;
 		}
 		out.push_back(std::string("the game's character shadows: ") + (!g_shadows.why.empty() ? "drawn (" + g_shadows.why + ")"
