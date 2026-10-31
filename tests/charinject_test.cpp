@@ -420,7 +420,7 @@ int main(int argc, char **argv)
 		ch::cache::status()[0]);
 	std::string why;
 	check(inj::prepare(device, why), "the renderer made" + (why.empty() ? "" : ": " + why));
-	inj::set_options(getenv("CHARS_PERPIXEL") != nullptr); // (the per-pixel option: CHARS_PERPIXEL=1)
+	inj::set_options(getenv("CHARS_PERPIXEL") != nullptr, getenv("CHARS_DETAIL") != nullptr); // (the per-pixel option: CHARS_PERPIXEL=1; the detail maps: CHARS_DETAIL=1)
 	// (with it the zone's sun, as the plugin passes it: the models' light 0 below is that sun, for its highlight)
 	const float sun_l = std::sqrt(0.31f * 0.31f + 0.951f * 0.951f), toward_sun[3] = { -0.31f / sun_l, -0.951f / sun_l, 0.0f };
 	inj::set_sun(getenv("CHARS_PERPIXEL") != nullptr ? toward_sun : nullptr);

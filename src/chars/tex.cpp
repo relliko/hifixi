@@ -2,6 +2,7 @@
 
 #include "tex.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace hifi::chars::tex
@@ -279,5 +280,111 @@ namespace hifi::chars::tex
 				}
 			t.levels.push_back(std::move(b));
 		}
+	}
+
+	namespace
+	{
+		// A separable Gaussian, clamped at the edges (as the character sampler clamps)
+		std::vector<float> blur(const std::vector<float> &in, uint32_t w, uint32_t h, float sigma)
+		{
+			const int r = int(3.0f * sigma) + 1;
+			std::vector<float> k(size_t(2 * r + 1));
+			float sum = 0.0f;
+			for (int i = -r; i <= r; ++i)
+				sum += k[size_t(i + r)] = std::exp(-0.5f * (float(i) / sigma) * (float(i) / sigma));
+			for (float &v : k)
+				v /= sum;
+			std::vector<float> tmp(in.size()), out(in.size());
+			for (uint32_t y = 0; y < h; ++y)
+				for (uint32_t x = 0; x < w; ++x)
+				{
+					float s = 0.0f;
+					for (int i = -r; i <= r; ++i)
+						s += k[size_t(i + r)] * in[size_t(y) * w + uint32_t(std::clamp(int(x) + i, 0, int(w) - 1))];
+					tmp[size_t(y) * w + x] = s;
+				}
+			for (uint32_t y = 0; y < h; ++y)
+				for (uint32_t x = 0; x < w; ++x)
+				{
+					float s = 0.0f;
+					for (int i = -r; i <= r; ++i)
+						s += k[size_t(i + r)] * tmp[size_t(std::clamp(int(y) + i, 0, int(h) - 1)) * w + x];
+					out[size_t(y) * w + x] = s;
+				}
+			return out;
+		}
+
+		float smooth(float e0, float e1, float x)
+		{
+			const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+			return t * t * (3.0f - 2.0f * t);
+		}
+	}
+
+	void make_detail(const texture &colour, texture &out)
+	{
+		out = texture();
+		if (colour.levels.empty())
+			return;
+		const level &c = colour.levels[0];
+		const uint32_t w = c.w, h = c.h;
+		const size_t n = size_t(w) * h;
+		std::memcpy(out.name, colour.name, 16);
+		out.w = w;
+		out.h = h;
+		std::vector<float> lum(n);
+		for (size_t i = 0; i < n; ++i)
+			lum[i] = (0.30f * c.rgba[i * 4] + 0.59f * c.rgba[i * 4 + 1] + 0.11f * c.rgba[i * 4 + 2]) / 255.0f;
+		// The height: the brightness less its broad shading (the light and shadow painted in), detail at three scales
+		const std::vector<float> broad = blur(lum, w, h, 6.0f);
+		std::vector<float> hp(n);
+		for (size_t i = 0; i < n; ++i)
+			hp[i] = lum[i] - broad[i];
+		std::vector<float> gx(n, 0.0f), gy(n, 0.0f);
+		const float scales[3][2] = { { 0.6f, 1.0f }, { 1.2f, 0.7f }, { 2.5f, 0.4f } };
+		for (const auto &sc : scales)
+		{
+			const std::vector<float> b = blur(hp, w, h, sc[0]);
+			auto at = [&](int x, int y) { return b[size_t(std::clamp(y, 0, int(h) - 1)) * w + uint32_t(std::clamp(x, 0, int(w) - 1))]; };
+			for (int y = 0; y < int(h); ++y)
+				for (int x = 0; x < int(w); ++x)
+				{
+					const float sx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1));
+					const float sy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1));
+					gx[size_t(y) * w + uint32_t(x)] += sc[1] * sx;
+					gy[size_t(y) * w + uint32_t(x)] += sc[1] * sy;
+				}
+		}
+		// Metal: bright texels with fine detail around them (the detail scaled by its 95th percentile); cavity: below
+		// the brightness around
+		const std::vector<float> fine = blur(lum, w, h, 1.5f);
+		std::vector<float> d(n);
+		for (size_t i = 0; i < n; ++i)
+			d[i] = std::fabs(lum[i] - fine[i]);
+		d = blur(d, w, h, 1.2f);
+		std::vector<float> sorted = d;
+		std::nth_element(sorted.begin(), sorted.begin() + ptrdiff_t(n * 95 / 100), sorted.end());
+		const float p95 = std::max(sorted[n * 95 / 100], 1e-6f);
+		const std::vector<float> around = blur(lum, w, h, 2.0f);
+		level l0;
+		l0.w = w;
+		l0.h = h;
+		l0.rgba.resize(n * 4);
+		constexpr float kRelief = 2.2f;
+		for (size_t i = 0; i < n; ++i)
+		{
+			float nx = -kRelief * gx[i], ny = -kRelief * gy[i], nz = 1.0f;
+			const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+			nx /= len;
+			ny /= len;
+			const float metal = smooth(0.28f, 0.55f, lum[i]) * smooth(0.25f, 0.7f, std::min(d[i] / p95, 1.0f));
+			const float cavity = std::clamp((around[i] - lum[i]) * 5.0f, 0.0f, 1.0f);
+			l0.rgba[i * 4] = uint8_t(std::lround(std::clamp(nx * 127.5f + 127.5f, 0.0f, 255.0f)));
+			l0.rgba[i * 4 + 1] = uint8_t(std::lround(std::clamp(ny * 127.5f + 127.5f, 0.0f, 255.0f)));
+			l0.rgba[i * 4 + 2] = uint8_t(std::lround(metal * 255.0f));
+			l0.rgba[i * 4 + 3] = uint8_t(std::lround(cavity * 255.0f));
+		}
+		out.levels.push_back(std::move(l0));
+		make_mips(out);
 	}
 }

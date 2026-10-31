@@ -39,4 +39,11 @@ namespace hifi::chars::tex
 	// The mips the game asks for, made from level 0 (6, or 1 when a side is under 32)
 	void make_mips(texture &t);
 	uint32_t mip_count(uint32_t w, uint32_t h);
+
+	// The detail map ([chars] detail; research/ffxi-re/tools/nmmockup.py, "multi-scale" and matmap) guessed from a
+	// texture's level 0, with the same mips: r, g the surface's tilt (tangent space: +u, +v down the picture; 0.5 flat), the
+	// height being the brightness with the painted broad shading taken out, at three scales; b metal (bright, finely
+	// detailed texels: trim, studs, buckles); a cavity (darker than around it: seams, crevices). Nothing in the game has
+	// these: a guess from the colours alone.
+	void make_detail(const texture &colour, texture &out);
 }

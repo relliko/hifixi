@@ -42,6 +42,7 @@ namespace hifi::chars::inject
 			std::unique_ptr<char_renderer> renderer; // (made and let go outside the mutex: see prepare)
 			std::unique_ptr<aura_ring> aura;         // (a see-through model's aura ring: made with it)
 			std::atomic<bool> per_pixel { false };
+			std::atomic<bool> detail { false };
 			// Toward the zone's sun (set_sun: the plugin's, from the zone pass), for the light split's share
 			std::mutex sun_mutex;
 			bool sun_known = false;
@@ -468,9 +469,10 @@ namespace hifi::chars::inject
 		drop(scene);
 	}
 
-	void set_options(bool per_pixel)
+	void set_options(bool per_pixel, bool detail)
 	{
 		g.per_pixel.store(per_pixel, std::memory_order_relaxed);
+		g.detail.store(detail, std::memory_order_relaxed);
 	}
 
 	void set_clock(double seconds)
@@ -578,6 +580,7 @@ namespace hifi::chars::inject
 			return;
 		char_options o;
 		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
+		o.detail = g.detail.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;
@@ -724,6 +727,7 @@ namespace hifi::chars::inject
 			return fail("the see-through target couldn't be made");
 		char_options o;
 		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
+		o.detail = g.detail.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;

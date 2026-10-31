@@ -19,7 +19,7 @@ namespace hifi::chars::inject
 {
 	bool prepare(ID3D12Device *device, std::string &why);
 	void release();
-	void set_options(bool per_pixel);
+	void set_options(bool per_pixel, bool detail = false);
 	// The en-spell effects' time (chardraw.hpp record_enspells) held at `seconds` (the tests, the offline viewer); below 0,
 	// the real clock again
 	void set_clock(double seconds);

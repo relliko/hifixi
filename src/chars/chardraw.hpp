@@ -94,6 +94,7 @@ namespace hifi::chars
 	struct char_options
 	{
 		bool per_pixel = false;
+		bool detail = false;    // the detail maps (tex::make_detail), per pixel only ([chars] detail)
 		bool sun_known = false; // sun: toward the zone's sun (world), for the light split's share
 		float sun[3] = {};
 		uint32_t lamp_count = 0; // the zone's lamps (0: none known; the game's own lamp light then)
