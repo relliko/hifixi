@@ -19,9 +19,12 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **FSR 2** in its place if you prefer it, or where FSR 3.1 can't run; **FSR 1** (edge-aware upscaling and sharpening) when both are off;
   - **Frame generation (AMD FSR 3):** a frame made between each two the game draws, for motion as smooth as twice the frames, the menus and text kept sharp. By default only while the game runs below half your screen's refresh rate;
   - the menus and text are always drawn at the screen's own size.
+- **Its own Direct3D 8 translator** (`d3d8.dll`): the game's drawing goes straight to Direct3D 12 through HiFi XI's own code, in dgVoodoo's place. HiFi XI knows every pass of the frame from it, with its shaders compiled ahead and kept between sessions.
 - **The zone, the characters and the zone's models drawn by HiFi XI itself** (ships and airships, Mog House furniture, garden plants), from your own game files, in the game's own look:
   - **Per-pixel light** with every texture's normal map, on the zone and on characters and monsters;
   - **Tone mapping, bloom and a colour grade** over the world;
+  - **Spell and ability effects, weapon trails, battle numbers, lens flares and the glow spells cast on the ground**, the **sky dome**, **names**, the **Mog House layout grid**, **cloth** (banners, Gigas, Treants) and the **glows and shimmers over characters** (two-hours, songs, warping out);
+  - **The interface** too, at the screen's own size after upscaling (off by default while it's new: `/hifi ui on`);
   - Always on: the game draws only what HiFi XI can't yet.
 - **A richer world**, drawn into the game's own frame:
   - **Grass** that bends around characters, wears into paths and is cut by weapon skills;
@@ -39,8 +42,8 @@ Everything is in one menu (`/hifi`): presets in a dropdown (Off, Balanced, High,
 ## Requirements
 
 - Ashita v4.
-- For the richer world (grass, shadows, water, weather, sky, lamps and glows): dgVoodoo's output on Direct3D 12. In dgVoodoo's config set `OutputAPI = d3d12_fl11_0`; the game's own Windows default is Direct3D 11, and the menu tells you when it isn't 12.
-  - With any other output (dgVoodoo on Direct3D 11, DXVK...), the frame rate and the view distance still work, and the game keeps its own water, rain and shadows.
+- A graphics card with Direct3D 12 (feature level 11 or newer).
+- HiFi XI's own `d3d8.dll` in the `bootloader` folder, not dgVoodoo's. If your launcher puts a Direct3D 8 wrapper there itself, switch that off: on Phoenix's launcher, **Settings -> Graphics -> My own wrapper**.
 - No ReShade: HiFi XI draws into Direct3D 12 itself. If ReShade's `dxgi.dll` is in your `bootloader` folder, move it out.
 
 Check your server's rules on client modifications before using it.
@@ -50,7 +53,9 @@ Check your server's rules on client modifications before using it.
 1. Unzip into your Ashita folder. You get:
    - `plugins\hifixi.dll`;
    - `bootloader\dxgi.dll`: HiFi XI's starter, which starts it before the game makes its Direct3D 12 device;
+   - `bootloader\d3d8.dll`: HiFi XI's Direct3D 8 translator, and `bootloader\d3d8-shader-cache\`, its shaders compiled ahead;
    - `bootloader\worldfx-sunlit.txt` and `worldfx-clearsky.txt`.
+   If a `d3d8.dll` (dgVoodoo's) was already in `bootloader`, keep it somewhere else in case you want it back.
 2. Add `/load hifixi` to your boot script (`scripts\default.txt`).
 3. If you used **hifps**, **drawcull** or the **worldfx** addon, leave them out: HiFi XI does their work. If they're loaded in a part of the script you can't edit, add `/addon unload <name>` for each before `/load hifixi`.
 
@@ -95,11 +100,13 @@ Settings are saved as you change them, in `config\hifixi\settings.ini`.
 
 ## Diagnostics
 
-With **Advanced -> GPU crash reports** on (the default), a GPU hang or page fault writes what the GPU was doing to `bootloader\worldfx-gpu-crash.txt`, with your GPU, its driver and the video memory in use at that moment. HiFi XI's log is `bootloader\hifixi.log`; it names your GPU, its driver and its video memory at start.
+With **Advanced -> GPU crash reports** on (the default), a GPU hang or page fault writes what the GPU was doing to `bootloader\worldfx-gpu-crash.txt`, with your GPU, its driver and the video memory in use at that moment. HiFi XI's log is `bootloader\hifixi.log`; it names your GPU, its driver and its video memory at start. The Direct3D 8 translator's is `bootloader\d3d8.log`: it notes any frame that took more than a quarter of a second, and where the time went.
+
+In `bootloader\d3d8.ini` (optional): `[d3d8]` `AsyncReadback=1` answers the game's own visibility tests from a frame or so before instead of waiting for the GPU, which keeps a hitch from stalling the game.
 
 If the GPU hangs (`DXGI_ERROR_DEVICE_HUNG`):
 
-- Set the game's profile in your graphics driver back to its defaults (NVIDIA Control Panel or AMD Software), with anisotropic filtering, antialiasing and texture filtering left to the application. For sharper textures at an angle, use dgVoodoo's own `Filtering` setting (an anisotropy level, 1 to 16) instead.
+- Set the game's profile in your graphics driver back to its defaults (NVIDIA Control Panel or AMD Software), with anisotropic filtering, antialiasing and texture filtering left to the application.
 - Run your GPU at its stock clocks and voltage.
 - Send the crash report and the log when you ask for help.
 
