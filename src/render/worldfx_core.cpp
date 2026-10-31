@@ -3880,8 +3880,6 @@ void worldfx::draw_panel(const ui &u)
 	{
 		if (u.slider_float("Ambient occlusion (0 = off)", &g.look.ao_strength, 0.0f, 2.0f, "%.2f"))
 			set_config("AOStrength", g.look.ao_strength);
-		if (u.slider_float("Surface relief (0 = off)", &g.look.relief, 0.0f, 2.0f, "%.2f"))
-			set_config("Relief", g.look.relief);
 		if (u.slider_float("Sun shadows (0 = off)", &g.sun_shadows, 0.0f, 1.0f, "%.2f"))
 			set_config("SunShadows", g.sun_shadows);
 		if (u.slider_float("Moon shadows (share of the sun's, 0 = off)", &g.moon_shadows, 0.0f, 1.0f, "%.2f"))
@@ -3900,8 +3898,6 @@ void worldfx::draw_panel(const ui &u)
 
 	if (u.header("Weather", true))
 	{
-		if (u.checkbox("Fog the grass, fireflies and water as the game fogs the world", &g.weather_fog))
-			set_config("WeatherFog", g.weather_fog);
 		if (u.checkbox("Sun and moon shadows fade as the game dims its sun (cloud, rain...)", &g.weather_shadows))
 			set_config("WeatherShadows", g.weather_shadows);
 		if (u.slider_float("Wet path and stone in rain (0 = off)", &g.wet_ground, 0.0f, 1.0f, "%.2f"))
@@ -3995,8 +3991,6 @@ void worldfx::draw_panel(const ui &u)
 	{
 		if (u.slider_float("Ambient occlusion radius (yalms)", &g.look.ao_radius, 0.3f, 3.0f, "%.2f"))
 			set_config("AORadius", g.look.ao_radius);
-		if (u.checkbox("Shadow map from the zone's meshes (what's off screen casts too)", &g.look.sun_map))
-			set_config("SunMap", g.look.sun_map);
 		if (u.slider_float("Lamp glow reach (times the lamp's own range)", &g.lamp_reach, 0.5f, 3.0f, "%.2f"))
 			set_config("LampReach", g.lamp_reach);
 		if (u.checkbox("Lamps: also lit lights the zone's lamp file doesn't list (from the game's light table)", &g.lamps_unbaked))
@@ -4091,18 +4085,15 @@ namespace
 			flag("GrassCuts", g.grass_cuts);
 			number("AOStrength", g.look.ao_strength, 0.0f, 2.0f);
 			number("AORadius", g.look.ao_radius, 0.3f, 3.0f);
-			number("Relief", g.look.relief, 0.0f, 2.0f);
 			number("SunShadows", g.sun_shadows, 0.0f, 1.0f);
 			number("MoonShadows", g.moon_shadows, 0.0f, 1.0f);
 			flag("SunCharacters", g.look.sun_characters);
-			flag("SunMap", g.look.sun_map);
 			number("LampGlow", g.lamp_glow, 0.0f, 2.0f);
 			number("LampReach", g.lamp_reach, 0.5f, 3.0f);
 			number("LampShadows", g.lamp_shadows, 0.0f, 1.0f);
 			flag("LampsUnbaked", g.lamps_unbaked);
 			number("FixtureGlow", g.fixture_glow, 0.0f, 2.0f);
 			number("EffectGlow", g.effect_glow, 0.0f, 2.0f);
-			flag("WeatherFog", g.weather_fog);
 			flag("WeatherShadows", g.weather_shadows);
 			number("WetGround", g.wet_ground, 0.0f, 1.0f);
 			number("SnowCover", g.snow_cover_amount, 0.0f, 1.0f);

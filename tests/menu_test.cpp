@@ -293,8 +293,8 @@ int main()
 	fake::click = "Ultra";
 	draw();
 	draw();
-	check(value("GrassDistance") == 140.0f && value("AOStrength") == 0.8f && value("SunCharacters") == 1.0f, "Ultra: its values in use");
-	check(saved("GrassDistance") == "140" && saved("AOStrength") == "0.8" && hifi::backend::preset() == "ultra" && fake::has("[Ultra]*"),
+	check(value("GrassDistance") == 140.0f && value("LampShadows") == 0.6f && value("SunCharacters") == 1.0f, "Ultra: its values in use");
+	check(saved("GrassDistance") == "140" && saved("LampShadows") == "0.6" && hifi::backend::preset() == "ultra" && fake::has("[Ultra]*"),
 		"Ultra's values saved, and it shown picked");
 	fake::click = "Off";
 	draw();

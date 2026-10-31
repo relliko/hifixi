@@ -58,9 +58,6 @@ namespace hifi::settings
 				"%.2f", nullptr, false, { 0.0f, 0.5f, 0.55f, 0.6f } },
 			{ "MoonShadows", tab::lighting, "Sun and moon", "Moon shadows", "By night, the moon's shadows as a share of the sun's (0: none).",
 				"%.2f", nullptr, false, { 0.0f, 0.6f, 1.0f, 1.0f } },
-			{ "SunMap", tab::lighting, "Sun and moon", "Shadows from the whole zone",
-				"Shadows from a map of the zone's own meshes, so what's off the screen (a tree behind you, a cliff) casts "
-				"too. Off: only what's on the screen casts.", nullptr, nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			{ "SunCharacters", tab::lighting, "Sun and moon", "Characters cast sun shadows",
 				"Characters and monsters cast long shadows with the rest, in place of the game's own small ones (The game's own tab).",
 				nullptr, nullptr, false, { 0.0f, 0.0f, 1.0f, 1.0f } },
@@ -68,13 +65,11 @@ namespace hifi::settings
 				"The shadows fade as the game dims its sun: weaker under cloud, gone in rain and fog.", nullptr, nullptr, false,
 				{ _, 1.0f, 1.0f, 1.0f } },
 			{ "AOStrength", tab::lighting, "Light on surfaces", "Ambient occlusion",
-				"Darkens corners, creases and the ground where things meet it, as indirect light would (0: off).", "%.2f",
-				nullptr, false, { 0.0f, 0.0f, 0.6f, 0.8f } },
+				"Darkens corners, creases and the ground where things meet it, as indirect light would (0: off; off in every "
+				"preset while it's being redone: it shows as grain on smooth surfaces).", "%.2f",
+				nullptr, false, { 0.0f, 0.0f, 0.0f, 0.0f } },
 			{ "AORadius", tab::lighting, "Light on surfaces", "Its reach", "How far from a corner the darkening reaches, in yalms.",
 				"%.2f yalms", nullptr, false, { _, _, 0.6f, 1.0f } },
-			{ "Relief", tab::lighting, "Light on surfaces", "Surface relief",
-				"Brings out the shape of rock, bark and walls from the light across them (0: off).", "%.2f", nullptr, false,
-				{ 0.0f, 0.0f, 0.4f, 0.6f } },
 			{ "LampGlow", tab::lighting, "Lamps and glows", "Lamp glow",
 				"Lit lamps, torches and street lights pool light on the ground and walls around them (0: off).", "%.2f",
 				nullptr, false, { 0.0f, 0.5f, 0.5f, 0.6f } },
@@ -142,9 +137,6 @@ namespace hifi::settings
 			{ "WaterSea", tab::world, "Water", "The sea to the horizon", "The game's own sea past the zone's edge drawn as World FX "
 				"water, out to the horizon.", nullptr, "Water", false, { 0.0f, 1.0f, 1.0f, 1.0f } },
 			// Weather
-			{ "WeatherFog", tab::world, "Weather", "Fog over the grass and water",
-				"The grass, fireflies and water fade into the game's fog as the world does.", nullptr, nullptr, false,
-				{ _, 1.0f, 1.0f, 1.0f } },
 			{ "WetGround", tab::world, "Weather", "Wet paths and stone in rain",
 				"Paths and stone darken and shine in rain, drying slowly after (0: off).", "%.2f", nullptr, false,
 				{ 0.0f, 0.5f, 0.5f, 0.6f } },
@@ -261,22 +253,11 @@ namespace hifi::settings
 				"FidelityFX Super Resolution 1 (sharp along edges) instead of the game's blur. The menus and text stay at the "
 				"screen's own size. Set a lower background resolution in the launcher for more frames. (/hifi upscale)", nullptr,
 				nullptr, false, { 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
-			{ "upscale.temporal", tab::upscaling, "AMD FSR", "FSR 2: smooth edges over the frames",
-				"With the background resolution at or below the screen's, AMD FidelityFX Super Resolution 2 builds each frame "
-				"from the last ones (the world drawn a fraction of a pixel apart each frame): edges as smooth as a background twice "
-				"the screen's size, for far less work. Set the background resolution to the screen's (or lower, for more frames) "
-				"in the launcher. Off: FSR 1 when the background is smaller. (/hifi upscale)", nullptr, "upscale.fsr", false,
-				{ 0.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
-			{ "upscale.fsr3", tab::upscaling, "AMD FSR", "FSR 3.1 (the newer upscaler)",
-				"AMD FidelityFX Super Resolution 3.1's upscaler in FSR 2's place: the same frames in, less ghosting behind moving "
-				"things, less shimmer, thin things (fences, hair, grass tips) kept better. Off: FSR 2. If it can't be made on "
-				"your graphics card, FSR 2 is used and the Upscaling tab says why.", nullptr, "upscale.temporal", false,
-				{ _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 			{ "upscale.masks", tab::upscaling, "AMD FSR", "Keep effects, water and weather crisp",
 				"FSR is told where the picture changes in ways its motion can't follow: spells, fire and particles the game "
 				"draws, and World FX's water, rain, snow and fireflies. It leans on the frame itself there instead of on the "
 				"frames before, so they don't smear or leave trails. Costs four copies of the world a frame.", nullptr,
-				"upscale.temporal", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
+				"upscale.fsr", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 			{ "upscale.sharpen", tab::upscaling, "AMD FSR", "Sharpening",
 				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most. Much more than the default brings out "
 				"the dithering in the game's own textures (a fine grid on skin and cloth).", "%.2f", "upscale.fsr", false,
@@ -285,7 +266,7 @@ namespace hifi::settings
 				"While FSR 2 draws the world, a frame is made between each two the game draws: motion as smooth as twice the "
 				"frames, the menus and text kept sharp. The game itself then runs at up to half the screen's refresh rate (122 at "
 				"244 Hz) and answers a little later, so it pays most where the game runs below that. Turning it on takes effect "
-				"the next time the game starts; off right away. (/hifi upscale framegen)", nullptr, "upscale.temporal", false,
+				"the next time the game starts; off right away. (/hifi upscale framegen)", nullptr, "upscale.fsr", false,
 				{ 0.0f, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "upscale.framegen_auto", tab::upscaling, "Frame generation", "Only while the game runs below half the refresh rate",
 				"Frames are made between only while the game runs slower than half the screen's refresh rate (122 at 244 Hz), "

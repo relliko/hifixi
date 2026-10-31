@@ -94,7 +94,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.58;
+	constexpr double kVersion = 0.59;
 	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
 	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
@@ -774,8 +774,8 @@ class hifixi final : public IPlugin
 	void follow_upscale()
 	{
 		const bool fsr = hifi::game::option_on("upscale", "fsr", true);
-		hifi::upscale::set_options(fsr && !m_upscale_refused, hifi::game::option_on("upscale", "temporal", true), hifi::game::option_number("upscale", "sharpen", 0.4f),
-			hifi::game::option_on("upscale", "fsr3", true));
+		hifi::upscale::set_options(fsr && !m_upscale_refused, true /* (FSR 3.1 always; the FSR 2 switch is gone since 0.59) */, hifi::game::option_number("upscale", "sharpen", 0.4f),
+			true /* (FSR 3.1, else FSR 2 when it can't be made; no switch since 0.59) */);
 		hifi::framegen::set_on(fsr && hifi::game::option_on("upscale", "framegen", false));
 		hifi::framegen::set_automatic(hifi::game::option_on("upscale", "framegen_auto", true));
 		// (FSR's masks: the world copied at World FX's passes as well as at the characters' end)

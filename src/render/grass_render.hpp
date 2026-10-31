@@ -272,9 +272,11 @@ namespace grass
 		// names, the background) and samples far brighter or darker than the rest
 		bool rule_in_front = true, rule_outliers = true;
 		bool grass = true;              // the blades (off: only the shading below)
-		// The shading pass, before the grass and the interface: ambient occlusion (0 off) within a radius,
-		// and surface relief from the textures' own detail (0 off)
-		float ao_strength = 0.8f, ao_radius = 1.0f, relief = 0.6f;
+		// The shading pass, before the grass and the interface: ambient occlusion (0 off) within a radius, and
+		// surface relief from the textures' own detail (0 off: no longer a setting since 0.59, the native zone's and
+		// characters' normal maps light the real relief; guessed from the brightness, it lifted the textures' dithering
+		// into a grain everywhere)
+		float ao_strength = 0.0f, ao_radius = 1.0f, relief = 0.0f;
 		// Sun shadows: toward the sun (the game's world: x east, y height with down positive, z north, a unit
 		// vector) and how dark its shadows are (0: none, the sun down or no sky)
 		float sun[3] = { 0.0f, -1.0f, 0.0f };
