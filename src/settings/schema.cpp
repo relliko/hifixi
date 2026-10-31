@@ -278,8 +278,9 @@ namespace hifi::settings
 				"frames before, so they don't smear or leave trails. Costs four copies of the world a frame.", nullptr,
 				"upscale.temporal", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 			{ "upscale.sharpen", tab::upscaling, "AMD FSR", "Sharpening",
-				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most.", "%.2f", "upscale.fsr", false,
-				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.8f },
+				"How much the upscaled world is sharpened (AMD's RCAS): 0 none, 1 the most. Much more than the default brings out "
+				"the dithering in the game's own textures (a fine grid on skin and cloth).", "%.2f", "upscale.fsr", false,
+				{ _, _, _, _ }, number, 0.0f, 1.0f, 0.4f },
 			{ "upscale.framegen", tab::upscaling, "Frame generation", "Frame generation (AMD FSR 3)",
 				"While FSR 2 draws the world, a frame is made between each two the game draws: motion as smooth as twice the "
 				"frames, the menus and text kept sharp. The game itself then runs at up to half the screen's refresh rate (122 at "

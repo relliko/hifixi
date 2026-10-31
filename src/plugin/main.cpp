@@ -94,7 +94,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.57;
+	constexpr double kVersion = 0.58;
 	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
 	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
@@ -774,7 +774,7 @@ class hifixi final : public IPlugin
 	void follow_upscale()
 	{
 		const bool fsr = hifi::game::option_on("upscale", "fsr", true);
-		hifi::upscale::set_options(fsr && !m_upscale_refused, hifi::game::option_on("upscale", "temporal", true), hifi::game::option_number("upscale", "sharpen", 0.8f),
+		hifi::upscale::set_options(fsr && !m_upscale_refused, hifi::game::option_on("upscale", "temporal", true), hifi::game::option_number("upscale", "sharpen", 0.4f),
 			hifi::game::option_on("upscale", "fsr3", true));
 		hifi::framegen::set_on(fsr && hifi::game::option_on("upscale", "framegen", false));
 		hifi::framegen::set_automatic(hifi::game::option_on("upscale", "framegen_auto", true));

@@ -104,7 +104,7 @@ namespace hifi::upscale
 			// (lists waiting on a resolve or ours: none, and a draw costs nothing here)
 			std::atomic<uint32_t> armed{ 0 };
 			std::atomic<bool> fsr{ true }, temporal{ true };
-			std::atomic<float> sharpen{ 0.8f };
+			std::atomic<float> sharpen{ 0.4f };
 			std::atomic<uint32_t> tint{ 0x808080 }; // (the game's resolve's: set_tint)
 			uint64_t faded = 0;                      // (frames drawn with a tint other than 0x808080)
 			made_t made;
