@@ -49,6 +49,8 @@ namespace hifi::chars::inject
 		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	};
 	void on_marker(ID3D12Resource *depth);
+	// Our d3d8.dll's word on the depth's planes at a mark (src/host/frameapi.hpp): exact, no barrier needed to know them
+	void set_depth_planes(ID3D12Resource *depth, const D3D12_RESOURCE_STATES planes[2]);
 	// The characters' end marker (kind 3) and each see-through marker (kind 4), with the seq they carry
 	void on_chars_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
 	void on_see_through(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);

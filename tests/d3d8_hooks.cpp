@@ -643,6 +643,14 @@ int main(int argc, char **argv)
 			tri_strip_band(0.5f, 0.75f, 0.5f, 0xFF404040, 4);
 			const int answered = mark(hifi::slotmark::zone_begin, 7);
 			tri_strip_band(-0.5f, 0.0f, 0.5f, 0xFF808080, 4);
+			// (A read into a small target, as a distortion grabs it mid-frame: not the world's end)
+			dev->SetRenderTarget(tiny, nullptr);
+			dev->SetTexture(0, A_tex);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			quad_rhw(-0.5f, -0.5f, 15.5f, 15.5f, 0xFFFFFFFF);
+			dev->SetTexture(0, nullptr);
+			const uint32_t calls_after_grab = g_direct.calls;
+			dev->SetRenderTarget(A, Az);
 			const RECT whole = { 0, 0, LONG(AW), LONG(AH) };
 			const POINT p0 = { 0, 0 };
 			dev->CopyRects(A, &whole, 1, out, &p0);
@@ -660,6 +668,7 @@ int main(int argc, char **argv)
 			std::snprintf(line, sizeof(line), "... and the world's end sent once, by itself, at the first copy reading A (%u calls; the second kind %u, seq %u)",
 				g_direct.calls, g_direct.kinds[1], g_direct.seqs[1]);
 			check(g_direct.calls == 2 && g_direct.kinds[1] == hifi::slotmark::world_end && g_direct.seqs[1] == 7, line);
+			check(calls_after_grab == 1, "... and not at a draw reading A into a 16 x 16 target (a distortion's grab, mid-frame)");
 			check(fm.list != nullptr && fm.rt == world_rt && fm.ds == world_ds && fm.width == AW && fm.height == AH && fm.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET &&
 					fm.rt_format == DXGI_FORMAT_R8G8B8A8_UNORM && fm.ds_format == DXGI_FORMAT_D24_UNORM_S8_UINT && fm.ds_plane_count == 2 &&
 					fm.ds_planes[0] == D3D12_RESOURCE_STATE_DEPTH_WRITE,

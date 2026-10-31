@@ -620,7 +620,7 @@ namespace hifi::d3d8
 
 	HRESULT device::copy_rect(surface *s, const RECT &r0, surface *d, POINT at)
 	{
-		mark_world_read(this, s != nullptr ? s->img : nullptr);
+		mark_world_read(this, s != nullptr ? s->img : nullptr, d != nullptr ? d->img : nullptr);
 		// (clipped to both surfaces)
 		RECT r = r0;
 		r.left = std::max<LONG>(r.left, 0);
@@ -2003,14 +2003,18 @@ namespace hifi::d3d8
 	// reads it after that (mark_world_read)
 	constexpr uint32_t kZoneBegin = 0, kWorldEnd = 13;
 	static ID3D12Resource *g_world = nullptr;
-	static uint32_t g_world_seq = 0;
+	static uint32_t g_world_seq = 0, g_world_width = 0;
 	static bool g_world_ended = true;
 
 	static int mark_now(device *d, uint32_t kind, uint32_t seq);
 
-	void mark_world_read(device *d, const image *read)
+	void mark_world_read(device *d, const image *read, const image *into)
 	{
 		if (g_world_ended || g_world == nullptr || read == nullptr || read->gpu.res != g_world || d != g_mark_device)
+			return;
+		// (only into something at least the world's width: the resolve, a screenshot; a distortion's grab of it into the
+		// 256 x 256 target mid-frame isn't its end)
+		if (into == nullptr || into->gpu.res == g_world || into->width < g_world_width)
 			return;
 		g_world_ended = true;
 		mark_now(d, kWorldEnd, g_world_seq);
@@ -2063,6 +2067,7 @@ namespace hifi::d3d8
 		{
 			g_world = m.rt;
 			g_world_seq = seq;
+			g_world_width = m.width;
 			g_world_ended = m.rt == nullptr;
 		}
 		return 1;

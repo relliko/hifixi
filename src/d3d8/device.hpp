@@ -117,8 +117,9 @@ namespace hifi::d3d8
 		void let_go();
 	};
 
-	// (src/host/frameapi.hpp's world end: before a draw or copy that reads `read`, the first after the zone began)
-	void mark_world_read(device *d, const image *read);
+	// (src/host/frameapi.hpp's world end: before a draw or copy that reads `read` into `into`, the first after the zone
+	// began into something at least the world's width)
+	void mark_world_read(device *d, const image *read, const image *into);
 
 	class device final : public IDirect3DDevice8
 	{

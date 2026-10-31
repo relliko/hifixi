@@ -610,6 +610,7 @@ namespace hifi::backend
 					return;
 				const D3D12_RESOURCE_STATES planes[2] = { fm->ds_planes[0], fm->ds_plane_count > 1 ? fm->ds_planes[1] : fm->ds_planes[0] };
 				zone::inject::set_depth_planes(depth, planes);
+				chars::inject::set_depth_planes(depth, planes);
 			};
 			// (the world's target's state: our d3d8.dll's when it's the one bound, else as the barriers left it)
 			const auto world_rt_state = [&]() { return fm != nullptr && fm->rt != nullptr && fm->rt == zone_rt ? fm->rt_state : d.world_rt_state; };

@@ -306,7 +306,7 @@ namespace hifi::d3d8
 		// (the world's end: this draw reads its target, before anything is bound for it)
 		for (IDirect3DBaseTexture8 *t : cur.textures)
 			if (const base_texture *bt = texture_of(t))
-				mark_world_read(this, bt->img);
+				mark_world_read(this, bt->img, rt->img);
 		const device_state &s = cur;
 
 		// ---- Shaders ----
