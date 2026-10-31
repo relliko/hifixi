@@ -418,8 +418,29 @@ namespace hifi::d3d8
 	{
 		{
 			timer t(perf_log, &perf.present_ms);
+			LARGE_INTEGER presented_at;
+			QueryPerformanceCounter(&presented_at);
 			present_frame(w, src, dst);
+			lf.present_ms += ms_since(presented_at);
 		}
+		// (the long-frame log: this frame against the one before)
+		if (lf.last.QuadPart != 0)
+		{
+			const double frame_ms = ms_since(lf.last);
+			if (frame_ms > kLongFrameMs)
+			{
+				const double inside = g.wait_ms + lf.pso_ms + lf.mark_ms + lf.present_ms;
+				log(1, "a long frame: %.0f ms since the last; waiting for the GPU %.0f ms (%u waits), pipelines made %.0f ms (%u), HiFi XI's passes %.0f ms "
+					"(%u marks, the longest %.0f ms at kind %u), Present %.0f ms; the rest (the game, its add-ons, HiFi XI's game side) %.0f ms",
+					frame_ms, g.wait_ms, g.waits, lf.pso_ms, lf.psos, lf.mark_ms, lf.marks, lf.longest_mark_ms, lf.longest_mark_kind, lf.present_ms,
+					std::max(0.0, frame_ms - inside));
+			}
+		}
+		QueryPerformanceCounter(&lf.last);
+		lf.pso_ms = lf.mark_ms = lf.present_ms = lf.longest_mark_ms = 0;
+		lf.psos = lf.marks = lf.longest_mark_kind = 0;
+		g.wait_ms = 0;
+		g.waits = 0;
 		if (perf_log && ++perf.frames == 30)
 		{
 			const double n = double(perf.frames);
@@ -599,6 +620,7 @@ namespace hifi::d3d8
 
 	HRESULT device::copy_rect(surface *s, const RECT &r0, surface *d, POINT at)
 	{
+		mark_world_read(this, s != nullptr ? s->img : nullptr);
 		// (clipped to both surfaces)
 		RECT r = r0;
 		r.left = std::max<LONG>(r.left, 0);
@@ -1975,40 +1997,79 @@ extern "C" void __cdecl HifiFrameSetHandler(hifi_frame_handler handler, void *co
 	hifi::d3d8::g_mark_context = context;
 }
 
+namespace hifi::d3d8
+{
+	// The world: the target bound at the zone's begin mark; its end (kWorldEnd) sent once, at the first draw or copy that
+	// reads it after that (mark_world_read)
+	constexpr uint32_t kZoneBegin = 0, kWorldEnd = 13;
+	static ID3D12Resource *g_world = nullptr;
+	static uint32_t g_world_seq = 0;
+	static bool g_world_ended = true;
+
+	static int mark_now(device *d, uint32_t kind, uint32_t seq);
+
+	void mark_world_read(device *d, const image *read)
+	{
+		if (g_world_ended || g_world == nullptr || read == nullptr || read->gpu.res != g_world || d != g_mark_device)
+			return;
+		g_world_ended = true;
+		mark_now(d, kWorldEnd, g_world_seq);
+	}
+
+	static int mark_now(device *d, uint32_t kind, uint32_t seq)
+	{
+		if (d == nullptr || g_mark_handler == nullptr || d->g.list() == nullptr)
+			return 0;
+		// (the targets bound and every barrier on the list, so the states handed over are the list's own at this point)
+		d->bind_targets();
+		d->g.flush_barriers();
+		hifi_frame_mark m = {};
+		m.list = d->g.list();
+		if (d->rt != nullptr && d->rt->img != nullptr)
+		{
+			m.rt = d->rt->img->gpu.res;
+			m.rtv = d->rt->rtv();
+			m.rt_format = d->rt->img->gpu_format;
+			m.rt_state = d->rt->img->gpu.state;
+			m.width = d->rt->width();
+			m.height = d->rt->height();
+		}
+		if (d->ds != nullptr && d->ds->img != nullptr)
+		{
+			m.ds = d->ds->img->gpu.res;
+			m.dsv = d->ds->dsv();
+			m.ds_format = d->ds->img->gpu_format;
+			m.ds_plane_count = d->ds->img->gpu.planes;
+			m.ds_planes[0] = d->ds->img->gpu.plane[0];
+			m.ds_planes[1] = d->ds->img->gpu.plane[1];
+		}
+		LARGE_INTEGER called_at;
+		QueryPerformanceCounter(&called_at);
+		g_mark_handler(g_mark_context, kind, seq, &m);
+		const double took = device::ms_since(called_at);
+		d->lf.mark_ms += took;
+		d->lf.marks++;
+		if (took > d->lf.longest_mark_ms)
+		{
+			d->lf.longest_mark_ms = took;
+			d->lf.longest_mark_kind = kind;
+		}
+		// (whatever the handler bound is forgotten: the next draw binds everything again; the heaps and root signature now)
+		d->bound.epoch = 0;
+		ID3D12DescriptorHeap *heaps[2] = { d->g.srv_heap, d->g.sampler_heap };
+		m.list->SetDescriptorHeaps(2, heaps);
+		m.list->SetGraphicsRootSignature(d->g.root);
+		if (kind == kZoneBegin)
+		{
+			g_world = m.rt;
+			g_world_seq = seq;
+			g_world_ended = m.rt == nullptr;
+		}
+		return 1;
+	}
+}
+
 extern "C" int __cdecl HifiFrameMark(uint32_t kind, uint32_t seq)
 {
-	using namespace hifi::d3d8;
-	device *const d = g_mark_device;
-	if (d == nullptr || g_mark_handler == nullptr || d->g.list() == nullptr)
-		return 0;
-	// (the targets bound and every barrier on the list, so the states handed over are the list's own at this point)
-	d->bind_targets();
-	d->g.flush_barriers();
-	hifi_frame_mark m = {};
-	m.list = d->g.list();
-	if (d->rt != nullptr && d->rt->img != nullptr)
-	{
-		m.rt = d->rt->img->gpu.res;
-		m.rtv = d->rt->rtv();
-		m.rt_format = d->rt->img->gpu_format;
-		m.rt_state = d->rt->img->gpu.state;
-		m.width = d->rt->width();
-		m.height = d->rt->height();
-	}
-	if (d->ds != nullptr && d->ds->img != nullptr)
-	{
-		m.ds = d->ds->img->gpu.res;
-		m.dsv = d->ds->dsv();
-		m.ds_format = d->ds->img->gpu_format;
-		m.ds_plane_count = d->ds->img->gpu.planes;
-		m.ds_planes[0] = d->ds->img->gpu.plane[0];
-		m.ds_planes[1] = d->ds->img->gpu.plane[1];
-	}
-	g_mark_handler(g_mark_context, kind, seq, &m);
-	// (whatever the handler bound is forgotten: the next draw binds everything again; the heaps and root signature now)
-	d->bound.epoch = 0;
-	ID3D12DescriptorHeap *heaps[2] = { d->g.srv_heap, d->g.sampler_heap };
-	m.list->SetDescriptorHeaps(2, heaps);
-	m.list->SetGraphicsRootSignature(d->g.root);
-	return 1;
+	return hifi::d3d8::mark_now(hifi::d3d8::g_mark_device, kind, seq);
 }

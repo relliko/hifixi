@@ -117,6 +117,9 @@ namespace hifi::d3d8
 		void let_go();
 	};
 
+	// (src/host/frameapi.hpp's world end: before a draw or copy that reads `read`, the first after the zone began)
+	void mark_world_read(device *d, const image *read);
+
 	class device final : public IDirect3DDevice8
 	{
 	public:
@@ -170,6 +173,23 @@ namespace hifi::d3d8
 		// The calling thread's time in the device (PerfLog=1: logged every 30 frames as a frame's average): draws, clears
 		// (the slot markers' apart: HiFi XI draws inside them), Present
 		bool perf_log = false;
+		// The long-frame log (always on): a frame more than kLongFrameMs after the one before is logged with where its
+		// time went: the GPU waited for, pipelines made, HiFi XI's passes (its marks' handlers), Present, and the rest
+		// (outside this device: the game, Ashita and its add-ons, HiFi XI's game side)
+		static constexpr double kLongFrameMs = 250.0;
+		struct long_frame
+		{
+			LARGE_INTEGER last = {};
+			double pso_ms = 0, mark_ms = 0, present_ms = 0, longest_mark_ms = 0;
+			uint32_t psos = 0, marks = 0, longest_mark_kind = 0;
+		} lf;
+		static double ms_since(const LARGE_INTEGER &t0)
+		{
+			LARGE_INTEGER t1, f;
+			QueryPerformanceCounter(&t1);
+			QueryPerformanceFrequency(&f);
+			return double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
+		}
 		struct perf_counters
 		{
 			double draw_ms = 0, clear_ms = 0, marker_ms = 0, present_ms = 0, max_marker_ms = 0;

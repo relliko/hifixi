@@ -163,6 +163,8 @@ namespace
 		// Zone and blades
 		uint32_t frames = 0;
 		uint32_t last_resolve_frame = 0;      // the frame grass last went in at the world's end (its read barrier)
+		uint32_t last_end_mark_frame = 0;     // the frame our d3d8.dll last said where the world ends (on_world_end)
+		uint64_t end_marks = 0;
 		// The world's views as last bound, for grass at its end on a list that has moved off it already
 		uint64_t world_rtv = 0, world_dsv = 0;
 		// The states the last barrier (on any list) put the world's target and depth in
@@ -2795,7 +2797,9 @@ namespace worldfx
 					d.world_ended = resources[i];
 					if (g.logging_moves && g.moves.size() < 1500)
 						g.moves += " rt-read";
-					if (!d.grass_done && g.world_rtv != 0 && g.world_dsv != 0)
+					// (our d3d8.dll says where the world ends: the barrier only follows the states then)
+					const bool marked_end = g.end_marks != 0 && g.frames - g.last_end_mark_frame <= kBarrierFrames;
+					if (!marked_end && !d.grass_done && g.world_rtv != 0 && g.world_dsv != 0)
 					{
 						d.grass_done = true;
 						g.last_resolve_frame = g.frames;
@@ -2819,6 +2823,22 @@ namespace worldfx
 			else if (resources[i] == g.world_ds)
 				g.last_ds_state = d.world_ds_state = after[i];
 		}
+	}
+
+	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.end_marks++;
+		g.last_end_mark_frame = g.frames;
+		if (d.grass_done || g.world_rtv == 0 || g.world_dsv == 0)
+			return;
+		d.grass_done = true;
+		d.world_ended = g.world_rt;
+		g.last_resolve_frame = g.frames;
+		if (resource_of(g.world_rtv) == g.world_rt && resource_of(g.world_dsv) == g.world_ds)
+			inject(list, d, g.world_rtv, g.world_dsv);
+		else
+			g.skip = "the world's views hold something else now (skipped)";
 	}
 
 	void on_clear_depth(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, bool depth, uint32_t rect_count, const D3D12_RECT *rects)

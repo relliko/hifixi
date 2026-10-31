@@ -303,6 +303,10 @@ namespace hifi::d3d8
 			return D3DERR_INVALIDCALL;
 		if (g.draws_in_list >= kSplitDraws)
 			g.submit(false);
+		// (the world's end: this draw reads its target, before anything is bound for it)
+		for (IDirect3DBaseTexture8 *t : cur.textures)
+			if (const base_texture *bt = texture_of(t))
+				mark_world_read(this, bt->img);
 		const device_state &s = cur;
 
 		// ---- Shaders ----
@@ -798,7 +802,11 @@ namespace hifi::d3d8
 			pd.RTVFormats[0] = kTargetView;
 			pd.DSVFormat = has_ds ? ds->img->gpu_format : DXGI_FORMAT_UNKNOWN;
 			pd.SampleDesc.Count = pk.samples;
+			LARGE_INTEGER made_at;
+			QueryPerformanceCounter(&made_at);
 			const HRESULT hr = g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pe.pso));
+			lf.pso_ms += ms_since(made_at);
+			lf.psos++;
 			if (FAILED(hr))
 			{
 				log_once(2, "a pipeline couldn't be made (0x%08lX)", static_cast<unsigned long>(hr));

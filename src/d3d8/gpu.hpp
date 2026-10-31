@@ -117,6 +117,10 @@ namespace hifi::d3d8
 		// Called before each submit (the device: nothing to do yet) and after each reset (the device marks its bindings gone)
 		std::function<void()> on_reset;
 
+		// (the long-frame log's: this frame's time waiting for the GPU on the calling thread, and how many waits)
+		double wait_ms = 0;
+		uint32_t waits = 0;
+
 	private:
 		struct page
 		{

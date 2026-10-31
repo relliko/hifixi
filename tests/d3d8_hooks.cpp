@@ -297,15 +297,18 @@ namespace
 	// white, then binds nothing and a 1x1 viewport (the draw after must bind the game's again)
 	struct direct_seen
 	{
-		uint32_t calls = 0, kind = 0, seq = 0;
-		hifi_frame_mark m = {};
+		uint32_t calls = 0, kinds[4] = {}, seqs[4] = {};
+		hifi_frame_mark m = {}; // (the first call's)
 	} g_direct;
 	void __cdecl direct_handler(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *m)
 	{
-		g_direct.calls++;
-		g_direct.kind = kind;
-		g_direct.seq = seq;
-		g_direct.m = *m;
+		if (g_direct.calls < 4)
+		{
+			g_direct.kinds[g_direct.calls] = kind;
+			g_direct.seqs[g_direct.calls] = seq;
+		}
+		if (g_direct.calls++ == 0)
+			g_direct.m = *m;
 		if (m->rt != nullptr && m->rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET)
 		{
 			const float white[4] = { 1, 1, 1, 1 };
@@ -638,7 +641,7 @@ int main(int argc, char **argv)
 			dev->SetRenderState(D3DRS_ZENABLE, TRUE);
 			dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 			tri_strip_band(0.5f, 0.75f, 0.5f, 0xFF404040, 4);
-			const int answered = mark(hifi::slotmark::zone_end, 7);
+			const int answered = mark(hifi::slotmark::zone_begin, 7);
 			tri_strip_band(-0.5f, 0.0f, 0.5f, 0xFF808080, 4);
 			const RECT whole = { 0, 0, LONG(AW), LONG(AH) };
 			const POINT p0 = { 0, 0 };
@@ -652,8 +655,11 @@ int main(int argc, char **argv)
 			dev->Present(nullptr, nullptr, nullptr, nullptr);
 			set(nullptr, nullptr);
 			const hifi_frame_mark &fm = g_direct.m;
-			check(answered == 1 && g_direct.calls == 1 && g_direct.kind == hifi::slotmark::zone_end && g_direct.seq == 7,
-				"HifiFrameMark: the handler called once, with the kind and seq");
+			check(answered == 1 && g_direct.kinds[0] == hifi::slotmark::zone_begin && g_direct.seqs[0] == 7,
+				"HifiFrameMark: the handler called with the kind and seq");
+			std::snprintf(line, sizeof(line), "... and the world's end sent once, by itself, at the first copy reading A (%u calls; the second kind %u, seq %u)",
+				g_direct.calls, g_direct.kinds[1], g_direct.seqs[1]);
+			check(g_direct.calls == 2 && g_direct.kinds[1] == hifi::slotmark::world_end && g_direct.seqs[1] == 7, line);
 			check(fm.list != nullptr && fm.rt == world_rt && fm.ds == world_ds && fm.width == AW && fm.height == AH && fm.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET &&
 					fm.rt_format == DXGI_FORMAT_R8G8B8A8_UNORM && fm.ds_format == DXGI_FORMAT_D24_UNORM_S8_UINT && fm.ds_plane_count == 2 &&
 					fm.ds_planes[0] == D3D12_RESOURCE_STATE_DEPTH_WRITE,

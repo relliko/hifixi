@@ -258,8 +258,14 @@ namespace hifi::d3d8
 	{
 		if (fence->GetCompletedValue() >= value)
 			return;
+		LARGE_INTEGER t0, t1, f;
+		QueryPerformanceCounter(&t0);
 		fence->SetEventOnCompletion(value, fence_event);
 		WaitForSingleObject(fence_event, INFINITE);
+		QueryPerformanceCounter(&t1);
+		QueryPerformanceFrequency(&f);
+		wait_ms += double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
+		waits++;
 	}
 
 	void gpu::wait_idle()

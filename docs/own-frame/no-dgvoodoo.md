@@ -63,6 +63,12 @@ dgVoodoo was a closed box: HiFi XI watched its Direct3D 12 output from outside.
   `on_frame_mark` (into the same `on_mark` dispatch); the five game-side senders (zoneslot, charslot, fxdraw, uidraw,
   worldmark) call src/game/directmark.hpp first and send the stencil pixel only when that answers 0. d3d8_hooks checks
   the channel (plain and debug layer). Every plugin suite green.
+- Step 3, part 1 (2026-10-30): the world's end said directly. d3d8.dll remembers the target bound at the zone-begin mark
+  and sends slotmark::world_end (13) once, at the start of the first draw or copy that reads it (the resolve), before
+  binding anything; World FX's `on_world_end` draws there, and its read-barrier inference stands down while those
+  come. d3d8.dll also logs any frame over 250 ms with where its time went (GPU waits, pipelines made, HiFi XI's passes,
+  Present, the rest outside it). grass::shader_key ignores "\r" (the embedded copy and a CRLF file on disk matched
+  never: grass_test's key check failed in a CRLF checkout, an installed worldfx.hlsl would be compiled again).
 - Found: tests\ui2d_dgv crashes on our d3d8.dll in `replay_d12` (it reaches into dgVoodoo itself), with the d3d8.dll
   from before step 2 too: it was only ever run against dgVoodoo. build.cmd now copies our d3d8.dll into build\dgv (was:
   whatever the game folder had). To be rewritten in step 5.

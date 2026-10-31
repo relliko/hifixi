@@ -849,12 +849,19 @@ namespace hifi::backend
 		// marks one of its passes; the same dispatch as a stencil marker's, with no pixel to spot
 		void __cdecl on_frame_mark(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *fm)
 		{
-			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || fm->dsv.ptr == 0)
+			// (the world's end comes with the resolve's targets bound, often no depth; every other mark is on a depth)
+			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || (fm->dsv.ptr == 0 && kind != slotmark::world_end))
 				return;
 			worldfx::list_data *const d = live(fm->list);
 			if (d == nullptr)
 				return;
 			host::quiet q;
+			// (the world's end: World FX draws into it there, before the resolve reads it)
+			if (kind == slotmark::world_end)
+			{
+				worldfx::on_world_end(fm->list, *d);
+				return;
+			}
 			slotmark::mark m;
 			m.kind = kind;
 			m.seq = seq & 15;

@@ -155,6 +155,10 @@ namespace worldfx
 	void on_root_descriptor(list_data &d, ID3D12RootSignature *root, uint32_t param, grass::root_arg::kind_t kind, uint64_t address);
 	// Transitions, each resource and the state it's moved to (after)
 	void on_barrier(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after);
+	// Our d3d8.dll's world end (src/host/frameapi.hpp, slotmark::world_end): the first draw or copy reading the world's
+	// target, before anything is bound for it. World FX draws into the world here; while these come, the world's read
+	// barrier no longer decides it.
+	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d);
 	void on_clear_depth(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, bool depth, uint32_t rect_count, const D3D12_RECT *rects); // before
 	void on_clear_target(list_data &d, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects);                      // before
 	void on_draw(list_data &d, uint64_t vertices); // before (vertices or indices times instances)

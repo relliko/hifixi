@@ -2001,7 +2001,16 @@ namespace grass
 			h = fnv(e.entry, std::strlen(e.entry) + 1, h);
 			h = fnv(e.target, std::strlen(e.target) + 1, h);
 		}
-		return fnv(source.data(), source.size(), h);
+		// (line ends don't count: the built-in copy is embedded with "\n" ones, a file on disk may have "\r\n" ones, and
+		// the same shaders keep the same key; a source without "\r" hashes as before)
+		if (source.find('\r') == std::string::npos)
+			return fnv(source.data(), source.size(), h);
+		std::string plain;
+		plain.reserve(source.size());
+		for (const char c : source)
+			if (c != '\r')
+				plain += c;
+		return fnv(plain.data(), plain.size(), h);
 	}
 
 	bool compile_shaders(const std::string &source, const std::wstring &cache_folder, shader_code &out, bool &from_cache, std::string &error)
