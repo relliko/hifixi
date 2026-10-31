@@ -49,7 +49,7 @@ namespace
 
 	constexpr uintptr_t kSite = 0x04609D;   // mov al, [ebp+17Ah] in 046070, every effect element's draw
 	constexpr const char *kPattern = "8D8DF8000000D91C2450E8????????8B00A3????????8A857A01000084C00F85";
-	constexpr uint32_t kSize = 0x270, kCode = 0x190, kCodeSize = 0xE0;
+	constexpr uint32_t kSize = 0x2A4, kCode = 0x190, kCodeSize = 0x114;
 	constexpr uint32_t kAllWord = 0x0C;     // the routine's all word (not 0: every weather element skipped)
 
 	// The routine for its memory at 0x30000000, written out (capstone's reading of it in the comments; the addon's was
@@ -85,8 +85,18 @@ namespace
 		"3C01" "7409"      // 73        cmp  al, 1; je found (80)
 		"3C05" "7503"      // 77        cmp  al, 5; jne out
 		"49" "75E3"        // 7B        dec  ecx; jnz up (61)
-		"EB49"             // 7E out:   jmp  out2 (C9)
+		"EB7D"             // 7E out:   jmp  out2 (FD)
 		"8B5620"           // 80 found: mov  edx, [esi+20h]
+		"84DB" "7430"      // 83        test bl, bl; jz keep (B7)       all mode spares the game's sky objects:
+		"81FA73746172" "7426" // 87     cmp  edx, 'star'; je spare (B5)
+		"81FA6D6F6F6E" "741E" // 8F     cmp  edx, 'moon'; je spare
+		"6681FA6C66" "7417" // 97       cmp  dx, 'lf'; je spare
+		"8B85FC000000"     // 9E        mov  eax, [ebp+0FCh]
+		"8B00" "8B4020"    // A4        mov  eax, [eax]; mov eax, [eax+20h]  the generator's name
+		"25FFFFFF00"       // A9        and  eax, 0FFFFFFh
+		"3D73756E00" "7502" // AE       cmp  eax, 'sun'; jne keep
+		"30DB"             // B5 spare: xor  bl, bl
+		// (from here on as before, 34h further)
 		"8B0D04000030"     // 83        mov  ecx, [30000004h]           seen_at
 		"83E11F"           // 89        and  ecx, 1Fh
 		"8914CD90000030"   // 8C        mov  [ecx*8+30000090h], edx     seen
@@ -305,7 +315,7 @@ namespace
 		check(uint8_t(call[0]) == 0xE8 && target == mem + kCode && uint8_t(call[5]) == 0x90, "04609D calls the routine (then a nop)");
 		check(bytes_at(site + 6, 32) == file_bytes(path, kSite + 6, 32) && bytes_at(site - 32, 32) == file_bytes(path, kSite - 32, 32),
 			"only those 6 bytes changed around it");
-		check(bytes_at(mem + kCode, kCodeSize) == from_hex(kRoutine), "the routine is as written out here, byte for byte (224 bytes)");
+		check(bytes_at(mem + kCode, kCodeSize) == from_hex(kRoutine), "the routine is as written out here, byte for byte (276 bytes)");
 		// (its page past it too: nothing written beyond the routine's memory)
 		check(bytes_at(mem + kCode + kCodeSize, 0x1000 - kCode - kCodeSize) == std::string(0x1000 - kCode - kCodeSize, '\0'),
 			"  and nothing past it (to the end of its page)");

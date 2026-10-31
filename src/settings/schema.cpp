@@ -187,12 +187,9 @@ namespace hifi::settings
 			{ "GloomFog", tab::world, "Weather", "Gloom", "In gloom and darkness, fog banks lying along the ground (0: none).",
 				"%.2f", "WeatherOwn", false, { _, _, 1.0f, 1.0f } },
 			// Sky
-			{ "Sky", tab::world, "Sky", "Sky", "The game's sky gradient drawn smooth, with a sun, a moon and stars of its own.",
+			{ "Sky", tab::world, "Sky", "Sky", "The game's sky gradient drawn smooth, without its bands. Its stars, constellations, moon and sun stay the "
+				"game's own, as it places them.",
 				nullptr, nullptr, false, { 0.0f, 0.0f, 1.0f, 1.0f } },
-			{ "SkySun", tab::world, "Sky", "Its sun and moon", "How bright they are (0: none).", "%.2f", "Sky", false,
-				{ _, _, 1.0f, 1.0f } },
-			{ "SkyStars", tab::world, "Sky", "Its stars", "How bright the stars are at night (0: none).", "%.2f", "Sky", false,
-				{ _, _, 1.0f, 1.0f } },
 
 			// Distance and display (drawcull's, now HiFi XI's: [drawcull])
 			{ "drawcull.world", tab::distance, "View distance", "World", "How far the zone is drawn, times the game's own.", "%.1fx",

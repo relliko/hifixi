@@ -414,7 +414,6 @@ namespace
 		// how high the sun is by the hour (its sine: night below 0) and whether the game's light is above the horizon
 		// (place_sun), for them
 		bool sky_on = false;
-		float sky_sun = 1.0f, sky_stars = 1.0f;
 		bool sky_debug = false; // (the debug view: what's repainted, what's left)
 		float hour_up = 0.0f;
 		bool light_up = false;
@@ -1639,12 +1638,16 @@ namespace
 			const float up = g.hour_up;
 			const float moon_in = std::clamp((-up - 0.1f) / 0.1f, 0.0f, 1.0f);
 			d.moon = up < 0.0f ? 1.0f : 0.0f;
-			d.sun = g.light_up ? g.sky_sun * clarity * (up >= 0.0f ? 1.0f : moon_in * (g.sun_from_game ? 1.0f : 0.0f)) : 0.0f;
+			// (no sun, moon or stars of its own: the sky's are the game's own objects over it, FFXI's constellations, its
+			// moon in its phase and its sun, which the weather's hiding spares; World FX paints only the gradient under them)
+			(void)moon_in;
+			(void)clarity;
+			d.sun = 0.0f;
 			static const float low_sun[3] = { 1.0f, 0.62f, 0.38f }, high_sun[3] = { 1.0f, 0.95f, 0.85f }, moon_light[3] = { 0.8f, 0.85f, 1.0f };
 			const float high = std::clamp(up / 0.4f, 0.0f, 1.0f);
 			for (int k = 0; k < 3; ++k)
 				d.disc[k] = up >= 0.0f ? low_sun[k] + (high_sun[k] - low_sun[k]) * high : moon_light[k];
-			d.stars = g.sky_stars * clarity * std::clamp((-up - 0.02f) / 0.15f, 0.0f, 1.0f);
+			d.stars = 0.0f;
 			d.star_turn = float(vanadiel_hour() / 24.0 * 6.283185307179586);
 			// (the moon's phase, its lit side as a northern sky has it: toward the west, the evening sun's side, while
 			// it waxes, toward the east while it wanes; the world's x is east)
@@ -3922,10 +3925,6 @@ void worldfx::draw_panel(const ui &u)
 			set_config("SnowAmount", g.snow_amount);
 		if (u.checkbox("Sky of its own: the game's gradient smooth, with a sun, a moon and stars", &g.sky_on))
 			set_config("Sky", g.sky_on);
-		if (u.slider_float("Its sun and moon (0 = none)", &g.sky_sun, 0.0f, 2.0f, "%.2f"))
-			set_config("SkySun", g.sky_sun);
-		if (u.slider_float("Its stars (0 = none)", &g.sky_stars, 0.0f, 2.0f, "%.2f"))
-			set_config("SkyStars", g.sky_stars);
 		if (u.checkbox("All of the weather its own (with its sky, under open sky: the game's weather left out, its sky layers too)", &g.weather_own))
 			set_config("WeatherOwn", g.weather_own);
 		u.text_disabled("  each part below off: only World FX's goes, the game's stays left out");
@@ -4106,8 +4105,6 @@ namespace
 			flag("Snow", g.snow_on);
 			number("SnowAmount", g.snow_amount, 0.0f, 2.0f);
 			flag("Sky", g.sky_on);
-			number("SkySun", g.sky_sun, 0.0f, 2.0f);
-			number("SkyStars", g.sky_stars, 0.0f, 2.0f);
 			flag("WeatherOwn", g.weather_own);
 			flag("Clouds", g.clouds_on);
 			whole("CloudQuality", g.cloud_quality, 0, 2);

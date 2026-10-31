@@ -42,11 +42,11 @@ namespace hifi::game::gamerain
 			constexpr uint32_t all = 0x0C;     // u32: not 0: every weather element skipped (all mode), the list not looked at for it
 			constexpr uint32_t list = 0x10;    // 16 pairs of u32: weather name, model name (0: any but the sky layers); a 0 name ends it
 			constexpr uint32_t seen = 0x90;    // 32 pairs of u32: the weather and model of the last weather elements that came by
-			constexpr uint32_t code = 0x190;   // the routine called in place of "mov al, [ebp+17Ah]" (224 bytes)
-			constexpr uint32_t size = 0x270;
+			constexpr uint32_t code = 0x190;   // the routine called in place of "mov al, [ebp+17Ah]" (276 bytes)
+			constexpr uint32_t size = 0x2A4;
 			constexpr uint32_t max = 16;
 			constexpr uint32_t seen_max = 32;
-			constexpr uint32_t code_size = 0xE0;
+			constexpr uint32_t code_size = 0x114;
 		}
 
 		constexpr const char *kSite = "8D8DF8000000D91C2450E8????????8B00A3????????8A857A01000084C00F85"; // 046087, the mov at +0x16
@@ -120,7 +120,7 @@ namespace hifi::game::gamerain
 			}
 		};
 
-		// The routine (called with ebp = the element; everything but al is kept); false if it isn't 224 bytes. bl is the
+		// The routine (called with ebp = the element; everything but al is kept); false if it isn't 276 bytes. bl is the
 		// answer all the way down: all mode sets it as soon as the element is known to be a weather's, so every way out
 		// from there (no folder found, a model on no list) skips it; the one count of skipped draws is at the end, so an
 		// element both in all mode and on the list is counted once.
@@ -171,9 +171,27 @@ namespace hifi::game::gamerain
 			c.op({ 0x75, 0x03 });                                               // 79        jne  out
 			c.op({ 0x49 });                                                     // 7B        dec  ecx
 			c.op({ 0x75, 0xE3 });                                               // 7C        jnz  up
-			c.op({ 0xEB, 0x49 });                                               // 7E out:   jmp  out2
+			c.op({ 0xEB, 0x7D });                                               // 7E out:   jmp  out2
 			c.op({ 0x8B, 0x56, 0x20 });                                         // 80 found: mov  edx, [esi+20h]           the weather's name
-			c.op({ 0x8B, 0x0D }).at(mem + gr::seen_at);                         // 83        mov  ecx, [seen_at]
+			// (all mode spares the game's own sky objects, FFXI's lore: what's in a star or moon folder (their own folder is
+			// the first found going up: the constellations, the moon in its phase and its halo), a lens flare's folder (lf..:
+			// left to HiFi XI's "Hide the lens flare"), and the sun, whose generator is sun.. at the weather's own level)
+			c.op({ 0x84, 0xDB });                                               // 83        test bl, bl                   all mode?
+			c.op({ 0x74, 0x30 });                                               // 85        jz   keep
+			c.op({ 0x81, 0xFA, 's', 't', 'a', 'r' });                           // 87        cmp  edx, 'star'
+			c.op({ 0x74, 0x26 });                                               // 8D        je   spare
+			c.op({ 0x81, 0xFA, 'm', 'o', 'o', 'n' });                           // 8F        cmp  edx, 'moon'
+			c.op({ 0x74, 0x1E });                                               // 95        je   spare
+			c.op({ 0x66, 0x81, 0xFA, 'l', 'f' });                               // 97        cmp  dx, 'lf'
+			c.op({ 0x74, 0x17 });                                               // 9C        je   spare
+			c.op({ 0x8B, 0x85, 0xFC, 0x00, 0x00, 0x00 });                       // 9E        mov  eax, [ebp+0FCh]          the generator's
+			c.op({ 0x8B, 0x00 });                                               // A4        mov  eax, [eax]
+			c.op({ 0x8B, 0x40, 0x20 });                                         // A6        mov  eax, [eax+20h]           own name
+			c.op({ 0x25, 0xFF, 0xFF, 0xFF, 0x00 });                             // A9        and  eax, 0FFFFFFh
+			c.op({ 0x3D, 's', 'u', 'n', 0x00 });                                // AE        cmp  eax, 'sun'
+			c.op({ 0x75, 0x02 });                                               // B3        jne  keep
+			c.op({ 0x30, 0xDB });                                               // B5 spare: xor  bl, bl                   drawn
+			c.op({ 0x8B, 0x0D }).at(mem + gr::seen_at);                         // B7 keep:  mov  ecx, [seen_at]           (offsets below: +34h)
 			c.op({ 0x83, 0xE1, 0x1F });                                         // 89        and  ecx, 31
 			c.op({ 0x89, 0x14, 0xCD }).at(mem + gr::seen);                      // 8C        mov  [seen+ecx*8], edx
 			c.op({ 0x89, 0x3C, 0xCD }).at(mem + gr::seen + 4);                  // 93        mov  [seen+4+ecx*8], edi

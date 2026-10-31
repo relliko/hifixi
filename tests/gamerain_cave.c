@@ -309,6 +309,18 @@ int main(int argc, char **argv)
 		a[m].e = no_model; a[m].hidden = 1; a[m++].what = "thunderstorm's generator without a model command: hidden";
 		a[m].e = deep; a[m].hidden = 1; a[m++].what = "clones 4 deep (no folder found): hidden (a weather generator's all the same)";
 		a[m].e = outside; a[m].hidden = 1; a[m++].what = "a weather-marked generator outside any weather folder (effe): hidden";
+		// (the game's own sky objects, FFXI's lore, spared: what's in a star or moon folder, a lens flare's lf.. folder,
+		// a generator named sun..; a sun model from another generator stays hidden: snow's sun2 above)
+		{
+			object *fine = folder("fine", weat);
+			object *sun1 = generator(fine, "suns", 1);
+			*(DWORD *)(sun1->b + 0x20) = name_of("sun1");
+			a[m].e = element(generator(folder("star", fine), "sta1", 1), 0x00400000); a[m].hidden = 0; a[m++].what = "fine weather's stars (its star folder): drawn";
+			a[m].e = element(generator(folder("moon", fine), "moon", 1), 0x00400000); a[m].hidden = 0; a[m++].what = "fine weather's moon (its moon folder): drawn";
+			a[m].e = element(generator(folder("lf02", fine), "lf02", 1), 0); a[m].hidden = 0; a[m++].what = "fine weather's lens flare (its lf02 folder): drawn";
+			a[m].e = element(sun1, 0x00400000); a[m].hidden = 0; a[m++].what = "fine weather's sun (generator sun1): drawn";
+			a[m].e = element(generator(fine, "cld_", 1), 0x00400000); a[m].hidden = 1; a[m++].what = "fine weather's clouds: hidden still";
+		}
 
 		for (int i = 0; i < 64; ++i)
 			seen[i] = 0;
