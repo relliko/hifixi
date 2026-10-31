@@ -69,6 +69,12 @@ dgVoodoo was a closed box: HiFi XI watched its Direct3D 12 output from outside.
   come. d3d8.dll also logs any frame over 250 ms with where its time went (GPU waits, pipelines made, HiFi XI's passes,
   Present, the rest outside it). grass::shader_key ignores "\r" (the embedded copy and a CRLF file on disk matched
   never: grass_test's key check failed in a CRLF checkout, an installed worldfx.hlsl would be compiled again).
+- Step 3, part 2 (2026-10-30): the marks' handlers take our d3d8.dll's word (on_mark's `fm`): the world's target and
+  its state, what's bound (the passes' bound_rt/ds/format), and the depth's planes set exactly in zone::inject
+  (`set_depth_planes`): no window after a new depth where the planes are unknown till a barrier shows them.
+- Left of step 3: the stencil-pixel path itself (the game side's Clear fallback, `ev_clear_depth`'s decoding, the
+  zoneslot/charslot/d3d8_hooks tests built on it), list_state capture/restore around our passes (our d3d8.dll rebinds
+  after a mark anyway), World FX's barrier inference and world-size learning once world_end is proven in game.
 - Found: tests\ui2d_dgv crashes on our d3d8.dll in `replay_d12` (it reaches into dgVoodoo itself), with the d3d8.dll
   from before step 2 too: it was only ever run against dgVoodoo. build.cmd now copies our d3d8.dll into build\dgv (was:
   whatever the game folder had). To be rewritten in step 5.
