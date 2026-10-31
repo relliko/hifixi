@@ -47,6 +47,8 @@ namespace hifi::zone::inject
 	};
 	// Any marker: the world's depth (its planes followed from now on)
 	void on_marker(ID3D12Resource *depth);
+	// Our d3d8.dll's word on the depth's planes at a mark (src/host/frameapi.hpp): exact, no barrier needed to know them
+	void set_depth_planes(ID3D12Resource *depth, const D3D12_RESOURCE_STATES planes[2]);
 	// The world's depth planes' states as dgVoodoo's barriers left them (depth, stencil), for others drawing into it at
 	// the markers (World FX's blades at the zone's end); false when that isn't this depth or a plane isn't known yet
 	bool depth_planes(ID3D12Resource *depth, D3D12_RESOURCE_STATES out[2]);

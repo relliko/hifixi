@@ -360,6 +360,16 @@ namespace hifi::zone::inject
 		}
 	}
 
+	void set_depth_planes(ID3D12Resource *depth, const D3D12_RESOURCE_STATES planes[2])
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (depth == nullptr)
+			return;
+		g.depth = depth;
+		g.plane[0] = planes[0];
+		g.plane[1] = planes[1];
+	}
+
 	void on_marker(ID3D12Resource *depth)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);

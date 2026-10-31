@@ -600,8 +600,19 @@ namespace hifi::backend
 		ID3D12Resource *zone_rt = nullptr;
 		DXGI_FORMAT zone_rt_format = DXGI_FORMAT_UNKNOWN;
 
-		void on_mark(ID3D12GraphicsCommandList *list, worldfx::list_data &d, uint64_t dsv, const slotmark::mark &m)
+		// fm: our d3d8.dll's word at the mark (src/host/frameapi.hpp), what's bound and the states exactly; nullptr for a
+		// stencil marker (the states as the barriers seen left them)
+		void on_mark(ID3D12GraphicsCommandList *list, worldfx::list_data &d, uint64_t dsv, const slotmark::mark &m, const hifi_frame_mark *fm = nullptr)
 		{
+			// (the depth's planes from our d3d8.dll, after the trackers have taken the depth in)
+			const auto exact_planes = [&](ID3D12Resource *depth) {
+				if (fm == nullptr || depth == nullptr || fm->ds != depth)
+					return;
+				const D3D12_RESOURCE_STATES planes[2] = { fm->ds_planes[0], fm->ds_plane_count > 1 ? fm->ds_planes[1] : fm->ds_planes[0] };
+				zone::inject::set_depth_planes(depth, planes);
+			};
+			// (the world's target's state: our d3d8.dll's when it's the one bound, else as the barriers left it)
+			const auto world_rt_state = [&]() { return fm != nullptr && fm->rt != nullptr && fm->rt == zone_rt ? fm->rt_state : d.world_rt_state; };
 			marks_seen[m.kind].fetch_add(1, std::memory_order_relaxed);
 			// (the own-frame passes: their module draws at its marker, src/host/passes.hpp)
 			if (m.kind >= slotmark::first_pass)
@@ -612,6 +623,7 @@ namespace hifi::backend
 				{
 					zone::inject::on_marker(depth);
 					chars::inject::on_marker(depth);
+					exact_planes(depth);
 				}
 				// (and the upscaled world, when it waits for the next call after the resolve, goes in before what they
 				// draw: a marker isn't a clear to it)
@@ -624,11 +636,11 @@ namespace hifi::backend
 				w.ds = depth;
 				w.rt_format = zone_rt_format;
 				w.ds_format = port_format_of_view(dsv);
-				w.rt_state = d.world_rt_state;
+				w.rt_state = world_rt_state();
 				w.planes_known = zone::inject::depth_planes(depth, w.ds_planes);
-				w.bound_rt = d.rt0;
-				w.bound_ds = d.ds;
-				w.bound_rt_format = d.state.rtv_count != 0 ? port_format_of_view(uint64_t(d.state.rtvs[0].ptr)) : DXGI_FORMAT_UNKNOWN;
+				w.bound_rt = fm != nullptr ? fm->rt : d.rt0;
+				w.bound_ds = fm != nullptr ? fm->ds : d.ds;
+				w.bound_rt_format = fm != nullptr ? fm->rt_format : d.state.rtv_count != 0 ? port_format_of_view(uint64_t(d.state.rtvs[0].ptr)) : DXGI_FORMAT_UNKNOWN;
 				passes::dispatch(m.kind, list, d.state, w, m.seq);
 				return;
 			}
@@ -646,10 +658,17 @@ namespace hifi::backend
 			ID3D12Resource *const depth = port_resource_of_view(dsv);
 			zone::inject::on_marker(depth);
 			chars::inject::on_marker(depth); // (native characters)
+			exact_planes(depth);
 			if (m.kind == slotmark::zone_begin)
 				worldfx::on_world_marker(d, dsv);
-			// The world's target: the one bound with this depth on this list, else the one found with it before
-			if (depth != nullptr && d.ds == depth && d.rt0 != nullptr && d.state.rtv_count != 0)
+			// The world's target: the one bound with this depth (our d3d8.dll says; else as this list last bound them), else
+			// the one found with it before
+			if (fm != nullptr && depth != nullptr && fm->ds == depth && fm->rt != nullptr)
+			{
+				zone_rt = fm->rt;
+				zone_rt_format = fm->rt_format;
+			}
+			else if (depth != nullptr && d.ds == depth && d.rt0 != nullptr && d.state.rtv_count != 0)
 			{
 				zone_rt = d.rt0;
 				zone_rt_format = port_format_of_view(uint64_t(d.state.rtvs[0].ptr));
@@ -661,7 +680,7 @@ namespace hifi::backend
 				w.ds = depth;
 				w.rt_format = zone_rt_format;
 				w.ds_format = port_format_of_view(dsv);
-				w.rt_state = d.world_rt_state;
+				w.rt_state = world_rt_state();
 				zone::inject::on_zone_end(list, d.state, w, m.seq);
 				// (then World FX's blades, written into the world's depth before the characters and effects)
 				D3D12_RESOURCE_STATES planes[2];
@@ -676,7 +695,7 @@ namespace hifi::backend
 				w.ds = depth;
 				w.rt_format = zone_rt_format;
 				w.ds_format = port_format_of_view(dsv);
-				w.rt_state = d.world_rt_state;
+				w.rt_state = world_rt_state();
 				if (m.kind == slotmark::chars_end)
 				{
 					// (the model actors the walk left to HiFi XI: ships, furniture, plants, drawn by the zone renderer)
@@ -865,7 +884,7 @@ namespace hifi::backend
 			slotmark::mark m;
 			m.kind = kind;
 			m.seq = seq & 15;
-			on_mark(fm->list, *d, uint64_t(fm->dsv.ptr), m);
+			on_mark(fm->list, *d, uint64_t(fm->dsv.ptr), m, fm);
 		}
 
 		// Our d3d8.dll told where to call (nullptr: let go, at stop); false when it isn't the one loaded
