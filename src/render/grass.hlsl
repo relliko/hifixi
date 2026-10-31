@@ -1996,7 +1996,9 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	float radius_px = min(shade.y * px_per_yalm, 96.0); // (capped: near the camera it would reach across the screen)
 	if (shade.x > 0.0 && radius_px >= 2.0)
 	{
-		float spin = noise * 6.2831853;
+		// (the pattern turned a little further every frame by the clock, so FSR's frames average it out; fixed, it showed
+		// as a fine grid on smooth surfaces such as skin, 2026-10-30)
+		float spin = (noise + frac(color.w * 61.803398875)) * 6.2831853;
 		float occ = 0.0;
 		[unroll] for (int i = 0; i < 12; ++i)
 		{
