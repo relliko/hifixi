@@ -39,8 +39,9 @@
  *   /hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]   the en-spell effect on your blades,
  *                  HiFi XI's own (src/chars chardraw; [chars] enspell): auto = the element of the en-spell on you
  *                  (Enfire .. Endark, the IIs too); off; or one element always (to look at it)
- *   /hifi nativechars [perpixel [on|off]]   HiFi XI drawing the characters in the game's place (src/chars; [chars]
- *                  perpixel its per-pixel lighting); the game draws any model whose data isn't up yet
+ *   /hifi nativechars [perpixel|detail [on|off]]   HiFi XI drawing the characters in the game's place (src/chars;
+ *                  [chars] perpixel its per-pixel lighting, [chars] detail the detail maps); the game draws any model
+ *                  whose data isn't up yet
  *   /hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]   the world upscaled to the screen with AMD FSR 1 when the background
  *                  resolution is below the screen's (src/upscale; [upscale] fsr, sharpen)
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
@@ -680,7 +681,8 @@ class hifixi final : public IPlugin
 				hifi::backend::log(1, ("HiFi XI: the native character renderer not made: " + why).c_str());
 			}
 		}
-		hifi::chars::inject::set_options(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault));
+		hifi::chars::inject::set_options(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault),
+			hifi::game::option_on("chars", "detail", hifi::chars::options::kDetailByDefault));
 		// (the zone's sun, for the light split's share of their light: the zone pass's of the last quarter second)
 		{
 			hifi::zone::inject::frame_camera c;
@@ -1043,6 +1045,16 @@ public:
 			for (const std::string &line : hifi::chars::cache::status())
 				say(line);
 		}
+		else if (arg == "nativechars detail" || arg == "nativechars detail on" || arg == "nativechars detail off") // (native characters)
+		{
+			const bool on = arg == "nativechars detail" ? !hifi::game::option_on("chars", "detail", hifi::chars::options::kDetailByDefault) : arg == "nativechars detail on";
+			hifi::game::set_option_on("chars", "detail", on);
+			follow_nativechars();
+			say(on ? (hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault)
+				? "Character detail maps on: relief, metal's shine and cavities guessed from each texture."
+				: "Character detail maps on, but they need per-pixel lighting (/hifi nativechars perpixel on).")
+				: "Character detail maps off.");
+		}
 		else if (arg == "nativechars" || arg == "nativechars perpixel" || arg == "nativechars perpixel on" || arg == "nativechars perpixel off") // (native characters)
 		{
 			if (arg != "nativechars")
@@ -1112,7 +1124,7 @@ public:
 				say("Direct3D 12 hooks not in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
 		return true;
 	}
 

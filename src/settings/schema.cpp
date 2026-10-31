@@ -249,6 +249,12 @@ namespace hifi::settings
 				"faces and folds. (/hifi nativechars perpixel)", nullptr, nullptr, false,
 				{ _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _, chars::options::kPerPixelByDefault ? 1.0f : _ },
 				flag, 0.0f, 1.0f, chars::options::kPerPixelByDefault ? 1.0f : 0.0f },
+			{ "chars.detail", tab::game, "Drawn by HiFi XI", "Character detail maps (experimental)",
+				"Relief, metal's shine and darker seams on gear, guessed from each texture's own colours (nothing in the game "
+				"has them): stitching, studs and trim catch the light, metal shines in its own colour. A guess: now and then a "
+				"bright pattern shines like metal. Needs per-pixel lighting. (/hifi nativechars detail)", nullptr, "chars.perpixel", false,
+				{ _, _, _, _ },
+				flag, 0.0f, 1.0f, chars::options::kDetailByDefault ? 1.0f : 0.0f },
 			// (the upscale: src/upscale)
 			{ "upscale.fsr", tab::upscaling, "AMD FSR", "Upscale the world with AMD FSR",
 				"When the game's background resolution is below the screen's, the world is stretched to the screen with AMD "

@@ -3,7 +3,8 @@
  *   0  CBV b0         the frame's constants (the upload ring's slot for its seq)
  *   1  8 constants b1 the draw: model, light scale, flags, vertex count, bone count, the composite's colour
  *   2  SRV t3         the instance's palette rows (48 bytes a bone)        3  SRV t4  the frame's models (the ring)
- *   4  table t0-t1    the mesh's vertices (68 bytes) and corners (12)       5  table t2 the group's texture (or T)
+ *   4  table t0-t1    the mesh's vertices (68 bytes) and corners (12)       5  table t2 the group's texture (or T),
+ *                                                                           t6 its detail map (the descriptor after it)
  *   s0                linear, clamped, mips linear (the character pass's sampler, 02BC12)
  * Pipelines are made as targets of new formats or sample counts come: the model draw, the composite.
  * Every index into a root SRV or table is clamped first (a root SRV has no bounds: a wild read can hang the GPU).
@@ -31,7 +32,7 @@ cbuffer frame_constants : register(b0)
 	row_major float4x4 view_proj;
 	float4 fog;          // rgb; w: 1 / (end - start), 0 for none
 	float4 fog_end;      // x: end
-	float4 options;      // x: per-pixel lighting; y: the frame's models
+	float4 options;      // x: per-pixel lighting; y: the frame's models; z: the detail maps ([chars] detail, per pixel only)
 	float4 sun_dir;      // toward the zone's sun (world), w: 1 when it's known (the light split's share: which light is it)
 	float4 camera;       // the camera (world), w: 1 when it's known (the sun's highlight)
 };
@@ -70,6 +71,7 @@ struct model_t
 StructuredBuffer<vertex_t> vertices : register(t0);
 StructuredBuffer<corner_t> corners : register(t1);
 Texture2D colour_map : register(t2);
+Texture2D detail_map : register(t6); // (tex::make_detail: rg the tilt, b metal, a cavity; the descriptor after the texture's)
 StructuredBuffer<bone_t> palette : register(t3);
 StructuredBuffer<model_t> models : register(t4);
 StructuredBuffer<bone_t> last_palette : register(t5);
@@ -83,6 +85,41 @@ static const float kMaterialDiffuse = 0.5;
 // everything else, broad (cloth and skin only take the sheen of it).
 static const float kSkyAbove = 1.2, kSkyBelow = 0.8, kSkyTint = 0.2;
 static const float kSpec = 0.08, kSpecMatte = 0.015, kSpecBroad = 8, kSpecSharp = 32;
+// The detail maps ([chars] detail; research/ffxi-re/tools/nmmockup.py --materials): metal's own highlight (tinted by
+// its texel, sharp) and the sky in it; how much a cavity takes off; metal's diffuse kept.
+static const float kMetalSpec = 0.6, kMetalSharp = 45, kMetalSky = 0.35, kCavity = 0.45, kMetalDiffuse = 0.55;
+
+// A texel's detail at uv: the normal tilted by it (the tangent frame from the screen derivatives of world and uv, so
+// mirrored halves and any UV layout need nothing stored), metal, cavity. Called in uniform control flow (options.z is
+// the frame's), before any discard.
+struct detail_t { float3 n; float metal; float cavity; };
+detail_t detail_at(float3 n, float3 world, float2 uv)
+{
+	detail_t d;
+	d.n = n;
+	d.metal = 0;
+	d.cavity = 0;
+	if (options.z <= 0 || options.x <= 0)
+		return d;
+	const float3 dp1 = ddx(world), dp2 = ddy(world);
+	const float2 duv1 = ddx(uv), duv2 = ddy(uv);
+	const float4 t = detail_map.Sample(clamp_linear, uv);
+	if (dot(t, t) <= 0)
+		return d; // (no detail map: a null view reads 0)
+	const float3 p2 = cross(dp2, n), p1 = cross(n, dp1);
+	const float3 tu = p2 * duv1.x + p1 * duv2.x, tv = p2 * duv1.y + p1 * duv2.y;
+	const float m = max(dot(tu, tu), dot(tv, tv));
+	if (m > 1e-20)
+	{
+		const float2 xy = t.rg * 2 - 1;
+		const float s = rsqrt(m);
+		const float3 b = tu * s * xy.x + tv * s * xy.y + n * sqrt(saturate(1 - dot(xy, xy)));
+		d.n = dot(b, b) > 1e-12 ? normalize(b) : n;
+	}
+	d.metal = t.b;
+	d.cavity = t.a;
+	return d;
+}
 
 float3 bone_point(uint b, float4 p)
 {
@@ -209,8 +246,10 @@ float4 shade(v2p i, out float share)
 {
 	const model_t m = models[min(model_index, (uint)options.y - 1)];
 	const float4 t = colour_map.Sample(clamp_linear, i.uv);
+	const detail_t dt = detail_at(normalize(i.normal), i.world, i.uv);
 	share = i.share;
-	const float4 colour = options.x > 0 ? lit(m, normalize(i.normal), i.world, share) : i.colour;
+	float4 colour = options.x > 0 ? lit(m, dt.n, i.world, share) : i.colour;
+	colour.rgb *= (1 - kCavity * dt.cavity) * (1 - (1 - kMetalDiffuse) * dt.metal);
 	const float3 s0 = saturate(2 * t.rgb * colour.rgb);
 	const float a0 = saturate(2 * t.a * m.tfactor.a);
 	float3 rgb;
@@ -229,8 +268,16 @@ float4 shade(v2p i, out float share)
 		if (a * 255 <= 69.5)
 			discard; // (ALPHAFUNC GREATER, ALPHAREF 0x45)
 	}
-	// (the sun's highlight after the texture, the sun's all of it)
-	const float3 spec = char_spec(m, i.normal, i.world, t);
+	// (the sun's highlight after the texture, the sun's all of it; on metal its own, in its colour, and the sky in it)
+	float3 spec = char_spec(m, dt.n, i.world, t);
+	if (dt.metal > 0 && camera.w > 0)
+	{
+		float3 dir;
+		const float3 sun = sun_light(m, dir);
+		const float3 tint = saturate(2 * t.rgb);
+		spec += dt.metal * tint * sun_spec(dt.n, dir, camera.xyz - i.world, sun, kMetalSharp, kMetalSpec);
+		rgb += dt.metal * kMetalSky * (1 - kCavity * dt.cavity) * tint * sky_ambient(m, m.ambient.rgb * light_scale, dt.n);
+	}
 	share = spec_share(share, rgb, spec);
 	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb + spec, i.fog), a);
 }
@@ -1392,7 +1439,10 @@ float4 pps(p2p i) : SV_Target
 			*e.out = code;
 		}
 
-		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2 } };
+		// (table 5: the texture at t2 and the descriptor after it, its detail map, at t6; root signature 1.0: descriptors
+		// volatile, so the one after a pass's own texture (T, the scene's copy) needn't be one, unread there)
+		D3D12_DESCRIPTOR_RANGE ranges[3] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2 },
+			{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6, 0, 1 } };
 		D3D12_ROOT_PARAMETER p[7] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 		p[0].Descriptor.ShaderRegister = 0;
@@ -1406,7 +1456,7 @@ float4 pps(p2p i) : SV_Target
 		for (UINT i = 0; i < 2; ++i)
 		{
 			p[4 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-			p[4 + i].DescriptorTable.NumDescriptorRanges = 1;
+			p[4 + i].DescriptorTable.NumDescriptorRanges = i == 0 ? 1 : 2;
 			p[4 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
 		}
 		p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // (the last frame's palette rows for the instance: t5)
@@ -1606,6 +1656,7 @@ float4 pps(p2p i) : SV_Target
 		c.fog[3] = span > 1e-3f ? 1.0f / span : 0.0f;
 		c.fog_end[0] = f.fog_end;
 		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
+		c.options[2] = o.detail ? 1.0f : 0.0f;
 		c.options[1] = float(std::min(f.models, kMaxModels));
 		if (o.sun_known)
 		{

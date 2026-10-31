@@ -80,7 +80,9 @@ namespace hifi::chars::cache
 			std::vector<uint8_t> raw;
 			state s = state::queued;
 			tex::texture decoded; // (dropped once uploaded)
+			tex::texture detail;  // its detail map (tex::make_detail; dropped once uploaded)
 			ID3D12Resource *t = nullptr;
+			ID3D12Resource *d = nullptr; // (the detail map: the slot's second descriptor)
 			uint32_t slot = kNoSlot;
 			double seen = 0.0;
 			uint64_t gpu_bytes = 0;
@@ -152,6 +154,7 @@ namespace hifi::chars::cache
 		void release_texture(texture_entry &e)
 		{
 			later(e.t);
+			later(e.d);
 			if (e.slot != kNoSlot)
 				g.free_slots.push_back(e.slot);
 			e.slot = kNoSlot;
@@ -287,7 +290,10 @@ namespace hifi::chars::cache
 			std::string why;
 			const bool ok = tex::decode(e.raw.data(), e.raw.size(), e.decoded, why);
 			if (ok)
+			{
 				tex::make_mips(e.decoded);
+				tex::make_detail(e.decoded, e.detail);
+			}
 			e.s = ok ? state::decoded : state::failed;
 			if (!ok)
 			{
@@ -319,12 +325,16 @@ namespace hifi::chars::cache
 				at = align(at + uint64_t(e->corners) * sizeof(os2::corner), 16);
 			}
 			at = align(at, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-			std::vector<std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>> spots(b.textures.size());
-			std::vector<std::vector<UINT>> rows(b.textures.size());
-			std::vector<std::vector<UINT64>> row_bytes(b.textures.size());
-			for (size_t i = 0; i < b.textures.size(); ++i)
+			// (each texture's colour, then its detail map: pictures 2i and 2i + 1)
+			std::vector<std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>> spots(2 * b.textures.size());
+			std::vector<std::vector<UINT>> rows(2 * b.textures.size());
+			std::vector<std::vector<UINT64>> row_bytes(2 * b.textures.size());
+			auto picture = [&](size_t i) -> const tex::texture & { return i % 2 == 0 ? b.textures[i / 2]->decoded : b.textures[i / 2]->detail; };
+			for (size_t i = 0; i < spots.size(); ++i)
 			{
-				const D3D12_RESOURCE_DESC d = texture_desc(b.textures[i]->decoded);
+				if (picture(i).levels.empty())
+					continue;
+				const D3D12_RESOURCE_DESC d = texture_desc(picture(i));
 				const UINT levels = d.MipLevels;
 				spots[i].resize(levels);
 				rows[i].resize(levels);
@@ -354,6 +364,12 @@ namespace hifi::chars::cache
 				const D3D12_RESOURCE_DESC d = texture_desc(e->decoded);
 				ok = ok && SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&e->t)));
 				e->gpu_bytes = device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+				if (!e->detail.levels.empty())
+				{
+					const D3D12_RESOURCE_DESC dd = texture_desc(e->detail);
+					ok = ok && SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&e->d)));
+					e->gpu_bytes += device->GetResourceAllocationInfo(0, 1, &dd).SizeInBytes;
+				}
 			}
 			uint8_t *mapped = nullptr;
 			const D3D12_RANGE none = { 0, 0 };
@@ -370,9 +386,9 @@ namespace hifi::chars::cache
 				std::memcpy(mapped + mesh_at[i], e.decoded.vertices.data(), size_t(vbytes));
 				std::memcpy(mapped + align(mesh_at[i] + vbytes, 16), e.decoded.corners.data(), size_t(e.corners) * sizeof(os2::corner));
 			}
-			for (size_t i = 0; i < b.textures.size(); ++i)
+			for (size_t i = 0; i < spots.size(); ++i)
 			{
-				const tex::texture &t = b.textures[i]->decoded;
+				const tex::texture &t = picture(i);
 				for (size_t l = 0; l < t.levels.size(); ++l)
 				{
 					const tex::level &lv = t.levels[l];
@@ -398,11 +414,11 @@ namespace hifi::chars::cache
 				if (e.corners != 0)
 					g.list->CopyBufferRegion(e.cb, 0, up, align(mesh_at[i] + vbytes, 16), uint64_t(e.corners) * sizeof(os2::corner));
 			}
-			for (size_t i = 0; i < b.textures.size(); ++i)
+			for (size_t i = 0; i < spots.size(); ++i)
 				for (UINT l = 0; l < UINT(spots[i].size()); ++l)
 				{
 					D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-					dst.pResource = b.textures[i]->t;
+					dst.pResource = i % 2 == 0 ? b.textures[i / 2]->t : b.textures[i / 2]->d;
 					dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 					dst.SubresourceIndex = l;
 					src.pResource = up;
@@ -473,7 +489,7 @@ namespace hifi::chars::cache
 							e->slot = g.free_slots.back();
 							g.free_slots.pop_back();
 							b.textures.push_back(e.get());
-							batch_bytes += uint64_t(e->decoded.w) * e->decoded.h * 6;
+							batch_bytes += uint64_t(e->decoded.w) * e->decoded.h * 12; // (colour and detail map, with mips)
 						}
 					}
 				if (decode_m.empty() && decode_t.empty() && b.meshes.empty() && b.textures.empty())
@@ -530,6 +546,9 @@ namespace hifi::chars::cache
 						v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 						v.Texture2D.MipLevels = UINT(e->decoded.levels.size());
 						g.device->CreateShaderResourceView(e->t, &v, cpu_descriptor(2 * e->slot));
+						// (the detail map beside it, read through the same table; a flat one's view (nullptr) when none)
+						v.Texture2D.MipLevels = e->d != nullptr ? UINT(e->detail.levels.size()) : 1;
+						g.device->CreateShaderResourceView(e->d, &v, cpu_descriptor(2 * e->slot + 1));
 					}
 				}
 				lock.lock();
@@ -558,6 +577,8 @@ namespace hifi::chars::cache
 					{
 						e->decoded.levels.clear();
 						e->decoded.levels.shrink_to_fit();
+						e->detail.levels.clear();
+						e->detail.levels.shrink_to_fit();
 						e->s = state::ready;
 						g.n.gpu_bytes += e->gpu_bytes;
 					}
