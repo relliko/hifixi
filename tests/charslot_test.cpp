@@ -2,14 +2,15 @@
  * Offline test of the character passes' slot markers (src/game/charslot.cpp, src/chars/marks.cpp, slotmark.hpp;
  * research/ffxi-re/notes-characters.md "For a native character renderer", part 1): each FFXiMain dump mapped at its
  * own base (game_dump.hpp).
- *   - the kinds 2-4 read back from their pixels; past them nothing;
+ *   - kind 4's name;
  *   - an image without the game's code: refused and said why, nothing written;
  *   - 0817E0's call of the walk 082D70 and the queue's immediate (0C7E82: 0CBD90) found; only the call's rel32 and the
  *     immediate changed;
  *   - the walk's stub run (its walk a stand-in): begin, the walk, end; eax returned, ebx/esi/edi kept;
  *   - the wrapper run as the flush calls it (cdecl, the actor; its callback a stand-in): the marker before the
  *     callback, the callback given the actor at [esp+4], from_flush while it runs only, the callback's eax returned;
- *   - through a stand-in device: the Clears at x = 16 kind + seq, the see-through one checked for stencil itself;
+ *   - through HiFi XI's d3d8.dll (a stand-in for HifiFrameMark): the three kinds with the seq; when it doesn't take them,
+ *     counted as not sent;
  *   - the Direct3D 12 side's order check: a frame's begin, end, see-throughs, the next begin; and what's out of order;
  *   - stop(): the dump again, byte for byte; refused while something else changed either site.
  *
@@ -19,6 +20,7 @@
 #include "../src/chars/marks.hpp"
 #include "../src/game/charslot.hpp"
 #include "../src/game/slotmark.hpp"
+#include "../src/game/directmark.hpp"
 #include "game_dump.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -137,55 +139,19 @@ namespace
 		return { a, b, s, d, before - after };
 	}
 
-	// A stand-in Direct3D 8 device (as zoneslot_test's)
-	uint32_t depth_format = 75;
-	int surfaces_out = 0, clears = 0, desc_asks = 0;
-	std::vector<int32_t> clear_xs;
-	uint32_t clear_flags = 0;
-	uint32_t surface_vt[16] = {}, device_vt[40] = {};
-	uint32_t surface_obj[1] = {}, device_obj[1] = {};
-	unsigned long __stdcall s_release(uintptr_t) { surfaces_out--; return 0; }
-	long __stdcall s_get_desc(uintptr_t, uint32_t desc[8])
+	// HiFi XI's d3d8.dll as the marks reach it (src/game/directmark.hpp): each recorded; answer 0 as a d3d8.dll of ours
+	// with no handler yet does
+	std::vector<std::pair<uint32_t, uint32_t>> direct;
+	int direct_answer = 1;
+	int __cdecl direct_fn(uint32_t kind, uint32_t seq)
 	{
-		std::memset(desc, 0, 32);
-		desc[0] = depth_format;
-		desc_asks++;
-		return 0;
-	}
-	long __stdcall d_get_ds(uintptr_t, uintptr_t *out)
-	{
-		*out = reinterpret_cast<uintptr_t>(surface_obj);
-		surfaces_out++;
-		return 0;
-	}
-	long __stdcall d_clear(uintptr_t, uint32_t count, const int32_t *rects, uint32_t flags, uint32_t, float, uint32_t)
-	{
-		clears++;
-		if (count == 1 && rects[1] == 0 && rects[2] == rects[0] + 1 && rects[3] == 1)
-			clear_xs.push_back(rects[0]);
-		clear_flags = flags;
-		return 0;
-	}
-	void make_device()
-	{
-		surface_vt[2] = uint32_t(reinterpret_cast<uintptr_t>(&s_release));
-		surface_vt[8] = uint32_t(reinterpret_cast<uintptr_t>(&s_get_desc));
-		surface_obj[0] = uint32_t(reinterpret_cast<uintptr_t>(surface_vt));
-		device_vt[33] = uint32_t(reinterpret_cast<uintptr_t>(&d_get_ds));
-		device_vt[36] = uint32_t(reinterpret_cast<uintptr_t>(&d_clear));
-		device_obj[0] = uint32_t(reinterpret_cast<uintptr_t>(device_vt));
+		direct.push_back({ kind, seq });
+		return direct_answer;
 	}
 
 	void test_read()
 	{
-		using hifi::slotmark::read;
-		hifi::slotmark::mark m;
-		check(read(false, true, 1, 32 + 3, 0, 32 + 4, 1, m) && m.kind == hifi::slotmark::chars_begin && m.seq == 3, "x 35: characters begin, seq 3");
-		check(read(false, true, 1, 48 + 15, 0, 48 + 16, 1, m) && m.kind == hifi::slotmark::chars_end && m.seq == 15, "x 63: characters end, seq 15");
-		check(read(false, true, 1, 64, 0, 65, 1, m) && m.kind == hifi::slotmark::see_through && m.seq == 0, "x 64: see-through, seq 0");
-		check(read(false, true, 1, 2 * 79, 0, 2 * 79 + 2, 2, m) && m.kind == hifi::slotmark::see_through && m.seq == 15, "  a 2x2 square at 2 x 79: see-through, seq 15");
-		check(!read(false, true, 1, 256, 0, 257, 1, m), "  x 256 (past the kinds): not a marker");
-		check(std::string(hifi::slotmark::kind_name(hifi::slotmark::see_through)) == "see-through character", "  kind 4's name");
+		check(std::string(hifi::slotmark::kind_name(hifi::slotmark::see_through)) == "see-through character", "kind 4's name");
 	}
 
 	void test_order()
@@ -261,35 +227,25 @@ namespace
 		check(n.seq == 3 && n.sent[2] == 2 && n.sent[3] == 2 && n.sent[4] == 2 && n.see_through == 3 && n.most_see_through == 2,
 			"  counts: 3 walks, 2 + 2 + 2 markers, 3 see-through callbacks, most 2 in a frame");
 
-		// Through a stand-in device
+		// Through HiFi XI's d3d8.dll
 		cs::set_sink(nullptr);
-		make_device();
-		cs::set_device(reinterpret_cast<uintptr_t>(device_obj));
+		hifi::game::set_direct_mark(&direct_fn);
 		cs::set_wanted(true);
-		depth_format = 75;
-		clears = 0;
-		clear_xs.clear();
+		direct.clear();
 		events.clear();
 		run_walk(s.stub);           // (seq 4)
 		run_wrapper(s.wrapper, 7);
-		check(clears == 3 && events == "WC", "  D24S8 depth: a Clear before and after the walk, one before the callback");
-		check(clear_xs.size() == 3 && clear_xs[0] == 32 + 4 && clear_xs[1] == 48 + 4 && clear_xs[2] == 64 + 4 && clear_flags == 4,
-			"  at x 36, 52, 68 (16 kind + seq 4), stencil only");
-		check(surfaces_out == 0, "  the depth surfaces released");
-		depth_format = 77; // (D24X8)
-		clears = 0;
+		check(events == "WC" && direct.size() == 3 && direct[0] == std::make_pair(uint32_t(hifi::slotmark::chars_begin), 4u) &&
+			direct[1] == std::make_pair(uint32_t(hifi::slotmark::chars_end), 4u) && direct[2] == std::make_pair(uint32_t(hifi::slotmark::see_through), 4u),
+			"  marked before and after the walk and before the callback, seq 4");
+		direct_answer = 0;
 		const uint64_t not_sent = cs::get_counts().not_sent;
 		run_walk(s.stub);
 		run_wrapper(s.wrapper, 7);
-		check(clears == 0 && cs::get_counts().not_sent == not_sent + 3, "  a depth without stencil: no Clear, all 3 counted as not sent");
-		depth_format = 75;
-		run_walk(s.stub);           // (seq 6)
-		depth_format = 77;
-		clears = 0;
-		run_wrapper(s.wrapper, 7);
-		check(clears == 0, "  the see-through marker checks the depth bound at its own time");
-		check(cs::status().find("not sent 4") != std::string::npos, "  status: " + cs::status());
-		cs::set_device(0);
+		check(cs::get_counts().not_sent == not_sent + 3, "  not taken (no handler in the d3d8.dll yet): all 3 counted as not sent");
+		check(cs::status().find("not sent 3") != std::string::npos, "  status: " + cs::status());
+		direct_answer = 1;
+		hifi::game::set_direct_mark(nullptr);
 		cs::set_wanted(false);
 		cs::set_listener(nullptr);
 

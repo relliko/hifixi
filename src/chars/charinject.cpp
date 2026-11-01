@@ -29,12 +29,6 @@ namespace hifi::chars::inject
 		constexpr D3D12_RESOURCE_STATES kUnknown = D3D12_RESOURCE_STATES(0xFFFFFFFF);
 		constexpr ULONGLONG kFailMs = 2000;
 
-		struct heaps
-		{
-			UINT count = 0;
-			ID3D12DescriptorHeap *h[2] = {};
-		};
-
 		struct state
 		{
 			std::mutex mutex;
@@ -50,7 +44,6 @@ namespace hifi::chars::inject
 			uint32_t lamp_count = 0; // (and its lamps: set_lamps)
 			char_lamp lamps[kFrameLamps] = {};
 			std::atomic<double> clock { -1.0 }; // (the en-spells' time: below 0, the real one)
-			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES plane[2] = { kUnknown, kUnknown };
 			// Our views: the world's target (0) and T (1); the world's depth
@@ -379,14 +372,6 @@ namespace hifi::chars::inject
 			g.snapshot_taken = true;
 		}
 
-		void put_back(ID3D12GraphicsCommandList *list, const grass::list_state &bound)
-		{
-			// (its heaps before its root tables: a table must be in the heaps bound when it's set)
-			const auto known = g.lists.find(list);
-			if (known != g.lists.end() && known->second.count != 0)
-				list->SetDescriptorHeaps(known->second.count, known->second.h);
-			bound.restore(list);
-		}
 	}
 
 	// (No device call while the mutex is held: dgVoodoo's recording thread takes it inside our hooks, which with the
@@ -459,7 +444,6 @@ namespace hifi::chars::inject
 			g.t = g.scene = nullptr;
 			g.view_rt = g.view_ds = nullptr;
 			g.device = nullptr;
-			g.lists.clear();
 			g.depth = nullptr;
 			g.plane[0] = g.plane[1] = kUnknown;
 		}
@@ -514,21 +498,6 @@ namespace hifi::chars::inject
 		return g.n;
 	}
 
-	void on_reset(ID3D12GraphicsCommandList *list)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		g.lists[list] = heaps();
-	}
-
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *h)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		heaps &x = g.lists[list];
-		x.count = h != nullptr ? std::min<UINT>(count, 2) : 0;
-		for (UINT i = 0; i < x.count; ++i)
-			x.h[i] = h[i];
-	}
-
 	void on_barrier(UINT count, const D3D12_RESOURCE_BARRIER *b)
 	{
 		if (b == nullptr)
@@ -568,7 +537,7 @@ namespace hifi::chars::inject
 		}
 	}
 
-	void on_chars_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
+	void on_chars_end(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4)
 	{
 		const frame *f = published(seq_low4);
 		if (f == nullptr)
@@ -642,7 +611,7 @@ namespace hifi::chars::inject
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
 		barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
 		barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);
-		put_back(list, bound);
+		// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 		g.n.frames++;
 		g.n.models += g.last.models;
 		g.n.overlays += g.last.overlays;
@@ -685,14 +654,7 @@ namespace hifi::chars::inject
 		const frame *f = published(g.seq & 15u);
 		if (f == nullptr || f->seq.load(std::memory_order_acquire) != g.seq)
 			return false;
-		// (the game's heaps go back after: World FX sets its own state, but binds no heaps. Not drawn at all when they
-		// aren't known: the game's next tables would point into ours.)
-		const auto known = g.lists.find(list);
-		if (known == g.lists.end() || known->second.count == 0)
-			return false;
 		const char_stats st = g.renderer->record_casters(list, *f, world_to_clip, dsv, size);
-		if (st.models != 0)
-			list->SetDescriptorHeaps(known->second.count, known->second.h);
 		if (st.draws == 0)
 			return false;
 		g.n.caster_frames++;
@@ -707,7 +669,7 @@ namespace hifi::chars::inject
 		};
 	}
 
-	void on_see_through(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
+	void on_see_through(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4)
 	{
 		const frame *f = published(seq_low4);
 		if (f == nullptr)
@@ -782,7 +744,7 @@ namespace hifi::chars::inject
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
 		barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
 		barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);
-		put_back(list, bound);
+		// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 		g.n.see_through++;
 	}
 }

@@ -465,13 +465,11 @@ int main(int argc, char **argv)
 		// The list, as dgVoodoo records the world round the characters' end marker
 		alloc->Reset();
 		list->Reset(alloc, nullptr);
-		inj::on_reset(list);
 		inj::on_marker(Az);
 		list->ClearRenderTargetView(rtv, kNight, 0, nullptr);
 		list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 		list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
 		list->SetDescriptorHeaps(1, &srvh);
-		inj::on_heaps(list, 1, &srvh);
 		grass::list_state bound;
 		bound.rtvs[0] = rtv;
 		bound.rtv_count = 1;
@@ -485,7 +483,7 @@ int main(int argc, char **argv)
 		barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 		barrier(list, Az, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 		barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-		inj::on_chars_end(list, bound, w, seq & 15);
+		inj::on_chars_end(list, w, seq & 15);
 		barrier(list, Az, 0, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};

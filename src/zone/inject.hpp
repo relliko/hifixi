@@ -32,9 +32,6 @@ namespace hifi::zone::inject
 	bool ready();
 	std::vector<std::string> status();
 
-	// dgVoodoo's lists, as the hooks see them
-	void on_reset(ID3D12GraphicsCommandList *list);
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps);
 	void on_barrier(UINT count, const D3D12_RESOURCE_BARRIER *barriers);
 
 	// The world as the markers name it: its target (with the format of dgVoodoo's view of it, and the state it's in on
@@ -70,10 +67,10 @@ namespace hifi::zone::inject
 	// characters' lamp light (main.cpp hands them over: chars::inject::set_lamps); how many (0 when the game drew it)
 	uint32_t last_lamps(frame_lamp out[kMaxLamps]);
 	// The zone's end marker: the pass published under that seq drawn there when it's HiFi XI's
-	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	void on_zone_end(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4);
 	// The characters' end marker: the model actors the walk under that seq left to HiFi XI (frame.hpp actor_frame) drawn
 	// there, before the characters; whether they can be handed over (the renderer up, none failed in the last two seconds)
-	void on_actors_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	void on_actors_end(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4);
 	bool actors_ready();
 
 	// World FX's sun shadow cascades from the zone this draws (zoneshadow.hpp; grass::renderer::set_zone_casters): the

@@ -1,10 +1,10 @@
 /*
- * HiFi XI: Relli's graphics work in one Ashita v4 plugin (hifps, drawcull, World FX and its feeder), on dgVoodoo's
- * Direct3D 12 output, without ReShade.
+ * HiFi XI: Relli's graphics work in one Ashita v4 plugin (hifps, drawcull, World FX and its feeder), on the Direct3D 12
+ * output of its own d3d8.dll (src/d3d8), without ReShade.
  *
  * - World FX (src/render/worldfx_core: grass, shading, shadows, water, weather, sky, lamps, glows) draws into the
  *   game's own frame on HiFi XI's Direct3D 12 hooks (src/host, src/backend). HiFi XI's starter (bootloader\dxgi.dll)
- *   starts it before dgVoodoo makes its device; without it, it starts here, late, and can't find the world.
+ *   starts it before the d3d8.dll makes its device; without it, it starts here, late, and can't find the world.
  * - The game side (src/game): what World FX needs from the game each frame (feed: the zone, characters near, weapon
  *   skills, lamps, glows, the weather), and the game's own effects it replaces left out while World FX draws;
  *   hifps's frame step, limiter and speed-ups (hifps/); drawcull's view distance (drawcull).
@@ -18,7 +18,7 @@
  *   /hifi gpu      World FX's GPU time by section, the costliest first
  *   /hifi gamedraw [zone|chars] [on|off]   the game's own zone or character drawing switched off (a debug toggle for
  *                  the native renderer to come: off at every start), or what's off
- *   /hifi streamlog [frames] [label]   the next world frame (up to 8) as dgVoodoo records it in Direct3D 12, call by
+ *   /hifi streamlog [frames] [label]   the next world frame (up to 8) as the d3d8.dll records it in Direct3D 12, call by
  *                  call, and the game's own Direct3D 8 draws of it, into bootloader\hifixi-stream-<time>-<label>.txt
  *                  (src/backend/streamlog; the label is what /hifi gamedraw has off when none is given)
  *   /hifi zoneslot [on|off]   the zone pass's slot markers (src/game/zoneslot: on by default, [zone] slot in the
@@ -355,7 +355,7 @@ class hifixi final : public IPlugin
 			say(hifi::backend::early() ? "Started before the game's Direct3D 12 device (the starter): World FX runs without ReShade. /hifi for the menu."
 				: "Running (started late).");
 		else if (hifi::backend::late_start(why))
-			say("Direct3D 12 hooks in, late: no starter (bootloader\\dxgi.dll), so the views dgVoodoo made before aren't known and World FX can't find the world.", true);
+			say("Direct3D 12 hooks in, late: no starter (bootloader\\dxgi.dll), so the views the d3d8.dll made before aren't known and World FX can't find the world.", true);
 		else
 			say("Direct3D 12 hooks not in: " + why, true);
 		if (hifi::backend::safe_start())
@@ -867,7 +867,7 @@ class hifixi final : public IPlugin
 		}
 		if (frames < 1 || frames > 8)
 		{
-			say("/hifi streamlog [frames 1-8] [label]: the next world frame(s) as dgVoodoo records them, into bootloader\\hifixi-stream-<time>-<label>.txt");
+			say("/hifi streamlog [frames 1-8] [label]: the next world frame(s) as the d3d8.dll records them, into bootloader\\hifixi-stream-<time>-<label>.txt");
 			return;
 		}
 		if (label.empty())

@@ -53,7 +53,7 @@ namespace
 	// ---- What the hooks hand on ----
 	struct view_info { ID3D12Resource *res; DXGI_FORMAT format; };
 	std::map<uint64_t, view_info> views;
-	struct mark_seen { uint32_t kind, seq; bool stencil_plane_write; bool rect_ok; uint64_t dsv; ID3D12Resource *bound_rt; ID3D12Resource *bound_ds; };
+	struct mark_seen { uint32_t kind, seq; ID3D12Resource *bound_rt, *bound_ds; bool list_known; };
 	std::vector<mark_seen> marks;
 	struct list_state
 	{
@@ -195,60 +195,17 @@ namespace
 		}
 	}
 
-	// HiFi XI drawing into the frame: other state set on the list, then what was bound put back
+	// HiFi XI drawing into the frame: other state set on the list, nothing put back (the d3d8.dll binds its own again)
 	void draw_into(ID3D12GraphicsCommandList *l)
 	{
 		hifi::host::quiet q;
-		const list_state s = lists[l];
 		l->SetDescriptorHeaps(1, &own_heap);
 		l->SetGraphicsRootSignature(own_root);
 		l->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
 		const D3D12_VIEWPORT vp = { 3.0f, 7.0f, 11.0f, 13.0f, 0.2f, 0.4f };
 		l->RSSetViewports(1, &vp);
 		l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
-		// (put back as grass::list_state does: heaps first, then targets, viewports, scissors, pipeline, topology, root)
-		if (s.heap_count != 0)
-			l->SetDescriptorHeaps(s.heap_count, s.heaps);
-		if (s.rtv_count != 0 || s.has_dsv)
-			l->OMSetRenderTargets(s.rtv_count, s.rtv_count != 0 ? &s.rtv : nullptr, FALSE, s.has_dsv ? &s.dsv : nullptr);
-		l->RSSetViewports(1, &s.vp);
-		l->RSSetScissorRects(1, &s.sc);
-		if (s.pso != nullptr)
-			l->SetPipelineState(s.pso);
-		if (s.topo != D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
-			l->IASetPrimitiveTopology(s.topo);
-		if (s.root != nullptr)
-		{
-			l->SetGraphicsRootSignature(s.root);
-			for (UINT p = 0; p < 2; ++p)
-				if (s.cbv[p] != 0)
-					l->SetGraphicsRootConstantBufferView(p, s.cbv[p]);
-			for (UINT p = 2; p < 4; ++p)
-				if (s.table[p].ptr != 0)
-					l->SetGraphicsRootDescriptorTable(p, s.table[p]);
-		}
 		injected++;
-	}
-
-	void ev_clear_depth(ID3D12GraphicsCommandList *l, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, UINT n, const D3D12_RECT *r)
-	{
-		hifi::slotmark::mark m;
-		if ((f & D3D12_CLEAR_FLAG_DEPTH) != 0 || r == nullptr || n == 0 ||
-			!hifi::slotmark::read(false, (f & D3D12_CLEAR_FLAG_STENCIL) != 0, n, r[0].left, r[0].top, r[0].right, r[0].bottom, m))
-			return;
-		mark_seen s;
-		s.kind = m.kind;
-		s.seq = m.seq;
-		s.dsv = uint64_t(dsv.ptr);
-		s.rect_ok = n == 1 && r[0].right - r[0].left == 1 && r[0].bottom - r[0].top == 1;
-		ID3D12Resource *ds = resource_of(dsv.ptr);
-		s.stencil_plane_write = ds != nullptr && plane_state[1][ds] == D3D12_RESOURCE_STATE_DEPTH_WRITE;
-		const list_state &ls = lists[l];
-		s.bound_rt = ls.rtv_count != 0 ? resource_of(ls.rtv.ptr) : nullptr;
-		s.bound_ds = ls.has_dsv ? resource_of(ls.dsv.ptr) : nullptr;
-		marks.push_back(s);
-		if (inject && m.kind == hifi::slotmark::zone_end)
-			draw_into(l);
 	}
 
 	const hifi::host::events &events()
@@ -267,7 +224,6 @@ namespace
 			x.root_table = ev_root_table;
 			x.root_cbv = ev_root_cbv;
 			x.barrier = ev_barrier;
-			x.clear_depth = ev_clear_depth;
 			x.draw = ev_draw;
 			x.heaps = ev_heaps;
 			x.execute = ev_execute;
@@ -286,11 +242,27 @@ namespace
 	struct VR { float x, y, z, w; DWORD c; float u, v; };
 	uint32_t seq = 0, readbacks_ok = 0;
 
+	// The game side's marks, as src/game/directmark.hpp sends them (HifiFrameMark), and the handler HiFi XI registers
+	// for the frames: what each was handed; at the zone's end, while inject is on, it draws in
+	hifi_frame_mark_fn g_mark = nullptr;
 	void marker(uint32_t kind)
 	{
-		const LONG x = LONG(hifi::slotmark::x_of(kind, seq));
-		const D3DRECT r = { x, 0, x + 1, 1 };
-		dev->Clear(1, &r, D3DCLEAR_STENCIL, 0, 1.0f, 0);
+		if (g_mark != nullptr)
+			g_mark(kind, seq);
+	}
+	void __cdecl frame_handler(void *, uint32_t kind, uint32_t s, const hifi_frame_mark *m)
+	{
+		if (kind == hifi::slotmark::world_end)
+			return;
+		mark_seen x;
+		x.kind = kind;
+		x.seq = s;
+		x.bound_rt = m->rt;
+		x.bound_ds = m->ds;
+		x.list_known = lists.count(m->list) != 0;
+		marks.push_back(x);
+		if (inject && kind == hifi::slotmark::zone_end)
+			draw_into(m->list);
 	}
 
 	// The direct channel's handler (src/host/frameapi.hpp): what it was handed; it clears an 8x8 corner of the target
@@ -558,7 +530,12 @@ int main(int argc, char **argv)
 	check(world_ds != nullptr && (world_ds->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0,
 		"A's depth readable by shaders (no DENY_SHADER_RESOURCE): World FX's SRV of it");
 
-	// Frames: three plain, the fourth read back; then HiFi XI drawing in at the zone's end, the fifth read back
+	// Frames: three plain, the fourth read back; then HiFi XI drawing in at the zone's end, the fifth read back (the
+	// marks through the direct channel)
+	const auto set_handler = reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(m, kHifiFrameSetHandler));
+	g_mark = reinterpret_cast<hifi_frame_mark_fn>(GetProcAddress(m, kHifiFrameMark));
+	if (set_handler != nullptr)
+		set_handler(&frame_handler, nullptr);
 	std::vector<uint32_t> plain, injected_px;
 	for (int f = 0; f < 4; ++f)
 		plain = frame(f == 3);
@@ -566,25 +543,26 @@ int main(int argc, char **argv)
 	inject = true;
 	injected_px = frame(true);
 	inject = false;
+	if (set_handler != nullptr)
+		set_handler(nullptr, nullptr);
 
 	// Markers
-	bool order = marks_plain == 16, rects = true, planes = true, bound = true, views_known = true;
+	bool order = marks_plain == 16, bound = true, depth = true, known = true;
 	for (size_t i = 0; i < marks.size(); ++i)
 	{
 		const mark_seen &s = marks[i];
 		order = order && s.kind == uint32_t(i % 4) && s.seq == uint32_t((i / 4 + 1) & 15);
-		rects = rects && s.rect_ok;
-		planes = planes && s.stencil_plane_write;
-		views_known = views_known && resource_of(s.dsv) == world_ds;
+		depth = depth && s.bound_ds == world_ds;
+		known = known && s.list_known;
 		if (s.kind == hifi::slotmark::zone_begin)
-			bound = bound && s.bound_rt == world_rt && s.bound_ds == world_ds;
+			bound = bound && s.bound_rt == world_rt;
 	}
 	char line[200];
-	std::snprintf(line, sizeof(line), "the slot markers came in order, as stencil-only clears of one pixel (%zu of them)", marks.size());
-	check(order && rects, line);
-	check(views_known, "each marker's view is A's depth (known from its making)");
-	check(planes, "each marker's stencil plane in DEPTH_WRITE just before it (subresource 1)");
-	check(bound, "at the zone's begin, A and its depth bound on the list (the world found by the marker)");
+	std::snprintf(line, sizeof(line), "the marks came in order, each through the direct channel (%zu of them)", marks.size());
+	check(order, line);
+	check(depth, "each mark handed A's depth");
+	check(known, "each mark on a list the hooks have seen made");
+	check(bound, "at the zone's begin, A bound with it (the world found by the mark)");
 	check(bad_subresources == 0, "A's depth's barriers name plane 0 or 1 (or all) only");
 	std::snprintf(line, sizeof(line), "the depth plane in DEPTH_WRITE for opaque draws (%u), DEPTH_READ for the blended piece (%u)", opaque_draws_plane_ok, blended_read);
 	check(opaque_draws_plane_bad == 0 && opaque_draws_plane_ok != 0 && blended_read != 0, line);
@@ -614,11 +592,11 @@ int main(int argc, char **argv)
 	// (the hooks' own statistic: the largest target seen turning readable, the first of equal size; the visibility test's
 	// target is A's size, as in the game)
 	check(st.world.width == AW && st.world.height == AH, "the hooks' own count finds a world-sized target turning readable");
-	check(injected == 1, "HiFi XI drew in at the zone's end marker");
+	check(injected == 1, "HiFi XI drew in at the zone's end mark");
 	size_t same = 0;
 	for (size_t i = 0; i < plain.size() && i < injected_px.size(); ++i)
 		same += plain[i] == injected_px[i] ? 1 : 0;
-	std::snprintf(line, sizeof(line), "the frame drawn after HiFi XI's state was put back is the same, pixel for pixel (%zu of %zu)", same, plain.size());
+	std::snprintf(line, sizeof(line), "the frame drawn after HiFi XI's own state is the same, pixel for pixel: the d3d8.dll bound its own again (%zu of %zu)", same, plain.size());
 	check(!plain.empty() && same == plain.size(), line);
 	// The direct channel: HifiFrameMark answers 0 without a handler; with one, it's called on the list with A and its
 	// depth in their states (A a target, the depth's planes as drawn), and the game's next draw lands where it should
@@ -628,7 +606,7 @@ int main(int argc, char **argv)
 		check(set != nullptr && mark != nullptr, "the d3d8.dll exports HifiFrameSetHandler and HifiFrameMark");
 		if (set != nullptr && mark != nullptr)
 		{
-			check(mark(hifi::slotmark::zone_end, 1) == 0, "HifiFrameMark without a handler: 0 (the game side sends its stencil marker then)");
+			check(mark(hifi::slotmark::zone_end, 1) == 0, "HifiFrameMark without a handler: 0 (the game side counts it not sent)");
 			set(&direct_handler, nullptr);
 			dev->BeginScene();
 			dev->SetRenderTarget(A, Az);

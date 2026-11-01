@@ -12,11 +12,11 @@
  *   - through the device as the game calls it, shadow then native: every state call made on the device as well; strips,
  *     fans and lists unrolled with each triangle's first vertex first; the draws left out of the device only when
  *     native; a DrawIndexedPrimitive, a Clear and a SetRenderTarget each cut a segment, marked before the game's call;
- *     a render-target texture left to the game; ApplyStateBlock followed by reading the state again; the markers at
- *     x = 16 kind + seq on the stencil only; the device's vtable its own again after;
+ *     a render-target texture left to the game; ApplyStateBlock followed by reading the state again; the markers to
+ *     HiFi XI's d3d8.dll (a stand-in for HifiFrameMark) with kind and seq; the device's vtable its own again after;
  *   - a texture taken once (LockRect read only, every level), held (one reference) while the store has it, taken again
  *     when its pixels change, let go by drop_textures();
- *   - no stencil on the bound depth: no window (the game draws all of it);
+ *   - no depth bound to mark with: no window (the game draws all of it);
  *   - stop(): the dump again, byte for byte; refused while something else changed a call.
  *
  *   build\uidraw_test.exe
@@ -28,6 +28,7 @@
 #include "../src/bake/dat.hpp"
 #include "../src/game/slotmark.hpp"
 #include "../src/game/uidraw.hpp"
+#include "../src/game/directmark.hpp"
 #include "../src/ui2d/fonthigh.hpp"
 #include "../src/ui2d/frame2d.hpp"
 #include "../src/ui2d/gate.hpp"
@@ -153,9 +154,22 @@ namespace
 		uint32_t vs = 0x144, ps = 0;
 		surface *rt = nullptr, *ds = nullptr;
 		uint32_t dpup = 0, dpup_vertices = 0, blocks = 0;
-		std::vector<int32_t> marks; // (x of each stencil-only one-pixel clear)
+		std::vector<int32_t> marks; // (16 kind + seq of each mark, in the d3d8.dll's order)
 	};
 	device *g_dev = nullptr;
+
+	// HiFi XI's d3d8.dll as the marks reach it (src/game/directmark.hpp): each into g_dev's list and the calls ("C<kind>.")
+	constexpr uint32_t x_of(uint32_t kind, uint32_t seq) { return 16 * kind + (seq & 15); }
+	int __cdecl direct_fn(uint32_t kind, uint32_t seq)
+	{
+		if (g_dev == nullptr)
+			return 0;
+		g_dev->marks.push_back(int32_t(x_of(kind, seq)));
+		char t[16];
+		std::snprintf(t, sizeof(t), "C%u.", unsigned(kind));
+		calls += t;
+		return 1;
+	}
 
 	long __stdcall d_set_rs(device *d, uint32_t s, uint32_t v) { d->rs[s & 255] = v; calls += 'S'; return 0; }
 	long __stdcall d_get_rs(device *d, uint32_t s, uint32_t *v) { *v = d->rs[s & 255]; return 0; }
@@ -194,17 +208,9 @@ namespace
 		calls += 'B';
 		return 0;
 	}
-	long __stdcall d_clear(device *d, uint32_t count, const int32_t *rects, uint32_t flags, uint32_t, float, uint32_t)
+	long __stdcall d_clear(device *, uint32_t, const int32_t *, uint32_t, uint32_t, float, uint32_t)
 	{
-		if (count == 1 && rects != nullptr && flags == 4 && rects[1] == 0 && rects[3] == 1 && rects[2] == rects[0] + 1)
-		{
-			d->marks.push_back(rects[0]);
-			char t[16];
-			std::snprintf(t, sizeof(t), "C%u.", unsigned(rects[0] / 16));
-			calls += t;
-		}
-		else
-			calls += 'X';
+		calls += 'X';
 		return 0;
 	}
 	long __stdcall d_dp(device *, uint32_t, uint32_t, uint32_t) { calls += 'P'; return 0; }
@@ -517,6 +523,8 @@ int main(int argc, char **argv)
 		uint32_t wrapper[8] = {};
 		wrapper[3] = uint32_t(reinterpret_cast<uintptr_t>(&dev));
 		const uint32_t own_vt = uint32_t(reinterpret_cast<uintptr_t>(dev.vt));
+		g_dev = &dev;
+		hifi::game::set_direct_mark(&direct_fn);
 
 		texture *const tex = make_texture(32, 32, 2, 0, 1, 0x40), *const target_tex = make_texture(64, 64, 1, 1, 0, 0x10);
 		const v28 quad[4] = { { 9.5f, 9.5f, 0, 1, 0x80808080, 0, 0 }, { 41.5f, 9.5f, 0, 1, 0x80808080, 1, 0 }, { 9.5f, 41.5f, 0, 1, 0x80808080, 0, 1 },
@@ -540,7 +548,7 @@ int main(int argc, char **argv)
 				mt + "the begin stub: the stack and eax, ebx, esi, edi as they were");
 			const uint32_t seq = ud::get_counts().seq;
 			check(ud::get_counts().windows == c0.windows + 1 && *reinterpret_cast<uint32_t *>(&dev) != own_vt, mt + "the window open on the wrapper's device");
-			check(dev.marks.size() == 1 && dev.marks[0] == int32_t(hifi::slotmark::x_of(hifi::slotmark::ui_begin, seq)), mt + "its begin marked (kind 9)");
+			check(dev.marks.size() == 1 && dev.marks[0] == int32_t(x_of(hifi::slotmark::ui_begin, seq)), mt + "its begin marked (kind 9)");
 			// The game's calls: a textured quad, a fan, a list; then a DIP (cut); a render-target texture (the game's)
 			set_tex(&dev, tex);
 			dpup(&dev, 5, 2, quad, 28);
@@ -565,7 +573,7 @@ int main(int argc, char **argv)
 			hifi::game::write_code(w.code + 0x20 + 0x11, saved_jmp, 5);
 			check(re.esp_diff == 0 && re.esi == 0x22222222 && re.edi == 0x33333333 && fade_args[0] == 0 && fade_args[1] == 0x80808080 &&
 				fade_ecx == uint32_t(reinterpret_cast<uintptr_t>(wrapper)), mt + "the end stub: the fade called with its two arguments and the wrapper, the stack kept");
-			// After the fade: a SetRenderTarget (cut) to a target whose depth has no stencil (left to the game), back
+			// After the fade: a SetRenderTarget (cut) to another target of the game's (left to it), back
 			dpup(&dev, 5, 2, quad, 28);
 			method<long(__stdcall *)(device *, surface *, surface *)>(&dev, 31)(&dev, &other, &plain_z);
 			dpup(&dev, 5, 2, quad, 28);
@@ -586,7 +594,7 @@ int main(int argc, char **argv)
 				continue;
 			const ud::counts c1 = ud::get_counts();
 			// Recorded: quad, fan, list | (DIP) | (render target texture: the game's) | quad after the block | (fade) quad |
-			// (SetRenderTarget) (no stencil: the game's) | (SetRenderTarget) quad
+			// (SetRenderTarget) (another target: the game's) | (SetRenderTarget) quad
 			check(f->draw_count == 6 && c1.recorded - c0.recorded == 6 && c1.passed - c0.passed == 3, mt + "6 draws recorded, 3 left to the game (" +
 				std::to_string(f->draw_count) + ", " + std::to_string(c1.passed - c0.passed) + ")");
 			check(f->segments.load() == 4, mt + "4 segments (" + std::to_string(f->segments.load()) + ")");
@@ -603,7 +611,7 @@ int main(int argc, char **argv)
 			check(fade != std::string::npos && calls.rfind("C10.", fade) != std::string::npos && calls.rfind("C10.", fade) > calls.find('B'), mt + "the interface's segment marked before the fade");
 			check(end != std::string::npos && calls.rfind("C11.", end) != std::string::npos && calls.rfind("C11.", end) > calls.rfind('T'), mt + "the frame's end marked before EndScene");
 			const uint32_t marks_x = uint32_t(dev.marks.back());
-			check(marks_x == hifi::slotmark::x_of(hifi::slotmark::frame_end, seq), mt + "markers at x = 16 kind + seq");
+			check(marks_x == x_of(hifi::slotmark::frame_end, seq), mt + "the frame's end marked with its seq");
 			uint32_t states = 0;
 			for (const char ch : calls)
 				states += ch == 'S';
@@ -689,7 +697,7 @@ int main(int argc, char **argv)
 			const u2::frame *f = u2::published(seq & 15);
 			check(f != nullptr && f->draw_count == 2 && f->segments.load() == 2 && f->seg[0].kind == hifi::slotmark::screen && f->seg[1].kind == hifi::slotmark::screen &&
 				f->draws[0].colour.op == 2 && f->draws[0].target_w == 2560, tag + "A: the wash recorded twice, two segments of kind 8 (the DIP's cut, the pop)");
-			check(dev.dpup == 0 && dev.marks.size() == 2 && uint32_t(dev.marks[1]) == hifi::slotmark::x_of(hifi::slotmark::screen, seq) &&
+			check(dev.dpup == 0 && dev.marks.size() == 2 && uint32_t(dev.marks[1]) == x_of(hifi::slotmark::screen, seq) &&
 				calls.rfind("C8.") < calls.find('p') && *reinterpret_cast<uint32_t *>(&dev) == own_vt && fake_pop_ecx == uint32_t(reinterpret_cast<uintptr_t>(wrapper)),
 				tag + "A: marked before the pop, the pop called with the wrapper, the device's own vtable back");
 			hifi::game::write_code(w.code + 0x60 + 0x14, saved_screen, 5);
@@ -738,14 +746,18 @@ int main(int argc, char **argv)
 			delete moji;
 			delete other_tex;
 		}
-		// No stencil on the bound depth: no window
+		// No depth bound to mark with, or no d3d8.dll of ours to take the marks: no window
 		{
 			const ud::counts c0 = ud::get_counts();
-			dev.ds = &plain_z;
+			dev.ds = nullptr;
 			run_begin(w.code, reinterpret_cast<uintptr_t>(wrapper));
-			check(ud::get_counts().no_window == c0.no_window + 1 && *reinterpret_cast<uint32_t *>(&dev) == own_vt, tag + "no stencil to mark on: no window, the game draws it");
+			check(ud::get_counts().no_window == c0.no_window + 1 && *reinterpret_cast<uint32_t *>(&dev) == own_vt, tag + "no depth bound: no window, the game draws it");
 			dev.ds = &bbz;
+			hifi::game::set_direct_mark(nullptr);
+			run_begin(w.code, reinterpret_cast<uintptr_t>(wrapper));
+			check(ud::get_counts().no_window == c0.no_window + 2 && *reinterpret_cast<uint32_t *>(&dev) == own_vt, tag + "not HiFi XI's d3d8.dll: no window, the game draws it");
 			ud::set_mode(ud::off);
+			g_dev = nullptr;
 		}
 		// stop(): refused while a call isn't ours, then the dump again
 		{

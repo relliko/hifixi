@@ -2,17 +2,13 @@
  * World FX's core (worldfx_core.hpp): grass for FFXI's world and all that's drawn with it (Direct3D 12 only), for
  * whichever host feeds it the events (the World FX ReShade add-on, HiFi XI's plugin).
  *
- * dgVoodoo turns the game's Direct3D 8 into Direct3D 12 command lists. This follows what dgVoodoo binds
- * on each list (the host's events: targets, pipeline, topology, viewports, scissors, root signature and
- * every root argument) and once a frame draws grass (grass_render) into the world's render target and
- * depth buffer with plain Direct3D 12 calls, then binds dgVoodoo's state again. The host never sees
- * those calls as dgVoodoo's, so its own idea of what is bound stays right.
- *
- * Which target: the world, as for the effects: the one that took the most vertices last frame with a
- * depth buffer bound. When: the first time this frame dgVoodoo moves off it (or closes the list while
- * on it) after 40% of last frame's world vertices have gone in since its depth was cleared. The zone's
- * meshes come first in a frame (client-notes "Frame anatomy"), so they're in by then, and whatever is
- * drawn later is depth-tested against the blades.
+ * HiFi XI's own d3d8.dll turns the game's Direct3D 8 into Direct3D 12 command lists and says where the game's passes
+ * are (src/host/frameapi.hpp). Which target: the world, the target and depth bound at the zone's marker
+ * (on_world_marker). When: at the world's end as the d3d8.dll marks it (on_world_end: the first read of the world's
+ * target, the resolve), where World FX draws grass and the rest into it with plain Direct3D 12 calls; the blades go in
+ * at the zone's end (on_zone_end), before the characters and effects. After either the d3d8.dll binds all of its own
+ * state again. The zone's meshes come first in a frame (client-notes "Frame anatomy"), so whatever is drawn later is
+ * depth-tested against the blades.
  *
  * Camera: the game's own (gGame +0x94 view, +0x154 projection, found in FFXiMain.dll by facelift's
  * 'game.sys' pattern). Zone: the worldfx Ashita addon puts it in the process environment
@@ -55,12 +51,8 @@ namespace
 	// The game's world found since its device was attached: World FX draws there (worldfx_drawing: HiFi XI's game side
 	// leaves the game's own water, rain... out only then; never on another output, DXVK or dgVoodoo's Direct3D 11)
 	std::atomic<bool> g_has_drawn{ false };
-	// A frame whose busiest depth-tested target took fewer vertices than this has no world in it
-	constexpr uint64_t kMinWorldVertices = 10000;
-	// Grass goes in at the world's end: the barrier that makes it readable (on_barrier). Without one for a
-	// while (kBarrierFrames), it goes in at the first move off the world once as much of it is drawn as the
-	// smallest recent frame's, or at a move to a target of another size (the resolve) past kResolveShare.
-	constexpr uint32_t kBarrierFrames = 60;
+	// Grass and the rest go in at the world's end, as our d3d8.dll says it (on_world_end: the first read of the world's
+	// target after its zone began, the resolve)
 	// At most kMaxPasses drawings between two presents: a full-screen pass at twice the screen's size many
 	// times in one frame is enough to make the GPU time out
 	constexpr uint32_t kMaxPasses = 2;
@@ -74,22 +66,11 @@ namespace
 	constexpr const char *kInGameVariable = "FFXI_WORLDFX_INGAME";
 	constexpr ULONGLONG kShadePauseMs = 5000;
 	constexpr float kShadeMaxMs = 30.0f;
-	constexpr double kResolveShare = 0.4;
-	// The first frame of moves off the world goes to ReShade.log after this many frames with grass
-	constexpr uint32_t kLogMovesAfter = 300;
-	// Frames whose world vertex counts the share is measured against (the smallest)
-	constexpr uint32_t kRecent = 8;
 	constexpr uint32_t kZoneCheckFrames = 30;
 	constexpr uint32_t kHistory = 120;
 
-	// What dgVoodoo has bound on one command list (worldfx_core.hpp)
+	// What's bound on one command list (worldfx_core.hpp)
 	using worldfx::list_data;
-
-	struct target_use
-	{
-		ID3D12Resource *rt, *ds;
-		uint64_t vertices;
-	};
 
 	// worldfx.hlsl compiled on a thread of its own (shader_thread): compiling all the shaders takes over 11 s, and done
 	// on the game's frame it froze the game until Windows closed it (in game, 2026-10-21). The frame picks the result
@@ -130,44 +111,24 @@ namespace
 		bool enabled = true;
 		grass::look look;
 
-		// One frame's moves off the world, for the log
-		uint32_t frames_with_grass = 0;
-		bool logging_moves = false, logged_moves = false;
-		uint32_t logged_frames = 0;
-		std::string moves;
-
-		// The first draw logged (with dgVoodoo's root signature)
+		// The first draw logged (with the game's root signature)
 		bool logged_first = false;
 
-		// Learnt from earlier frames
+		// The world as the game side's zone marker names it (on_world_marker: the target and depth bound there); at which
+		// present the last one came, how many since the start
 		ID3D12Resource *world_rt = nullptr;
 		ID3D12Resource *world_ds = nullptr;
-		// The world as the game side's zone marker names it (on_world_marker): its depth, the target bound with it there;
-		// at which present the last one came, how many since the start. While they come, they decide the world, not the
-		// vertex counts (with the game's zone off, its UI outweighs what's left in the world).
-		ID3D12Resource *marker_rt = nullptr;
-		ID3D12Resource *marker_ds = nullptr;
 		uint64_t marker_present = 0; // (g.presents then)
 		uint64_t markers = 0;
 		bool marker_logged = false;
-		uint64_t world_vertices_last = 0; // the smallest of the recent frames' (what the share is of)
-		uint64_t recent[8] = {};
-		uint32_t recent_pos = 0, recent_count = 0;
-		bool world_cleared = false; // the world started over (a clear) since the last present
-		bool color_clears = false;  // the world's colour clear has been seen (else its depth clear is the boundary)
 
 		// This frame
-		std::vector<target_use> uses;
-		uint64_t world_vertices = 0; // into the world since its depth was cleared
-		bool tried = false;
+		bool tried = false; // the world's end came
 		bool drew = false;
 
 		// Zone and blades
 		uint32_t frames = 0;
-		uint32_t last_resolve_frame = 0;      // the frame grass last went in at the world's end (its read barrier)
-		uint32_t last_end_mark_frame = 0;     // the frame our d3d8.dll last said where the world ends (on_world_end)
-		uint64_t end_marks = 0;
-		// The world's views as last bound, for grass at its end on a list that has moved off it already
+		// The world's views as last bound (for its end, where the resolve's targets are bound)
 		uint64_t world_rtv = 0, world_dsv = 0;
 		// The states the last barrier (on any list) put the world's target and depth in
 		D3D12_RESOURCE_STATES last_rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -474,8 +435,6 @@ namespace
 		bool last_at_marker = false; // (the last world's end drew the rest, its blades at the zone's end)
 		grass::draw_stats marker_blades;
 		uint64_t blades_at_markers = 0;
-		uint64_t at_vertices = 0;
-		uint64_t of_vertices = 0;
 		bool history[kHistory] = {};
 		uint32_t history_pos = 0;
 		uint32_t history_count = 0;
@@ -1079,60 +1038,6 @@ namespace
 			d.state.viewport_count, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth, static_cast<unsigned>(d.state.topology));
 		text += tail;
 		log_message(0, text.c_str());
-	}
-
-	// Whether grass goes in now: the list is leaving (or closing on) the world after enough of it (mutex held)
-	// A finished world's vertex count. The share is of the smallest of the last few: a world drawing less than
-	// the one before (turning, a monster gone) still reaches it, so grass doesn't skip it even at 100%.
-	void learn_world_size(uint64_t vertices)
-	{
-		if (vertices < kMinWorldVertices)
-			return;
-		g.recent[g.recent_pos] = vertices;
-		g.recent_pos = (g.recent_pos + 1) % kRecent;
-		if (g.recent_count < kRecent)
-			g.recent_count++;
-		g.world_vertices_last = vertices;
-		for (uint32_t i = 0; i < g.recent_count; ++i)
-			g.world_vertices_last = std::min(g.world_vertices_last, g.recent[i]);
-	}
-
-	// Whether grass went in at the world's read barrier lately (else the fallbacks in due)
-	bool barrier_seen()
-	{
-		return g.frames - g.last_resolve_frame <= kBarrierFrames;
-	}
-
-	// to: the target moved to (0 at list close)
-	bool due(ID3D12Resource *rt, ID3D12Resource *ds, ID3D12Resource *to = nullptr)
-	{
-		if (g.world_rt == nullptr || rt != g.world_rt || ds != g.world_ds)
-			return false;
-		const double share = g.world_vertices_last != 0 ? double(g.world_vertices) / double(g.world_vertices_last) : 0.0;
-		if (g.logging_moves && g.moves.size() < 1500)
-		{
-			char item[96] = "";
-			if (to != nullptr && g.dev != nullptr)
-			{
-				const D3D12_RESOURCE_DESC rd = to->GetDesc();
-				std::snprintf(item, sizeof(item), " %.0f%%->%ux%u", share * 100.0, unsigned(rd.Width), unsigned(rd.Height));
-			}
-			else
-				std::snprintf(item, sizeof(item), " %.0f%%->close", share * 100.0);
-			g.moves += item;
-		}
-		// (the world's read barrier is where grass goes in; this is for when there's none)
-		if (barrier_seen() || g.tried || g.world_vertices < kMinWorldVertices)
-			return false;
-		if (share >= 1.0)
-			return true;
-		// A move to a target of another size than the world's, past the first part: the resolve
-		if (to != nullptr && share >= kResolveShare && g.dev != nullptr)
-		{
-			const D3D12_RESOURCE_DESC a = to->GetDesc(), w = g.world_rt->GetDesc();
-			return a.Width >= 640 && (a.Width != w.Width || a.Height != w.Height);
-		}
-		return false;
 	}
 
 	// Lit lights from the game's light table are this fresh at most (ms): older, the worldfx Ashita addon is gone,
@@ -2077,13 +1982,6 @@ namespace
 			g.skip = "the world ended more than twice this frame (the rest skipped)";
 			return;
 		}
-		if (g.logging_moves && g.moves.size() < 1500)
-		{
-			// (with the world's states as this list knows them: the game may have changed them on another list)
-			char item[64];
-			std::snprintf(item, sizeof(item), " [GRASS rt 0x%X ds 0x%X]", static_cast<unsigned>(d.world_rt_state), static_cast<unsigned>(d.world_ds_state));
-			g.moves += item;
-		}
 		g.skip = nullptr;
 		const bool water_on = (g.look.water || g.look.water_debug) && g.renderer != nullptr && g.renderer->water_loaded();
 		const bool rain_on = (g.rain_on || g.snow_on) && g.renderer != nullptr && g.renderer->rain_loaded();
@@ -2102,14 +2000,7 @@ namespace
 			g.skip = "no blades for this zone";
 			return;
 		}
-		// (only the root signature is needed: our d3d8.dll sets it once a list and the restore puts it back; a list it
-		// hasn't drawn on yet has no pipeline, targets or tables of its own, and it binds them all at its next draw. Asking
-		// for a pipeline too left a twelfth of the frames unshaded on it, 2026-10-30: the sun's shadows came and went)
-		if (d.state.root == nullptr)
-		{
-			g.skip = "the game's root signature wasn't seen on this list";
-			return;
-		}
+		// (nothing of the game's needed on the list: our d3d8.dll binds all of its own again after the mark)
 		grass::camera cam;
 		if (const char *why = read_camera(cam))
 		{
@@ -2193,14 +2084,7 @@ namespace
 			std::snprintf(text, sizeof(text), "FFXI World FX: shading pass on, %.1f s after the game said a character is in", (now - g.in_game_since) / 1000.0);
 			log_message(0, text);
 		}
-		// The game's pipeline, root signature and arguments, targets and viewport back, whenever the renderer
-		// bound its own (the shading pass does too, with no grass near: left bound, the game's next draws ran
-		// with them and hung the GPU)
-		if (g.last.bound)
-		{
-			d.state.restore(list);
-			gpu_crash::mark(list, L"worldfx: the game's state put back");
-		}
+		// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 		if (!error.empty())
 		{
 			g.error = error;
@@ -2213,42 +2097,21 @@ namespace
 		if (draws == 0)
 			g.skip = "no blades near the camera";
 		g.drew = draws != 0;
-		g.at_vertices = g.world_vertices;
-		g.of_vertices = g.world_vertices_last;
 	}
 
-	// Presents a zone marker keeps the world for: past them without one, the vertex counts decide again
+	// Presents a zone marker keeps the world for (status)
 	constexpr uint32_t kMarkerPresents = 8;
 
 	// Whether the game side's zone markers name the world now (mutex held)
 	bool marked()
 	{
-		return g.marker_rt != nullptr && g.markers != 0 && g.presents - g.marker_present <= kMarkerPresents;
+		return g.world_rt != nullptr && g.markers != 0 && g.presents - g.marker_present <= kMarkerPresents;
 	}
 
 	bool same_size(ID3D12Resource *a, ID3D12Resource *b)
 	{
 		const D3D12_RESOURCE_DESC x = a->GetDesc(), y = b->GetDesc();
 		return x.Width == y.Width && x.Height == y.Height && x.SampleDesc.Count == y.SampleDesc.Count;
-	}
-
-	void count_draw(list_data &d, uint64_t vertices)
-	{
-		if (d.rt0 == 0 || d.ds == 0)
-			return;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		bool found = false;
-		for (target_use &use : g.uses)
-			if (use.rt == d.rt0 && use.ds == d.ds)
-			{
-				use.vertices += vertices;
-				found = true;
-				break;
-			}
-		if (!found)
-			g.uses.push_back({ d.rt0, d.ds, vertices });
-		if (d.rt0 == g.world_rt && d.ds == g.world_ds)
-			g.world_vertices += vertices;
 	}
 
 	void end_frame()
@@ -2283,50 +2146,10 @@ namespace
 			g.passes = 0;
 			g.passes_wanted = 0;
 		}
-		const target_use *best = nullptr;
-		for (const target_use &use : g.uses)
-			if (best == nullptr || use.vertices > best->vertices)
-				best = &use;
-		if (marked())
-		{
-			// (the zone marker's world: its count still taken as the world's size where no clear said so)
-			if (!g.world_cleared)
-				for (const target_use &use : g.uses)
-					if (use.rt == g.world_rt && use.ds == g.world_ds)
-						learn_world_size(use.vertices);
-		}
-		else if (best != nullptr && best->vertices >= kMinWorldVertices)
-		{
-			if (best->rt != g.world_rt || best->ds != g.world_ds)
-				g.recent_count = 0;
-			g.world_rt = best->rt;
-			g.world_ds = best->ds;
-			if (!g.world_cleared)
-				learn_world_size(best->vertices); // (no clear of the world's depth seen: present is the boundary)
-		}
 		if (!g.tried)
 		{
-			g.skip = g.world_rt == 0 ? "no world target yet" : "the world wasn't left after enough of it was drawn";
+			g.skip = g.world_rt == 0 ? "no world target yet (no zone marker from HiFi XI's d3d8.dll)" : "the world's end wasn't marked this frame";
 			g.last = {};
-		}
-		if (g.logging_moves)
-		{
-			// Three presents' worth, each line from one present to the next
-			char head[160];
-			std::snprintf(head, sizeof(head), "FFXI World FX: moves off the world and clears, present %u of 3 (share of %llu vertices -> new target; grass %s):",
-				g.logged_frames + 1, static_cast<unsigned long long>(g.world_vertices_last), g.drew ? "drawn" : "not drawn");
-			log_message(0, (head + g.moves).c_str());
-			g.moves.clear();
-			if (++g.logged_frames >= 3)
-			{
-				g.logging_moves = false;
-				g.logged_moves = true;
-			}
-		}
-		else if (!g.logged_moves && g.drew && ++g.frames_with_grass >= kLogMovesAfter)
-		{
-			g.logging_moves = true;
-			g.moves.clear();
 		}
 		if (g.in_game)
 		{
@@ -2339,13 +2162,7 @@ namespace
 		g.history_pos = (g.history_pos + 1) % kHistory;
 		if (g.history_count < kHistory)
 			g.history_count++;
-		g.uses.clear();
-		if (!g.world_cleared)
-		{
-			g.world_vertices = 0;
-			g.tried = false;
-		}
-		g.world_cleared = false;
+		g.tried = false;
 		g.drew = false;
 	}
 }
@@ -2650,8 +2467,6 @@ namespace worldfx
 		g.zone_tried = false;
 		g.world_rt = nullptr;
 		g.world_ds = nullptr;
-		g.marker_rt = nullptr;
-		g.marker_ds = nullptr;
 		gpu_crash::watch(device, addon_folder() + L"worldfx-gpu-crash.txt", log_gpu_crash, crash_context);
 		log_message(0, ("FFXI World FX: the GPU: " + gpu_crash::gpu_name(device) + "; video memory: " + gpu_crash::gpu_memory(device)).c_str());
 		log_message(0, ("FFXI World FX: the GPU supports " + gpu_crash::gpu_features(device)).c_str());
@@ -2674,9 +2489,6 @@ namespace worldfx
 		g.dev = nullptr;
 		g.world_rt = nullptr;
 		g.world_ds = nullptr;
-		g.marker_rt = nullptr;
-		g.marker_ds = nullptr;
-		g.uses.clear();
 	}
 
 	void shutdown()
@@ -2697,21 +2509,8 @@ namespace worldfx
 		d.world_ds_state = g.last_ds_state;
 	}
 
-	void on_close(ID3D12GraphicsCommandList *list, list_data &d)
+	void on_targets(ID3D12GraphicsCommandList *, list_data &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv)
 	{
-		if (d.rt0 == nullptr)
-			return;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (due(d.rt0, d.ds))
-			inject(list, d, uint64_t(d.state.rtvs[0].ptr), uint64_t(d.state.dsv.ptr));
-	}
-
-	void on_targets(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv)
-	{
-		ID3D12Resource *const old_rt = d.rt0, *const old_ds = d.ds;
-		const uint64_t old_rtv = d.state.rtv_count != 0 ? uint64_t(d.state.rtvs[0].ptr) : 0;
-		const uint64_t old_dsv = uint64_t(d.state.dsv.ptr);
-
 		// The new binding (already made: this comes after the call)
 		count = std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
 		d.state.rtv_count = count;
@@ -2726,12 +2525,6 @@ namespace worldfx
 			g.world_rtv = rtvs[0];
 			g.world_dsv = dsv;
 		}
-		if (old_rt == nullptr || (old_rt == d.rt0 && old_ds == d.ds))
-			return;
-
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (due(old_rt, old_ds, d.rt0))
-			inject(list, d, old_rtv, old_dsv);
 	}
 
 	void on_pipeline(list_data &d, ID3D12PipelineState *pso)
@@ -2791,7 +2584,7 @@ namespace worldfx
 		}
 	}
 
-	void on_barrier(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after)
+	void on_barrier(ID3D12GraphicsCommandList *, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		for (uint32_t i = 0; i < count; ++i)
@@ -2799,42 +2592,7 @@ namespace worldfx
 			if (resources[i] == nullptr)
 				continue;
 			if (resources[i] == g.world_rt)
-			{
-				const D3D12_RESOURCE_STATES was = d.world_rt_state;
 				g.last_rt_state = d.world_rt_state = after[i];
-				// The world turned from a target into something read: its end (the resolve samples it next). Grass
-				// goes in here, told by this list alone: no counts shared between frames, which dgVoodoo records
-				// overlapping, the more so the higher the frame rate. (Earlier points left part of the ground out
-				// of its copy, and blades read fog there.)
-				const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-				if ((d.world_rt_state & read) != 0 && (was & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0)
-				{
-					d.world_ended = resources[i];
-					if (g.logging_moves && g.moves.size() < 1500)
-						g.moves += " rt-read";
-					// (our d3d8.dll says where the world ends: the barrier only follows the states then)
-					const bool marked_end = g.end_marks != 0 && g.frames - g.last_end_mark_frame <= kBarrierFrames;
-					if (!marked_end && !d.grass_done && g.world_rtv != 0 && g.world_dsv != 0)
-					{
-						d.grass_done = true;
-						g.last_resolve_frame = g.frames;
-						// The views were saved at the world's last bind: dgVoodoo may have put another target in those
-						// descriptors since (while a zone loads), and a full-screen pass through them would then write
-						// far outside it
-						if (resource_of(g.world_rtv) == g.world_rt && resource_of(g.world_dsv) == g.world_ds)
-							inject(list, d, g.world_rtv, g.world_dsv);
-						else
-						{
-							g.skip = "the world's views hold something else now (skipped)";
-							if (!g.logged_stale_views)
-							{
-								g.logged_stale_views = true;
-								log_message(1, "FFXI World FX: the world's saved views held another target at its end (skipped; logged once)");
-							}
-						}
-					}
-				}
-			}
 			else if (resources[i] == g.world_ds)
 				g.last_ds_state = d.world_ds_state = after[i];
 		}
@@ -2843,58 +2601,17 @@ namespace worldfx
 	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
-		g.end_marks++;
-		g.last_end_mark_frame = g.frames;
 		if (d.grass_done || g.world_rtv == 0 || g.world_dsv == 0)
 			return;
 		d.grass_done = true;
 		d.world_ended = g.world_rt;
-		g.last_resolve_frame = g.frames;
 		if (resource_of(g.world_rtv) == g.world_rt && resource_of(g.world_dsv) == g.world_ds)
 			inject(list, d, g.world_rtv, g.world_dsv);
 		else
 			g.skip = "the world's views hold something else now (skipped)";
 	}
 
-	void on_clear_depth(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, bool depth, uint32_t rect_count, const D3D12_RECT *rects)
-	{
-		if (!depth)
-			return;
-		ID3D12Resource *const res = resource_of(dsv);
-		if (res != nullptr && res == g.world_ds && !covers_all(res, rect_count, rects))
-		{
-			std::lock_guard<std::mutex> lock(g.mutex);
-			if (g.logging_moves && g.moves.size() < 1500)
-				g.moves += " depth-clear(part)";
-			return;
-		}
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (res != g.world_ds)
-			return;
-		const double share = g.world_vertices_last != 0 ? double(g.world_vertices) / double(g.world_vertices_last) : 0.0;
-		if (g.logging_moves && g.moves.size() < 1500)
-		{
-			char item[48];
-			std::snprintf(item, sizeof(item), " %.0f%%:depth-clear", share * 100.0);
-			g.moves += item;
-		}
-		// Whatever clears the world's depth (the frame's start, or a test mid-frame: the lens flare's and the
-		// glows' visibility tests clear and switch surfaces), grass goes in before it while the ground is there
-		if (!barrier_seen() && !g.tried && share >= kResolveShare && g.world_vertices >= kMinWorldVertices && d.rt0 == g.world_rt && d.ds == g.world_ds)
-			inject(list, d, uint64_t(d.state.rtvs[0].ptr), dsv);
-		if (!g.color_clears)
-		{
-			// (no clear of the world's colour seen: its depth clear is the frame boundary)
-			learn_world_size(g.world_vertices);
-			g.world_vertices = 0;
-			g.tried = false;
-			g.world_cleared = true;
-		}
-	}
-
-	// The world's colour (the sky/fog clear) is cleared once, at the frame's start: the frame boundary for grass.
-	// Not present: dgVoodoo records the next frame's lists on another thread while the last one presents, so a
-	// present can land in the middle of a world, and counting from it put grass (and its copy) after a clear.
+	// The world's colour (the sky/fog clear) is cleared once, at the frame's start, to the zone's fog
 	void on_clear_target(list_data &, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects)
 	{
 		ID3D12Resource *const res = resource_of(rtv);
@@ -2902,14 +2619,7 @@ namespace worldfx
 		if (res == nullptr || res != g.world_rt)
 			return;
 		if (!covers_all(res, rect_count, rects))
-		{
-			if (g.logging_moves && g.moves.size() < 1500)
-				g.moves += " colour-clear(part)";
 			return;
-		}
-		if (g.logging_moves && g.moves.size() < 1500)
-			g.moves += " colour-clear";
-		g.color_clears = true;
 		// (the colour it's cleared to is the zone's fog: the water's sky along the horizon)
 		if (color != nullptr)
 		{
@@ -2917,44 +2627,23 @@ namespace worldfx
 				g.look.fog[i] = std::clamp(color[i], 0.0f, 1.0f);
 			g.look.fog_known = true;
 		}
-		learn_world_size(g.world_vertices);
-		g.world_vertices = 0;
-		g.tried = false;
-		g.world_cleared = true;
 	}
 
-	void on_world_marker(list_data &d, uint64_t dsv)
+	void on_world_marker(ID3D12Resource *rt, ID3D12Resource *ds, uint64_t rtv, uint64_t dsv)
 	{
-		ID3D12Resource *const ds = resource_of(dsv);
-		if (ds == nullptr)
+		if (rt == nullptr || ds == nullptr || rtv == 0 || dsv == 0)
 			return;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
 		g.look_at_marker = false;
 		g.markers++;
 		g.marker_present = g.presents;
-		// The target: the one bound with this depth on this list (a list dgVoodoo has just reset has none bound: then
-		// the one found with it before)
-		ID3D12Resource *rt = nullptr;
-		if (d.ds == ds && d.rt0 != nullptr && same_size(d.rt0, ds))
-			rt = d.rt0;
-		else if (g.marker_ds == ds)
-			rt = g.marker_rt;
-		else if (g.world_ds == ds && g.world_rt != nullptr && same_size(g.world_rt, ds))
-			rt = g.world_rt;
-		g.marker_ds = ds;
-		g.marker_rt = rt;
-		if (rt == nullptr || (rt == g.world_rt && ds == g.world_ds))
+		g.world_rtv = rtv;
+		g.world_dsv = dsv;
+		if (rt == g.world_rt && ds == g.world_ds)
 			return;
 		g.world_rt = rt;
 		g.world_ds = ds;
-		g.recent_count = 0;
-		// (its views: the ones bound now, else from its next bind)
-		if (d.rt0 == rt && d.state.rtv_count != 0)
-		{
-			g.world_rtv = uint64_t(d.state.rtvs[0].ptr);
-			g.world_dsv = dsv;
-		}
 		const D3D12_RESOURCE_DESC w = rt->GetDesc();
 		char text[160];
 		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %llux%u%s", static_cast<unsigned long long>(w.Width), w.Height,
@@ -2970,9 +2659,9 @@ namespace worldfx
 		ID3D12Resource *const ds = resource_of(dsv);
 		if (!g.in_game || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
 			return;
-		// (the world the markers named, its views still its own, D24S8 as the blades' depth; dgVoodoo's state seen)
+		// (the world the markers named, its views still its own, D24S8 as the blades' depth)
 		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || g.world_rtv == 0 || resource_of(g.world_rtv) != g.world_rt ||
-			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT || d.state.root == nullptr)
+			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT)
 			return;
 		grass::camera cam;
 		if (read_camera(cam) != nullptr)
@@ -3011,11 +2700,6 @@ namespace worldfx
 			std::swap(b[k].Transition.StateBefore, b[k].Transition.StateAfter);
 		if (n != 0)
 			list->ResourceBarrier(n, b);
-		if (g.marker_blades.bound)
-		{
-			d.state.restore(list);
-			gpu_crash::mark(list, L"worldfx: the game's state put back (the blades at the zone's end)");
-		}
 		if (!error.empty())
 		{
 			g.error = error;
@@ -3025,11 +2709,6 @@ namespace worldfx
 		}
 		g.blades_at_marker = true;
 		g.blades_at_markers++;
-	}
-
-	void on_draw(list_data &d, uint64_t vertices)
-	{
-		count_draw(d, vertices);
 	}
 
 	void on_present(ID3D12CommandQueue *queue)
@@ -3748,7 +3427,7 @@ static void status_lines(const worldfx::ui &u)
 	{
 		const D3D12_RESOURCE_DESC w = g.world_rt->GetDesc();
 		text(u, "The world: %llux%u, found %s", static_cast<unsigned long long>(w.Width), w.Height,
-			marked() ? "by the game's zone marker" : "by what's drawn most (no zone markers lately)");
+			marked() ? "by the game's zone marker" : "(no zone markers lately)");
 	}
 	else
 		u.text_disabled(g.markers != 0 ? "The world: not found yet (zone markers seen, but not yet with its target bound)" : "The world: not found yet");

@@ -16,7 +16,7 @@
 // run as before, so what World FX's patches leave out stays out.
 //
 // The gate: elements are taken only while set_native says so (the plugin's module: the Direct3D 12 side up and its
-// markers seen), the bound depth has a stencil for the markers, and per element only what's reproduced faithfully:
+// markers seen), HiFi XI's d3d8.dll is there for the markers, and per element only what's reproduced faithfully:
 // the classes handled, every texture on the GPU, a lit element's lights worked out as 0467E0 does, a blend letter
 // 0467E0 knows. Everything else is the game's, element by element: never a hole.
 
@@ -51,7 +51,7 @@ namespace hifi::game::fxdraw
 		uint64_t flushes = 0;
 		uint64_t taken[16] = {};  // (by fx::element_class)
 		uint64_t empty = 0;       // taken, nothing to draw (as the game's own early returns)
-		uint64_t game = 0;        // left to the game: not taking (native off, no stencil)
+		uint64_t game = 0;        // left to the game: not taking (native off, no d3d8.dll of ours for the markers)
 		uint64_t unsupported = 0; // ... a class not handled yet
 		uint64_t lit = 0;         // ... lit (flags bit 16), its lights not to be had
 		uint64_t lit_taken = 0;   // (of those taken, lit)
@@ -69,7 +69,7 @@ namespace hifi::game::fxdraw
 	counts get_counts();
 	std::string status();
 
-	// For the tests: the sites and our stubs; a sink for the markers (instead of the device); the device
+	// For the tests: the sites and our stubs; a sink for the markers (instead of the d3d8.dll)
 	struct sites
 	{
 		uintptr_t setup_call = 0, setup = 0;        // 04612E, 0467E0
@@ -92,7 +92,6 @@ namespace hifi::game::fxdraw
 	};
 	sites where();
 	void set_sink(void (*sink)(uint32_t kind, uint32_t seq));
-	void set_device(uintptr_t device);
 	// The setup the call goes on to for what's left to the game (start() sets 0467E0)
 	void set_setup(uintptr_t setup);
 	// ... and the battle numbers' glyph bind (1207B0) and draw (00CD00) theirs go on to (start() sets the game's)

@@ -1,10 +1,10 @@
 /*
  * AMD FSR 2 over the world (temporal.hpp). The motion pass's root signature:
- *   0  40 constants b0  A's width, height, the depth copy's row pitch (words), whether the blades' motion is there; the
+ *   0  40 constants b0  A's width, height, (unused), whether the blades' motion is there; the
  *                       jitter (NDC); PROJECTION's _11 and _22 (without the jitter); the reprojection: this frame's view
  *                       space to the last frame's clip (inverse VIEW x last VIEW x last PROJECTION, row vectors); VIEW's
  *                       first three rows (a world direction into view space); whether the characters' motion is there
- *   1  table            t0 the depth copy (raw), t1 the blades' motion (World FX's; a null view when there's none), t2
+ *   1  table            t0 A's depth (plane 0, R24_UNORM_X8), t1 the blades' motion (World FX's; a null view when there's none), t2
  *                       the characters' motion (chars::inject::motion; or a null view), u0 the depth (R32_FLOAT), u1 the
  *                       motion (R16G16_FLOAT)
  * Its descriptors: kSlots fives in a shader-visible heap of its own, five a frame.
@@ -33,14 +33,14 @@ namespace hifi::upscale::temporal
 		const char *kMotion = R"(
 cbuffer motion_constants : register(b0)
 {
-	uint width, height, pitch, use_blades;
+	uint width, height, pad_c2, use_blades;
 	float2 jitter_ndc;
 	float p11, p22;
 	row_major float4x4 reproject;
 	float4 view_x, view_y, view_z; // (VIEW's rows: a world direction into view space)
 	uint use_chars, pad0, pad1, pad2;
 };
-ByteAddressBuffer depth_in : register(t0);
+Texture2D<float> depth_in : register(t0);
 Texture2D<float4> blades_in : register(t1);
 Texture2D<float4> chars_in : register(t2); // xyz a character's move since the last frame (world), w its view depth
 RWTexture2D<float> depth_out : register(u0);
@@ -51,8 +51,7 @@ void motion_cs(uint3 id : SV_DispatchThreadID)
 {
 	if (id.x >= width || id.y >= height)
 		return;
-	// (D24 in a word's low 24 bits, as the copy lays plane 0 out)
-	const float z = float(depth_in.Load((id.y * pitch + id.x) * 4) & 0xFFFFFF) / 16777215.0;
+	const float z = depth_in.Load(int3(id.xy, 0));
 	depth_out[id.xy] = z;
 	// The point under the pixel's centre, without the jitter it was drawn with: z = 1 - 0.1 / d (the sky: far off)
 	const float2 ndc = float2((id.x + 0.5) / width * 2.0 - 1.0, 1.0 - (id.y + 0.5) / height * 2.0) - jitter_ndc;
@@ -123,7 +122,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 
 		constexpr UINT kSlots = 16;
 		constexpr UINT kConstants = 40;
-		constexpr UINT kMotionViews = 5; // (a frame's: the depth copy, the blades', the characters', the depth, the motion)
+		constexpr UINT kMotionViews = 5; // (a frame's: A's depth, the blades', the characters', the depth, the motion)
 		constexpr UINT kMaskConstants = 4;
 
 		// (a copy's typeless format as its views read it)
@@ -245,7 +244,6 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		drop(_motion);
 		drop(_root);
 		drop(_heap);
-		drop(_depth_copy);
 		drop(_depth);
 		drop(_mv);
 		drop(_output);
@@ -309,33 +307,6 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * kMotionViews, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
 			ok = SUCCEEDED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap)));
 			_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-		}
-		// The depth copy: plane 0 of a D24S8 of A's size, as CopyTextureRegion lays it out
-		if (ok)
-		{
-			D3D12_RESOURCE_DESC dd = {};
-			dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-			dd.Width = render_w;
-			dd.Height = render_h;
-			dd.DepthOrArraySize = 1;
-			dd.MipLevels = 1;
-			dd.Format = DXGI_FORMAT_R24G8_TYPELESS;
-			dd.SampleDesc.Count = 1;
-			dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-			D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
-			UINT64 size = 0;
-			device->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, &size);
-			_pitch_words = fp.Footprint.RowPitch / 4;
-			D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
-			D3D12_RESOURCE_DESC bd = {};
-			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			bd.Width = size;
-			bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
-			bd.SampleDesc.Count = 1;
-			bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-			ok = size != 0 && size != UINT64(-1) &&
-				SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_depth_copy)));
-			_copy_state = D3D12_RESOURCE_STATE_COMMON; // (buffers start in COMMON, whatever is asked)
 		}
 		if (ok)
 		{
@@ -442,6 +413,11 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			why = "the world or its depth isn't as FSR 2 was made for";
 			return false;
 		}
+		if ((dd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0)
+		{
+			why = "the world's depth can't be read by shaders";
+			return false;
+		}
 		// This frame's reprojection: inverse VIEW x the last frame's VIEW x PROJECTION (both without the jitter)
 		double view[16], proj[16], view_proj[16], inv_view[16], reproject[16];
 		for (int i = 0; i < 16; ++i)
@@ -464,23 +440,10 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			_last_view_proj[i] = float(view_proj[i]);
 		_have_last = true;
 
-		// A's depth (plane 0) into the copy
-		transition(list, depth, 0, depth_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-		transition(list, _depth_copy, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, _copy_state, D3D12_RESOURCE_STATE_COPY_DEST);
-		{
-			D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-			dst.pResource = _depth_copy;
-			dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-			UINT64 size = 0;
-			_device->GetCopyableFootprints(&dd, 0, 1, 0, &dst.PlacedFootprint, nullptr, nullptr, &size);
-			src.pResource = depth;
-			src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			src.SubresourceIndex = 0;
-			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-		}
-		transition(list, depth, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, depth_state);
-		transition(list, _depth_copy, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-		_copy_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		// A's depth (plane 0) read by the motion pass where it is (until 2026-10-31 copied out first: dgVoodoo's depth
+		// couldn't be read through a view)
+		constexpr D3D12_RESOURCE_STATES kDepthRead = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		transition(list, depth, 0, depth_state, kDepthRead);
 
 		// The motion pass: the depth as floats and the camera's motion
 		const UINT slot = _slot++ % kSlots;
@@ -499,12 +462,12 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		}
 		{
 			D3D12_SHADER_RESOURCE_VIEW_DESC s = {};
-			s.Format = DXGI_FORMAT_R32_TYPELESS;
-			s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+			s.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+			s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 			s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-			s.Buffer.NumElements = UINT(_depth_copy->GetDesc().Width / 4);
-			s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-			_device->CreateShaderResourceView(_depth_copy, &s, cpu);
+			s.Texture2D.MipLevels = 1;
+			s.Texture2D.PlaneSlice = 0;
+			_device->CreateShaderResourceView(depth, &s, cpu);
 			// (the blades' motion, or a null view of its kind)
 			D3D12_SHADER_RESOURCE_VIEW_DESC b = {};
 			b.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -526,7 +489,6 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			uint32_t c[kConstants] = {};
 			c[0] = _rw;
 			c[1] = _rh;
-			c[2] = _pitch_words;
 			c[3] = blades != nullptr ? 1u : 0u;
 			const float f[4] = { 2.0f * cam.jitter[0] / float(_rw), -2.0f * cam.jitter[1] / float(_rh), float(proj[0]), float(proj[5]) };
 			std::memcpy(&c[4], f, sizeof(f));
@@ -550,6 +512,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			list->SetComputeRootDescriptorTable(1, { _heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(slot * kMotionViews) * _step });
 			list->Dispatch((_rw + 7) / 8, (_rh + 7) / 8, 1);
 		}
+		transition(list, depth, 0, kDepthRead, depth_state);
 
 		// The masks: the game's effects (opaque against pre_fx) and World FX's own see-through things (shaded, or pre_fx
 		// when World FX didn't shade, against pre_air), from this frame's copies of A's size

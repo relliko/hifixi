@@ -166,7 +166,7 @@ namespace hifi::fx::inject
 		return g.markers.load(std::memory_order_acquire);
 	}
 
-	void on_run(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq_low4)
+	void on_run(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq_low4)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.n.markers++;
@@ -198,8 +198,6 @@ namespace hifi::fx::inject
 			return fail("the world's target isn't known here");
 		if (!w.planes_known)
 			return fail("the world's depth planes' states aren't known yet");
-		if (w.heap_count == 0)
-			return fail("the list's descriptor heaps aren't known");
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv;
 		if (!views(w, rtv, dsv))
 			return fail("views of the world couldn't be made");
@@ -223,9 +221,7 @@ namespace hifi::fx::inject
 		barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
 		barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
 		barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);
-		// (its heaps before its root tables: a table must be in the heaps bound when it's set)
-		list->SetDescriptorHeaps(w.heap_count, w.heaps);
-		bound.restore(list);
+		// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 		g.n.elements += st.elements;
 		g.n.draws += st.draws;
 		g.n.triangles += st.triangles;

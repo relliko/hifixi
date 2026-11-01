@@ -183,7 +183,7 @@ namespace hifi::world
 		// A pass into the world at its marker: the target a target (and the depth's planes writable when `depth`), draw(t),
 		// then all as dgVoodoo left it
 		template <typename F>
-		void into_world(pass k, ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, bool depth, F draw)
+		void into_world(pass k, ID3D12GraphicsCommandList *list, const passes::world &w, bool depth, F draw)
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			target t;
@@ -214,7 +214,7 @@ namespace hifi::world
 				barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, planes[1]);
 				barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, planes[0]);
 			}
-			bound.restore(list);
+			// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 			if (ok)
 				g.p[k].drawn++;
 			else
@@ -229,13 +229,13 @@ namespace hifi::world
 			g.p[k].target_known.store(w.rt != nullptr && w.rt_format != DXGI_FORMAT_UNKNOWN, std::memory_order_relaxed);
 		}
 
-		void on_sky(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq)
+		void on_sky(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq)
 		{
 			seen(sky_pass, w);
 			const sky_frame *const f = sky_published(seq);
 			if (f == nullptr || !f->native)
 				return;
-			into_world(sky_pass, list, bound, w, false, [&](const target &t, uint64_t frame, std::string &why) { return g.r->sky(list, t, *f, frame, why); });
+			into_world(sky_pass, list, w, false, [&](const target &t, uint64_t frame, std::string &why) { return g.r->sky(list, t, *f, frame, why); });
 		}
 
 		// SRV formats of a depth resource's plane 0 (unknown: none can be made)
@@ -256,7 +256,7 @@ namespace hifi::world
 			}
 		}
 
-		void on_names(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq)
+		void on_names(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq)
 		{
 			seen(names_pass, w);
 			const names_frame *const f = names_published(seq);
@@ -276,10 +276,10 @@ namespace hifi::world
 					return;
 				}
 			}
-			into_world(names_pass, list, bound, w, true, [&](const target &t, uint64_t frame, std::string &why) { return g.r->names(list, t, *f, frame, why); });
+			into_world(names_pass, list, w, true, [&](const target &t, uint64_t frame, std::string &why) { return g.r->names(list, t, *f, frame, why); });
 		}
 
-		void on_grid(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq)
+		void on_grid(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq)
 		{
 			seen(grid_pass, w);
 			const grid_frame *const f = grid_published(seq);
@@ -288,7 +288,7 @@ namespace hifi::world
 			bool depth = false;
 			for (uint32_t i = 0; i < f->count && !depth; ++i)
 				depth = f->lines[i].keep_z != 0;
-			into_world(grid_pass, list, bound, w, depth, [&](const target &t, uint64_t frame, std::string &why) { return g.r->grid(list, t, *f, frame, why); });
+			into_world(grid_pass, list, w, depth, [&](const target &t, uint64_t frame, std::string &why) { return g.r->grid(list, t, *f, frame, why); });
 		}
 
 		// The upscale's overlay: the names kept at their marker, over the upscaled screen

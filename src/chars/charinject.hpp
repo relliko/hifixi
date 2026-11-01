@@ -38,8 +38,7 @@ namespace hifi::chars::inject
 	bool motion(ID3D12Resource *&texture, uint64_t &frames);
 	std::vector<std::string> status();
 
-	void on_reset(ID3D12GraphicsCommandList *list);
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps);
+
 	void on_barrier(UINT count, const D3D12_RESOURCE_BARRIER *barriers);
 
 	struct world
@@ -52,8 +51,8 @@ namespace hifi::chars::inject
 	// Our d3d8.dll's word on the depth's planes at a mark (src/host/frameapi.hpp): exact, no barrier needed to know them
 	void set_depth_planes(ID3D12Resource *depth, const D3D12_RESOURCE_STATES planes[2]);
 	// The characters' end marker (kind 3) and each see-through marker (kind 4), with the seq they carry
-	void on_chars_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
-	void on_see_through(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	void on_chars_end(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4);
+	void on_see_through(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4);
 	// World FX's casters (grass::renderer::set_casters): the last frame drawn's models, depth only, into a sun shadow map
 	// seen through world_to_clip; the game's descriptor heaps put back after. Whether any was drawn.
 	bool record_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);

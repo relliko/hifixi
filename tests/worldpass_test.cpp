@@ -66,7 +66,7 @@ namespace
 	{
 		// (as the backend: the depth to zone/inject first, then the pass's handler)
 		hifi::zone::inject::on_marker(g_world.ds);
-		if (hifi::passes::dispatch(kind, g_list, g_bound, g_world, seq & 15))
+		if (hifi::passes::dispatch(kind, g_list, g_world, seq & 15))
 			g_dispatched[kind]++;
 	}
 

@@ -8,8 +8,8 @@
  * matrix, TEXTUREFACTOR as it computes it, the blend by the letter, z write by flags bit 12, the class's stages and
  * geometry from the chunks through fxgeo), one run; the textures go through fxtextures (decoded on its thread, copied
  * in on the list at the marker). An MMB effect mesh is drawn from its DAT's data on the GPU as the native zone
- * renderer has it (zonemesh::load_file, gpu_zone uploaded on the test's queue): its pieces by the model's name. The marker is handled on a list recorded as dgVoodoo records (its own root signature,
- * heap and targets bound), which must be bound again after. The picture must match the oracle's: the mean difference
+ * renderer has it (zonemesh::load_file, gpu_zone uploaded on the test's queue): its pieces by the model's name. The marker is handled on a list recorded as our d3d8.dll records (its own heap and
+ * targets bound; nothing put back after: the d3d8.dll binds its own again). The picture must match the oracle's: the mean difference
  * per channel and the share of pixels off by more than 24 (of 255) small (8-bit blending and the rasteriser's own
  * rounding differ, never the shapes, colours or order).
  *
@@ -572,7 +572,7 @@ int main(int argc, char **argv)
 		check(built != 0 && skipped == 0, name + ": " + std::to_string(built) + " of " + std::to_string(o.elements.size()) + " elements made into a frame (" +
 			std::to_string(skipped) + " not)");
 
-		// The list as dgVoodoo records it: cleared, its own heap and targets, then the marker
+		// The list as our d3d8.dll records it: cleared, its own heap and targets, then the marker
 		ID3D12CommandAllocator *alloc = nullptr;
 		ID3D12GraphicsCommandList *list = nullptr;
 		device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
@@ -586,14 +586,6 @@ int main(int argc, char **argv)
 		const D3D12_RECT sc = { 0, 0, LONG(W), LONG(H) };
 		list->RSSetViewports(1, &vp);
 		list->RSSetScissorRects(1, &sc);
-		grass::list_state bound;
-		bound.rtvs[0] = rtv;
-		bound.rtv_count = 1;
-		bound.dsv = dsv;
-		bound.viewports[0] = vp;
-		bound.viewport_count = 1;
-		bound.scissors[0] = sc;
-		bound.scissor_count = 1;
 		hifi::passes::world w;
 		w.rt = A;
 		w.ds = Az;
@@ -602,14 +594,9 @@ int main(int argc, char **argv)
 		w.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		w.planes_known = true;
 		w.ds_planes[0] = w.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-		w.heap_count = 1;
-		w.heaps[0] = game_heap;
 		const fx::inject::counts before = fx::inject::get_counts();
-		fx::inject::on_run(list, bound, w, seq & 15);
+		fx::inject::on_run(list, w, seq & 15);
 		const fx::inject::counts after = fx::inject::get_counts();
-		// (the marker's own clear, as dgVoodoo hands it on: the state must be the game's again)
-		const D3D12_RECT pixel = { LONG(16 * 5 + (seq & 15)), 0, LONG(16 * 5 + (seq & 15) + 1), 1 };
-		list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &pixel);
 		barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
 		dst.pResource = back;
@@ -762,7 +749,6 @@ int main(int argc, char **argv)
 		list->ClearRenderTargetView(rtv, black, 0, nullptr);
 		list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 		list->SetDescriptorHeaps(1, &game_heap);
-		grass::list_state bound;
 		hifi::passes::world w;
 		w.rt = A;
 		w.ds = Az;
@@ -770,9 +756,7 @@ int main(int argc, char **argv)
 		w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 		w.planes_known = true;
 		w.ds_planes[0] = w.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-		w.heap_count = 1;
-		w.heaps[0] = game_heap;
-		fx::inject::on_run(list, bound, w, seq & 15);
+		fx::inject::on_run(list, w, seq & 15);
 		barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
 		dst.pResource = back;
@@ -866,7 +850,6 @@ int main(int argc, char **argv)
 			dl->ClearRenderTargetView(rtv, blue, 1, &right);
 			dl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			dl->SetDescriptorHeaps(1, &game_heap);
-			grass::list_state dbound;
 			hifi::passes::world dw;
 			dw.rt = A;
 			dw.ds = Az;
@@ -875,9 +858,7 @@ int main(int argc, char **argv)
 			dw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			dw.planes_known = true;
 			dw.ds_planes[0] = dw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-			dw.heap_count = 1;
-			dw.heaps[0] = game_heap;
-			fx::inject::on_run(dl, dbound, dw, seq & 15);
+			fx::inject::on_run(dl, dw, seq & 15);
 			barrier(dl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION ddst = {}, dsrc = {};
 			ddst.pResource = back;
@@ -973,7 +954,6 @@ int main(int argc, char **argv)
 			dl->ClearRenderTargetView(rtv, green, 1, &top);
 			dl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			dl->SetDescriptorHeaps(1, &game_heap);
-			grass::list_state dbound;
 			hifi::passes::world dw;
 			dw.rt = A;
 			dw.ds = Az;
@@ -982,9 +962,7 @@ int main(int argc, char **argv)
 			dw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			dw.planes_known = true;
 			dw.ds_planes[0] = dw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-			dw.heap_count = 1;
-			dw.heaps[0] = game_heap;
-			fx::inject::on_run(dl, dbound, dw, seq & 15);
+			fx::inject::on_run(dl, dw, seq & 15);
 			barrier(dl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION ddst = {}, dsrc = {};
 			ddst.pResource = back;
@@ -1078,7 +1056,6 @@ int main(int argc, char **argv)
 			sl->ClearRenderTargetView(rtv, none, 0, nullptr);
 			sl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			sl->SetDescriptorHeaps(1, &game_heap);
-			grass::list_state sbound;
 			hifi::passes::world sw;
 			sw.rt = A;
 			sw.ds = Az;
@@ -1087,9 +1064,7 @@ int main(int argc, char **argv)
 			sw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			sw.planes_known = true;
 			sw.ds_planes[0] = sw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-			sw.heap_count = 1;
-			sw.heaps[0] = game_heap;
-			fx::inject::on_run(sl, sbound, sw, seq & 15);
+			fx::inject::on_run(sl, sw, seq & 15);
 			barrier(sl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION sdst = {}, ssrc = {};
 			sdst.pResource = back;
@@ -1161,7 +1136,6 @@ int main(int argc, char **argv)
 			fl->ClearRenderTargetView(rtv, none, 0, nullptr);
 			fl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			fl->SetDescriptorHeaps(1, &game_heap);
-			grass::list_state fbound;
 			hifi::passes::world fw;
 			fw.rt = A;
 			fw.ds = Az;
@@ -1170,9 +1144,7 @@ int main(int argc, char **argv)
 			fw.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			fw.planes_known = true;
 			fw.ds_planes[0] = fw.ds_planes[1] = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-			fw.heap_count = 1;
-			fw.heaps[0] = game_heap;
-			fx::inject::on_run(fl, fbound, fw, seq & 15);
+			fx::inject::on_run(fl, fw, seq & 15);
 			barrier(fl, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION fdst = {}, fsrc = {};
 			fdst.pResource = back;
@@ -1274,7 +1246,7 @@ int main(int argc, char **argv)
 			list->ClearRenderTargetView(rtv, black, 0, nullptr);
 			list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			list->SetDescriptorHeaps(1, &game_heap);
-			fx::inject::on_run(list, bound, w, seq & 15);
+			fx::inject::on_run(list, w, seq & 15);
 			barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 			list->Close();
@@ -1352,7 +1324,7 @@ int main(int argc, char **argv)
 			list->ClearRenderTargetView(rtv, black, 0, nullptr);
 			list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			list->SetDescriptorHeaps(1, &game_heap);
-			fx::inject::on_run(list, bound, w, seq & 15);
+			fx::inject::on_run(list, w, seq & 15);
 			barrier(list, A, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 			list->Close();

@@ -188,8 +188,6 @@ float4 ps(O i) : SV_Target
 			uint32_t next_free = 0;
 			std::vector<pending_tex> pending;
 			uint8_t null_texel[4] = { 0, 0, 0, 255 };
-			std::atomic<uint32_t> forced { filtering::app }, anisotropy { 1 };
-			std::atomic<bool> keep_point { true };
 			std::mutex pso_mutex; // (writers only: made outside it)
 			pso_entry psos[kPipelines];
 			std::atomic<uint32_t> pso_count { 0 };
@@ -357,29 +355,13 @@ float4 ps(O i) : SV_Target
 			return made;
 		}
 
-		// The filter dgVoodoo samples with: stage 0's, unless its own setting forces one (Filtering: point, bilinear,
-		// linear mip, trilinear or an anisotropic level), which a texture sampled with MINFILTER POINT keeps out of when
-		// KeepFilterIfPointSampled is on (as tests/ui2d_dgv.cpp finds dgVoodoo 2.87 doing)
+		// The filter stage 0 asks for, as our d3d8.dll samples with it (src/d3d8/device_draw.cpp): a stage not point
+		// sampled both ways is linear both ways, mips blended whenever they're on (dgVoodoo's look with Phoenix's
+		// dgVoodoo.conf, kept)
 		uint32_t filter_code(const draw &d)
 		{
-			uint32_t mn = d.min_filter == 2 ? 1 : 0, mg = d.mag_filter == 2 ? 1 : 0, mp = d.mip_filter == 2 ? 2 : d.mip_filter == 1 ? 1 : 0;
-			const uint32_t forced = g.forced.load(std::memory_order_relaxed);
-			if (forced != filtering::app && !(g.keep_point.load(std::memory_order_relaxed) && d.min_filter == 1))
-				switch (forced)
-				{
-				case filtering::point:
-					mn = mg = 0, mp = mp != 0 ? 1 : 0;
-					break;
-				case filtering::bilinear:
-					mn = mg = 1, mp = mp != 0 ? 1 : 0;
-					break;
-				case filtering::linear_mip:
-				case filtering::trilinear:
-					mn = mg = 1, mp = mp != 0 ? 2 : 0;
-					break;
-				default:
-					return kAnisotropic + (mp != 0 ? 1 : 0);
-				}
+			const bool linear = d.min_filter == 2 || d.mag_filter == 2;
+			const uint32_t mn = linear || d.min_filter == 3 ? 1 : 0, mg = linear || d.mag_filter == 3 ? 1 : 0, mp = d.mip_filter != 0 ? 2 : 0;
 			return (mn * 2 + mg) * 3 + mp;
 		}
 
@@ -389,7 +371,7 @@ float4 ps(O i) : SV_Target
 			return (filter_code(d) * 3 + u) * 3 + v;
 		}
 
-		// Every sampler stage 0 can ask for (the anisotropic ones at dgVoodoo's level)
+		// Every sampler stage 0 can ask for
 		void write_samplers()
 		{
 			for (uint32_t f = 0; f < kFilters; ++f)
@@ -402,7 +384,7 @@ float4 ps(O i) : SV_Target
 						s.AddressU = D3D12_TEXTURE_ADDRESS_MODE(u + 1);
 						s.AddressV = D3D12_TEXTURE_ADDRESS_MODE(v + 1);
 						s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-						s.MaxAnisotropy = f >= kAnisotropic ? std::max(1u, std::min(16u, g.anisotropy.load())) : 1;
+						s.MaxAnisotropy = 1;
 						s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
 						s.MaxLOD = mp == 0 ? 0.0f : D3D12_FLOAT32_MAX;
 						D3D12_CPU_DESCRIPTOR_HANDLE at = g.sampler_heap->GetCPUDescriptorHandleForHeapStart();
@@ -774,57 +756,6 @@ float4 ps(O i) : SV_Target
 		return g.ready.load(std::memory_order_acquire);
 	}
 
-	filtering::setting filtering::read(const std::string &conf)
-	{
-		setting out;
-		bool directx = false;
-		size_t at = 0;
-		while (at < conf.size())
-		{
-			size_t end = conf.find(char(10), at);
-			if (end == std::string::npos)
-				end = conf.size();
-			std::string line = conf.substr(at, end - at);
-			at = end + 1;
-			while (!line.empty() && (line.back() == char(13) || line.back() == ' ' || line.back() == char(9)))
-				line.pop_back();
-			if (line.empty() || line[0] == ';')
-				continue;
-			if (line[0] == '[')
-			{
-				directx = line == "[DirectX]";
-				continue;
-			}
-			const size_t eq = line.find('=');
-			if (!directx || eq == std::string::npos)
-				continue;
-			std::string key = line.substr(0, eq), value = line.substr(eq + 1);
-			while (!key.empty() && (key.back() == ' ' || key.back() == char(9)))
-				key.pop_back();
-			while (!value.empty() && (value.front() == ' ' || value.front() == char(9)))
-				value.erase(value.begin());
-			if (key == "Filtering")
-			{
-				const int level = std::atoi(value.c_str());
-				out.forced = level >= 1 && level <= 16 ? anisotropic : value == "pointsampled" ? point : value == "bilinear" || value == "pointmip" ? bilinear :
-					value == "linearmip" ? linear_mip : value == "trilinear" ? trilinear : app;
-				out.anisotropy = level >= 1 && level <= 16 ? uint32_t(level) : 1;
-			}
-			else if (key == "KeepFilterIfPointSampled")
-				out.keep_point = value == "true";
-		}
-		return out;
-	}
-
-	void set_filtering(uint32_t forced, uint32_t anisotropy, bool keep_point)
-	{
-		g.forced.store(forced);
-		g.anisotropy.store(anisotropy);
-		g.keep_point.store(keep_point);
-		if (ready())
-			write_samplers();
-	}
-
 	void set_null_texel(const uint8_t bgra[4])
 	{
 		std::memcpy(g.null_texel, bgra, 4);
@@ -1063,7 +994,7 @@ float4 ps(O i) : SV_Target
 	}
 
 	const char *record(ID3D12GraphicsCommandList *list, const frame &f, const segment &s, ID3D12Resource *target, DXGI_FORMAT format,
-		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw, D3D12_RESOURCE_STATES target_state,
+		bool draw, D3D12_RESOURCE_STATES target_state,
 		const world_source &world)
 	{
 		if (!ready())
@@ -1076,8 +1007,6 @@ float4 ps(O i) : SV_Target
 		const D3D12_RESOURCE_DESC td = target->GetDesc();
 		const uint32_t samples = std::max<uint32_t>(td.SampleDesc.Count, 1);
 		note_target(format, samples);
-		if (heap_count == 0 || heaps == nullptr)
-			return "the list's descriptor heaps aren't known";
 		if (s.first + s.count > f.draw_count || s.first + s.count < s.first)
 			return "the segment isn't in its frame";
 		if (s.count == 0)
@@ -1241,9 +1170,7 @@ float4 ps(O i) : SV_Target
 		move(target, target_now, target_state);
 		if (!world_is_target)
 			move(world.rt, world_now, world.state);
-		// dgVoodoo's heaps, then its state (a table must be in the heaps bound when it's set)
-		list->SetDescriptorHeaps(heap_count, heaps);
-		bound.restore(list);
+		// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 		g.segments.fetch_add(1, std::memory_order_relaxed);
 		g.draws.fetch_add(s.count, std::memory_order_relaxed);
 		g.batches.fetch_add(batches, std::memory_order_relaxed);

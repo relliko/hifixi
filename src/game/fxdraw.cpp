@@ -151,18 +151,9 @@ namespace hifi::game::fxdraw
 		// 047018: mov ecx, [env]; push 0; push fog start; push fog end; push fog colour; call 18BA20 (at +0x17); call 0464D0
 		constexpr const char *kFog = "8B0D????????6A0068????????68????????68????????E8????????E8";
 		constexpr intptr_t kFogEnv = 2, kFogCall = 0x17;
-		// The client's IDirect3DDevice8 (Ashita's wrapper object): [renderer + 8] (as zoneslot and charslot find it)
-		constexpr const char *kDevicePat = "8BC8E8????????85C0A3????????0F84????????8B5C241C";
 
 		constexpr size_t kCodeSize = 0x40, kEntryStubAt = 0x20;
 		constexpr size_t kFlushMark1 = 0x03, kFlushWalk = 0x0C, kFlushMark2 = 0x13, kEntryCall = 0x24;
-
-		constexpr uint32_t kRelease = 2, kGetDepthStencilSurface = 33, kClear = 36, kSurfaceGetDesc = 8;
-		constexpr uint32_t kClearStencil = 4; // D3DCLEAR_STENCIL
-		using release_fn = unsigned long(__stdcall *)(uintptr_t self);
-		using get_surface_fn = long(__stdcall *)(uintptr_t self, uintptr_t *out);
-		using get_desc_fn = long(__stdcall *)(uintptr_t self, uint32_t desc[8]);
-		using clear_fn = long(__stdcall *)(uintptr_t self, uint32_t count, const int32_t *rects, uint32_t flags, uint32_t color, float z, uint32_t stencil);
 
 		using setup_fn = uint32_t(__fastcall *)(uintptr_t element, uintptr_t edx, uint32_t arg);
 		using callback_fn = uint32_t(__cdecl *)(uintptr_t arg);
@@ -218,8 +209,7 @@ namespace hifi::game::fxdraw
 			// The plugin's say
 			volatile bool native = false, wanted = false, probe = false;
 			double clock = 0.0;
-			// The marker device
-			uintptr_t renderer_ptr = 0, device_override = 0;
+			// Where markers go instead of the d3d8.dll (the tests)
 			void (*sink)(uint32_t, uint32_t) = nullptr;
 			// The flush under way
 			bool in_flush = false, taking = false, can_mark = false;
@@ -252,45 +242,10 @@ namespace hifi::game::fxdraw
 			return v;
 		}
 
-		uintptr_t client_device()
-		{
-			if (g.device_override != 0)
-				return g.device_override;
-			if (g.renderer_ptr == 0)
-			{
-				const uintptr_t p = find(kDevicePat);
-				if (p == 0)
-					return 0;
-				g.renderer_ptr = word(p + 10);
-			}
-			const uint32_t r = word(g.renderer_ptr);
-			return r != 0 ? word(r + 8) : 0;
-		}
-
-		template <typename F>
-		F method(uintptr_t object, uint32_t index)
-		{
-			return reinterpret_cast<F>(uintptr_t(*reinterpret_cast<const uint32_t *>(*reinterpret_cast<const uint32_t *>(object) + 4 * index)));
-		}
-
-		bool depth_has_stencil(uintptr_t dev)
-		{
-			uintptr_t surface = 0;
-			if (method<get_surface_fn>(dev, kGetDepthStencilSurface)(dev, &surface) < 0 || surface == 0)
-				return false;
-			uint32_t desc[8] = {};
-			const bool got = method<get_desc_fn>(surface, kSurfaceGetDesc)(surface, desc) >= 0;
-			method<release_fn>(surface, kRelease)(surface);
-			return got && (desc[0] == 73 || desc[0] == 75 || desc[0] == 79); // D15S1, D24S8, D24X4S4
-		}
-
-		// Whether this flush's markers can go out (a sink, or the device with a stencil on the bound depth)
+		// Whether this flush's markers can go out (a sink, or HiFi XI's d3d8.dll to take them)
 		bool markers_possible()
 		{
-			if (g.sink != nullptr)
-				return true;
-			const uintptr_t dev = client_device();
-			return dev != 0 && depth_has_stencil(dev);
+			return g.sink != nullptr || hifi::game::direct_channel();
 		}
 
 		void send_marker()
@@ -301,21 +256,7 @@ namespace hifi::game::fxdraw
 				g.n.markers++;
 				return;
 			}
-			// (our own d3d8.dll: a call, no stencil pixel)
 			if (hifi::game::direct_mark(slotmark::fx_run, g.seq))
-			{
-				g.n.markers++;
-				return;
-			}
-			const uintptr_t dev = client_device();
-			if (dev == 0)
-			{
-				g.n.not_sent++;
-				return;
-			}
-			const int32_t x = int32_t(slotmark::x_of(slotmark::fx_run, g.seq));
-			const int32_t rect[4] = { x, 0, x + 1, 1 };
-			if (method<clear_fn>(dev, kClear)(dev, 1, rect, kClearStencil, 0, 1.0f, 0) >= 0)
 				g.n.markers++;
 			else
 				g.n.not_sent++;
@@ -3186,7 +3127,6 @@ namespace hifi::game::fxdraw
 		n.wanted = g.wanted;
 		n.probe = g.probe;
 		n.clock = g.clock;
-		n.device_override = g.device_override;
 		n.sink = g.sink;
 		n.in = true;
 		const counts kept = g.n;
@@ -3216,7 +3156,6 @@ namespace hifi::game::fxdraw
 		// (on the game's thread, between frames: no flush running)
 		free_code(g.code);
 		state n;
-		n.device_override = g.device_override;
 		n.sink = g.sink;
 		n.native = g.native;
 		n.wanted = g.wanted;
@@ -3355,10 +3294,6 @@ namespace hifi::game::fxdraw
 		g.sink = sink;
 	}
 
-	void set_device(uintptr_t device)
-	{
-		g.device_override = device;
-	}
 
 	void set_setup(uintptr_t setup)
 	{

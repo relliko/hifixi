@@ -374,7 +374,6 @@ int main(int argc, char **argv)
 	ID3D12GraphicsCommandList *list = nullptr;
 	device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
 	device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
-	inj::on_reset(list);
 	{
 		// (dgVoodoo's texture filled first)
 		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
@@ -399,7 +398,6 @@ int main(int argc, char **argv)
 	list->RSSetViewports(1, &vpt);
 	list->RSSetScissorRects(1, &sc);
 	list->SetDescriptorHeaps(1, &srvh);
-	inj::on_heaps(list, 1, &srvh);
 	list->SetGraphicsRootSignature(game_root);
 	list->SetGraphicsRoot32BitConstant(0, 7, 0);
 	list->SetGraphicsRootDescriptorTable(1, table);
@@ -407,7 +405,7 @@ int main(int argc, char **argv)
 	list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	const D3D12_VERTEX_BUFFER_VIEW vbv = { vb->GetGPUVirtualAddress(), 64, 16 };
 	list->IASetVertexBuffers(0, 1, &vbv);
-	// What dgVoodoo has bound now, as the backend's list_state follows it
+	// What the game has bound now (our d3d8.dll binds it all again after a mark: the test does that with it)
 	grass::list_state bound;
 	bound.rtvs[0] = rtv;
 	bound.rtv_count = 1;
@@ -437,13 +435,11 @@ int main(int argc, char **argv)
 	uint64_t zgen = 0;
 	const bool bounds_before = inj::zone_bounds(zlo, zhi, zgen);
 	hifi::light::take(); // (World FX asking for the light split: from now on the native passes draw it)
-	inj::on_zone_end(list, bound, w, 5);
-	const D3D12_RECT pixel = { 16, 0, 17, 1 };
-	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &pixel); // (the marker itself)
+	inj::on_zone_end(list, w, 5);
 	// Passes it mustn't draw: the same seq again, a pass not HiFi XI's
-	inj::on_zone_end(list, bound, w, 5);
+	inj::on_zone_end(list, w, 5);
 	fill(6, false);
-	inj::on_zone_end(list, bound, w, 6);
+	inj::on_zone_end(list, w, 6);
 	// A characters' end marker with the walk's model actors (one of the zone's models, as a model DAT's would be; high
 	// above the street, out of the picture the checks below read), the same seq again, and a walk with none
 	{
@@ -470,9 +466,9 @@ int main(int argc, char **argv)
 		hifi::zone::actor_slot(4).count = 0;
 		hifi::zone::actor_publish(hifi::zone::actor_slot(4), 4);
 		// (the planes as the characters' end marker finds them: as dgVoodoo left them for this one)
-		inj::on_actors_end(list, bound, w, 3);
-		inj::on_actors_end(list, bound, w, 3);
-		inj::on_actors_end(list, bound, w, 4);
+		inj::on_actors_end(list, w, 3);
+		inj::on_actors_end(list, w, 3);
+		inj::on_actors_end(list, w, 4);
 		const std::vector<std::string> st = inj::status();
 		const std::string &line = st.back();
 		check(line.find("model actors") != std::string::npos && line.find("1 passes drawn, 0 couldn't be") != std::string::npos && line.find("the last: 1 objects") != std::string::npos &&
@@ -518,6 +514,7 @@ int main(int argc, char **argv)
 	const D3D12_CPU_DESCRIPTOR_HANDLE sun_dsv = sun_heap->GetCPUDescriptorHandleForHeapStart();
 	list->ClearDepthStencilView(sun_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 	const uint32_t sun_triangles = bounds_after ? inj::record_zone_casters(list, sun_m, sun_dsv, kMap) : 0;
+	list->SetDescriptorHeaps(1, &srvh); // (as our d3d8.dll does after a mark: its heaps, then its state)
 	bound.restore(list);
 	barrier(list, sun_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	{
@@ -581,6 +578,7 @@ int main(int argc, char **argv)
 		gm[14] = -m_top / m_span;
 		gm[15] = 1.0f;
 		ground_triangles = bounds_after ? inj::floor_hook()(nullptr, list, gm, grtv, gdsv, kGround) : 0;
+		list->SetDescriptorHeaps(1, &srvh); // (as our d3d8.dll does after a mark: its heaps, then its state)
 		bound.restore(list);
 		barrier(list, ground_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		D3D12_TEXTURE_COPY_LOCATION gdst = {}, gsrc = {};
@@ -868,9 +866,7 @@ int main(int argc, char **argv)
 		const double first_luma = luma_at(px);
 		alloc->Reset();
 		list->Reset(alloc, nullptr);
-		inj::on_reset(list);
 		list->SetDescriptorHeaps(1, &srvh); // (dgVoodoo's heaps on its new list, as the stand-in's root table needs them)
-		inj::on_heaps(list, 1, &srvh);
 		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		ID3D12Resource *outs[4] = {};
@@ -884,7 +880,7 @@ int main(int argc, char **argv)
 			inj::set_options(k < 2);
 			list->ClearRenderTargetView(rtv, sky, 0, nullptr);
 			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-			inj::on_zone_end(list, bound, w, seqs[k]);
+			inj::on_zone_end(list, w, seqs[k]);
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
 			to.pResource = outs[k];
@@ -1081,9 +1077,7 @@ int main(int argc, char **argv)
 
 		alloc->Reset();
 		list->Reset(alloc, nullptr);
-		inj::on_reset(list);
 		list->SetDescriptorHeaps(1, &srvh);
-		inj::on_heaps(list, 1, &srvh);
 		// (the world back from its copies: dgVoodoo's planes as for the marker before)
 		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1092,6 +1086,7 @@ int main(int argc, char **argv)
 		auto map_out = [&](int k, auto &&draw) {
 			list->ClearDepthStencilView(small_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 			draw();
+			list->SetDescriptorHeaps(1, &srvh); // (as our d3d8.dll does after a mark: its heaps, then its state)
 			bound.restore(list);
 			barrier(list, cmap, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION sdst = {}, ssrc = {};
@@ -1111,11 +1106,11 @@ int main(int argc, char **argv)
 		uint32_t near_triangles = 0;
 		// The pass with the card at rest, then swayed all the way: the moving layer after each
 		pass(9, 0.0f);
-		inj::on_zone_end(list, bound, w, 9);
+		inj::on_zone_end(list, w, 9);
 		const bool bounds_now = inj::zone_bounds(blo, bhi, gen_before);
 		map_out(0, [&] { movers_drew[0] = inj::record_zone_movers(list, m_movers, small_dsv, kSmall); });
 		pass(10, 1.0f);
-		inj::on_zone_end(list, bound, w, 10);
+		inj::on_zone_end(list, w, 10);
 		map_out(1, [&] { movers_drew[1] = inj::record_zone_movers(list, m_movers, small_dsv, kSmall); });
 		inj::zone_bounds(blo, bhi, gen_after);
 		// The near and far cascades, the layer drawn just now

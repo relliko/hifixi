@@ -815,8 +815,6 @@ int main(int argc, char **argv)
 		check(inj::prepare(g.device, why), "charinject: the renderer made" + (why.empty() ? "" : ": " + why));
 		ID3D12DescriptorHeap *heap = ch::cache::heap();
 		begin_list(g);
-		inj::on_reset(g.list);
-		inj::on_heaps(g.list, 1, &heap);
 		inj::on_marker(ds);
 		D3D12_RESOURCE_BARRIER planes[1] = {};
 		planes[0].Transition.pResource = ds;
@@ -836,7 +834,7 @@ int main(int argc, char **argv)
 		w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 		w.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		grass::list_state bound;
-		inj::on_see_through(g.list, bound, w, 47 & 15);
+		inj::on_see_through(g.list, w, 47 & 15);
 		run(g);
 		const std::vector<uint8_t> px = read_back(g, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, 4);
 		std::string first;
@@ -860,8 +858,6 @@ int main(int argc, char **argv)
 			check(inj::prepare(g.device, why_), "aura: the renderer made" + (why_.empty() ? "" : ": " + why_));
 			ID3D12DescriptorHeap *heap = ch::cache::heap();
 			begin_list(g);
-			inj::on_reset(g.list);
-			inj::on_heaps(g.list, 1, &heap);
 			inj::on_marker(ds);
 			D3D12_RESOURCE_BARRIER planes[1] = {};
 			planes[0].Transition.pResource = ds;
@@ -884,7 +880,7 @@ int main(int argc, char **argv)
 			w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 			w.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			grass::list_state bound;
-			inj::on_see_through(g.list, bound, w, seq & 15);
+			inj::on_see_through(g.list, w, seq & 15);
 			run(g);
 			px = read_back(g, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, 4);
 		};

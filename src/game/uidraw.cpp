@@ -117,7 +117,7 @@ namespace hifi::game::uidraw
 			uint32_t vs = 0, ps = 0;
 			uint32_t target_w = 0, target_h = 0;
 			uintptr_t target = 0;  // the bound target's surface (a pointer to compare: no reference held)
-			bool markable = false; // the bound depth has a stencil
+			bool markable = false; // marks can go out here: a depth bound, HiFi XI's d3d8.dll to take them
 		};
 
 		struct state
@@ -209,9 +209,7 @@ namespace hifi::game::uidraw
 			g.st.markable = false;
 			if (orig<getp_fn>(kGetDepthStencilSurface)(dev, &ds) >= 0 && ds != 0)
 			{
-				uint32_t dd[8] = {};
-				if (method<desc_fn>(ds, kSurfDesc)(ds, dd) >= 0)
-					g.st.markable = dd[0] == 73 || dd[0] == 75 || dd[0] == 79; // D15S1, D24S8, D24X4S4
+				g.st.markable = g.sink != nullptr || hifi::game::direct_channel();
 				release(ds);
 			}
 			return true;
@@ -481,12 +479,7 @@ namespace hifi::game::uidraw
 				g.sink(kind, g.seq & 15u);
 				return true;
 			}
-			// (our own d3d8.dll: a call, no stencil pixel)
-			if (hifi::game::direct_mark(kind, g.seq))
-				return true;
-			const int32_t x = int32_t(slotmark::x_of(kind, g.seq));
-			const int32_t rect[4] = { x, 0, x + 1, 1 };
-			return orig<clear_fn>(kClear)(g.dev, 1, rect, 4, 0, 1.0f, 0) >= 0; // (D3DCLEAR_STENCIL)
+			return hifi::game::direct_mark(kind, g.seq);
 		}
 
 		// What's recorded since the last segment published as one, and its marker sent

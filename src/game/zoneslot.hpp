@@ -6,10 +6,9 @@
 // keys on the markers: the world is the target the zone is drawn into (World FX's world found with the game's zone
 // off too), and the native zone renderer to come draws there.
 //
-// The marker is a one-pixel stencil clear of the world's depth through the game's own device (its vtable as the game
-// calls it: hifps's batching proxy flushes before a Clear, so the marker keeps its place among the draws). Only while
-// the Direct3D 12 side can see it (set_wanted) and the bound depth surface has a stencil; otherwise the stub just
-// calls the pass. The pass itself is always the game's (gamedraw switches its drawing off).
+// The marker is a call into HiFi XI's own d3d8.dll (directmark.hpp), which hands it on in place among the game's
+// draws. Only while the Direct3D 12 side can see it (set_wanted) and that d3d8.dll is the one loaded; otherwise the
+// stub just calls the pass. The pass itself is always the game's (gamedraw switches its drawing off).
 
 #include "game.hpp"
 #include <string>
@@ -30,21 +29,20 @@ namespace hifi::game::zoneslot
 	struct counts
 	{
 		uint64_t sent[4] = {};
-		uint64_t not_sent = 0;      // wanted, but no device or no stencil on the bound depth
+		uint64_t not_sent = 0;      // wanted, but HiFi XI's d3d8.dll isn't there to take them
 		uint32_t seq = 0;
 	};
 	counts get_counts();
 	std::string status();
 
 	// For the tests: where the call is and our stub (0 when not in), the pass it calls; what a marker does instead of
-	// the device's Clear (kind, seq), and a device of their own (an object whose first word is its vtable)
+	// going to the d3d8.dll (kind, seq)
 	struct sites
 	{
 		uintptr_t call = 0, stub = 0, pass = 0;
 	};
 	sites where();
 	void set_sink(void (*sink)(uint32_t kind, uint32_t seq));
-	void set_device(uintptr_t device);
 
 	// Told of each pass's begin (kind 0) and end (1) on the game's thread, before its marker, whether markers are sent
 	// or not: the native zone draw's (zonedraw::on_slot). The renderer is the zone renderer (the begin's ecx).

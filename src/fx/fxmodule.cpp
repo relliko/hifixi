@@ -143,9 +143,9 @@ namespace hifi::fx
 			}
 		}
 
-		void on_marker(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq_low4)
+		void on_marker(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq_low4)
 		{
-			inject::on_run(list, bound, w, seq_low4);
+			inject::on_run(list, w, seq_low4);
 		}
 
 		const passes::registrar module_entry(passes::module { "fx", &present, &update, &status, &stop, &command, &device });

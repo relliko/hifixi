@@ -95,7 +95,8 @@ namespace worldfx
 	// and that weather
 	void weather_look_now(grass::look::weather_fx &out, grass::weather *drawn = nullptr);
 
-	// What dgVoodoo has bound on one command list: the host keeps one for each list, reset with the list
+	// What's bound on one command list (our d3d8.dll's, followed by the hooks): the host keeps one for each list, reset
+	// with the list
 	struct list_data
 	{
 		grass::list_state state;
@@ -105,8 +106,8 @@ namespace worldfx
 		D3D12_RESOURCE_STATES world_rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		D3D12_RESOURCE_STATES world_ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 		bool grass_done = false; // grass went in on this list at the world's end
-		// The world turned readable on this list in the last on_barrier (its end: the resolve reads it next), for the host
-		// to take and clear
+		// The world's end came on this list (on_world_end: the resolve reads it next), for the host to take and clear at the
+		// barrier that makes it readable
 		ID3D12Resource *world_ended = nullptr;
 	};
 
@@ -128,7 +129,7 @@ namespace worldfx
 	void set_floor_source(grass::renderer::floor_fn fn, void *context);
 	// The light split the host draws (grass::renderer::set_light_source), likewise
 	void set_light_source(grass::renderer::light_fn fn, void *context);
-	// The camera of the frame dgVoodoo is finishing (VIEW and PROJECTION, row vectors), from the host: the zone pass's
+	// The camera of the frame being finished (VIEW and PROJECTION, row vectors), from the host: the zone pass's
 	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called under the core's mutex.
 	using camera_source_fn = bool (*)(void *context, float view[16], float proj[16]);
 	void set_camera_source(camera_source_fn source, void *context);
@@ -141,11 +142,9 @@ namespace worldfx
 	// At process exit: the device may be gone, its objects are left to the process's end
 	void shutdown();
 
-	// The events, for lists of the attached device, each in the place ReShade raises its own: "after" once the call
-	// is made, "before" ahead of it. The core may record on the list in on_close, on_targets, on_barrier and
-	// on_clear_depth: the host mustn't see those calls as dgVoodoo's.
+	// The events, for lists of the attached device: "after" once the call is made, "before" ahead of it. The core
+	// records on the list only at the marks (on_world_end, on_zone_end): the host mustn't see those calls as the game's.
 	void on_reset(list_data &d);                                                       // after Reset
-	void on_close(ID3D12GraphicsCommandList *list, list_data &d);                      // before Close
 	void on_targets(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv); // after
 	void on_pipeline(list_data &d, ID3D12PipelineState *pso);
 	void on_topology(list_data &d, D3D12_PRIMITIVE_TOPOLOGY topology);
@@ -158,16 +157,13 @@ namespace worldfx
 	// Transitions, each resource and the state it's moved to (after)
 	void on_barrier(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after);
 	// Our d3d8.dll's world end (src/host/frameapi.hpp, slotmark::world_end): the first draw or copy reading the world's
-	// target, before anything is bound for it. World FX draws into the world here; while these come, the world's read
-	// barrier no longer decides it.
+	// target, before anything is bound for it. World FX draws into the world here.
 	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d);
-	void on_clear_depth(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, bool depth, uint32_t rect_count, const D3D12_RECT *rects); // before
-	void on_clear_target(list_data &d, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects);                      // before
-	void on_draw(list_data &d, uint64_t vertices); // before (vertices or indices times instances)
-	// The game side's zone marker (src/game/slotmark.hpp), cleared on this depth view: the world is this depth and the
-	// target bound with it. While markers come they decide the world, not the vertex counts (the game's zone may be off).
-	void on_world_marker(list_data &d, uint64_t dsv);
-	// The game side's zone end marker (the world's depth through dsv; its planes' states as dgVoodoo left them, depth
+	void on_clear_target(list_data &d, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects); // before
+	// The game side's zone marker (src/game/slotmark.hpp) through our d3d8.dll: the world is the target and depth bound
+	// there, through those views
+	void on_world_marker(ID3D12Resource *rt, ID3D12Resource *ds, uint64_t rtv, uint64_t dsv);
+	// The game side's zone end marker (the world's depth through dsv; its planes' states as our d3d8.dll has them, depth
 	// and stencil): the blades drawn there, into the world with its depth written, before the characters and effects
 	// (the world's end then draws the rest without them)
 	void on_zone_end(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, const D3D12_RESOURCE_STATES planes[2]);

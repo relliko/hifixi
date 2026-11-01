@@ -11,8 +11,8 @@
 //     model draw it leads to came from the priority-12 flush (from_flush). The n-th see-through marker of a frame names
 //     the n-th callback of that frame.
 //
-// The markers are one-pixel stencil clears of the bound depth through the game's own device, as zoneslot's: only while
-// the Direct3D 12 side can see them (set_wanted) and the bound depth has a stencil. The game's walk and callbacks always
+// The markers are calls into HiFi XI's own d3d8.dll (directmark.hpp), as zoneslot's: only while the Direct3D 12 side can
+// see them (set_wanted) and that d3d8.dll is the one loaded. The game's walk and callbacks always
 // run as before (/hifi gamedraw chars switches the drawing off).
 
 #include "game.hpp"
@@ -38,7 +38,7 @@ namespace hifi::game::charslot
 	struct counts
 	{
 		uint64_t sent[5] = {};   // (by kind: 2 begin, 3 end, 4 see-through)
-		uint64_t not_sent = 0;   // wanted, but no device or no stencil on the bound depth
+		uint64_t not_sent = 0;   // wanted, but HiFi XI's d3d8.dll isn't there to take them
 		uint64_t see_through = 0; // the see-through callbacks run since start
 		uint32_t seq = 0;        // the opaque walks since start (the markers carry its low 4 bits)
 		uint32_t frame_see_through = 0, most_see_through = 0; // in the last walk's frame, the most in one frame
@@ -54,7 +54,6 @@ namespace hifi::game::charslot
 	};
 	sites where();
 	void set_sink(void (*sink)(uint32_t kind, uint32_t seq));
-	void set_device(uintptr_t device);
 
 	// Told of each begin (kind 2), end (3) and see-through callback (4, with its actor) on the game's thread, before
 	// its marker: the native character renderer's

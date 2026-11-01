@@ -163,6 +163,7 @@ extern "C" const char *__cdecl worldfx_folder() { return ""; }
 int main(int argc, char **argv)
 {
 	namespace up = hifi::upscale;
+	std::setvbuf(stdout, nullptr, _IONBF, 0); // (each line out at once: a crash keeps what came before it)
 	ID3D12Debug *debug = nullptr;
 	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
 		debug->EnableDebugLayer();
@@ -507,7 +508,7 @@ int main(int argc, char **argv)
 			dd.MipLevels = 1;
 			dd.SampleDesc.Count = 1;
 			dd.Format = DXGI_FORMAT_R24G8_TYPELESS;
-			dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+			dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL; // (readable by shaders, as our d3d8.dll makes it: FSR reads it)
 			D3D12_CLEAR_VALUE cv = {};
 			cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 			cv.DepthStencil.Depth = 0.995f;
@@ -560,7 +561,7 @@ int main(int argc, char **argv)
 			f.jitter[0] = jx;
 			f.jitter[1] = jy;
 			hifi::zone::publish(f, seq);
-			zi::on_zone_end(list, grass::list_state(), zi::world(), seq % 16);
+			zi::on_zone_end(list, zi::world(), seq % 16);
 			seq++;
 		};
 		auto fsr2_drawn = [&]() {

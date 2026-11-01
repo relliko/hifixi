@@ -27,12 +27,6 @@ namespace hifi::zone::inject
 		constexpr D3D12_RESOURCE_STATES kUnknown = D3D12_RESOURCE_STATES(0xFFFFFFFF);
 		constexpr ULONGLONG kFailMs = 2000; // (not ready for this long after a pass couldn't be drawn)
 
-		struct heaps
-		{
-			UINT count = 0;
-			ID3D12DescriptorHeap *h[2] = {};
-		};
-
 		struct state
 		{
 			std::mutex mutex;
@@ -55,7 +49,6 @@ namespace hifi::zone::inject
 			std::atomic<ULONGLONG> movers_at { 0 };
 			std::atomic<bool> shadow_up { false };
 			std::atomic<bool> per_pixel { false };
-			std::unordered_map<ID3D12GraphicsCommandList *, heaps> lists;
 			// The world's depth and its planes' states as recorded (dgVoodoo's one thread)
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES plane[2] = { kUnknown, kUnknown };
@@ -157,7 +150,7 @@ namespace hifi::zone::inject
 		// split as well, while World FX reads it), draw(t, o) recorded, then all as dgVoodoo left it, its heaps and state
 		// bound again. Null, or why the world isn't ready for one.
 		template <typename F>
-		const char *draw_world(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, F draw)
+		const char *draw_world(ID3D12GraphicsCommandList *list, const world &w, F draw)
 		{
 			if (g.renderer == nullptr || !g.renderer->ready() || g.device == nullptr)
 				return "the renderer isn't made";
@@ -194,11 +187,7 @@ namespace hifi::zone::inject
 			barrier(list, w.rt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, w.rt_state);
 			barrier(list, w.ds, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, p1);
 			barrier(list, w.ds, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, p0);
-			// (its heaps before its root tables: a table must be in the heaps bound when it's set)
-			const auto known = g.lists.find(list);
-			if (known != g.lists.end() && known->second.count != 0)
-				list->SetDescriptorHeaps(known->second.count, known->second.h);
-			bound.restore(list);
+			// (nothing put back: our d3d8.dll binds all of its own state again after a mark)
 			return nullptr;
 		}
 	}
@@ -278,7 +267,6 @@ namespace hifi::zone::inject
 			g.rtv_heap = g.dsv_heap = nullptr;
 			g.view_rt = g.view_ds = nullptr;
 			g.device = nullptr;
-			g.lists.clear();
 			g.depth = nullptr;
 			g.plane[0] = g.plane[1] = kUnknown;
 		}
@@ -327,21 +315,6 @@ namespace hifi::zone::inject
 			g.actors_why.empty() ? "" : (g.actors_why + ")").c_str(), g.actors_last.objects, g.actors_last.draws, g.actors_last.triangles);
 		lines.push_back(line);
 		return lines;
-	}
-
-	void on_reset(ID3D12GraphicsCommandList *list)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		g.lists[list] = heaps();
-	}
-
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *h)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		heaps &x = g.lists[list];
-		x.count = h != nullptr ? std::min<UINT>(count, 2) : 0;
-		for (UINT i = 0; i < x.count; ++i)
-			x.h[i] = h[i];
 	}
 
 	void on_barrier(UINT count, const D3D12_RESOURCE_BARRIER *b)
@@ -422,7 +395,7 @@ namespace hifi::zone::inject
 		return g.lamp_count;
 	}
 
-	void on_zone_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
+	void on_zone_end(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4)
 	{
 		const frame *f = published(seq_low4);
 		if (f == nullptr)
@@ -461,7 +434,7 @@ namespace hifi::zone::inject
 		g.last_seq = seq;
 		if (f->zone == nullptr || !f->zone->ready())
 			return fail("the zone's data isn't on the GPU");
-		if (const char *why = draw_world(list, bound, w, [&](const draw_target &t, const draw_options &o) { g.last = g.renderer->record(list, t, *f, o, ++g.frame_number); }))
+		if (const char *why = draw_world(list, w, [&](const draw_target &t, const draw_options &o) { g.last = g.renderer->record(list, t, *f, o, ++g.frame_number); }))
 			return fail(why);
 		g.drawn++;
 		g.last_zone = f->zone;
@@ -488,7 +461,7 @@ namespace hifi::zone::inject
 		return g.renderer != nullptr && g.renderer->ready() && (at == 0 || GetTickCount64() - at > kFailMs);
 	}
 
-	void on_actors_end(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4)
+	void on_actors_end(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4)
 	{
 		const actor_frame *f = actor_published(seq_low4);
 		if (f == nullptr || f->count == 0)
@@ -508,7 +481,7 @@ namespace hifi::zone::inject
 		p.zones = f->data;
 		p.zone_count = std::min(f->data_count, kMaxActors);
 		const uint32_t count = std::min(f->count, kMaxActors);
-		if (const char *why = draw_world(list, bound, w,
+		if (const char *why = draw_world(list, w,
 				[&](const draw_target &t, const draw_options &o) { g.actors_last = g.renderer->record(list, t, p, f->objects, count, o, ++g.frame_number); }))
 			return actors_fail(why);
 		g.actors_drawn++;
@@ -521,14 +494,10 @@ namespace hifi::zone::inject
 		// with it, not with a frame it missed)
 		constexpr ULONGLONG kMoversFreshMs = 2000;
 
-		// The zone drawn lately, else nullptr; the second map that pass drew (nullptr: none); and the list's heaps
-		// (count 0: not known)
-		gpu_zone *fresh_zone(ID3D12GraphicsCommandList *list, heaps &h, gpu_zone **second = nullptr)
+		// The zone drawn lately, else nullptr; the second map that pass drew (nullptr: none)
+		gpu_zone *fresh_zone(gpu_zone **second = nullptr)
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
-			if (list != nullptr)
-				if (const auto known = g.lists.find(list); known != g.lists.end())
-					h = known->second;
 			if (g.last_zone == nullptr || GetTickCount64() - g.last_zone_at > kZoneFreshMs)
 				return nullptr;
 			if (second != nullptr)
@@ -547,9 +516,8 @@ namespace hifi::zone::inject
 	// the sun reaches in; the box around both)
 	bool zone_bounds(float lo[3], float hi[3], uint64_t &generation)
 	{
-		heaps h;
 		gpu_zone *second = nullptr;
-		gpu_zone *const z = fresh_zone(nullptr, h, &second);
+		gpu_zone *const z = fresh_zone(&second);
 		std::lock_guard<std::mutex> lock(g.shadow_mutex);
 		if (z == nullptr || g.shadow == nullptr || !g.shadow->bounds(*z, lo, hi))
 			return false;
@@ -571,10 +539,9 @@ namespace hifi::zone::inject
 
 	uint32_t record_zone_casters(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
 	{
-		heaps h;
 		gpu_zone *second = nullptr;
-		gpu_zone *const z = fresh_zone(list, h, &second);
-		if (z == nullptr || h.count == 0)
+		gpu_zone *const z = fresh_zone(&second);
+		if (z == nullptr)
 			return 0;
 		std::lock_guard<std::mutex> lock(g.shadow_mutex);
 		if (g.shadow == nullptr)
@@ -583,8 +550,6 @@ namespace hifi::zone::inject
 		uint32_t triangles = g.shadow->record(list, *z, world_to_clip, dsv, size, hole);
 		if (second != nullptr && g.second_shadow != nullptr)
 			triangles += g.second_shadow->record(list, *second, world_to_clip, dsv, size, hole);
-		// (the game's heaps back: World FX binds none of its own)
-		list->SetDescriptorHeaps(h.count, h.h);
 		g.shadow_frames++;
 		g.shadow_triangles += triangles;
 		return triangles;
@@ -601,10 +566,9 @@ namespace hifi::zone::inject
 				return 0;
 			std::memcpy(env, g.floor_env, sizeof(env));
 		}
-		heaps h;
 		gpu_zone *second = nullptr;
-		gpu_zone *const z = fresh_zone(list, h, &second);
-		if (z == nullptr || h.count == 0)
+		gpu_zone *const z = fresh_zone(&second);
+		if (z == nullptr)
 			return 0;
 		std::lock_guard<std::mutex> lock(g.shadow_mutex);
 		if (g.shadow == nullptr)
@@ -612,16 +576,14 @@ namespace hifi::zone::inject
 		uint32_t triangles = g.shadow->record(list, *z, world_to_clip, dsv, size, false, env, rtv);
 		if (second != nullptr && g.second_shadow != nullptr)
 			triangles += g.second_shadow->record(list, *second, world_to_clip, dsv, size, false, env, rtv);
-		list->SetDescriptorHeaps(h.count, h.h);
 		return triangles;
 	}
 
 	bool record_zone_movers(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
 	{
-		heaps h;
 		gpu_zone *second = nullptr;
-		gpu_zone *const z = fresh_zone(list, h, &second);
-		if (z == nullptr || h.count == 0)
+		gpu_zone *const z = fresh_zone(&second);
+		if (z == nullptr)
 			return false;
 		std::vector<frame_object> movers;
 		{
@@ -641,7 +603,6 @@ namespace hifi::zone::inject
 			triangles += g.second_shadow->record_movers(list, *second, world_to_clip, dsv, size);
 			instances += g.second_shadow->last_movers();
 		}
-		list->SetDescriptorHeaps(h.count, h.h);
 		g.mover_frames++;
 		g.mover_triangles += triangles;
 		g.mover_instances += instances;

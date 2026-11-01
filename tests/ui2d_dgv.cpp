@@ -1,15 +1,18 @@
 /*
- * HiFi XI's own 2D renderer against dgVoodoo itself (src/game/uidraw.cpp, src/ui2d; docs/own-frame/2d.md "Tests").
+ * HiFi XI's own 2D renderer against HiFi XI's own d3d8.dll (src/game/uidraw.cpp, src/ui2d; docs/own-frame/2d.md "Tests").
+ * (The file's name is from when the reference was dgVoodoo's d3d8.dll.)
  *
- * dgVoodoo's own d3d8.dll (the game's, beside this program with the game's dgVoodoo.conf but OutputAPI d3d11warp: no
- * GPU) is the reference. Each case is one frame of Direct3D 8 calls made through dgVoodoo's device: a background (a
- * gradient and a few rectangles, the "world"), then the window as the game's loop tail opens it, the case's 2D calls
- * made through the device as the game makes them (so through uidraw's vtable), the window closed:
- *   - "shadow": the recorder records and dgVoodoo draws everything; its back buffer is the reference. The recorded
+ * The d3d8.dll beside this program (build.cmd copies build\d3d8\d3d8.dll there) is the reference; its marks go to a
+ * handler of the test's through the direct channel (src/host/frameapi.hpp). Each case is one frame of Direct3D 8 calls
+ * made through its device: a background (a gradient and a few rectangles, the "world"), then the window as the game's
+ * loop tail opens it, the case's 2D calls made through the device as the game makes them (so through uidraw's vtable),
+ * the window closed:
+ *   - "shadow": the recorder records and the d3d8.dll draws everything; its back buffer is the reference. The recorded
  *     segments are then drawn by render2d on a Direct3D 12 WARP device with the debug layer, into a target holding the
- *     same background, on a list set up as dgVoodoo leaves its own (its root signature, heaps, pipeline, viewport,
- *     target), and dgVoodoo's next draw made after with nothing bound again. Pixels compared with dgVoodoo's;
- *   - "native": the same calls with native drawing on: dgVoodoo's back buffer is the background alone (every draw
+ *     same background, on a list set up as the d3d8.dll leaves its own (its root signature, heaps, pipeline, viewport,
+ *     target), and its next draw made after with its state bound again (as the d3d8.dll does after a mark). Pixels
+ *     compared with the d3d8.dll's;
+ *   - "native": the same calls with native drawing on: the d3d8.dll's back buffer is the background alone (every draw
  *     recorded was left out of its stream), the recorded frame the same as the shadow one's.
  * Cases:
  *   - the d3dlog captures' interface sections (C:\Games\PhoenixXI\d3dlog\*.txt, from just after the resolve to EndScene):
@@ -19,7 +22,7 @@
  *     function, both shade modes, the cull modes, MIRROR, TFACTOR, the null texture, FVF 0x44, lists and fans, a
  *     viewport clip, a pixel shader-free stage 1 left on (the game's then), a render-target texture (the game's).
  *
- *   build\dgv\ui2d_dgv.exe [capture ...]       (from build\dgv: dgVoodoo reads its dgVoodoo.conf there)
+ *   build\dgv\ui2d_dgv.exe [capture ...]       (from build\dgv, with the d3d8.dll there)
  *   UI2D_SAVE=1: writes <case>-dgv.bmp, <case>-ours.bmp, <case>-diff.bmp
  */
 
@@ -33,6 +36,7 @@
 #include "../src/game/slotmark.hpp"
 #include "../src/game/uidraw.hpp"
 #include "../src/host/passes.hpp"
+#include "../src/host/frameapi.hpp"
 #include "../src/ui2d/frame2d.hpp"
 #include "../src/ui2d/render2d.hpp"
 #include <algorithm>
@@ -686,11 +690,13 @@ namespace
 		wc.hInstance = GetModuleHandleA(nullptr);
 		wc.lpszClassName = "ui2d_dgv";
 		RegisterClassA(&wc);
-		d.hwnd = CreateWindowA("ui2d_dgv", "ui2d dgVoodoo", WS_OVERLAPPEDWINDOW, 0, 0, 640, 360, nullptr, nullptr, wc.hInstance, nullptr);
+		d.hwnd = CreateWindowA("ui2d_dgv", "ui2d d3d8", WS_OVERLAPPEDWINDOW, 0, 0, 640, 360, nullptr, nullptr, wc.hInstance, nullptr);
+		// (on WARP, as the 2D renderer here: the GPU's filtering rounds its weights otherwise, by a step in places)
+		SetEnvironmentVariableA("D3D8_WARP", "1");
 		d.dll = LoadLibraryA(".\\d3d8.dll");
 		if (d.dll == nullptr)
 		{
-			why = "dgVoodoo's d3d8.dll isn't beside this program";
+			why = "HiFi XI's d3d8.dll isn't beside this program";
 			return false;
 		}
 		using create_fn = IDirect3D8 *(WINAPI *)(UINT);
@@ -967,6 +973,9 @@ float4 ps() : SV_Target { return colour; }
 				continue;
 			if (m->Severity > D3D12_MESSAGE_SEVERITY_WARNING)
 				continue;
+			// (the d3d8.dll's own clears share this WARP device: a target made without a clear value is only slower)
+			if (m->ID == D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE || m->ID == D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE)
+				continue;
 			if (count++ == 0)
 				first.assign(m->pDescription, m->DescriptionByteLength);
 		}
@@ -1172,7 +1181,6 @@ float4 ps() : SV_Target { return colour; }
 		// The markers as the backend hands them on (src/host/passes: the heaps it saw set, the target bound with the
 		// back buffer's depth): the window's begin, then each segment's (drawn: they're marked native here, as the
 		// gate would have them)
-		hifi::passes::on_heaps(g.list, 2, heaps);
 		hifi::passes::world w;
 		w.ds = g.depth;
 		w.ds_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -1201,13 +1209,13 @@ float4 ps() : SV_Target { return colour; }
 				w.rt_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				w.rt_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			}
-			hifi::passes::dispatch(hifi::slotmark::ui_begin, g.list, st, w, seq);
+			hifi::passes::dispatch(hifi::slotmark::ui_begin, g.list, w, seq);
 		}
 		const uint64_t failed_before = ui2d_failed();
 		for (uint32_t k = 0; k < n; ++k)
 		{
 			const_cast<u2::segment &>(f.seg[k]).native = true;
-			if (!hifi::passes::dispatch(f.seg[k].kind, g.list, st, w, seq) || ui2d_failed() != failed_before)
+			if (!hifi::passes::dispatch(f.seg[k].kind, g.list, w, seq) || ui2d_failed() != failed_before)
 			{
 				why = "segment " + std::to_string(k) + " not drawn";
 				g.list->Close();
@@ -1221,7 +1229,9 @@ float4 ps() : SV_Target { return colour; }
 			b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			g.list->ResourceBarrier(1, &b);
 		}
-		// dgVoodoo's next draw, nothing set again but its constants
+		// The d3d8.dll's next draw: its heaps and state bound again (as it does after a mark), then its constants
+		g.list->SetDescriptorHeaps(2, heaps);
+		st.restore(g.list);
 		const float c[8] = { -1.0f, -1.0f + 2.0f * 24.0f / H, -1.0f + 2.0f * 24.0f / W, -1.0f, 0x10 / 255.0f, 0xE0 / 255.0f, 0xF0 / 255.0f, 1.0f };
 		g.list->SetGraphicsRoot32BitConstants(0, 8, c, 0);
 		g.list->DrawInstanced(4, 1, 0, 0);
@@ -1922,26 +1932,27 @@ int main(int argc, char **argv)
 		std::fflush(stdout);
 		return EXCEPTION_EXECUTE_HANDLER;
 	});
-	dgv d;
+	// (the WARP device first: turning the debug layer on after the d3d8.dll has made its Direct3D 12 device removes that)
 	std::string why;
-	if (!open_dgv(d, why))
-	{
-		std::printf("SKIP  dgVoodoo: %s\n", why.c_str());
-		return 0;
-	}
 	d12 g;
 	if (!open_d12(g, why))
 	{
 		check(false, why);
 		return 1;
 	}
-	// (dgVoodoo's own filtering setting, as the plugin reads it from the game's dgVoodoo.conf)
+	dgv d;
+	if (!open_dgv(d, why))
 	{
-		std::ifstream conf("dgVoodoo.conf", std::ios::binary);
-		const std::string text((std::istreambuf_iterator<char>(conf)), std::istreambuf_iterator<char>());
-		const u2::render::filtering::setting f = u2::render::filtering::read(text);
-		u2::render::set_filtering(f.forced, f.anisotropy, f.keep_point);
-		std::printf("dgVoodoo's filtering: %u (anisotropy %u), point-sampled textures kept: %s\n", f.forced, f.anisotropy, f.keep_point ? "yes" : "no");
+		std::printf("SKIP  the d3d8.dll: %s\n", why.c_str());
+		return 0;
+	}
+	// (the marks through the direct channel, as the plugin's backend takes them: answered, nothing drawn there)
+	if (const auto set = reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(d.dll, kHifiFrameSetHandler)))
+		set([](void *, uint32_t, uint32_t, const hifi_frame_mark *) {}, nullptr);
+	else
+	{
+		check(false, "the d3d8.dll beside this program is HiFi XI's (HifiFrameSetHandler)");
+		return 1;
 	}
 	const bool made = u2::render::make(g.device, why);
 	check(made, "the 2D renderer made on WARP" + (why.empty() ? "" : ": " + why));

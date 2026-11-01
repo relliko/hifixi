@@ -678,7 +678,6 @@ int main(int argc, char **argv)
 	ID3D12GraphicsCommandList *list = nullptr;
 	device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
 	device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
-	inj::on_reset(list);
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
 		dst.pResource = tex;
@@ -699,7 +698,6 @@ int main(int argc, char **argv)
 	list->RSSetViewports(1, &vpt);
 	list->RSSetScissorRects(1, &sc);
 	list->SetDescriptorHeaps(1, &srvh);
-	inj::on_heaps(list, 1, &srvh);
 	list->SetGraphicsRootSignature(game_root);
 	list->SetGraphicsRoot32BitConstant(0, 7, 0);
 	list->SetGraphicsRootDescriptorTable(1, table);
@@ -732,18 +730,14 @@ int main(int argc, char **argv)
 	barrier(list, Az, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 	inj::set_motion_wanted(samples == 1); // (the characters' motion for FSR, as while it draws: chardraw.hpp "Motion")
-	inj::on_chars_end(list, bound, w, seq & 15);
-	const D3D12_RECT end_pixel = { 48 + 5, 0, 48 + 6, 1 };
-	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &end_pixel);
-	inj::on_chars_end(list, bound, w, seq & 15); // (the same seq again: nothing)
+	inj::on_chars_end(list, w, seq & 15);
+	inj::on_chars_end(list, w, seq & 15); // (the same seq again: nothing)
 	// A draw of dgVoodoo's in between, writing depth (the stencil plane back to read; then to write for the marker)
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
 	barrier(list, Az, 0, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 	barrier(list, Az, 1, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-	inj::on_see_through(list, bound, w, seq & 15);
-	const D3D12_RECT st_pixel = { 64 + 5, 0, 64 + 6, 1 };
-	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &st_pixel);
-	inj::on_see_through(list, bound, w, seq & 15); // (a second see-through marker: there's no second model)
+	inj::on_see_through(list, w, seq & 15);
+	inj::on_see_through(list, w, seq & 15); // (a second see-through marker: there's no second model)
 	// World FX's casters' pass (its shading pass calls record_casters): the sun straight overhead, a D32 map
 	// kCasterSize square looking down on all four (x across, z down the map, depth by height: the top of the box
 	// nearest), then the game's state put back as World FX does after its pass
@@ -777,6 +771,7 @@ int main(int argc, char **argv)
 	const D3D12_CPU_DESCRIPTOR_HANDLE caster_dsv = caster_heap->GetCPUDescriptorHandleForHeapStart();
 	list->ClearDepthStencilView(caster_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 	const bool casters_drawn = inj::record_casters(list, caster_m, caster_dsv, kCasterSize);
+	list->SetDescriptorHeaps(1, &srvh); // (as our d3d8.dll does after a mark: its heaps, then its state)
 	bound.restore(list);
 	barrier(list, caster_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	{
@@ -1081,9 +1076,7 @@ int main(int argc, char **argv)
 		const float zone_lamp[8] = { lamp_at[0], lamp_at[1], lamp_at[2], 6.0f, lamp_colour[0], lamp_colour[1], lamp_colour[2], 0.5f };
 		alloc->Reset();
 		list->Reset(alloc, nullptr);
-		inj::on_reset(list);
 		list->SetDescriptorHeaps(1, &srvh);
-		inj::on_heaps(list, 1, &srvh);
 		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 		ID3D12Resource *outs[3] = {};
@@ -1096,7 +1089,7 @@ int main(int argc, char **argv)
 			inj::set_lamps(k == 1 ? zone_lamp : nullptr, k == 1 ? 1 : 0);
 			list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
 			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-			inj::on_chars_end(list, bound, w, s & 15);
+			inj::on_chars_end(list, w, s & 15);
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
 			to.pResource = outs[k];

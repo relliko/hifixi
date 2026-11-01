@@ -1,6 +1,5 @@
 #include <d3d12.h>
 #include "streamlog.hpp"
-#include "../game/slotmark.hpp"
 #include "../host/hooks.hpp"
 #include <share.h>
 #include <algorithm>
@@ -14,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-// The stream log (streamlog.hpp). While one is being made, the hooks hand over every call (on_call, on dgVoodoo's
+// The stream log (streamlog.hpp). While one is being made, the hooks hand over every call (on_call, on the d3d8.dll's
 // threads, and the game thread's at readbacks); each is written out as a line as it comes, under one lock, which slows
 // the frame being logged and no other. The game's Direct3D 8 draws come in on the game thread alone (d3d8_draw).
 
@@ -73,7 +72,7 @@ namespace hifi::backend::streamlog
 		std::unordered_map<const void *, uint32_t> list_ids, queue_ids, resource_ids, pso_ids, root_ids;
 		std::unordered_map<DWORD, uint32_t> thread_ids;
 
-		// The totals over the frames logged (written with the file: dgVoodoo's calls, HiFi XI's own left out)
+		// The totals over the frames logged (written with the file: the d3d8.dll's calls, HiFi XI's own left out)
 		struct list_totals
 		{
 			std::string rt = "?", ds = "?"; // (bound since the log started; "?" before)
@@ -350,10 +349,6 @@ namespace hifi::backend::streamlog
 					: (flags & D3D12_CLEAR_FLAG_STENCIL) != 0 ? "stencil" : "nothing";
 				add(b, "ClearDepthStencilView %s %s, depth %g stencil %u", view(a[0]).c_str(), what, from_bits(a[2]), unsigned(a[3] & 0xFF));
 				rects_text(b, a[4], ptr<D3D12_RECT>(a[5]));
-				// (HiFi XI's own slot markers, slotmark.hpp: the game side's one-pixel stencil clears)
-				if (const D3D12_RECT *r = ptr<D3D12_RECT>(a[5]); r != nullptr)
-					if (slotmark::mark m; slotmark::read((flags & D3D12_CLEAR_FLAG_DEPTH) != 0, (flags & D3D12_CLEAR_FLAG_STENCIL) != 0, uint32_t(a[4]), r->left, r->top, r->right, r->bottom, m))
-						add(b, "  <- slot marker: %s, seq %u", slotmark::kind_name(m.kind), m.seq);
 				break;
 			}
 			case host::list_clear_target:
@@ -416,7 +411,7 @@ namespace hifi::backend::streamlog
 			return b;
 		}
 
-		// A world frame's start: the depth cleared over all of a target at least 640 wide, by dgVoodoo
+		// A world frame's start: the depth cleared over all of a target at least 640 wide, by the d3d8.dll
 		bool frame_start(uint32_t s, const uint64_t *a, bool quiet)
 		{
 			if (quiet || s != host::list_clear_depth || (a[1] & D3D12_CLEAR_FLAG_DEPTH) == 0 || views == nullptr)
@@ -474,7 +469,7 @@ namespace hifi::backend::streamlog
 		}
 
 		// Where a world frame's own calls begin, of the last `count` (get(i): the i-th's record): its colour clear (the last
-		// of dgVoodoo's among the last kRing), with the barriers and the reset just before it; count when there's none
+		// of the d3d8.dll's among the last kRing), with the barriers and the reset just before it; count when there's none
 		template <typename Get>
 		size_t prelude_start(size_t count, Get get)
 		{
@@ -589,15 +584,15 @@ namespace hifi::backend::streamlog
 			if (!context.empty() && context.back() != '\n')
 				h += '\n';
 			add(h, "World frames asked for: %u; logged: %u. Ended: %s.\n", frames_wanted, frames_seen, ended.c_str());
-			h += "A world frame starts at the depth clear over all of a target at least 640 wide (dgVoodoo clears the world's colour, then its\n"
+			h += "A world frame starts at the depth clear over all of a target at least 640 wide (the d3d8.dll clears the world's colour, then its\n"
 				 "depth); the colour clear before it, and anything between, comes from the calls kept while waiting.\n"
 				 "Each line: the call's number, microseconds since the log started (the present after the request), the thread (game = the\n"
-				 "game's own; t1.. dgVoodoo's), 'hifi' for HiFi XI's own calls (World FX drawing into the frame), the object (L = command\n"
+				 "game's own; t1.. the d3d8.dll's), 'hifi' for HiFi XI's own calls (World FX drawing into the frame), the object (L = command\n"
 				 "list, Q = queue, dev = device), the call. R<n>(WxH f<DXGI format> [x<samples>]) = a resource, P<n> a pipeline, S<n> a root\n"
 				 "signature; barrier states are D3D12_RESOURCE_STATES (0x4 render target, 0x10 depth write, 0x20 depth read, 0x80 pixel\n"
 				 "shader resource, 0x400/0x800 copy dest/source); depth's sub 0 is its depth plane, sub 1 its stencil.\n";
 			std::fputs(h.c_str(), f);
-			std::fputs("\n==== Direct3D 12: dgVoodoo's calls (and HiFi XI's own) ====\n", f);
+			std::fputs("\n==== Direct3D 12: the d3d8.dll's calls (and HiFi XI's own) ====\n", f);
 			std::fputs(text.c_str(), f);
 			std::fprintf(f, "\n==== The game's Direct3D 8 draws in the same game frame(s): HiFi XI's tap on the client device's four draw calls, with the FFXiMain return addresses on the stack (image offsets, innermost first) ====\n");
 			std::fputs(d3d8.c_str(), f);
@@ -652,7 +647,7 @@ namespace hifi::backend::streamlog
 				}
 			}
 			std::string s;
-			add(s, "\n==== Totals over the world frames above (dgVoodoo's calls; HiFi XI's own, %s of them, left out) ====\n", thousands(own_calls).c_str());
+			add(s, "\n==== Totals over the world frames above (the d3d8.dll's calls; HiFi XI's own, %s of them, left out) ====\n", thousands(own_calls).c_str());
 			add(s, "calls: %s;", thousands(calls).c_str());
 			for (uint32_t i = 0; i < host::slot_count; ++i)
 				if (by_slot[i] != 0)

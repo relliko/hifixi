@@ -24,7 +24,7 @@ namespace hifi::fx::inject
 	bool ready();
 	// fx_run markers handled since the start (the game side's proof that its markers come through)
 	uint64_t markers_seen();
-	void on_run(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq_low4);
+	void on_run(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq_low4);
 
 	struct counts
 	{

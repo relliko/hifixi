@@ -13,9 +13,7 @@
  * on_slot is cdecl C++ (ebx, esi, edi, ebp kept); ecx and eax are kept around it for the pass and its caller. Its
  * second argument is what's under the kind: at the begin the saved ecx, the renderer.
  *
- * The marker: Clear(1, {x, 0, x + 1, 1}, D3DCLEAR_STENCIL, 0, 1.0, 0) on the client device (Ashita's wrapper, [renderer
- * + 8], through whatever vtable it has now: hifps's proxy flushes its batch at a Clear), when the depth surface bound
- * now has a stencil (D15S1, D24S8, D24X4S4: the world's is D24S8). Checked at the begin; the end follows it.
+ * The marker: a call into HiFi XI's own d3d8.dll (directmark.hpp), which hands it on in place among the game's draws.
  */
 
 #include "zoneslot.hpp"
@@ -30,68 +28,22 @@ namespace hifi::game::zoneslot
 	{
 		constexpr const char *kCall = "8B83500100005E85C074??8BCBE8????????EB"; // 178CC1; the call at +0x0D
 		constexpr intptr_t kCallAt = 0x0D;
-		// The client's IDirect3DDevice8 (Ashita's wrapper object): [renderer + 8] (as hifps's exp finds it)
-		constexpr const char *kDevicePat = "8BC8E8????????85C0A3????????0F84????????8B5C241C";
 
 		constexpr size_t kStubSize = 0x20;
 		constexpr size_t kCallMark1 = 0x04, kCallPass = 0x0D, kCallMark2 = 0x16; // (the stub's three calls)
-
-		// IDirect3DDevice8 and IDirect3DSurface8, as far as used here
-		constexpr uint32_t kRelease = 2, kGetDepthStencilSurface = 33, kClear = 36, kSurfaceGetDesc = 8;
-		constexpr uint32_t kClearStencil = 4;            // D3DCLEAR_STENCIL
-		using release_fn = unsigned long(__stdcall *)(uintptr_t self);
-		using get_surface_fn = long(__stdcall *)(uintptr_t self, uintptr_t *out);
-		using get_desc_fn = long(__stdcall *)(uintptr_t self, uint32_t desc[8]); // (D3DSURFACE_DESC: Format first)
-		using clear_fn = long(__stdcall *)(uintptr_t self, uint32_t count, const int32_t *rects, uint32_t flags, uint32_t color, float z, uint32_t stencil);
 
 		struct state
 		{
 			uintptr_t call = 0, stub = 0, pass = 0;
 			uint8_t saved[5] = {}, ours[5] = {};
 			bool in = false;
-			uintptr_t renderer_ptr = 0; // (where the renderer pointer is kept, found once)
-			uintptr_t device_override = 0;
 			void (*sink)(uint32_t, uint32_t) = nullptr;
 			void (*listener)(uint32_t, uint32_t, uintptr_t) = nullptr;
 			uintptr_t renderer = 0;     // (the zone renderer, from the begin)
 			volatile bool wanted = false;
-			bool marking = false;       // the begin was marked: so is the end
 			counts n;
 		};
 		state g;
-
-		uintptr_t client_device()
-		{
-			if (g.device_override != 0)
-				return g.device_override;
-			if (g.renderer_ptr == 0)
-			{
-				const uintptr_t p = find(kDevicePat);
-				if (p == 0)
-					return 0;
-				g.renderer_ptr = word(p + 10);
-			}
-			const uint32_t r = word(g.renderer_ptr);
-			return r != 0 ? word(r + 8) : 0;
-		}
-
-		template <typename F>
-		F method(uintptr_t object, uint32_t index)
-		{
-			return reinterpret_cast<F>(uintptr_t(*reinterpret_cast<const uint32_t *>(*reinterpret_cast<const uint32_t *>(object) + 4 * index)));
-		}
-
-		// Whether the depth surface bound now has a stencil to mark
-		bool depth_has_stencil(uintptr_t dev)
-		{
-			uintptr_t surface = 0;
-			if (method<get_surface_fn>(dev, kGetDepthStencilSurface)(dev, &surface) < 0 || surface == 0)
-				return false;
-			uint32_t desc[8] = {};
-			const bool got = method<get_desc_fn>(surface, kSurfaceGetDesc)(surface, desc) >= 0;
-			method<release_fn>(surface, kRelease)(surface);
-			return got && (desc[0] == 73 || desc[0] == 75 || desc[0] == 79); // D15S1, D24S8, D24X4S4
-		}
 
 		void send(uint32_t kind)
 		{
@@ -101,28 +53,7 @@ namespace hifi::game::zoneslot
 				g.n.sent[kind]++;
 				return;
 			}
-			// (our own d3d8.dll: a call, no stencil pixel)
 			if (hifi::game::direct_mark(kind, g.n.seq))
-			{
-				g.n.sent[kind]++;
-				return;
-			}
-			const uintptr_t dev = client_device();
-			if (dev == 0)
-			{
-				g.n.not_sent++;
-				return;
-			}
-			if (kind == slotmark::zone_begin)
-				g.marking = depth_has_stencil(dev);
-			if (!g.marking)
-			{
-				g.n.not_sent++;
-				return;
-			}
-			const int32_t x = int32_t(slotmark::x_of(kind, g.n.seq));
-			const int32_t rect[4] = { x, 0, x + 1, 1 };
-			if (method<clear_fn>(dev, kClear)(dev, 1, rect, kClearStencil, 0, 1.0f, 0) >= 0)
 				g.n.sent[kind]++;
 			else
 				g.n.not_sent++;
@@ -134,7 +65,6 @@ namespace hifi::game::zoneslot
 			if (kind == slotmark::zone_begin)
 			{
 				g.n.seq++;
-				g.marking = false;
 				g.renderer = renderer;
 			}
 			// (the listener before the marker: at the end, the pass's frame is published before its marker goes)
@@ -227,11 +157,9 @@ namespace hifi::game::zoneslot
 		}
 		// (on the game's thread, as the zone task: nothing is in the stub now)
 		free_code(g.stub);
-		const uintptr_t device_override = g.device_override;
 		void (*const sink)(uint32_t, uint32_t) = g.sink;
 		void (*const listener)(uint32_t, uint32_t, uintptr_t) = g.listener;
 		g = state();
-		g.device_override = device_override;
 		g.sink = sink;
 		g.listener = listener;
 		return true;
@@ -272,11 +200,6 @@ namespace hifi::game::zoneslot
 	void set_sink(void (*sink)(uint32_t, uint32_t))
 	{
 		g.sink = sink;
-	}
-
-	void set_device(uintptr_t device)
-	{
-		g.device_override = device;
 	}
 
 	void set_listener(void (*listener)(uint32_t kind, uint32_t seq, uintptr_t renderer))

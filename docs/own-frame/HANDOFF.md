@@ -22,7 +22,7 @@ Written because the session was about to run out of usage. A new session picks u
   - cloth_test build\test\cloth_oracle.bin; actors_draw_test build\test\cloth_oracle.bin
   - charinject_test build\test\chars_pose.bin; charslot_test; zoneslot_test; charmodel_test; modelactor_test;
     zoneinject_test; upscale_test; gamewater_test; uidraw_test; hook_test (and --debug); menu_test (never from build\)
-  - ui2d_dgv: run from build\dgv (uses dgVoodoo's d3d8.dll copied there by build.cmd)
+  - ui2d_dgv: run from build\dgv (against our d3d8.dll, copied there by build.cmd, on WARP)
   - d3d8: `build_d3d8.cmd` (full, not quick) builds build\d3d8\d3d8_unit.exe, d3d8_hooks.exe, d3d8_frame.exe; run
     from build\d3d8: `d3d8_unit.exe`, `d3d8_hooks.exe .\d3d8.dll [--debug]`
 - Last result (b17a428): full build and every suite above green (fx_test 161, fx_render_test 45, actors_draw_test 21,

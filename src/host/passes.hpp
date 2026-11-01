@@ -30,20 +30,16 @@ namespace hifi::passes
 		ID3D12Resource *rt = nullptr, *ds = nullptr;
 		DXGI_FORMAT rt_format = DXGI_FORMAT_UNKNOWN, ds_format = DXGI_FORMAT_UNKNOWN;
 		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		// The depth's two planes' states as dgVoodoo's barriers left them (the zone renderer follows them), when known
+		// The depth's two planes' states as our d3d8.dll has them, when known
 		bool planes_known = false;
 		D3D12_RESOURCE_STATES ds_planes[2] = {};
-		// What dgVoodoo last bound on the list (its OMSetRenderTargets: bound lazily, so it may be older than the marker),
-		// the target's view's format; the back buffer for the kinds slotmark::on_back_buffer names
+		// What our d3d8.dll has bound at the marker, the target's view's format; the back buffer for the kinds
+		// slotmark::on_back_buffer names
 		ID3D12Resource *bound_rt = nullptr, *bound_ds = nullptr;
 		DXGI_FORMAT bound_rt_format = DXGI_FORMAT_UNKNOWN;
-		// The list's descriptor heaps as dgVoodoo last set them (heap_count 0: not known yet): bound again after a pass
-		// binds its own, before grass::list_state::restore (a root table must be in the heaps bound when it's set)
-		UINT heap_count = 0;
-		ID3D12DescriptorHeap *heaps[2] = {};
 	};
 
-	using marker_fn = void (*)(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	using marker_fn = void (*)(ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4);
 
 	struct module
 	{
@@ -72,9 +68,6 @@ namespace hifi::passes
 	};
 
 	// The backend and the plugin
-	// (dgVoodoo's lists: reset, and each SetDescriptorHeaps, followed for world::heaps)
-	void on_reset(ID3D12GraphicsCommandList *list);
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps);
-	bool dispatch(uint32_t kind, ID3D12GraphicsCommandList *list, const grass::list_state &bound, const world &w, uint32_t seq_low4);
+	bool dispatch(uint32_t kind, ID3D12GraphicsCommandList *list, const world &w, uint32_t seq_low4);
 	const std::vector<module> &modules();
 }

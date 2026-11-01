@@ -91,7 +91,7 @@ namespace hifi::ui2d
 			return false;
 		}
 
-		void on_begin(ID3D12GraphicsCommandList *, const grass::list_state &, const passes::world &w, uint32_t seq_low4)
+		void on_begin(ID3D12GraphicsCommandList *, const passes::world &w, uint32_t seq_low4)
 		{
 			side.seq = seq_low4 & 15u;
 			side.next = 0;
@@ -101,7 +101,7 @@ namespace hifi::ui2d
 			ok_at.store(GetTickCount64(), std::memory_order_release);
 		}
 
-		void on_segment(ID3D12GraphicsCommandList *list, const grass::list_state &bound, const passes::world &w, uint32_t seq_low4)
+		void on_segment(ID3D12GraphicsCommandList *list, const passes::world &w, uint32_t seq_low4)
 		{
 			const uint32_t seq = seq_low4 & 15u;
 			if (seq != side.seq)
@@ -138,7 +138,7 @@ namespace hifi::ui2d
 				world = { target, format, state };
 			else
 				world = { w.rt, w.rt_format, w.rt_state };
-			if (const char *why = render::record(list, *f, s, target, format, bound, w.heap_count, w.heaps, s.native, state, world))
+			if (const char *why = render::record(list, *f, s, target, format, s.native, state, world))
 			{
 				fail(why);
 				return;

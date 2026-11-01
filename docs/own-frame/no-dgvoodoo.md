@@ -72,11 +72,25 @@ dgVoodoo was a closed box: HiFi XI watched its Direct3D 12 output from outside.
 - Step 3, part 2 (2026-10-30): the marks' handlers take our d3d8.dll's word (on_mark's `fm`): the world's target and
   its state, what's bound (the passes' bound_rt/ds/format), and the depth's planes set exactly in zone::inject
   (`set_depth_planes`): no window after a new depth where the planes are unknown till a barrier shows them.
-- Left of step 3: the stencil-pixel path itself (the game side's Clear fallback, `ev_clear_depth`'s decoding, the
-  zoneslot/charslot/d3d8_hooks tests built on it), list_state capture/restore around our passes (our d3d8.dll rebinds
-  after a mark anyway), World FX's barrier inference and world-size learning once world_end is proven in game.
-- Found: tests\ui2d_dgv crashes on our d3d8.dll in `replay_d12` (it reaches into dgVoodoo itself), with the d3d8.dll
-  from before step 2 too: it was only ever run against dgVoodoo. build.cmd now copies our d3d8.dll into build\dgv (was:
-  whatever the game folder had). To be rewritten in step 5.
+- Step 3, the rest (2026-10-31, world_end proven in game since 0.57):
+  - the stencil-pixel path gone: the game side's five senders mark only through directmark.hpp (a d3d8.dll that isn't
+    ours: nothing marked, counted "not sent", the game draws those passes); uidraw opens a window only with a depth bound
+    and the direct channel there; slotmark::read/x_of, the backend's stencil decoding and streamlog's gone; on_mark
+    takes only our d3d8.dll's word (hifi_frame_mark), no fallback to what the hooks saw bound;
+  - nothing put back after a pass at a mark: no list_state restore, no game heaps set again (zone, characters, fx, world,
+    2D, World FX, the casters and ground map); the passes lost their `bound` argument; the per-list heap tracking in
+    zone::inject, chars::inject and passes gone (upscale keeps its own: it draws outside marks);
+  - World FX: the world from the zone marker's target and views (on_world_marker(rt, ds, rtv, dsv)); drawn only at
+    world_end; gone: vertex counting (on_draw, count_draw, learn_world_size, the "busiest target" pick at present), due()
+    and the injections at a move off the world, list close, depth clear and read barrier, the moves log.
+- Step 5 (2026-10-31): FSR's motion pass reads A's depth through an R24_UNORM_X8 view (no copy into a buffer each
+  frame); render2d's dgVoodoo.conf filtering (filtering::read, set_filtering) gone: it samples as our d3d8.dll does (a
+  stage not point both ways linear both ways, mips blended when on); tests\ui2d_dgv runs against our d3d8.dll on WARP
+  (made after the test's WARP device: the debug layer turned on later removes a device; its marks through the direct
+  channel), 117 of 117.
+- Left: step 4 (the handoff rings keyed by seq, the "seconds late" releases), harmless; comments that still say
+  dgVoodoo where they describe history.
+- Found: tests\ui2d_dgv crashed on our d3d8.dll in `replay_d12`: its "next draw" leaned on the 2D renderer putting the
+  state back, and its debug layer removed the d3d8.dll's device (fixed in step 5, below).
 
 Each step lands with every suite green and is installed only after an in-game look.

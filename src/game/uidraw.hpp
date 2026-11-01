@@ -22,11 +22,12 @@
 // segment and a marker sent for it (kind 10, slotmark.hpp), then the game's call goes through. So the order on screen is
 // the game's, whatever is left to it.
 //
-// Markers: one-pixel stencil clears of the bound depth (the back buffer's own D24S8), as zoneslot's: kind 9 at the
-// window's start, 10 at each cut and just before the fade after the menus (0129EA: the interface's end), 11 at its
-// end; each 10 or 11 names the next segment of the window. A window opens only while the bound depth has a stencil.
+// Markers: calls into HiFi XI's own d3d8.dll (directmark.hpp) with the back buffer and its depth bound, as zoneslot's:
+// kind 9 at the window's start, 10 at each cut and just before the fade after the menus (0129EA: the interface's end),
+// 11 at its end; each 10 or 11 names the next segment of the window. A window opens only while a depth is bound and
+// that d3d8.dll is the one loaded.
 //
-// Render targets: A (the world's, dgVoodoo's own resource) is read by the draws that copy it (the crossfade's, the
+// Render targets: A (the world's, the d3d8.dll's own resource) is read by the draws that copy it (the crossfade's, the
 // afterimage's, the UI-size target's); the game's other render-target textures (the crossfade's frozen frame, the
 // afterimage's history, the UI-size target) get targets of HiFi XI's own, drawn into and read by the recorded draws,
 // so a switch to one of them doesn't cut: the whole sequence is HiFi XI's. The UI-size target's is the screen's size:
@@ -68,7 +69,7 @@ namespace hifi::game::uidraw
 	struct counts
 	{
 		uint64_t windows = 0;          // opened
-		uint64_t no_window = 0;        // ... not: the device's state couldn't be read, or no stencil to mark on
+		uint64_t no_window = 0;        // ... not: the device's state couldn't be read, or no d3d8.dll of ours or depth to mark with
 		uint64_t movie = 0;            // ... not: the opening movie plays (the game draws it all)
 		uint64_t recorded = 0;         // draws recorded
 		uint64_t native = 0;           // ... and left out of the game's stream
@@ -106,7 +107,7 @@ namespace hifi::game::uidraw
 	void set_font_high(bool on);
 	// Which of the game's textures are A and the UI-size target (tests: the game's from the wrapper, +0x194 and +0x1E0)
 	void set_render_targets(uintptr_t world, uintptr_t ui_target);
-	// Markers handed to sink instead of the device's Clear (tests)
+	// Markers handed to sink instead of the d3d8.dll (tests)
 	void set_sink(void (*sink)(uint32_t kind, uint32_t seq));
 	// The device the stubs use instead of the wrapper's (tests; 0: the wrapper's)
 	void set_device(uintptr_t device);

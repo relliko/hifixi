@@ -38,30 +38,13 @@ namespace hifi::ui2d::render
 	void release();
 	bool ready();
 
-	// dgVoodoo's own Filtering setting (dgVoodoo.conf [DirectX]), which overrides stage 0's filter: app-driven, point,
-	// bilinear, linear mip, trilinear, or anisotropic (at a level 1-16); KeepFilterIfPointSampled keeps a texture sampled
-	// with MINFILTER POINT as it asks. The setting as dgVoodoo reads it: filtering::read.
-	namespace filtering
-	{
-		enum : uint32_t { app = 0, point = 1, bilinear = 2, linear_mip = 3, trilinear = 4, anisotropic = 5 };
-		struct setting
-		{
-			uint32_t forced = app, anisotropy = 1;
-			bool keep_point = true;
-		};
-		// dgVoodoo.conf's text: [DirectX] Filtering ("appdriven", "pointsampled", "bilinear", "pointmip", "linearmip",
-		// "trilinear" or an anisotropic level 1-16) and KeepFilterIfPointSampled
-		setting read(const std::string &conf);
-	}
-	void set_filtering(uint32_t forced, uint32_t anisotropy, bool keep_point);
-
 	// What a texture of nothing reads as (Direct3D 8's stage with no texture set): B, G, R, A
 	void set_null_texel(const uint8_t bgra[4]);
 
 	// The texture store (the game's thread). add: a slot for it (its pixels kept until upload()), kNoTexture and why
 	// when it can't be had. upload: every texture added since on the GPU (waits for it); false and why when that
-	// failed (those slots fail record()). drop: let go (its resource a few seconds later: dgVoodoo's lists may still
-	// hold it).
+	// failed (those slots fail record()). drop: let go (its resource a few seconds later: the d3d8.dll's lists may
+	// still hold it).
 	uint32_t add_texture(const texfmt::texture &t, std::string &why);
 	bool upload(std::string &why);
 	bool pending();
@@ -98,7 +81,7 @@ namespace hifi::ui2d::render
 	// dgVoodoo's heaps and state put back after; or, when !draw, only checked. Null when it was (or could be) drawn, else
 	// why not.
 	const char *record(ID3D12GraphicsCommandList *list, const frame &f, const segment &s, ID3D12Resource *target, DXGI_FORMAT format,
-		const grass::list_state &bound, UINT heap_count, ID3D12DescriptorHeap *const *heaps, bool draw,
+		bool draw,
 		D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET, const world_source &world = world_source());
 
 	struct stats

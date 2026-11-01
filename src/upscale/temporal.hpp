@@ -80,12 +80,9 @@ namespace hifi::upscale::temporal
 		ID3D12PipelineState *_motion = nullptr;
 		ID3D12DescriptorHeap *_heap = nullptr;
 		UINT _step = 0;
-		ID3D12Resource *_depth_copy = nullptr; // (a buffer: plane 0 as the copy lays it out)
-		uint32_t _pitch_words = 0;
 		ID3D12Resource *_depth = nullptr, *_mv = nullptr, *_output = nullptr;
 		D3D12_RESOURCE_STATES _depth_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _mv_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 		D3D12_RESOURCE_STATES _output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		D3D12_RESOURCE_STATES _copy_state = D3D12_RESOURCE_STATE_COMMON;
 		uint32_t _slot = 0;
 		bool _have_last = false;
 		float _last_view_proj[16] = {}; // (the last frame's VIEW x PROJECTION without the jitter)
