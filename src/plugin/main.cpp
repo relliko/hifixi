@@ -94,7 +94,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.60;
+	constexpr double kVersion = 0.61;
 	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
 	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
