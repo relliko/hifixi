@@ -260,8 +260,10 @@ float3 floor_colour(float3 p, out bool found)
 			float4 c = float4(f16tof32(t.x), f16tof32(t.x >> 16), f16tof32(t.y), f16tof32(t.y >> 16));
 			if (abs(c.a - p.y) < 1.5 && finite4(c))
 			{
+				// (a little darker and less saturated than the map: taken straight, it read lime green in game)
 				found = true;
-				return max(c.rgb, 0.0);
+				float3 g = max(c.rgb, 0.0);
+				return lerp(dot(g, float3(0.3, 0.59, 0.11)).xxx, g, 0.8) * 0.8;
 			}
 		}
 	}
