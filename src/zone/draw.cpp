@@ -16,6 +16,7 @@
 #include "hemi_spec.hpp"
 #include "light_split.hpp"
 #include "zone_gpu.hpp"
+#include "../host/shadercache.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -435,7 +436,7 @@ light_out ps_light(v2p i)
 		for (int k = 0; k < 3; ++k)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
-			if (FAILED(compile(source.data(), source.size(), "hifixi_zone", nullptr, nullptr, k == 0 ? "vs" : k == 1 ? "ps" : "ps_light", k == 0 ? "vs_5_0" : "ps_5_0",
+			if (FAILED(hifi::shadercache::compile(compile, source.data(), source.size(), "hifixi_zone", nullptr, nullptr, k == 0 ? "vs" : k == 1 ? "ps" : "ps_light", k == 0 ? "vs_5_0" : "ps_5_0",
 					D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the zone shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");

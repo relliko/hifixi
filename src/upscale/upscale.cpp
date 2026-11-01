@@ -19,6 +19,7 @@
 #include "fsr2_shaders.hpp"
 #include "../framegen/framegen.hpp"
 #include "fsr2/ffx_fsr2.h"
+#include "../host/shadercache.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -258,7 +259,7 @@ namespace hifi::upscale
 				for (int i = 0; i < 4; ++i)
 				{
 					ID3DBlob *code = nullptr, *errors = nullptr;
-					if (FAILED(compile(kSource, std::strlen(kSource), "hifixi_upscale", nullptr, &inc, entries[i][0], entries[i][1], D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+					if (FAILED(hifi::shadercache::compile(compile, kSource, std::strlen(kSource), "hifixi_upscale", nullptr, &inc, entries[i][0], entries[i][1], D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 					{
 						why = std::string("the upscale shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 						drop(errors);

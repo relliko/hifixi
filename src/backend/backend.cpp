@@ -15,6 +15,7 @@
 #include "../host/events.hpp"
 #include "../host/passes.hpp"
 #include "../host/frameapi.hpp"
+#include "../host/shadercache.hpp"
 #include "../render/worldfx_core.hpp"
 #include <share.h>
 #include <algorithm>
@@ -422,6 +423,8 @@ namespace hifi::backend
 				g_folder = slash == std::wstring::npos ? std::wstring() : g_folder.substr(0, slash + 1);
 			else if (!g_folder.empty() && g_folder.back() != L'\\' && g_folder.back() != L'/')
 				g_folder += L'\\';
+			// (HiFi XI's own shaders kept compiled beside the log: src/host/shadercache.hpp)
+			shadercache::set_folder(g_folder + L"hifixi-shader-cache\\");
 			g_settings = settings_path();
 			import_settings();
 			tidy_settings();
@@ -1084,6 +1087,7 @@ namespace hifi::backend
 		out.push_back(line);
 		for (const std::string &l : worldfx::frame_counts())
 			out.push_back(l);
+		out.push_back(shadercache::status());
 		size_t known = 0;
 		{
 			std::lock_guard<std::mutex> lock(views_mutex);

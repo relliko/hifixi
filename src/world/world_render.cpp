@@ -13,6 +13,7 @@
 #include <windows.h>
 #include "render.hpp"
 #include "dome.hpp"
+#include "../host/shadercache.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -214,7 +215,7 @@ float4 names_over_ps(glyph_out i) : SV_Target
 		for (int k = 0; k < 6; ++k)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
-			if (FAILED(compile(kShader, std::strlen(kShader), "hifixi_world", nullptr, nullptr, kEntries[k].name, kEntries[k].profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code,
+			if (FAILED(hifi::shadercache::compile(compile, kShader, std::strlen(kShader), "hifixi_world", nullptr, nullptr, kEntries[k].name, kEntries[k].profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code,
 					&errors)))
 			{
 				why = std::string("the world's shaders didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");

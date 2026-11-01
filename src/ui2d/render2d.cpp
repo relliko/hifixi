@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include "render2d.hpp"
+#include "../host/shadercache.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <atomic>
@@ -623,8 +624,8 @@ float4 ps(O i) : SV_Target
 		}
 		const size_t length = std::strlen(kShader);
 		ID3DBlob *errors = nullptr;
-		if (FAILED(compile(kShader, length, "hifixi_2d", nullptr, nullptr, "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &g.vs, &errors)) ||
-			FAILED(compile(kShader, length, "hifixi_2d", nullptr, nullptr, "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &g.ps, &errors)))
+		if (FAILED(hifi::shadercache::compile(compile, kShader, length, "hifixi_2d", nullptr, nullptr, "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &g.vs, &errors)) ||
+			FAILED(hifi::shadercache::compile(compile, kShader, length, "hifixi_2d", nullptr, nullptr, "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &g.ps, &errors)))
 		{
 			why = errors != nullptr ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize()) : "the shaders didn't compile";
 			drop(errors);

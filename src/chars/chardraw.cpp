@@ -16,6 +16,7 @@
 #include "cache.hpp"
 #include "../zone/hemi_spec.hpp"
 #include "../zone/light_split.hpp"
+#include "../host/shadercache.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -1426,7 +1427,7 @@ float4 pps(p2p i) : SV_Target
 			ID3DBlob *code = nullptr, *errors = nullptr;
 			const bool en = e.out == &_en_svs || e.out == &_en_sps || e.out == &_en_pvs || e.out == &_en_pps;
 			const std::string src = en ? std::string(kEnShader) : std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
-			if (FAILED(compile(src.data(), src.size(), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+			if (FAILED(hifi::shadercache::compile(compile, src.data(), src.size(), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the character shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)
@@ -2105,7 +2106,7 @@ float4 ps_solid(v2p i) : SV_Target
 		for (const entry &e : entries)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
-			if (FAILED(compile(kAuraShader, std::strlen(kAuraShader), "hifixi_aura", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+			if (FAILED(hifi::shadercache::compile(compile, kAuraShader, std::strlen(kAuraShader), "hifixi_aura", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the aura ring's shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)

@@ -36,6 +36,7 @@
 #include "../src/zone/zone_gpu.hpp"
 #include "../src/zone/zoneshadow.hpp"
 #include "game_dump.hpp"
+#include "../src/host/shadercache.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -162,6 +163,9 @@ int main(int argc, char **argv)
 {
 	std::setvbuf(stdout, nullptr, _IONBF, 0); // (each line out as it's printed: a crash shows where it was)
 	namespace inj = hifi::zone::inject;
+	// (the zone's shaders through the shader cache, as in game: the first run compiles them and writes them down, a run
+	// after reads them back; the pictures below are checked either way)
+	hifi::shadercache::set_folder(L"build\\shadercache_test\\");
 	uintptr_t base = 0;
 	if (dump::map(dump::kDumps[0], base) == 0)
 	{
@@ -1203,6 +1207,7 @@ int main(int argc, char **argv)
 		small_heap->Release();
 	}
 	dump::unmap(base);
+	std::printf("%s\n", hifi::shadercache::status().c_str());
 	if (failures == 0)
 		std::printf("\nall passed (%d)\n", passes);
 	else

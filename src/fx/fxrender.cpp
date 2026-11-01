@@ -22,6 +22,7 @@
 #include "fxrender.hpp"
 #include "fxtextures.hpp"
 #include "../zone/zone_gpu.hpp"
+#include "../host/shadercache.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
@@ -351,7 +352,7 @@ float4 ps_grab(g2p i) : SV_Target
 		for (const entry &e : entries)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
-			if (FAILED(compile(kShader, std::strlen(kShader), "hifixi_fx", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+			if (FAILED(hifi::shadercache::compile(compile, kShader, std::strlen(kShader), "hifixi_fx", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the effects' shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)

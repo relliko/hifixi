@@ -13,6 +13,7 @@
 #include <d3dcompiler.h>
 #include "zoneshadow.hpp"
 #include "zone_gpu.hpp"
+#include "../host/shadercache.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -188,7 +189,7 @@ float4 ps_ground(v2g i) : SV_Target
 		ID3DBlob *vs = nullptr, *ps = nullptr, *vs_ground = nullptr, *ps_ground = nullptr, *errors = nullptr;
 		for (auto [entry, target, out] : { std::tuple<const char *, const char *, ID3DBlob **> { "vs", "vs_5_0", &vs }, { "ps", "ps_5_0", &ps },
 				 { "vs_ground", "vs_5_0", &vs_ground }, { "ps_ground", "ps_5_0", &ps_ground } })
-			if (FAILED(compile(kShader, std::strlen(kShader), "hifixi_zone_shadow", nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &errors)))
+			if (FAILED(hifi::shadercache::compile(compile, kShader, std::strlen(kShader), "hifixi_zone_shadow", nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &errors)))
 			{
 				why = std::string("the zone's shadow shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)

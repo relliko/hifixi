@@ -21,6 +21,7 @@
 #include "temporal.hpp"
 #include "fsr2/ffx_fsr2.h"
 #include "fsr2/dx12/ffx_fsr2_dx12.h"
+#include "../host/shadercache.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -271,7 +272,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
 		const auto compile = compiler != nullptr ? reinterpret_cast<compile_fn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
 		ID3DBlob *cs = nullptr, *errors = nullptr;
-		if (compile == nullptr || FAILED(compile(kMotion, std::strlen(kMotion), "hifixi_motion", nullptr, nullptr, "motion_cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &errors)))
+		if (compile == nullptr || FAILED(hifi::shadercache::compile(compile, kMotion, std::strlen(kMotion), "hifixi_motion", nullptr, nullptr, "motion_cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &errors)))
 		{
 			why = std::string("the motion pass didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "no d3dcompiler_47.dll");
 			drop(errors);
@@ -320,7 +321,7 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		if (ok)
 		{
 			ID3DBlob *mcs = nullptr;
-			ok = SUCCEEDED(compile(kMask, std::strlen(kMask), "hifixi_masks", nullptr, nullptr, "mask_cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &mcs, &errors));
+			ok = SUCCEEDED(hifi::shadercache::compile(compile, kMask, std::strlen(kMask), "hifixi_masks", nullptr, nullptr, "mask_cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &mcs, &errors));
 			drop(errors);
 			D3D12_DESCRIPTOR_RANGE mr[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 4 } };
 			D3D12_ROOT_PARAMETER mp[2] = {};
