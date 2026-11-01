@@ -92,4 +92,6 @@ namespace hifi::zone::inject
 	grass::renderer::zone_bounds_fn zone_bounds_hook();
 	grass::renderer::zone_draw_fn zone_draw_hook();
 	grass::renderer::caster_fn movers_hook();
+	// The ground's colour map for the grass (World FX's set_floor_source): docs/own-frame/grass-colour.md
+	grass::renderer::floor_fn floor_hook();
 }

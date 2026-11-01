@@ -272,14 +272,6 @@ namespace hifi::settings
 				{ _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 
 			// Advanced
-			{ "GrassHue", tab::advanced, "Grass colour", "Grass colour where the ground hasn't been seen",
-				"Grass takes its colour from the ground under it as the ground comes into view; until then, this.", nullptr,
-				"Grass", false, { _, _, _, _ } },
-			{ "GrassRuleInFront", tab::advanced, "Grass colour", "Learn only from the ground itself",
-				"Colours aren't learned from characters, trees, names or the sky in front of the ground.", nullptr, "Grass", false,
-				{ _, _, _, _ } },
-			{ "GrassRuleOutliers", tab::advanced, "Grass colour", "Drop colours far off the rest",
-				"A sample far brighter or darker than the ones around it isn't learned.", nullptr, "Grass", false, { _, _, _, _ } },
 			{ "FireflySize", tab::advanced, "Fine-tuning", "Firefly glow", "How big a firefly's glow is.", "%.2f yalms", "Grass", false,
 				{ _, _, _, _ } },
 			{ "GpuCrashReports", tab::advanced, "Diagnostics", "GPU crash reports",

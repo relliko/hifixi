@@ -117,6 +117,8 @@ namespace
 		void *casters_context = nullptr;
 		grass::renderer::zone_bounds_fn zone_bounds = nullptr;
 		grass::renderer::zone_draw_fn zone_draw = nullptr;
+		grass::renderer::floor_fn floor = nullptr; // (the ground's colour map: set_floor_source)
+		void *floor_context = nullptr;
 		void *zone_casters_context = nullptr;
 		grass::renderer::light_fn light = nullptr;
 		void *light_context = nullptr;
@@ -2596,6 +2598,15 @@ namespace worldfx
 			g.renderer->set_zone_casters(bounds, draw, context);
 	}
 
+	void set_floor_source(grass::renderer::floor_fn fn, void *context)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.floor = fn;
+		g.floor_context = context;
+		if (g.renderer != nullptr)
+			g.renderer->set_floor_source(fn, context);
+	}
+
 	void set_light_source(grass::renderer::light_fn fn, void *context)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
@@ -2616,6 +2627,7 @@ namespace worldfx
 		g.renderer->set_casters(g.casters, g.casters_context);
 		g.renderer->set_zone_casters(g.zone_bounds, g.zone_draw, g.zone_casters_context);
 		g.renderer->set_light_source(g.light, g.light_context);
+		g.renderer->set_floor_source(g.floor, g.floor_context);
 		g.shader_stamp = 0; // (a new renderer starts from the built-in shaders: worldfx.hlsl is loaded again)
 		g.shader_status = "built in";
 		g.error.clear();
@@ -3996,22 +4008,6 @@ void worldfx::draw_panel(const ui &u)
 			set_config("LampsUnbaked", g.lamps_unbaked);
 		if (u.slider_float("Firefly glow (yalms)", &g.look.firefly_size, 0.05f, 0.4f, "%.2f"))
 			set_config("FireflySize", g.look.firefly_size);
-		u.text("Grass colour, learned from the ground under each tuft:");
-		if (u.checkbox("Only learn from the ground itself (not characters, trees, names, background)", &g.look.rule_in_front))
-			set_config("GrassRuleInFront", g.look.rule_in_front);
-		if (u.checkbox("Drop samples far brighter or darker than the rest", &g.look.rule_outliers))
-			set_config("GrassRuleOutliers", g.look.rule_outliers);
-		if (u.color_edit3("Grass hue (where the ground hasn't been seen)", g.look.color))
-		{
-			set_config("GrassHueR", g.look.color[0]);
-			set_config("GrassHueG", g.look.color[1]);
-			set_config("GrassHueB", g.look.color[2]);
-		}
-		if (u.button("Forget the colours learned") && g.renderer != nullptr)
-		{
-			std::string ignored;
-			g.renderer->forget_colours(ignored);
-		}
 	}
 
 	if (u.header("Status", false))
@@ -4077,7 +4073,6 @@ namespace
 			number("GrassDistance", g.look.distance, 10.0f, 200.0f);
 			number("GrassHeight", g.look.height, 0.1f, 1.5f);
 			whole("GrassTuft", g.look.tuft, 1, 12);
-			colour("GrassHue", g.look.color);
 			number("Fireflies", g.look.fireflies, 0.0f, 2.0f);
 			number("FireflySize", g.look.firefly_size, 0.05f, 0.4f);
 			number("GrassWear", g.grass_wear, 0.0f, 2.0f);
@@ -4122,8 +4117,6 @@ namespace
 			number("Bloom", g.bloom, 0.0f, 2.0f);
 			number("ColourGrade", g.colour_grade, 0.0f, 2.0f);
 			flag("VisTest", g.vis_option);
-			flag("GrassRuleInFront", g.look.rule_in_front);
-			flag("GrassRuleOutliers", g.look.rule_outliers);
 			flag("WaterDebug", g.look.water_debug);
 			flag("SkyDebug", g.sky_debug);
 			flag("Water", g.look.water);

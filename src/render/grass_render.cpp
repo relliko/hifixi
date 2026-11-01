@@ -131,6 +131,15 @@ namespace grass
 		constexpr float kVolReach = 80.0f, kVolThinning = 9.0f;
 		// ... reaching this many yalms each way from the camera across the sun's rays (kSunMapSize texels: 3.1 cm each)
 		constexpr float kCasterReach = 32.0f;
+		// The ground's colour map (draw_floor): kFloorSize texels square reaching kFloorReach yalms each way (0.31 of a yalm a
+		// texel: the ground's own textures vary over a yalm or so), drawn again at least every kFloorEvery seconds; its
+		// copy's header, kFloorHeader bytes (the placement alignment rows must start at)
+		constexpr UINT kFloorSize = 1024;
+		constexpr float kFloorReach = 160.0f;
+		constexpr double kFloorEvery = 2.0;
+		constexpr UINT64 kFloorHeader = 512;
+		constexpr UINT64 kFloorBytes = kFloorHeader + UINT64(1024) * 1024 * 8; // (the map at the start of the blades' memory: grass.hlsl kMemoryBase)
+		constexpr float kFloorNone = -65504.0f; // (a texel nothing facing up was drawn into: its height)
 		// The lamps' shadow maps (draw_lamp_maps): cubes for this many lamps, kLampMapSize texels a face, from kLampMapNear
 		// yalms off the light (its own lantern, bowl or bracket inside that: grass.hlsl kLampBody) out to its glow's reach;
 		// each face a little wider than a quarter turn (its middle kLampMapScale of it the quarter turn) so a lookup's
@@ -1909,6 +1918,12 @@ namespace grass
 		_vis_box_data = nullptr;
 		release(_vis_boxes);
 		unload_shadow();
+		release(_floor_map);
+		release(_floor_depth);
+		release(_floor_rtv);
+		release(_floor_dsv);
+		_floor_drawn = false;
+		_floor_at = -1.0;
 		release(_sun_map);
 		release(_caster_map);
 		release(_far_map);
@@ -2112,7 +2127,7 @@ namespace grass
 		params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
 		params[6].Descriptor.ShaderRegister = 1;
 		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL; // (the sun's shadows, in the shading passes; the snow's trails, read by the snow layer's corners too)
-		desc.NumParameters = 7;
+		desc.NumParameters = 7; // (64 values at most: 52 constants and six root views fill them)
 		desc.pParameters = params;
 		desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
 
@@ -4489,6 +4504,129 @@ namespace grass
 		return true;
 	}
 
+	// The ground's colour map: its texture (kFloorSize square, R16G16B16A16_FLOAT, cleared to nothing: alpha kFloorNone), a
+	// D32 depth (cleared to 0: GREATER keeps the lowest surface), their views, and the copy (its header, then the rows),
+	// made once. From straight above eye: world x to the map's columns, world z to its rows (row 0 its far +z edge), world
+	// y over the zone's box to the depth (y is down: the larger, the lower). Drawn again when eye has left the middle half,
+	// the zone's data changed, or kFloorEvery seconds passed; the header (WriteBufferImmediate) says what's in the copy.
+	bool renderer::draw_floor(ID3D12GraphicsCommandList *list, const float eye[3], double now)
+	{
+		// (the zone's box and its data's number from the host, as the cascades take them: here too with no sun shadows)
+		float box_lo[3], box_hi[3];
+		uint64_t source = 0;
+		// (into the blades' memory, once it's been zeroed: a fresh one is zeroed at the grass's draw, after this)
+		if (_floor == nullptr || _device == nullptr || _memory == nullptr || _memory_fresh || _zone_bounds == nullptr ||
+			!_zone_bounds(_zone_casters_context, box_lo, box_hi, &source))
+			return false;
+		const float half = 0.5f * kFloorReach;
+		const bool moved = std::fabs(eye[0] - _floor_middle[0]) > half || std::fabs(eye[2] - _floor_middle[1]) > half;
+		if (_floor_drawn && !moved && _floor_source == source && now - _floor_at < kFloorEvery && now >= _floor_at)
+			return true;
+		ID3D12GraphicsCommandList2 *list2 = nullptr;
+		if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list2))) || list2 == nullptr)
+			return false;
+		const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		if (_floor_map == nullptr)
+		{
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = d.Height = kFloorSize;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.SampleDesc.Count = 1;
+			d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			D3D12_CLEAR_VALUE cv = {};
+			cv.Format = d.Format;
+			cv.Color[3] = kFloorNone;
+			bool ok = SUCCEEDED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&_floor_map)));
+			d.Format = DXGI_FORMAT_D32_FLOAT;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+			D3D12_CLEAR_VALUE dv = {};
+			dv.Format = d.Format;
+			ok = ok && SUCCEEDED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv, IID_PPV_ARGS(&_floor_depth)));
+			const D3D12_DESCRIPTOR_HEAP_DESC rh = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 }, dh = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+			ok = ok && SUCCEEDED(_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&_floor_rtv))) && SUCCEEDED(_device->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&_floor_dsv)));
+			if (!ok)
+			{
+				release(_floor_map);
+				release(_floor_depth);
+				release(_floor_rtv);
+				release(_floor_dsv);
+				list2->Release();
+				return false;
+			}
+			_floor_map->SetName(L"worldfx: the ground's colour");
+			_device->CreateRenderTargetView(_floor_map, nullptr, _floor_rtv->GetCPUDescriptorHandleForHeapStart());
+			_device->CreateDepthStencilView(_floor_depth, nullptr, _floor_dsv->GetCPUDescriptorHandleForHeapStart());
+		}
+		// (on its own texel grid, so the colours don't crawl as it follows the camera)
+		const float texel = 2.0f * kFloorReach / kFloorSize;
+		const float cx = std::round(eye[0] / texel) * texel, cz = std::round(eye[2] / texel) * texel;
+		const float lo = box_lo[1] - 1.0f, span = std::max(box_hi[1] - box_lo[1] + 2.0f, 1.0f);
+		float m[16] = {};
+		m[0] = 1.0f / kFloorReach;  // x -> clip x
+		m[9] = 1.0f / kFloorReach;  // z -> clip y (row 0 the far +z edge)
+		m[6] = 1.0f / span;         // y -> depth
+		m[12] = -cx / kFloorReach;
+		m[13] = -cz / kFloorReach;
+		m[14] = -lo / span;
+		m[15] = 1.0f;
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtv = _floor_rtv->GetCPUDescriptorHandleForHeapStart(), dsv = _floor_dsv->GetCPUDescriptorHandleForHeapStart();
+		section(list, L"worldfx: the ground's colour");
+		const float none[4] = { 0.0f, 0.0f, 0.0f, kFloorNone };
+		list->ClearRenderTargetView(rtv, none, 0, nullptr);
+		list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+		const bool drawn = _floor(_floor_context, list, m, rtv, dsv, kFloorSize) != 0;
+		// The rows into the blades' memory after the header, and the header (its middle, texels a yalm, size, a row's uints,
+		// drawn); the memory a UAV again after (the grass's draw orders it after its last frame's writes)
+		transition(list, _memory, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+		if (drawn)
+		{
+			const D3D12_RESOURCE_DESC desc = _floor_map->GetDesc();
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+			_device->GetCopyableFootprints(&desc, 0, 1, kFloorHeader, &footprint, nullptr, nullptr, nullptr);
+			transition(list, _floor_map, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+			dst.pResource = _memory;
+			dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			dst.PlacedFootprint = footprint;
+			src.pResource = _floor_map;
+			src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			src.SubresourceIndex = 0;
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			transition(list, _floor_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const float per = float(kFloorSize) / (2.0f * kFloorReach);
+			uint32_t words[6] = {};
+			std::memcpy(&words[0], &cx, 4);
+			std::memcpy(&words[1], &cz, 4);
+			std::memcpy(&words[2], &per, 4);
+			words[3] = kFloorSize;
+			words[4] = footprint.Footprint.RowPitch / 4;
+			words[5] = 1;
+			D3D12_WRITEBUFFERIMMEDIATE_PARAMETER w[6] = {};
+			for (int i = 0; i < 6; ++i)
+			{
+				w[i].Dest = _memory->GetGPUVirtualAddress() + UINT64(i) * 4;
+				w[i].Value = words[i];
+			}
+			list2->WriteBufferImmediate(6, w, nullptr);
+		}
+		else
+		{
+			D3D12_WRITEBUFFERIMMEDIATE_PARAMETER w = { _memory->GetGPUVirtualAddress() + 20, 0 };
+			list2->WriteBufferImmediate(1, &w, nullptr);
+		}
+		list2->Release();
+		transition(list, _memory, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		_floor_middle[0] = cx;
+		_floor_middle[1] = cz;
+		_floor_at = now;
+		_floor_source = source;
+		_floor_drawn = drawn;
+		return drawn;
+	}
+
 	// The sun pass's parameters for the casters' map (kCasterParams floats, after the clouds'): three float4s taking a
 	// view-space point (x, y, z, 1) to its texel's column and row and its depth there, as a cascade's; then its depth a
 	// yalm, where it starts in the copy (uints, as bits), a texel's size (yalms)
@@ -4817,7 +4955,7 @@ namespace grass
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 		D3D12_RESOURCE_DESC desc = {};
 		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc.Width = UINT64(_blade_count) * kMemoryStride;
+		desc.Width = kFloorBytes + UINT64(_blade_count) * kMemoryStride; // (the ground's colour map first: draw_floor)
 		desc.Height = 1;
 		desc.DepthOrArraySize = 1;
 		desc.MipLevels = 1;
@@ -4835,6 +4973,7 @@ namespace grass
 		}
 		_memory->SetName(L"worldfx: colour memory");
 		_memory_fresh = true; // (zeroed at the next draw)
+		_floor_drawn = false; // (and the ground's colour map drawn into it again after)
 		return true;
 	}
 
@@ -6160,6 +6299,9 @@ namespace grass
 				_zeros->SetName(L"worldfx: zeros");
 			}
 
+			// (the ground's colour map first, when it's due: its own targets, the host's heaps and state after)
+			if (_floor != nullptr)
+				draw_floor(list, eye, double(l.time));
 			section(list, L"worldfx: grass");
 			stats.bound = true;
 			// (with their motion: the second target cleared to nothing (w 0: no blade), then written beside them)
@@ -6190,7 +6332,7 @@ namespace grass
 			if (_memory_fresh)
 			{
 				transition(list, _memory, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-				const UINT64 size = UINT64(_blade_count) * kMemoryStride;
+				const UINT64 size = kFloorBytes + UINT64(_blade_count) * kMemoryStride;
 				for (UINT64 at = 0; at < size; at += zero_chunk)
 					list->CopyBufferRegion(_memory, at, _zeros, 0, std::min(zero_chunk, size - at));
 				transition(list, _memory, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

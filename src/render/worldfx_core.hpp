@@ -124,6 +124,8 @@ namespace worldfx
 	void set_casters(grass::renderer::caster_fn fn, void *context);
 	// The zone's casters the host draws itself (grass::renderer::set_zone_casters), likewise
 	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context);
+	// The ground's colour map the host draws for the grass (grass::renderer::set_floor_source), likewise
+	void set_floor_source(grass::renderer::floor_fn fn, void *context);
 	// The light split the host draws (grass::renderer::set_light_source), likewise
 	void set_light_source(grass::renderer::light_fn fn, void *context);
 	// The camera of the frame dgVoodoo is finishing (VIEW and PROJECTION, row vectors), from the host: the zone pass's

@@ -529,6 +529,68 @@ int main(int argc, char **argv)
 		ssrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 		list->CopyTextureRegion(&sdst, 0, 0, 0, &ssrc, nullptr);
 	}
+	// The ground's colour map for the grass (floor_hook: docs/own-frame/grass-colour.md) over the whole zone from above,
+	// as World FX draws it (x across, z down from its far edge, the lowest surface by height), out to be read
+	constexpr UINT kGround = 512;
+	ID3D12Resource *ground_map = nullptr, *ground_depth = nullptr, *ground_back = nullptr;
+	ID3D12DescriptorHeap *ground_rtv_heap = nullptr, *ground_dsv_heap = nullptr;
+	uint32_t ground_triangles = 0;
+	{
+		D3D12_RESOURCE_DESC cd = {};
+		cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		cd.Width = cd.Height = kGround;
+		cd.DepthOrArraySize = 1;
+		cd.MipLevels = 1;
+		cd.SampleDesc.Count = 1;
+		cd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = cd.Format;
+		cv.Color[3] = -65504.0f;
+		D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT }, rh = { D3D12_HEAP_TYPE_READBACK };
+		device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&ground_map));
+		cd.Format = DXGI_FORMAT_D32_FLOAT;
+		cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		D3D12_CLEAR_VALUE dv = {};
+		dv.Format = cd.Format;
+		device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv, IID_PPV_ARGS(&ground_depth));
+		D3D12_DESCRIPTOR_HEAP_DESC rd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 }, dd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+		device->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&ground_rtv_heap));
+		device->CreateDescriptorHeap(&dd, IID_PPV_ARGS(&ground_dsv_heap));
+		device->CreateRenderTargetView(ground_map, nullptr, ground_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+		device->CreateDepthStencilView(ground_depth, nullptr, ground_dsv_heap->GetCPUDescriptorHandleForHeapStart());
+		D3D12_RESOURCE_DESC b = {};
+		b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		b.Width = UINT64(kGround) * kGround * 8;
+		b.Height = 1;
+		b.DepthOrArraySize = 1;
+		b.MipLevels = 1;
+		b.SampleDesc.Count = 1;
+		b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		device->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ground_back));
+		const float none[4] = { 0.0f, 0.0f, 0.0f, -65504.0f };
+		const D3D12_CPU_DESCRIPTOR_HANDLE grtv = ground_rtv_heap->GetCPUDescriptorHandleForHeapStart(), gdsv = ground_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+		list->ClearRenderTargetView(grtv, none, 0, nullptr);
+		list->ClearDepthStencilView(gdsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+		float gm[16] = {};
+		gm[0] = 1.0f / m_reach;
+		gm[9] = 1.0f / m_reach;
+		gm[6] = 1.0f / m_span;
+		gm[12] = -m_x / m_reach;
+		gm[13] = -m_z / m_reach;
+		gm[14] = -m_top / m_span;
+		gm[15] = 1.0f;
+		ground_triangles = bounds_after ? inj::floor_hook()(nullptr, list, gm, grtv, gdsv, kGround) : 0;
+		bound.restore(list);
+		barrier(list, ground_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION gdst = {}, gsrc = {};
+		gdst.pResource = ground_back;
+		gdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		gdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R16G16B16A16_FLOAT, kGround, kGround, 1, kGround * 8 };
+		gsrc.pResource = ground_map;
+		gsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		list->CopyTextureRegion(&gdst, 0, 0, 0, &gsrc, nullptr);
+	}
 	// The light split drawn with the pass, as World FX takes it, out to be read
 	ID3D12Resource *const light = hifi::light::take(), *light_back = nullptr;
 	if (light != nullptr)
@@ -687,6 +749,58 @@ int main(int argc, char **argv)
 				}
 			std::fclose(pf);
 		}
+	// The ground's colour map: what faces up covers a good part of it, every height within the zone's box, colours lit
+	// and not black (build\zone_ground_map.ppm for a look)
+	if (ground_back != nullptr)
+	{
+		const auto half = [](uint16_t h) {
+			const uint32_t sign = uint32_t(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
+			uint32_t bits;
+			if (e == 0)
+				bits = sign; // (denormals as 0: none matter here)
+			else if (e == 31)
+				bits = sign | 0x7F800000u | (m << 13);
+			else
+				bits = sign | ((e - 15 + 127) << 23) | (m << 13);
+			float f;
+			std::memcpy(&f, &bits, 4);
+			return f;
+		};
+		uint16_t *gp = nullptr;
+		ground_back->Map(0, nullptr, reinterpret_cast<void **>(&gp));
+		uint32_t covered = 0, inside = 0, lit = 0;
+		double luma = 0.0;
+		for (size_t i = 0; i < size_t(kGround) * kGround; ++i)
+		{
+			const float y = half(gp[i * 4 + 3]);
+			if (y < -60000.0f)
+				continue;
+			covered++;
+			inside += y >= zlo[1] - 1.0f && y <= zhi[1] + 1.0f;
+			const float r = half(gp[i * 4]), g = half(gp[i * 4 + 1]), b = half(gp[i * 4 + 2]);
+			const float l = 0.3f * r + 0.59f * g + 0.11f * b;
+			lit += l > 0.02f && l <= 1.0f;
+			luma += l;
+		}
+		const double share = double(covered) / (double(kGround) * kGround);
+		std::snprintf(line, sizeof(line), "the ground's colour map from the zone's data: %u triangles, %.0f%% of it covered, %u of %u heights in the zone's box, "
+			"%u lit (a mean brightness of %.2f)", ground_triangles, share * 100, inside, covered, lit, covered != 0 ? luma / covered : 0.0);
+		check(ground_triangles > 1000 && share > 0.1 && inside == covered && lit > covered / 2, line);
+		if (FILE *pf = nullptr; fopen_s(&pf, "build\\zone_ground_map.ppm", "wb") == 0 && pf != nullptr)
+		{
+			std::fprintf(pf, "P6 %u %u 255\n", kGround, kGround);
+			for (size_t i = 0; i < size_t(kGround) * kGround; ++i)
+			{
+				const bool here = half(gp[i * 4 + 3]) > -60000.0f;
+				uint8_t c[3];
+				for (int k = 0; k < 3; ++k)
+					c[k] = here ? uint8_t(std::min(255.0f, std::max(0.0f, half(gp[i * 4 + k])) * 255.0f)) : uint8_t(k == 2 ? 80 : 0);
+				std::fwrite(c, 1, 3, pf);
+			}
+			std::fclose(pf);
+		}
+		ground_back->Unmap(0, nullptr);
+	}
 		sun_back->Unmap(0, nullptr);
 		check(st.size() > 1 && st[1].find("1 drawn") != std::string::npos, "counted: " + (st.size() > 1 ? st[1] : std::string()));
 	}

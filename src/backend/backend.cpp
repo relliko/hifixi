@@ -1186,6 +1186,7 @@ extern "C" __declspec(dllexport) int __cdecl hifixi_zone_test(const void *image,
 	if (!zone_casters_set)
 	{
 		worldfx::set_zone_casters(hifi::zone::inject::zone_bounds_hook(), hifi::zone::inject::zone_draw_hook(), nullptr);
+		worldfx::set_floor_source(hifi::zone::inject::floor_hook(), nullptr);
 		zone_casters_set = true;
 	}
 	const zm::zone &d = gz->data();

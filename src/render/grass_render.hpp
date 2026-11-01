@@ -731,6 +731,17 @@ namespace grass
 			_light = fn;
 			_light_context = context;
 		}
+		// The ground's own colour the host draws (HiFi XI: the native zone data, docs/own-frame/grass-colour.md): from above,
+		// world_to_clip taking world x, z to the map and the height (world y) to its depth, into rtv (R16G16B16A16_FLOAT,
+		// size square, cleared: alpha kFloorNone) and dsv (D32, cleared to 0): each texel the ground facing up there, lit,
+		// its height in alpha, the lowest surface kept. Returns the triangles drawn (0: none, the blades' own hue then).
+		using floor_fn = uint32_t (*)(void *context, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+			D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size);
+		void set_floor_source(floor_fn fn, void *context)
+		{
+			_floor = fn;
+			_floor_context = context;
+		}
 		// Forgets the clouds' last picture: the next frame marches every pixel of it again (as after a weather jump)
 		void forget_clouds() { _cloud_known = false; }
 		// Forgets the ground colours seen so far (each blade point remembers its own, see the shader)
@@ -792,6 +803,10 @@ namespace grass
 		uint32_t draw_sun_map(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3], double clock, uint32_t &triangles, std::string &error);
 		void sun_map_params(const camera &cam, double clock, float out[32], float prev[32], float farthest[32]) const;
 		bool draw_casters(ID3D12GraphicsCommandList *list, const float eye[3], const float sun[3]);
+		// The ground's colour map (set_floor_source) around eye, drawn again when eye has left its middle half, the zone's
+		// data has changed or kFloorEvery seconds have passed (the light moves), then copied into the start of the blades'
+		// memory (u0) after its header; false when there's none (the header then says so)
+		bool draw_floor(ID3D12GraphicsCommandList *list, const float eye[3], double now);
 		void caster_params(const camera &cam, float out[16]) const;
 		bool lamp_maps_for(std::string &error);
 		void draw_lamp_maps(ID3D12GraphicsCommandList *list, const camera &cam, const look &l, const float eye[3], float out[32], draw_stats &stats);
@@ -932,6 +947,18 @@ namespace grass
 		// The host's light split (set_light_source)
 		light_fn _light = nullptr;
 		void *_light_context = nullptr;
+		// The ground's colour map: drawn by the host (_floor), its texture and depth and their views; copied to the start of
+		// the blades' memory (u0: a header of kFloorHeader bytes, its middle x, z (floats), texels a yalm, its size, a row's
+		// uints, 1 when drawn; then the rows; the points' records after, grass.hlsl kMemoryBase), where it's centred and
+		// when it was drawn, for what zone data
+		floor_fn _floor = nullptr;
+		void *_floor_context = nullptr;
+		ID3D12Resource *_floor_map = nullptr, *_floor_depth = nullptr;
+		ID3D12DescriptorHeap *_floor_rtv = nullptr, *_floor_dsv = nullptr;
+		float _floor_middle[2] = {};
+		double _floor_at = -1.0;
+		uint64_t _floor_source = 0;
+		bool _floor_drawn = false;
 		uint64_t _map_source = 0;
 		float _map_lo[3] = {}, _map_hi[3] = {};
 		bool _map_bounds = false;

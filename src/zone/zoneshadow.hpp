@@ -48,7 +48,12 @@ namespace hifi::zone
 		// world_to_clip is a cascade's (parallel rays: depth not cut) or a lamp's cube face's (a perspective: what's behind
 		// it or past its far plane cut too). With hole, a near cascade (kHoleReach yalms each way or less) leaves out the
 		// movers wholly within kHole of its middle.
-		uint32_t record(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, bool hole = false);
+		// With ground (12 floats: toward the sun, w unused; the sun's diffuse; the ambient: the zone's environment 0), the
+		// ground map instead (docs/own-frame/grass-colour.md): into rtv (kGroundFormat, size square) and dsv (D32, cleared
+		// to 0: the lowest surface kept), what faces up, lit, its height in alpha.
+		uint32_t record(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, bool hole = false,
+			const float *ground = nullptr, D3D12_CPU_DESCRIPTOR_HANDLE rtv = {});
+		static constexpr DXGI_FORMAT kGroundFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 		// The moving layer. note_pass: the objects of the last pass drawn that are this map's (zone_index: 0 the zone, 1
 		// the second map), for the plants' sways and the doors' live matrices; record_movers: the movers seen through
@@ -73,11 +78,13 @@ namespace hifi::zone
 		};
 		// The groups' pieces drawn: places and list the root SRVs t2 and t3 read, place_count their places
 		uint32_t draw_groups(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size,
-			D3D12_GPU_VIRTUAL_ADDRESS places, D3D12_GPU_VIRTUAL_ADDRESS visible, uint32_t place_count, const std::vector<group> &groups);
+			D3D12_GPU_VIRTUAL_ADDRESS places, D3D12_GPU_VIRTUAL_ADDRESS visible, uint32_t place_count, const std::vector<group> &groups,
+			const float *ground = nullptr, D3D12_CPU_DESCRIPTOR_HANDLE rtv = {});
 		bool is_mover(uint32_t model) const;
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
 		ID3D12PipelineState *_pso = nullptr;
+		ID3D12PipelineState *_ground_pso = nullptr; // (the ground map's)
 		// The visible lists: a ring of kRingSlots x kMaxVisible uints (upload heap, mapped), each record's list from the next
 		// free place; the records made
 		ID3D12Resource *_ring = nullptr;

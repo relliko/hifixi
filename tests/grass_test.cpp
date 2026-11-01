@@ -4212,7 +4212,10 @@ int main(int argc, char **argv)
 		const double still = blade_light(150, 160, 90, false);
 		const double dark = blade_light(25, 30, 15, true);
 		std::printf("  blade brightness: %.0f on light ground, %.0f back on it after a frame on dark, %.0f on dark forgotten\n", light, still, dark);
-		check(still > 0.95 * light && dark < 0.5 * light, "blades remember their ground's colour across frames");
+		// (since 0.59 the colour comes from the ground's map the host draws, docs/own-frame/grass-colour.md; with none, as
+		// here, the grass's own hue: what the screen shows under the blades no longer changes them)
+		check(std::fabs(still - light) < 0.05 * light && std::fabs(dark - light) < 0.05 * light,
+			"without the ground's map, blades take the grass's own hue whatever the screen shows under them");
 		check(g.report_messages() == 0, "no debug-layer errors (colour memory)");
 	}
 
@@ -4253,7 +4256,7 @@ int main(int argc, char **argv)
 		const double shadowed = blades(75, 80, 45, 2);
 		const double after = blades(150, 160, 90, 2);
 		std::printf("  a shadow over the grass: blades %.0f on light ground, %.0f with the ground half as bright, %.0f when it's gone\n", lit, shadowed, after);
-		check(shadowed < 0.7 * lit, "a shadow passing over darkens the grass at once");
+		check(std::fabs(shadowed - lit) < 0.05 * lit, "the screen under the grass going dark doesn't change it (its colour isn't the screen's)");
 		check(std::fabs(after - lit) < 0.05 * lit, "and isn't learned: gone with it");
 		check(g.report_messages() == 0, "no debug-layer errors (shadow over the grass)");
 	}

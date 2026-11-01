@@ -234,12 +234,51 @@ uint ground_at(float3 p, out float3 colour)
 // Then (kMemoryStride bytes a point in all) the point's wear: see wear_of.
 RWByteAddressBuffer memory : register(u0);
 static const uint kMemoryStride = 20;
+static const uint kMemoryBase = 512 + 1024 * 1024 * 8; // (the ground's colour map first: grass_render.cpp kFloorBytes)
 static const float kFollow = 0.03;
 
-// seen_from: how far (view depth) the colour returned was seen from, the fog of that distance in it (0: a guess)
+// The ground's own colour under a root, from the host's map (t4: grass_render.cpp draw_floor, the native zone drawn from
+// above, lit, the lowest surface facing up; docs/own-frame/grass-colour.md): its header (the middle x, z, texels a yalm,
+// its size, a row's uints, 1 when drawn), then the rows (R16G16B16A16_FLOAT: the colour, the surface's height). Taken
+// where that surface is the root's own (within 1.5 yalms of its height: not a bridge above it), else the grass's hue at
+// a ground's brightness. No fog in it (seen_from 0).
+// (it's at the start of the blades' memory, u0, below: the points' records after it, at kMemoryBase)
+static const uint kFloorHeader = 512;
+
+float3 floor_colour(float3 p, out bool found)
+{
+	found = false;
+	uint4 h = memory.Load4(0);
+	uint2 h2 = memory.Load2(16);
+	[branch] if (h2.y != 0)
+	{
+		float per = asfloat(h.z), half_size = 0.5 * float(h.w);
+		int2 q = int2(floor(float2((p.x - asfloat(h.x)) * per + half_size, (asfloat(h.y) - p.z) * per + half_size)));
+		if (all(q >= 0) && all(q < int(h.w)))
+		{
+			uint2 t = memory.Load2(kFloorHeader + (uint(q.y) * h2.x + uint(q.x) * 2u) * 4u);
+			float4 c = float4(f16tof32(t.x), f16tof32(t.x >> 16), f16tof32(t.y), f16tof32(t.y >> 16));
+			if (abs(c.a - p.y) < 1.5 && finite4(c))
+			{
+				found = true;
+				return max(c.rgb, 0.0);
+			}
+		}
+	}
+	return color.rgb * (0.22 / max(dot(color.rgb, float3(0.3, 0.59, 0.11)), 0.01));
+}
+
 float3 ground_colour(uint point_index, float3 p, bool first_vertex, out float seen_from)
 {
-	uint3 m = memory.Load3(point_index * kMemoryStride);
+	seen_from = 0.0;
+	bool found;
+	return floor_colour(p, found);
+}
+
+// (the colour as it was learned from the screen before 0.59: kept for reference, no longer called)
+float3 learned_ground_colour(uint point_index, float3 p, bool first_vertex, out float seen_from)
+{
+	uint3 m = memory.Load3(kMemoryBase + point_index * kMemoryStride);
 	float3 kept = float3(f16tof32(m.x), f16tof32(m.x >> 16), f16tof32(m.y));
 	float kept_from = f16tof32(m.y >> 16);
 	// (a colour that isn't a number is learned again, as if never seen)
@@ -256,7 +295,7 @@ float3 ground_colour(uint point_index, float3 p, bool first_vertex, out float se
 	if (known ? seen < 4 : seen == 0)
 	{
 		if (known && first_vertex)
-			memory.Store(point_index * kMemoryStride + 8, 0u);
+			memory.Store(kMemoryBase + point_index * kMemoryStride + 8, 0u);
 		seen_from = known ? kept_from : 0.0;
 		return known ? kept * shaded : now;
 	}
@@ -288,7 +327,7 @@ float3 ground_colour(uint point_index, float3 p, bool first_vertex, out float se
 		next_from = 0.0;
 	}
 	if (first_vertex)
-		memory.Store3(point_index * kMemoryStride, uint3(f32tof16(next.r) | (f32tof16(next.g) << 16), f32tof16(next.b) | (f32tof16(next_from) << 16),
+		memory.Store3(kMemoryBase + point_index * kMemoryStride, uint3(f32tof16(next.r) | (f32tof16(next.g) << 16), f32tof16(next.b) | (f32tof16(next_from) << 16),
 			uint(saturate(darkness) * 65535.0 + 0.5)));
 	seen_from = known ? kept_from : from;
 	return known ? kept * shaded : next;
@@ -345,7 +384,7 @@ bool blade_motion() { return ((crowd.x >> 16) & 32768) != 0; }
 static const float kWearHold = 240.0, kWearFill = 20.0, kRegrow = 240.0;
 float2 wear_of(uint point_index, float3 p, bool first_vertex)
 {
-	uint at = point_index * kMemoryStride + 12;
+	uint at = kMemoryBase + point_index * kMemoryStride + 12;
 	float2 until = finite_or(asfloat(memory.Load2(at)), float2(0.0, 0.0));
 	float4 w = actors[kWear];
 	float now = w.x;

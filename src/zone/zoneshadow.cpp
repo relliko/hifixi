@@ -34,6 +34,12 @@ cbuffer draw_constants : register(b0)
 	uint index_count;
 	uint vertex_count;
 	uint place_count;
+	uint pad0, pad1;
+	// (the ground map's: the zone's light, environment 0 of the last pass: toward the sun (world), its diffuse, the
+	// ambient, as the zone pass lights a fixed-function piece)
+	float4 sun_dir;
+	float4 sun;
+	float4 ambient;
 };
 struct vertex { float3 pos; float3 normal; uint colour; float2 uv; float3 sway; };
 struct place { float3 r0; float3 r1; float3 r2; float3 t; float sway; float3 spare; };
@@ -70,6 +76,46 @@ void ps(v2p i)
 	if (tested != 0 && saturate(4 * colour_map.Sample(wrap, i.uv).a * i.alpha) <= 96.0 / 255.0)
 		discard;
 }
+
+// The ground map (grass colour, docs/own-frame/grass-colour.md): from above, what faces up, lit as the zone pass lights a
+// fixed-function piece (the vertex colour x (ambient + sun x N.L), saturated, then the texture x 2: MODULATE2X), and its
+// height (world y, down positive) in alpha; the depth (GREATER) keeps the lowest surface, the ground under a canopy
+struct v2g
+{
+	float4 pos : SV_Position;
+	float2 uv : TEXCOORD0;
+	float4 vcol : COLOR0;
+	float3 n : TEXCOORD1;
+	float y : TEXCOORD2;
+};
+
+v2g vs_ground(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+{
+	const vertex v = vertices[min(indices[min(first_index + vid, index_count - 1)], vertex_count - 1)];
+	const place p = places[min(visible[list_start + iid], place_count - 1)];
+	const float3 o = v.pos + v.sway * p.sway;
+	const float3 w = o.x * p.r0 + o.y * p.r1 + o.z * p.r2 + p.t;
+	v2g r;
+	r.pos = mul(float4(w, 1), world_to_clip);
+	r.uv = v.uv;
+	const uint c = v.colour;
+	r.vcol = float4((c >> 16) & 255, (c >> 8) & 255, c & 255, c >> 24) / 255.0;
+	r.n = v.normal.x * p.r0 + v.normal.y * p.r1 + v.normal.z * p.r2;
+	r.y = w.y;
+	return r;
+}
+
+float4 ps_ground(v2g i) : SV_Target
+{
+	const float3 n = normalize(i.n);
+	if (!(n.y < -0.3)) // (facing up: the game's y is down; a wall or an underside isn't ground)
+		discard;
+	const float4 t = colour_map.Sample(wrap, i.uv);
+	if (tested != 0 && saturate(4 * t.a * i.vcol.a) <= 96.0 / 255.0)
+		discard;
+	const float3 lit = saturate(i.vcol.rgb * (ambient.rgb + sun.rgb * max(0.0, dot(n, sun_dir.xyz))));
+	return float4(saturate(t.rgb * lit * 2.0), i.y);
+}
 )";
 
 		constexpr uint32_t kRingSlots = 16;
@@ -78,7 +124,7 @@ void ps(v2p i)
 		constexpr uint32_t kMaxMovers = 4096;   // (a frame's: the plants and door parts within the casters' map)
 		constexpr uint32_t kPlaceFloats = 16;
 		constexpr UINT64 kMoverSlot = UINT64(kMaxMovers) * (kPlaceFloats * 4 + 4);
-		constexpr UINT kConstants = 22;
+		constexpr UINT kConstants = 36; // (22 the casters', 2 to align, 12 the ground map's light)
 
 		// A placement's key for finding it again from a pass's object: its model and its translation to a sixteenth
 		uint64_t place_key(uint32_t model, const float t[3])
@@ -118,6 +164,7 @@ void ps(v2p i)
 			drop(o.first);
 		_old.clear();
 		drop(_pso);
+		drop(_ground_pso);
 		drop(_root);
 		_zone = nullptr;
 		_boxes.clear();
@@ -138,14 +185,17 @@ void ps(v2p i)
 			why = "d3dcompiler_47.dll isn't there";
 			return false;
 		}
-		ID3DBlob *vs = nullptr, *ps = nullptr, *errors = nullptr;
-		for (auto [entry, target, out] : { std::tuple<const char *, const char *, ID3DBlob **> { "vs", "vs_5_0", &vs }, { "ps", "ps_5_0", &ps } })
+		ID3DBlob *vs = nullptr, *ps = nullptr, *vs_ground = nullptr, *ps_ground = nullptr, *errors = nullptr;
+		for (auto [entry, target, out] : { std::tuple<const char *, const char *, ID3DBlob **> { "vs", "vs_5_0", &vs }, { "ps", "ps_5_0", &ps },
+				 { "vs_ground", "vs_5_0", &vs_ground }, { "ps_ground", "ps_5_0", &ps_ground } })
 			if (FAILED(compile(kShader, std::strlen(kShader), "hifixi_zone_shadow", nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &errors)))
 			{
 				why = std::string("the zone's shadow shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
 				if (errors != nullptr)
 					errors->Release();
 				drop(vs);
+				drop(ps);
+				drop(vs_ground);
 				release();
 				return false;
 			}
@@ -193,9 +243,19 @@ void ps(v2p i)
 			d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
 			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
 			ok = SUCCEEDED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&_pso)));
+			// (the ground map's: a colour target with the height, the lowest surface kept)
+			d.VS = { vs_ground->GetBufferPointer(), vs_ground->GetBufferSize() };
+			d.PS = { ps_ground->GetBufferPointer(), ps_ground->GetBufferSize() };
+			d.NumRenderTargets = 1;
+			d.RTVFormats[0] = kGroundFormat;
+			d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+			ok = ok && SUCCEEDED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&_ground_pso)));
 		}
 		drop(vs);
 		drop(ps);
+		drop(vs_ground);
+		drop(ps_ground);
 		if (ok)
 		{
 			D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
@@ -338,9 +398,10 @@ void ps(v2p i)
 		return true;
 	}
 
-	uint32_t zone_shadow::record(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, bool hole)
+	uint32_t zone_shadow::record(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size, bool hole,
+		const float *ground, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 	{
-		if (_pso == nullptr || !z.ready() || !prepare_zone(z) || z.heap() == nullptr || z.vertices() == nullptr || z.indices() == nullptr)
+		if ((ground != nullptr ? _ground_pso : _pso) == nullptr || !z.ready() || !prepare_zone(z) || z.heap() == nullptr || z.vertices() == nullptr || z.indices() == nullptr)
 			return 0;
 		const zm::zone &d = z.data();
 		// The placements in the cascade: their boxes' corners through world_to_clip within x, y of -1..1 (a box all to
@@ -408,11 +469,12 @@ void ps(v2p i)
 		if (groups.empty())
 			return 0;
 		return draw_groups(list, z, world_to_clip, dsv, size, _places->GetGPUVirtualAddress(), _ring->GetGPUVirtualAddress() + UINT64(first) * 4,
-			uint32_t(d.placements.size()), groups);
+			uint32_t(d.placements.size()), groups, ground, rtv);
 	}
 
 	uint32_t zone_shadow::draw_groups(ID3D12GraphicsCommandList *list, gpu_zone &z, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size,
-		D3D12_GPU_VIRTUAL_ADDRESS places, D3D12_GPU_VIRTUAL_ADDRESS visible, uint32_t place_count, const std::vector<group> &groups)
+		D3D12_GPU_VIRTUAL_ADDRESS places, D3D12_GPU_VIRTUAL_ADDRESS visible, uint32_t place_count, const std::vector<group> &groups, const float *ground,
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 	{
 		const zm::zone &d = z.data();
 		const D3D12_RESOURCE_DESC vd = z.vertices()->GetDesc(), id = z.indices()->GetDesc();
@@ -420,14 +482,17 @@ void ps(v2p i)
 		if (vertex_count == 0 || index_count == 0 || place_count == 0)
 			return 0;
 		ID3D12DescriptorHeap *const heap = z.heap();
-		list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+		if (ground != nullptr)
+			list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+		else
+			list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
 		const D3D12_VIEWPORT vp = { 0.0f, 0.0f, float(size), float(size), 0.0f, 1.0f };
 		const D3D12_RECT sc = { 0, 0, LONG(size), LONG(size) };
 		list->RSSetViewports(1, &vp);
 		list->RSSetScissorRects(1, &sc);
 		list->SetDescriptorHeaps(1, &heap);
 		list->SetGraphicsRootSignature(_root);
-		list->SetPipelineState(_pso);
+		list->SetPipelineState(ground != nullptr ? _ground_pso : _pso);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		list->SetGraphicsRootShaderResourceView(1, z.vertices()->GetGPUVirtualAddress());
 		list->SetGraphicsRootShaderResourceView(2, z.indices()->GetGPUVirtualAddress());
@@ -436,6 +501,8 @@ void ps(v2p i)
 		list->SetGraphicsRoot32BitConstants(0, 16, world_to_clip, 0);
 		const uint32_t counts[3] = { index_count, vertex_count, place_count };
 		list->SetGraphicsRoot32BitConstants(0, 3, counts, 19);
+		if (ground != nullptr)
+			list->SetGraphicsRoot32BitConstants(0, 12, ground, 24);
 		// (a table must always be set: the white stand-in where nothing's tested)
 		D3D12_GPU_DESCRIPTOR_HANDLE bound = z.texture_srv(zm::kNone);
 		list->SetGraphicsRootDescriptorTable(5, bound);
@@ -450,7 +517,7 @@ void ps(v2p i)
 				const zm::piece &pc = d.pieces[m.first_piece + k];
 				if (pc.triangles == 0 || (pc.bits & zm::kBlended) != 0)
 					continue;
-				if (gr.tested != 0)
+				if (gr.tested != 0 || ground != nullptr) // (the ground map reads every piece's texture)
 				{
 					const D3D12_GPU_DESCRIPTOR_HANDLE h = z.texture_srv(pc.texture);
 					if (h.ptr != bound.ptr)

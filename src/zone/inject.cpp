@@ -65,6 +65,9 @@ namespace hifi::zone::inject
 			DXGI_FORMAT view_rt_format = DXGI_FORMAT_UNKNOWN, view_ds_format = DXGI_FORMAT_UNKNOWN;
 			// The camera of the last zone pass whose end was recorded (last_camera)
 			frame_camera camera;
+			// (the last pass's environment 0, for the ground's colour map: toward the sun, w 0; its diffuse; the ambient)
+			float floor_env[12] = {};
+			bool have_floor_env = false;
 			bool have_camera = false;
 			frame_lamp lamps[kMaxLamps]; // (and its lamps, when it was drawn here: last_lamps)
 			uint32_t lamp_count = 0;
@@ -435,6 +438,17 @@ namespace hifi::zone::inject
 			g.camera.seq = f->seq.load(std::memory_order_acquire);
 			g.camera.at = GetTickCount64();
 			g.have_camera = true;
+			// (the last native pass's light kept for the ground's colour map: a pass the game draws itself leaves it)
+			if (f->native)
+			{
+				for (int k = 0; k < 3; ++k)
+				{
+					g.floor_env[k] = f->sun_dir[k];
+					g.floor_env[4 + k] = f->sun[k];
+					g.floor_env[8 + k] = f->ambient[k];
+				}
+				g.have_floor_env = true;
+			}
 			g.lamp_count = f->native ? std::min(f->lamp_count, kMaxLamps) : 0;
 			std::memcpy(g.lamps, f->lamps, size_t(g.lamp_count) * sizeof(frame_lamp));
 		}
@@ -576,6 +590,32 @@ namespace hifi::zone::inject
 		return triangles;
 	}
 
+	// The ground's colour map (docs/own-frame/grass-colour.md): the zone's placements from above into rtv and dsv, lit with
+	// the last pass's environment 0; triangles drawn (0 before a pass has given its light)
+	uint32_t record_zone_floor(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
+	{
+		float env[12];
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			if (!g.have_floor_env)
+				return 0;
+			std::memcpy(env, g.floor_env, sizeof(env));
+		}
+		heaps h;
+		gpu_zone *second = nullptr;
+		gpu_zone *const z = fresh_zone(list, h, &second);
+		if (z == nullptr || h.count == 0)
+			return 0;
+		std::lock_guard<std::mutex> lock(g.shadow_mutex);
+		if (g.shadow == nullptr)
+			return 0;
+		uint32_t triangles = g.shadow->record(list, *z, world_to_clip, dsv, size, false, env, rtv);
+		if (second != nullptr && g.second_shadow != nullptr)
+			triangles += g.second_shadow->record(list, *second, world_to_clip, dsv, size, false, env, rtv);
+		list->SetDescriptorHeaps(h.count, h.h);
+		return triangles;
+	}
+
 	bool record_zone_movers(ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size)
 	{
 		heaps h;
@@ -617,6 +657,13 @@ namespace hifi::zone::inject
 	{
 		return [](void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
 			return record_zone_casters(list, world_to_clip, dsv, size);
+		};
+	}
+
+	grass::renderer::floor_fn floor_hook()
+	{
+		return [](void *, ID3D12GraphicsCommandList *list, const float world_to_clip[16], D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
+			return record_zone_floor(list, world_to_clip, rtv, dsv, size);
 		};
 	}
 
