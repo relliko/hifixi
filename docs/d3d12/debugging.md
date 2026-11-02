@@ -76,9 +76,8 @@ Our own breadcrumbs (`WriteBufferImmediate`):
 
 Turning things on:
 
-- `D3D12DebugLayer=1` in settings.ini: read in `before_device`, `src/render/worldfx_core.cpp:2384`. Only when the
-  host's hooks accept the debug layer's classes (`debug_layer_allowed`, :2387); `is_runtime`
-  (`src/host/hooks.cpp:590`) lets `D3D12SDKLayers.dll` count as the runtime.
+- `D3D12DebugLayer=1` in settings.ini: read in `before_device` (`src/render/worldfx_core.cpp`), from the starter's
+  early start, before our d3d8.dll makes its device (`debug_layer_allowed`: the backend passes true).
 - `gpu_crash::enable_debug_layer`, `src/render/gpu_crash.cpp:194`: `EnableDebugLayer` (:204), and GBV only when
   the environment variable `HIFIXI_GBV=1` (:209-211). GBV is never in a setting.
 - Messages: `write_debug_messages` (`gpu_crash.cpp:219`), called each present (`worldfx_core.cpp:2809`), drops
@@ -139,9 +138,9 @@ Hang report (the game thread, not the GPU):
   a root SRV has no bounds: NVIDIA hung, WARP didn't care. Found only with `HIFIXI_GBV=1` +
   `D3D12DebugLayer=1`, then bisected by draw count. Lesson: run new GPU code on the real GPU with GBV, not
   only on WARP.
-- Debug layer deadlocks: device calls or Release under a mutex the recording hooks also take deadlock with the
-  debug layer's lock (zone shadows, inject::prepare). Hooks call the original with the thread quiet
-  (`src/host/hooks.cpp:92-104`), or the layer's wrapper calling the real object counts every call twice.
+- Debug layer deadlocks: device calls or Release under a mutex another thread takes inside a D3D12 or DXGI call
+  deadlock with the debug layer's lock (zone shadows, inject::prepare; until step 5b, our hooks ran inside those
+  calls).
 - The GBV session of 2026-11-02 deadlocked twice, not a GPU hang. GBV's slowness turned automatic frame generation
   on; AMD's presenter thread and then the character cache worker reset internal lists, our hooks took
   `g.mutex` for them while the game thread held `g.mutex` and waited on the debug layer. Fixed by ignoring list

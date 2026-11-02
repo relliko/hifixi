@@ -29,10 +29,10 @@ Locks:
 - Not in Microsoft's docs, but seen in our hang stacks: the runtime, the debug layer and DXGI take locks of their own
   inside calls. With the debug layer on, list calls (SetGraphicsRootSignature, Reset) waited on a debug-layer lock.
 - DXGI's Present (also on AMD's frame generation threads) and the debug layer reset command lists of their own while
-  holding those locks. HiFi XI hooks list Reset/barrier calls in the whole process, so our hook code runs inside
-  someone else's lock.
-- So: never hold one of our mutexes while calling into D3D12 or DXGI if any hook path can try to take that mutex from
-  another thread. Either drop the lock before the call, or make the hook path not take it (see quiet threads below).
+  holding those locks. Until step 5b HiFi XI hooked list Reset/barrier calls in the whole process, so our code ran
+  inside someone else's lock; nothing is hooked now.
+- So: never hold one of our mutexes while calling into D3D12 or DXGI if another thread can take that mutex while it's
+  inside a D3D12 or DXGI call. Drop the lock before the call.
 - Never call a swap chain method (GetDesc1, ResizeBuffers, Present) while holding one of our locks.
 
 Recording on several threads:
@@ -70,16 +70,10 @@ Present and frame latency:
 
 The game-thread-only rule:
 
-- `src/backend/backend.cpp:123-134`: `g_render_thread` is the thread our d3d8.dll records the game's frames on (set at
-  the first frame mark). `elsewhere()` is true on every other thread.
-- `src/backend/backend.cpp:137-140`: `live()` gives the core a list's data only on the game thread.
-- `src/backend/backend.cpp:520-523`: `ev_reset` returns at once on any other thread, so no World FX or upscale lock is
-  taken from a loader's or DXGI's list.
-- `src/host/hooks.cpp:664-667`: `host::quiet` (scoped) and `quiet_thread()` (for good) make the hooks pass a thread's
-  calls straight through. backend.cpp wraps its own D3D12 calls in `host::quiet q;` (e.g. lines 531, 538, 550).
-- `src/framegen/fg_threads.h`: the hook AMD's presenter and interpolation threads call first.
-  `FrameInterpolationSwapchainDX12.cpp:421` and `:511` call it; `src/backend/backend.cpp:979` sets it to
-  `host::quiet_thread`.
+- Since step 5b nothing of Direct3D 12's is hooked: HiFi XI's passes run only at our d3d8.dll's marks, which come on
+  the game's thread (the one the game's Direct3D 8 calls come on), and at the plugin's present. No loader's, DXGI's
+  or AMD's thread ever runs HiFi XI's code inside a D3D12 call. (`elsewhere()`, `host::quiet`, `quiet_thread` and the
+  edit to AMD's FrameInterpolationSwapchainDX12.cpp that called it went with the hooks.)
 - `src/framegen/framegen.hpp:37-40`: `framegen::present()` runs on the game thread with no HiFi XI lock held.
 - `src/render/worldfx_core.cpp` holds World FX's `g.mutex`. The hook paths that used to take it from any thread
   (`on_reset`, `on_barrier`, `on_targets`, `on_clear_target`) are gone since step 4: World FX is entered only at the

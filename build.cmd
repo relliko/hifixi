@@ -1,6 +1,6 @@
 @echo off
 rem Builds build\hifixi.dll (32-bit, like the game), the render engine (build_engine.cmd: build\engine\worldfx_engine.lib)
-rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests but hook_test). Every
+rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests). Every
 rem suite is run by python -I tests\run_suites.py.
 rem The Ashita v4 plugin SDK is in deps\ashita (a sparse clone of AshitaXI/Ashita-v4beta, plugins\sdk only); the Windows
 rem SDK headers and libraries are the NuGet copy reshade-worldfx uses (no Windows SDK installed on this PC).
@@ -76,9 +76,9 @@ set "PASSES_ACTORS="
 set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
 
-rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
+rem The plugin: the Ashita side, the backend (World FX's core at our d3d8.dll's marks), with the engine
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
-  /LD src\plugin\main.cpp src\plugin\hangwatch.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  /LD src\plugin\main.cpp src\plugin\hangwatch.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp ^
   %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
   /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /MAP:build\hifixi.map /DEF:src\plugin\exports.def user32.lib dxgi.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
@@ -92,21 +92,9 @@ del /q build\starter\dxgi.exp build\starter\dxgi.lib 2>nul
 echo Built build\starter\dxgi.dll
 call "%~dp0build_d3d8.cmd" %1 || exit /b 1
 
-rem The hooks' offline test (WARP): build\hook_test.exe [--debug]
-cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\hook_test.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\test\\" /Fe"build\hook_test.exe" ^
-  /link /NOLOGO || exit /b 1
-echo Built build\hook_test.exe
-
-rem "build.cmd quick": the plugin, the starter and hook_test only (a small fix). The other tests stay as the last full
+rem "build.cmd quick": the plugin, the starter and our d3d8.dll only (a small fix). The other tests stay as the last full
 rem build left them: run the full build when what they test changed, and before a public release.
 if /i "%~1"=="quick" exit /b 0
-
-rem The stream log (/hifi streamlog) on the hooks, on WARP: build\streamlog_test.exe
-cl /nologo /MP /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\streamlog_test.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\test\\" ^
-  /Fe"build\streamlog_test.exe" /link /NOLOGO || exit /b 1
-echo Built build\streamlog_test.exe
 
 rem GPU objects let go behind the GPU (src\host\retire.hpp), on WARP: build\retire_test.exe
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
@@ -224,7 +212,7 @@ echo Built build\dgv\ui2d_dgv.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
-  tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp ^
   %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib dxgi.lib || exit /b 1
 echo Built build\menu_test.exe
 

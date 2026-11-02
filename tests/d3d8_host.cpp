@@ -1,47 +1,45 @@
 /*
- * HiFi XI's hooks (src/host/hooks.cpp, as they are) over our d3d8.dll's Direct3D 12 stream (docs/own-frame/d3d8.md):
- * what HiFi XI relies on from dgVoodoo, checked on ours. The hooks go in first (on a WARP throwaway, as HiFi XI's
- * starter puts them in), then a frame shaped like FFXI's is drawn through d3d8.dll (D3D8_WARP=1: WARP, the debug layer
- * with D3D8_DEBUG=1):
- *   the world target A (1024x576 A8R8G8B8 + D24S8) cleared, the sky, the zone between HiFi XI's slot markers (1x1
- *   stencil-only clears at x = 16 kind + seq), a blended zone piece (Z writes off), the characters between theirs, a
+ * d3d8_host: the DLL as HiFi XI meets it (docs/own-frame/d3d8.md, src/host/frameapi.hpp): our d3d8.dll's direct channel
+ * (channel 4: HifiFrameSetHandler/HifiFrameMark, HifiFrameVersion, HifiFrameDevice, HifiFrameSetWorldFormat,
+ * HifiFrameSetSpeedups), nothing hooked. A frame shaped like FFXI's is drawn through d3d8.dll (D3D8_WARP=1: WARP, the
+ * debug layer with D3D8_DEBUG=1):
+ *   the world target A (1024x576 A8R8G8B8 + D24S8) cleared, the sky, the zone between HiFi XI's marks (HifiFrameMark,
+ *   as src/game/directmark.hpp sends them), a blended zone piece (Z writes off), the characters between theirs, a
  *   visibility test (a second target with A's depth, a 16x16 downsample, CopyRects into system memory, LockRect), the
  *   effects, the resolve onto the back buffer, the UI, Present; five frames.
  *
- *   build\d3d8\d3d8_hooks.exe <d3d8.dll>
+ *   build\d3d8\d3d8_host.exe <d3d8.dll>
  *
- * Checked, from the hooks' events (as backend.cpp gets them):
- *   - A's views: render target view of format 28 on a resource of 27, depth view 45 on 44 (made through the hooked
- *     device, so HiFi XI knows them);
- *   - each marker arrives as ClearDepthStencilView(A's view, stencil only, 1 rect = the marker's pixel) in order, its
- *     stencil plane put in DEPTH_WRITE just before (subresource 1), and slotmark::read reads it back;
- *   - when the zone begins, the target bound with A's depth on that list is A (world discovery by the marker);
- *   - viewports half a pixel in, depth 0..1; descriptor heaps set after every reset before the list draws;
- *   - the depth planes' barriers name subresource 0 or 1 only; plane 0 in DEPTH_WRITE for opaque draws, DEPTH_READ
- *     for the blended piece; A goes RENDER_TARGET -> PIXEL_SHADER_RESOURCE at the resolve, whose draw is next (4
- *     vertices into the bigger back buffer);
- *   - the list is closed and submitted between the visibility test's copy and its LockRect;
- *   - every list submitted is of the hooked class, none recorded unseen.
- * And HiFi XI drawing into the frame: at the zone's end marker, inside the hook (the thread quiet, as backend.cpp
- * draws), other heaps, root signature, targets, viewport and topology are set, then the state the hooks saw put back
- * (as grass::list_state does). The frame read back must be the same, pixel for pixel, as without it.
- * Then the direct channel (HifiFrameMark), the float world (HifiFrameSetWorldFormat) and the frame-rate speed-ups
- * (HifiFrameSetSpeedups): an interface-like run of quads the same, pixel for pixel, with dedupe and batch on, in fewer
- * draws.
+ * Checked, from what the marks hand over:
+ *   - the marks in order, kind and seq, each on a list with A's depth bound and both its planes in depth states;
+ *   - the depth's plane 0 as each zone draw leaves it (marks of the spare kind 15 between them): DEPTH_WRITE after
+ *     the opaque ground, DEPTH_READ after the blended piece drawn with Z writes off;
+ *   - at the zone's begin, A bound with it (the world found by the mark), and every mark naming A and its depth as the
+ *     world; A's views as that mark hands them: render target view of format 28 on a resource of 27, depth view 45 on
+ *     44, the depth readable by shaders (World FX's SRV of it);
+ *   - the resolve's mark (kind 14) once per frame, right after the resolve: the back buffer bound (bigger than A, a
+ *     target), A as the world, the resolve's 4 vertices;
+ *   - HiFi XI drawing into the frame at the zone's end mark (other heaps, root signature, targets, viewport and
+ *     topology set, nothing put back): the frame read back the same, pixel for pixel, as without it.
+ * Then the direct channel on its own: HifiFrameMark without a handler; with one, its kind and seq, the world's end sent
+ * once at the first copy reading A and not at a distortion's grab, A and its depth and their states handed over, what
+ * the handler drew kept and the game's next draw binding its own again; HifiFrameVersion == kHifiFrameChannel (4); the
+ * world's clear colour; the world's depth at a mark with no depth bound; HifiFrameDevice. The float world
+ * (HifiFrameSetWorldFormat): A made again in RGBA16F in the same view, light past white on the GPU, back to 8 bits. The
+ * frame-rate speed-ups (HifiFrameSetSpeedups): an interface-like run of quads the same, pixel for pixel, with dedupe and
+ * batch on, in fewer draws (the device's own count, HifiFrameSpeedupStats).
  */
 
-#include "../src/host/hooks.hpp"
-#include "../src/host/events.hpp"
 #include "../src/game/slotmark.hpp"
 #include "../src/host/frameapi.hpp"
 #include <d3d12.h>
-#include <dxgi1_4.h>
 #include <d3d8.h>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
-#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -61,38 +59,20 @@ namespace
 			failures++;
 	}
 
-	// ---- What the hooks hand on ----
-	struct view_info { ID3D12Resource *res; DXGI_FORMAT format; };
-	std::map<uint64_t, view_info> views;
-	struct mark_seen { uint32_t kind, seq; ID3D12Resource *bound_rt, *bound_ds; bool list_known; };
-	std::vector<mark_seen> marks;
-	struct list_state
+	// ---- What the marks hand over ----
+	struct mark_seen
 	{
-		bool heaps_set = false;
-		uint32_t draws_before_heaps = 0;
-		ID3D12DescriptorHeap *heaps[2] = {};
-		UINT heap_count = 0;
-		D3D12_CPU_DESCRIPTOR_HANDLE rtv = {}, dsv = {};
-		UINT rtv_count = 0;
-		bool has_dsv = false;
-		D3D12_VIEWPORT vp = {};
-		D3D12_RECT sc = {};
-		ID3D12PipelineState *pso = nullptr;
-		D3D12_PRIMITIVE_TOPOLOGY topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-		ID3D12RootSignature *root = nullptr;
-		D3D12_GPU_VIRTUAL_ADDRESS cbv[2] = {};
-		D3D12_GPU_DESCRIPTOR_HANDLE table[4] = {};
+		uint32_t kind, seq;
+		ID3D12GraphicsCommandList *list;
+		ID3D12Resource *bound_rt, *bound_ds, *world_rt, *world_ds;
+		D3D12_RESOURCE_STATES planes[2];
+		uint32_t plane_count;
 	};
-	std::map<void *, list_state> lists;
-	std::map<ID3D12Resource *, D3D12_RESOURCE_STATES> plane_state[2];
-	ID3D12Resource *world_rt = nullptr, *world_ds = nullptr, *back = nullptr;
-	uint32_t bad_subresources = 0, viewport_bad = 0, viewports = 0, draws = 0, closes = 0, executes = 0;
-	uint32_t opaque_draws_plane_ok = 0, opaque_draws_plane_bad = 0, blended_read = 0;
-	bool expect_blended = false, expect_opaque = false;
-	bool world_ended = false, resolve_seen = false;
-	int resolve_draw_vertices = -1;
-	ID3D12Resource *resolve_target = nullptr;
-	uint32_t readback_phase = 0; // 1: the copy made, waiting for the close; 2: closed and submitted
+	std::vector<mark_seen> marks;
+	// (the world as the first zone's begin mark hands it)
+	ID3D12Resource *world_rt = nullptr, *world_ds = nullptr;
+	D3D12_CPU_DESCRIPTOR_HANDLE world_rtv = {};
+	DXGI_FORMAT world_rt_view = DXGI_FORMAT_UNKNOWN, world_ds_view = DXGI_FORMAT_UNKNOWN;
 	bool inject = false;
 	uint32_t injected = 0;
 
@@ -100,148 +80,18 @@ namespace
 	ID3D12DescriptorHeap *own_heap = nullptr;
 	ID3D12RootSignature *own_root = nullptr;
 
-	ID3D12Resource *resource_of(uint64_t v)
-	{
-		const auto it = views.find(v);
-		return it != views.end() ? it->second.res : nullptr;
-	}
-
-	void ev_view(ID3D12Device *d, D3D12_DESCRIPTOR_HEAP_TYPE, D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *r, DXGI_FORMAT f, uint32_t)
-	{
-		views[uint64_t(at.ptr)] = { r, f };
-		if (dev12 == nullptr)
-			dev12 = d;
-	}
-	void ev_reset(ID3D12GraphicsCommandList *l) { lists[l] = list_state(); }
-	void ev_created(ID3D12GraphicsCommandList *l) { lists[l] = list_state(); }
-	void ev_close(ID3D12GraphicsCommandList *) { closes++; }
-	void ev_execute(ID3D12CommandQueue *, UINT, ID3D12CommandList *const *)
-	{
-		executes++;
-		if (readback_phase == 1)
-			readback_phase = 2;
-	}
-	void ev_heaps(ID3D12GraphicsCommandList *l, UINT n, ID3D12DescriptorHeap *const *h)
-	{
-		list_state &s = lists[l];
-		s.heaps_set = true;
-		s.heap_count = n;
-		for (UINT i = 0; i < n && i < 2; ++i)
-			s.heaps[i] = h[i];
-	}
-	void ev_targets(ID3D12GraphicsCommandList *l, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv)
-	{
-		list_state &s = lists[l];
-		s.rtv_count = n;
-		s.rtv = n != 0 ? rtvs[0] : D3D12_CPU_DESCRIPTOR_HANDLE {};
-		s.has_dsv = dsv != nullptr;
-		s.dsv = dsv != nullptr ? *dsv : D3D12_CPU_DESCRIPTOR_HANDLE {};
-	}
-	void ev_viewports(ID3D12GraphicsCommandList *l, UINT n, const D3D12_VIEWPORT *v)
-	{
-		viewports++;
-		if (n != 1 || v[0].TopLeftX - float(int(v[0].TopLeftX)) != 0.5f || v[0].TopLeftY - float(int(v[0].TopLeftY)) != 0.5f || v[0].MinDepth != 0.0f || v[0].MaxDepth != 1.0f)
-			viewport_bad++;
-		lists[l].vp = v[0];
-	}
-	void ev_scissors(ID3D12GraphicsCommandList *l, UINT, const D3D12_RECT *r) { lists[l].sc = r[0]; }
-	void ev_pipeline(ID3D12GraphicsCommandList *l, ID3D12PipelineState *p) { lists[l].pso = p; }
-	void ev_topology(ID3D12GraphicsCommandList *l, D3D12_PRIMITIVE_TOPOLOGY t) { lists[l].topo = t; }
-	void ev_root_signature(ID3D12GraphicsCommandList *l, ID3D12RootSignature *r)
-	{
-		list_state &s = lists[l];
-		s.root = r;
-		std::memset(s.cbv, 0, sizeof(s.cbv));
-		std::memset(s.table, 0, sizeof(s.table));
-	}
-	void ev_root_cbv(ID3D12GraphicsCommandList *l, UINT p, D3D12_GPU_VIRTUAL_ADDRESS a)
-	{
-		if (p < 2)
-			lists[l].cbv[p] = a;
-	}
-	void ev_root_table(ID3D12GraphicsCommandList *l, UINT p, D3D12_GPU_DESCRIPTOR_HANDLE h)
-	{
-		if (p < 4)
-			lists[l].table[p] = h;
-	}
-	void ev_barrier(ID3D12GraphicsCommandList *, UINT n, const D3D12_RESOURCE_BARRIER *b)
-	{
-		for (UINT i = 0; i < n; ++i)
-		{
-			if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
-				continue;
-			const D3D12_RESOURCE_TRANSITION_BARRIER &t = b[i].Transition;
-			if (t.pResource == world_ds)
-			{
-				if (t.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
-					plane_state[0][t.pResource] = plane_state[1][t.pResource] = t.StateAfter;
-				else if (t.Subresource < 2)
-					plane_state[t.Subresource][t.pResource] = t.StateAfter;
-				else
-					bad_subresources++;
-			}
-			if (t.pResource == world_rt && (t.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) && (t.StateAfter & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
-				world_ended = true;
-		}
-	}
-	void ev_draw(ID3D12GraphicsCommandList *l, uint64_t vertices)
-	{
-		draws++;
-		list_state &s = lists[l];
-		if (!s.heaps_set)
-			s.draws_before_heaps++;
-		if (world_ended && !resolve_seen && resolve_draw_vertices < 0)
-		{
-			resolve_seen = true;
-			resolve_draw_vertices = int(vertices);
-			resolve_target = resource_of(s.rtv.ptr);
-		}
-		if (expect_opaque || expect_blended)
-		{
-			const D3D12_RESOURCE_STATES p0 = plane_state[0][world_ds];
-			if (expect_opaque)
-				(p0 == D3D12_RESOURCE_STATE_DEPTH_WRITE ? opaque_draws_plane_ok : opaque_draws_plane_bad)++;
-			if (expect_blended && p0 == D3D12_RESOURCE_STATE_DEPTH_READ)
-				blended_read++;
-		}
-	}
-
 	// HiFi XI drawing into the frame: other state set on the list, nothing put back (the d3d8.dll binds its own again)
 	void draw_into(ID3D12GraphicsCommandList *l)
 	{
-		hifi::host::quiet q;
-		l->SetDescriptorHeaps(1, &own_heap);
-		l->SetGraphicsRootSignature(own_root);
+		if (own_heap != nullptr)
+			l->SetDescriptorHeaps(1, &own_heap);
+		if (own_root != nullptr)
+			l->SetGraphicsRootSignature(own_root);
 		l->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
 		const D3D12_VIEWPORT vp = { 3.0f, 7.0f, 11.0f, 13.0f, 0.2f, 0.4f };
 		l->RSSetViewports(1, &vp);
 		l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
 		injected++;
-	}
-
-	const hifi::host::events &events()
-	{
-		static hifi::host::events e = [] {
-			hifi::host::events x;
-			x.created = ev_created;
-			x.reset = ev_reset;
-			x.close = ev_close;
-			x.targets = ev_targets;
-			x.pipeline = ev_pipeline;
-			x.topology = ev_topology;
-			x.viewports = ev_viewports;
-			x.scissors = ev_scissors;
-			x.root_signature = ev_root_signature;
-			x.root_table = ev_root_table;
-			x.root_cbv = ev_root_cbv;
-			x.barrier = ev_barrier;
-			x.draw = ev_draw;
-			x.heaps = ev_heaps;
-			x.execute = ev_execute;
-			x.view = ev_view;
-			return x;
-		}();
-		return e;
 	}
 
 	// ---- The Direct3D 8 frame ----
@@ -251,7 +101,7 @@ namespace
 	IDirect3DSurface8 *A = nullptr, *Az = nullptr, *bb = nullptr, *test = nullptr, *tiny = nullptr, *sys = nullptr, *out = nullptr;
 	struct V { float x, y, z; DWORD c; float u, v; };
 	struct VR { float x, y, z, w; DWORD c; float u, v; };
-	uint32_t seq = 0, readbacks_ok = 0;
+	uint32_t seq = 0;
 
 	// The game side's marks, as src/game/directmark.hpp sends them (HifiFrameMark), and the handler HiFi XI registers
 	// for the frames: what each was handed; at the zone's end, while inject is on, it draws in
@@ -268,8 +118,20 @@ namespace
 		ID3D12Resource *rt = nullptr, *world = nullptr;
 		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_COMMON;
 	} g_resolves;
+	// (the depth's plane 0 at the marks after each zone draw: DEPTH_WRITE after the opaque ground, DEPTH_READ after the
+	// blended piece drawn with Z writes off, as each draw leaves it)
+	uint32_t g_after_opaque_ok = 0, g_after_opaque_bad = 0, g_after_blended_ok = 0, g_after_blended_bad = 0, g_probe_in_frame = 0;
 	void __cdecl frame_handler(void *, uint32_t kind, uint32_t s, const hifi_frame_mark *m)
 	{
+		if (kind == hifi::slotmark::spare_15)
+		{
+			const D3D12_RESOURCE_STATES p0 = m->ds_planes[0];
+			if (g_probe_in_frame++ % 2 == 0)
+				(p0 == D3D12_RESOURCE_STATE_DEPTH_WRITE ? g_after_opaque_ok : g_after_opaque_bad)++;
+			else
+				((p0 & D3D12_RESOURCE_STATE_DEPTH_READ) != 0 && (p0 & D3D12_RESOURCE_STATE_DEPTH_WRITE) == 0 ? g_after_blended_ok : g_after_blended_bad)++;
+			return;
+		}
 		if (kind == hifi::slotmark::resolve)
 		{
 			g_resolves.count++;
@@ -281,12 +143,25 @@ namespace
 		}
 		if (kind == hifi::slotmark::world_end)
 			return;
+		if (kind == hifi::slotmark::zone_begin && world_rt == nullptr)
+		{
+			world_rt = m->rt;
+			world_ds = m->ds;
+			world_rtv = m->rtv;
+			world_rt_view = m->rt_format;
+			world_ds_view = m->ds_format;
+		}
 		mark_seen x;
 		x.kind = kind;
 		x.seq = s;
+		x.list = m->list;
 		x.bound_rt = m->rt;
 		x.bound_ds = m->ds;
-		x.list_known = lists.count(m->list) != 0;
+		x.world_rt = m->world_rt;
+		x.world_ds = m->world_ds;
+		x.planes[0] = m->ds_planes[0];
+		x.planes[1] = m->ds_planes[1];
+		x.plane_count = m->ds_plane_count;
 		marks.push_back(x);
 		if (inject && kind == hifi::slotmark::zone_end)
 			draw_into(m->list);
@@ -300,12 +175,12 @@ namespace
 		hifi_frame_mark m = {};   // (the first call's)
 		hifi_frame_mark end = {}; // (the second's: the world's end)
 	} g_direct;
-	void __cdecl direct_handler(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *m)
+	void __cdecl direct_handler(void *, uint32_t kind, uint32_t s, const hifi_frame_mark *m)
 	{
 		if (g_direct.calls < 4)
 		{
 			g_direct.kinds[g_direct.calls] = kind;
-			g_direct.seqs[g_direct.calls] = seq;
+			g_direct.seqs[g_direct.calls] = s;
 		}
 		if (g_direct.calls == 0)
 			g_direct.m = *m;
@@ -354,7 +229,6 @@ namespace
 		bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
 		bd.SampleDesc.Count = 1;
 		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		hifi::host::quiet q;
 		if (FAILED(dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_float.rb))))
 			return;
 		D3D12_RESOURCE_BARRIER b = {};
@@ -417,17 +291,15 @@ namespace
 		dev->SetTexture(0, tex);
 		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
 		dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-		expect_opaque = true;
 		tri_strip_band(-1.0f, 0.5f, 0.6f, 0xFF808080, 20);
-		expect_opaque = false;
+		marker(hifi::slotmark::spare_15); // (the depth planes after the opaque ground)
 		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 		dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
 		dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 		dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 		dev->SetRenderState(D3DRS_ZBIAS, 8);
-		expect_blended = true;
 		tri_strip_band(-0.5f, 0.0f, 0.55f, 0x8040A060, 6);
-		expect_blended = false;
+		marker(hifi::slotmark::spare_15); // (... and after the blended piece, Z writes off)
 		dev->SetRenderState(D3DRS_ZBIAS, 0);
 		dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
@@ -435,9 +307,7 @@ namespace
 		// Characters, between theirs
 		marker(hifi::slotmark::chars_begin);
 		dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
-		expect_opaque = true;
 		tri_strip_band(-0.2f, 0.3f, 0.4f, 0xFFC08040, 4);
-		expect_opaque = false;
 		marker(hifi::slotmark::chars_end);
 		// A visibility test: a quad into the test target with A's depth, downsampled to 16x16, read back
 		dev->SetRenderTarget(test, Az);
@@ -452,12 +322,9 @@ namespace
 		const RECT r16 = { 0, 0, 16, 16 };
 		const POINT p0 = { 0, 0 };
 		dev->CopyRects(tiny, &r16, 1, sys, &p0);
-		readback_phase = 1;
 		D3DLOCKED_RECT lr;
 		sys->LockRect(&lr, nullptr, D3DLOCK_READONLY);
-		readbacks_ok += readback_phase == 2 ? 1 : 0;
 		sys->UnlockRect();
-		readback_phase = 0;
 		// Effects in A (Z writes off), then the resolve and the UI on the back buffer
 		dev->SetRenderTarget(A, Az);
 		dev->SetViewport(&vp);
@@ -481,7 +348,6 @@ namespace
 				std::memcpy(px.data() + size_t(y) * AW, static_cast<const uint8_t *>(o.pBits) + size_t(y) * o.Pitch, AW * 4);
 			out->UnlockRect();
 		}
-		world_ended = resolve_seen = false;
 		dev->SetRenderTarget(bb, nullptr);
 		D3DVIEWPORT8 sv = { 0, 0, 1280, 720, 0.0f, 1.0f };
 		dev->SetViewport(&sv);
@@ -502,6 +368,11 @@ namespace
 		dev->Present(nullptr, nullptr, nullptr, nullptr);
 		return px;
 	}
+
+	bool depth_state(D3D12_RESOURCE_STATES s)
+	{
+		return s == D3D12_RESOURCE_STATE_DEPTH_WRITE || (s & D3D12_RESOURCE_STATE_DEPTH_READ) != 0;
+	}
 }
 
 int main(int argc, char **argv)
@@ -509,11 +380,10 @@ int main(int argc, char **argv)
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	if (argc < 2)
 	{
-		std::printf("d3d8_hooks.exe <d3d8.dll>\n");
+		std::printf("d3d8_host.exe <d3d8.dll>\n");
 		return 1;
 	}
-	// (D3D8_DEBUG=1: the debug layer on before anything is made, so the hooks go into its classes as they do in
-	// hook_test --debug; the DLL logs what it says)
+	// (D3D8_DEBUG=1: the debug layer on before anything is made; the DLL logs what it says)
 	if (std::getenv("D3D8_DEBUG") != nullptr)
 	{
 		ID3D12Debug *debug = nullptr;
@@ -523,22 +393,14 @@ int main(int argc, char **argv)
 			debug->Release();
 		}
 	}
-	// The hooks first, on a WARP throwaway (as HiFi XI's starter puts them in)
-	IDXGIFactory4 *factory = nullptr;
-	IDXGIAdapter *warp = nullptr;
-	if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
-		factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
-	std::string why;
-	check(hifi::host::install(why, warp), ("HiFi XI's hooks in (" + why + ")").c_str());
-	hifi::host::set_events(&events());
 
 	SetEnvironmentVariableA("D3D8_WARP", "1");
 	WNDCLASSA wc = {};
 	wc.lpfnWndProc = DefWindowProcA;
 	wc.hInstance = GetModuleHandleA(nullptr);
-	wc.lpszClassName = "d3d8_hooks";
+	wc.lpszClassName = "d3d8_host";
 	RegisterClassA(&wc);
-	HWND window = CreateWindowA("d3d8_hooks", "d3d8_hooks", WS_OVERLAPPEDWINDOW, 40, 40, 1296, 759, nullptr, nullptr, wc.hInstance, nullptr);
+	HWND window = CreateWindowA("d3d8_host", "d3d8_host", WS_OVERLAPPEDWINDOW, 40, 40, 1296, 759, nullptr, nullptr, wc.hInstance, nullptr);
 	HMODULE m = LoadLibraryA(argv[1]);
 	using create_fn = IDirect3D8 *(WINAPI *)(UINT);
 	const auto create = m != nullptr ? reinterpret_cast<create_fn>(GetProcAddress(m, "Direct3DCreate8")) : nullptr;
@@ -581,10 +443,12 @@ int main(int argc, char **argv)
 			static_cast<DWORD *>(lr.pBits)[y * lr.Pitch / 4 + x] = ((x ^ y) & 4) ? 0xFF907050 : 0xFF506070;
 	tex->UnlockRect(0);
 
-	// HiFi XI's own heap and root signature (made on the game's device, the thread quiet)
+	// The game's Direct3D 12 device, as HiFi XI gets it (HifiFrameDevice), and HiFi XI's own heap and root signature on it
+	const auto device_of = reinterpret_cast<hifi_frame_device_fn>(GetProcAddress(m, kHifiFrameDevice));
+	ID3D12CommandQueue *queue = nullptr;
+	const bool named = device_of != nullptr && device_of(&dev12, &queue) != 0;
 	if (dev12 != nullptr)
 	{
-		hifi::host::quiet q;
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 		hd.NumDescriptors = 16;
@@ -595,23 +459,7 @@ int main(int argc, char **argv)
 		if (SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)))
 			dev12->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&own_root));
 	}
-	check(own_heap != nullptr && own_root != nullptr, "HiFi XI's own heap and root signature made");
-
-	// A's views as HiFi XI sees them made
-	for (const auto &v : views)
-	{
-		const D3D12_RESOURCE_DESC d = v.second.res != nullptr ? v.second.res->GetDesc() : D3D12_RESOURCE_DESC {};
-		if (d.Width == AW && d.Height == AH && v.second.format == DXGI_FORMAT_R8G8B8A8_UNORM && world_rt == nullptr && d.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS)
-			world_rt = v.second.res;
-		if (d.Width == AW && d.Height == AH && v.second.format == DXGI_FORMAT_D24_UNORM_S8_UINT && d.Format == DXGI_FORMAT_R24G8_TYPELESS)
-			world_ds = v.second.res;
-	}
-	check(world_rt != nullptr, "A's render target view: format 28 on a resource of 27, made through the hooked device");
-	check(world_ds != nullptr, "A's depth view: format 45 on a resource of 44");
-	// (World FX reads A's depth in its shaders, as dgVoodoo lets it: an SRV of R24_UNORM_X8_TYPELESS, the resource in
-	// DEPTH_READ | PIXEL_SHADER_RESOURCE; a depth made with DENY_SHADER_RESOURCE removed the device in game, 2026-10-30)
-	check(world_ds != nullptr && (world_ds->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0,
-		"A's depth readable by shaders (no DENY_SHADER_RESOURCE): World FX's SRV of it");
+	check(own_heap != nullptr && own_root != nullptr, "HiFi XI's own heap and root signature made on the device HifiFrameDevice names");
 
 	// Frames: three plain, the fourth read back; then HiFi XI drawing in at the zone's end, the fifth read back (the
 	// marks through the direct channel)
@@ -629,57 +477,47 @@ int main(int argc, char **argv)
 	if (set_handler != nullptr)
 		set_handler(nullptr, nullptr);
 
+	// The world as the zone's begin mark named it
+	const D3D12_RESOURCE_DESC rt_desc = world_rt != nullptr ? world_rt->GetDesc() : D3D12_RESOURCE_DESC {};
+	const D3D12_RESOURCE_DESC ds_desc = world_ds != nullptr ? world_ds->GetDesc() : D3D12_RESOURCE_DESC {};
+	check(world_rt != nullptr && rt_desc.Width == AW && rt_desc.Height == AH && world_rt_view == DXGI_FORMAT_R8G8B8A8_UNORM && rt_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS,
+		"A's render target view, as the zone's begin mark hands it: format 28 on a resource of 27, A's size");
+	check(world_ds != nullptr && ds_desc.Width == AW && ds_desc.Height == AH && world_ds_view == DXGI_FORMAT_D24_UNORM_S8_UINT && ds_desc.Format == DXGI_FORMAT_R24G8_TYPELESS,
+		"A's depth view: format 45 on a resource of 44");
+	// (World FX reads A's depth in its shaders, as dgVoodoo lets it: an SRV of R24_UNORM_X8_TYPELESS, the resource in
+	// DEPTH_READ | PIXEL_SHADER_RESOURCE; a depth made with DENY_SHADER_RESOURCE removed the device in game, 2026-10-30)
+	check(world_ds != nullptr && (ds_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0,
+		"A's depth readable by shaders (no DENY_SHADER_RESOURCE): World FX's SRV of it");
+
 	// Markers
-	bool order = marks_plain == 16, bound = true, depth = true, known = true;
+	bool order = marks_plain == 16, bound = true, depth = true, planes = true, lists = true, world = true;
 	for (size_t i = 0; i < marks.size(); ++i)
 	{
 		const mark_seen &s = marks[i];
 		order = order && s.kind == uint32_t(i % 4) && s.seq == uint32_t((i / 4 + 1) & 15);
 		depth = depth && s.bound_ds == world_ds;
-		known = known && s.list_known;
+		planes = planes && s.plane_count == 2 && depth_state(s.planes[0]) && depth_state(s.planes[1]);
+		lists = lists && s.list != nullptr;
+		world = world && s.world_rt == world_rt && s.world_ds == world_ds;
 		if (s.kind == hifi::slotmark::zone_begin)
 			bound = bound && s.bound_rt == world_rt;
 	}
 	char line[200];
 	std::snprintf(line, sizeof(line), "the marks came in order, each through the direct channel (%zu of them)", marks.size());
-	check(order, line);
+	check(order && marks.size() == 20, line);
+	check(lists, "each mark handed a list to record on");
 	check(depth, "each mark handed A's depth");
-	check(known, "each mark on a list the hooks have seen made");
+	check(planes, "... both its planes, each in a depth state");
+	std::snprintf(line, sizeof(line), "the depth's plane 0 as each zone draw left it: DEPTH_WRITE after the opaque ground (%u of %u), DEPTH_READ after the blended piece (%u of %u)",
+		g_after_opaque_ok, g_after_opaque_ok + g_after_opaque_bad, g_after_blended_ok, g_after_blended_ok + g_after_blended_bad);
+	check(g_after_opaque_ok == 5 && g_after_opaque_bad == 0 && g_after_blended_ok == 5 && g_after_blended_bad == 0, line);
 	check(bound, "at the zone's begin, A bound with it (the world found by the mark)");
-	check(bad_subresources == 0, "A's depth's barriers name plane 0 or 1 (or all) only");
-	std::snprintf(line, sizeof(line), "the depth plane in DEPTH_WRITE for opaque draws (%u), DEPTH_READ for the blended piece (%u)", opaque_draws_plane_ok, blended_read);
-	check(opaque_draws_plane_bad == 0 && opaque_draws_plane_ok != 0 && blended_read != 0, line);
-	std::snprintf(line, sizeof(line), "viewports half a pixel in, depth 0..1 (%u of %u not)", viewport_bad, viewports);
-	check(viewport_bad == 0 && viewports != 0, line);
-	bool heaps = true;
-	for (const auto &l : lists)
-		heaps = heaps && l.second.draws_before_heaps == 0;
-	check(heaps, "descriptor heaps set after every reset before the list draws");
-	if (std::getenv("D3D8_ASYNCREADBACK") != nullptr)
-	{
-		// (asynchronous readbacks: the test's answer is an earlier frame's, nothing submitted or waited on for it)
-		std::snprintf(line, sizeof(line), "asynchronous readbacks: no list closed for the visibility tests (%u of %u closed)", readbacks_ok, seq);
-		check(readbacks_ok == 0, line);
-	}
-	else
-	{
-		std::snprintf(line, sizeof(line), "the list closed and submitted between each visibility test's copy and its LockRect (%u of %u)", readbacks_ok, seq);
-		check(readbacks_ok == seq, line);
-	}
-	std::snprintf(line, sizeof(line), "the resolve: A turned readable, the next draw of %d vertices into the bigger back buffer", resolve_draw_vertices);
-	check(resolve_draw_vertices == 4 && resolve_target != nullptr && resolve_target != world_rt && resolve_target->GetDesc().Width > AW, line);
-	const hifi::host::stats st = hifi::host::get_stats();
-	std::snprintf(line, sizeof(line), "every list submitted of the hooked class, none recorded unseen (%llu lists, %llu foreign, %llu calls unseen)",
-		static_cast<unsigned long long>(st.lists_executed), static_cast<unsigned long long>(st.lists_foreign), static_cast<unsigned long long>(st.lists_unknown_state));
-	check(st.lists_executed != 0 && st.lists_foreign == 0 && st.lists_unknown_state == 0, line);
-	// (the hooks' own statistic: the largest target seen turning readable, the first of equal size; the visibility test's
-	// target is A's size, as in the game)
-	check(st.world.width == AW && st.world.height == AH, "the hooks' own count finds a world-sized target turning readable");
+	check(world, "every mark names A and its depth as the world");
 	check(injected == 1, "HiFi XI drew in at the zone's end mark");
 	std::snprintf(line, sizeof(line), "the resolve's mark after each frame's resolve (%u of 5): its target bound (the back buffer, a target), A as the world, %u vertices",
 		g_resolves.count, g_resolves.vertices);
-	check(g_resolves.count == 5 && g_resolves.rt == resolve_target && g_resolves.world == world_rt && g_resolves.vertices == 4 &&
-			g_resolves.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET, line);
+	check(g_resolves.count == 5 && g_resolves.rt != nullptr && g_resolves.rt != world_rt && g_resolves.rt->GetDesc().Width > AW && g_resolves.world == world_rt &&
+			g_resolves.vertices == 4 && g_resolves.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET, line);
 	size_t same = 0;
 	for (size_t i = 0; i < plain.size() && i < injected_px.size(); ++i)
 		same += plain[i] == injected_px[i] ? 1 : 0;
@@ -741,7 +579,7 @@ int main(int argc, char **argv)
 			std::snprintf(line, sizeof(line), "... what it drew stays (corner %06X), and the game's next draw binds A, its viewport and pipeline again "
 				"(band %06X, below it %06X)", corner, band, past);
 			check(corner == 0xFFFFFF && band == 0x808080 && past == 0, line);
-			// The channel's version 2: the world (A and its depth, named at the zone's begin) at every mark, bound or not
+			// The channel's version: the world (A and its depth, named at the zone's begin) at every mark, bound or not
 			const auto version = reinterpret_cast<hifi_frame_version_fn>(GetProcAddress(m, kHifiFrameVersion));
 			check(version != nullptr && version() == kHifiFrameChannel, "HifiFrameVersion: 4 (the marks carry the world's states, its clear colour and the resolve)");
 			check(fm.world_clear_known == 1 && fm.world_clear[0] == 0.0f && fm.world_clear[1] == 0.0f && fm.world_clear[2] == 0.0f && fm.world_clear[3] == 1.0f,
@@ -773,23 +611,20 @@ int main(int argc, char **argv)
 			check(g_direct.calls == 2 && ui.ds == nullptr && ui.rt != world_rt && ui.world_ds == world_ds && ui.world_rt == world_rt &&
 					ui.world_ds_planes[0] == zb.ds_planes[0] && ui.world_ds_planes[1] == zb.ds_planes[1], line);
 			// HifiFrameDevice: the device the world was made on, and a direct queue
-			const auto device_of = reinterpret_cast<hifi_frame_device_fn>(GetProcAddress(m, kHifiFrameDevice));
-			ID3D12Device *d12 = nullptr, *made_on = nullptr;
-			ID3D12CommandQueue *queue = nullptr;
-			const bool named = device_of != nullptr && device_of(&d12, &queue) != 0;
+			ID3D12Device *made_on = nullptr;
 			if (world_rt != nullptr)
 				world_rt->GetDevice(IID_PPV_ARGS(&made_on));
-			check(named && d12 != nullptr && d12 == made_on && queue != nullptr && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT,
+			check(named && dev12 != nullptr && dev12 == made_on && queue != nullptr && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT,
 				"HifiFrameDevice: the world's device and a direct queue (no submit has to be watched for them)");
 			if (made_on != nullptr)
 				made_on->Release();
 		}
 	}
 	// The float world (HifiFrameSetWorldFormat): asked for, A is made again in RGBA16F at the zone's begin mark, before
-	// the handler sees it, through the same view (the hooks see the new texture in it); the game's draws land in it and
-	// light added past white stays there (a white band with half white added over it: 1.5 on the GPU); a copy of it into
-	// memory comes back clamped, as an 8-bit target's; the resolve reads it; asked back to 8 bits, the next zone's begin
-	// makes it RGBA8 again
+	// the handler sees it, through the same view (the same descriptor the zone's begin handed before); the game's draws
+	// land in it and light added past white stays there (a white band with half white added over it: 1.5 on the GPU); a
+	// copy of it into memory comes back clamped, as an 8-bit target's; the resolve reads it; asked back to 8 bits, the
+	// next zone's begin makes it RGBA8 again
 	{
 		const auto set = reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(m, kHifiFrameSetHandler));
 		const auto mark = reinterpret_cast<hifi_frame_mark_fn>(GetProcAddress(m, kHifiFrameMark));
@@ -857,13 +692,11 @@ int main(int argc, char **argv)
 				g_float.rb = nullptr;
 			}
 			const hifi_frame_mark &b = g_float.begin;
-			const auto v = views.find(uint64_t(b.rtv.ptr));
 			check(g_float.begun && b.rt != nullptr && b.rt != world_rt && b.rt_format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
 					b.rt->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_TYPELESS && b.width == AW && b.height == AH && b.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET,
 				"... at the zone's begin, A made again: RGBA16F (a typeless resource, float views), the same size, a target");
-			check(v != views.end() && v->second.res == b.rt && v->second.format == DXGI_FORMAT_R16G16B16A16_FLOAT,
-				"... in the same view, which the hooks saw made again with the new texture");
-			char line[200];
+			check(g_float.begun && world_rtv.ptr != 0 && b.rtv.ptr == world_rtv.ptr,
+				"... in the same view: the zone's begin hands the descriptor it handed for the 8-bit A");
 			std::snprintf(line, sizeof(line), "... the band on the GPU past white: %.3f %.3f %.3f (1.5 wanted), alpha %.3f", on_gpu[0], on_gpu[1], on_gpu[2], on_gpu[3]);
 			check(g_float.ended && std::fabs(on_gpu[0] - 1.502f) < 0.01f && std::fabs(on_gpu[1] - 1.502f) < 0.01f && std::fabs(on_gpu[2] - 1.502f) < 0.01f, line);
 			std::snprintf(line, sizeof(line), "... copied into memory, clamped to white as an 8-bit target's (%08X)", band);
@@ -880,7 +713,8 @@ int main(int argc, char **argv)
 		}
 	}
 	// The frame-rate speed-ups (HifiFrameSetSpeedups): an interface-like run of quads drawn with them off, with dedupe
-	// and batch, and with batch alone must read back the same, pixel for pixel; batched, it takes fewer draws on the list.
+	// and batch, and with batch alone must read back the same, pixel for pixel; batched, it takes fewer draws on the list
+	// (the device's own count of the draws it recorded: HifiFrameSpeedupStats' fourth).
 	// In the run: quads that overlap (blended: order shows), the same shader and texture set again before each (dropped
 	// by dedupe), a stage op changed mid-run, the texture locked and rewritten mid-run (the quads before keep its old
 	// texels), flat shading (not batched), a fan (not a quad), a stencil-only marker clear, two quads reading a render
@@ -889,6 +723,12 @@ int main(int argc, char **argv)
 		const auto set_speedups = reinterpret_cast<hifi_frame_set_speedups_fn>(GetProcAddress(m, kHifiFrameSetSpeedups));
 		const auto speedup_stats = reinterpret_cast<hifi_frame_speedup_stats_fn>(GetProcAddress(m, kHifiFrameSpeedupStats));
 		check(set_speedups != nullptr && speedup_stats != nullptr, "the d3d8.dll exports HifiFrameSetSpeedups and HifiFrameSpeedupStats");
+		const auto draws = [&]() {
+			uint32_t s[4] = {};
+			if (speedup_stats != nullptr)
+				speedup_stats(s);
+			return s[3];
+		};
 		IDirect3DTexture8 *ui = nullptr;
 		dev->CreateTexture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &ui);
 		auto fill_ui = [&](uint32_t c) {
@@ -916,7 +756,7 @@ int main(int argc, char **argv)
 			if (speedup_stats != nullptr)
 				speedup_stats(s0);
 			fill_ui(0xC040C080);
-			const uint32_t d0 = uint32_t(draws);
+			const uint32_t d0 = draws();
 			dev->BeginScene();
 			dev->SetRenderTarget(A, Az);
 			D3DVIEWPORT8 vp = { 0, 0, AW, AH, 0.0f, 1.0f };
@@ -969,7 +809,7 @@ int main(int argc, char **argv)
 					std::memcpy(px.data() + size_t(y) * AW, static_cast<const uint8_t *>(o.pBits) + size_t(y) * o.Pitch, AW * 4);
 				out->UnlockRect();
 			}
-			d3d12_draws = uint32_t(draws) - d0;
+			d3d12_draws = draws() - d0;
 			dev->Present(nullptr, nullptr, nullptr, nullptr);
 			if (speedup_stats != nullptr)
 			{
@@ -1007,13 +847,13 @@ int main(int argc, char **argv)
 			dev->BeginScene();
 			dev->SetRenderTarget(A, Az);
 			dev->SetTexture(0, ui);
-			const uint32_t before = uint32_t(draws);
+			const uint32_t before = draws();
 			uint32_t stats_before[4] = {};
 			speedup_stats(stats_before);
 			glyphs(3, 40, 9);
-			const uint32_t waiting = uint32_t(draws) - before;
+			const uint32_t waiting = draws() - before;
 			set_speedups(0);
-			const uint32_t after = uint32_t(draws) - before;
+			const uint32_t after = draws() - before;
 			uint32_t stats_after[4] = {};
 			speedup_stats(stats_after);
 			dev->SetTexture(0, nullptr);

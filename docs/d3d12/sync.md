@@ -138,8 +138,9 @@ AMD frame generation (src/framegen)
 - The comment at src/framegen/framegen.cpp:300 assumes every list that used a kit was on the game's queue. AMD's
   interpolation may run on its async compute queue. Check that path is ordered behind the game queue's signal before
   relying on this.
-- DXGI's present work and AMD's presenter thread call back into HiFi XI's list hooks. So nothing in framegen calls the
-  swap chain or waits for the GPU while holding `gen.mutex` or a hook's lock (src/framegen/framegen.cpp:65-70).
+- Nothing in framegen calls the swap chain or waits for the GPU while holding `gen.mutex`
+  (src/framegen/framegen.cpp:65-70): DXGI's present and AMD's presenter thread take locks of their own. (Until step 5b
+  they also called back into HiFi XI's list hooks.)
 
 ## Mistakes this project made
 

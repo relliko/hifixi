@@ -2,8 +2,8 @@
 
   python -I tests\\run_suites.py [hifixi folder] [log folder]     (defaults: this repo, build\\suites)
 
-The suites that need an argument get it (the oracle files build.cmd made, our d3d8.dll); hook_test also runs with
---debug, zoneinject_test again on the GPU (ZONE_GPU=1, alone, after the rest). A suite that fails is run once more on
+The suites that need an argument get it (the oracle files build.cmd made, our d3d8.dll); zoneinject_test runs again on
+the GPU (ZONE_GPU=1, alone, after the rest). A suite that fails is run once more on
 its own: zonedraw_test's "mapped at its base" sometimes fails when the address it wants is taken, and passes alone.
 The exit code is the number of suites that failed. Each suite's whole output is in the log folder.
 """
@@ -31,10 +31,9 @@ runs = []
 for exe in sorted(glob.glob(os.path.join(build, '*_test.exe'))):
     name = os.path.splitext(os.path.basename(exe))[0]
     runs.append((name, [exe] + ARGS.get(name, []), None))
-runs.append(('hook_test_debug', [os.path.join(build, 'hook_test.exe'), '--debug'], None))
 runs.append(('engine_check', [os.path.join(build, 'engine_check.exe')], None))
 runs.append(('d3d8_unit', [os.path.join(build, 'd3d8', 'd3d8_unit.exe')], None))
-runs.append(('d3d8_hooks', [os.path.join(build, 'd3d8', 'd3d8_hooks.exe'), r'build\d3d8\d3d8.dll'], None))
+runs.append(('d3d8_host', [os.path.join(build, 'd3d8', 'd3d8_host.exe'), r'build\d3d8\d3d8.dll'], None))
 runs.append(('zoneinject_gpu', [os.path.join(build, 'zoneinject_test.exe')], {'ZONE_GPU': '1'}))
 GPU = {'zoneinject_gpu'}
 

@@ -113,16 +113,14 @@ The direct channel (exact states, no guessing):
   to unknown; the mark's exact planes come right after, or the pass refuses ("the world's depth planes' states aren't
   known yet").
 
-The barrier inference still left (dgVoodoo era):
+No barrier inference is left (step 5b, 2026-11-02): HiFi XI hooks nothing of Direct3D 12's.
 
-- `ev_barrier` in `src/backend/backend.cpp`: FSR's old resolve placement alone (`upscale::after_barrier`, and the
-  backend's `list_capture` of what's bound, for its restore). Since step 5a FSR is placed by our d3d8.dll's resolve
-  mark (kind 14, channel 4: right after the first draw that reads the world into a target at least its width after
-  its end, a copy before it or not; `upscale::on_resolve`, nothing put back); the old placement only works out what it
-  would have done, compared at the mark, disagreements counted in the status and logged. `[upscale] placement=guess`
-  puts the old way back. The hooks go once an in-game run shows no disagreement (step 5b). World FX follows no barrier since
-  step 4: the world's target and depth, their states and the fog (the world's last whole clear, channel 3) come with
-  every mark (`worldfx::world_mark`, built by the backend's `world_of`).
+- FSR is placed by our d3d8.dll's resolve mark (kind 14, channel 4: right after the first draw that reads the world
+  into a target at least its width after its end, a copy before it or not; `upscale::on_resolve`, nothing put back).
+  The first in-game run with the old placement compared beside it (81ea82a) placed it 5786 times with 0
+  disagreements; the old placement and its hooks then went.
+- World FX follows no barrier since step 4: the world's target and depth, their states and the fog (the world's last
+  whole clear, channel 3) come with every mark (`worldfx::world_mark`, built by the backend's `world_of`).
 
 Our own passes on the game's depth:
 
@@ -137,7 +135,6 @@ Our own resources:
 - `src/render/grass_render.cpp:4692,5295`, `src/fx/fxrender.cpp:596`: our private depths (floor map, blade depth, fx)
   are DENY_SHADER_RESOURCE on purpose: nothing samples them. Keep it that way, or drop the flag first.
 - `src/render/grass_render.cpp:3564,6120`: UAV barriers between World FX's passes over the same buffer.
-- `src/backend/streamlog.cpp:260,593`: the stream log names barrier types and says sub 0 = depth, sub 1 = stencil.
 - `src/d3d8/gpu.cpp:60`, `src/render/gpu_crash.cpp:204,211`, `src/render/worldfx_core.cpp:2384`: debug layer and GPU
   validation switches.
 
@@ -146,7 +143,7 @@ Our own resources:
 - **DENY_SHADER_RESOURCE on the game's depth (2026-10-30).** The first in-game run of our d3d8.dll removed the device
   (DXGI_ERROR_INVALID_CALL) 0.04 s after World FX's first grass draw; then every texture creation failed (black world).
   A debug-layer run named it: our depth was made with DENY_SHADER_RESOURCE, and World FX's SRV of it was invalid.
-  dgVoodoo's depth had been readable. Fix c08fb81 (`src/d3d8/resource.cpp:164`) and a d3d8_hooks check. Lesson: a
+  dgVoodoo's depth had been readable. Fix c08fb81 (`src/d3d8/resource.cpp:164`) and a d3d8_hooks check (now tests/d3d8_host.cpp). Lesson: a
   resource someone else samples must be made readable; check flags before making a view (as temporal.cpp:430 does).
 - **Waiting for a barrier that never came (v0.57).** The character renderer learned the depth's planes only from
   barriers. With the direct channel, at a mark the planes were already where the draw needed them, so no barrier came
