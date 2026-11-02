@@ -20,7 +20,7 @@ python tools\embed.py src\render\grass.hlsl "%OUT%\grass_hlsl.inc"
 set "EMBED=%ERRORLEVEL%"
 popd
 if not "%EMBED%"=="0" exit /b 1
-cl /nologo /c /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I "%OUT%" ^
+cl /nologo /MP /c /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I "%OUT%" ^
   "%HERE%src\render\grass_render.cpp" "%HERE%src\render\vistest.cpp" "%HERE%src\render\gpu_crash.cpp" "%HERE%src\render\worldfx_core.cpp" ^
   /Fo"%OUT%\obj\\" || exit /b 1
 lib /nologo /OUT:"%OUT%\worldfx_engine.lib" "%OUT%\obj\grass_render.obj" "%OUT%\obj\vistest.obj" "%OUT%\obj\gpu_crash.obj" ^

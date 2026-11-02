@@ -1,0 +1,5 @@
+# LF in every checkout, whatever core.autocrlf says: tests hold these byte for byte against what a tool writes with LF.
+# src/render/grass.hlsl against the shaders tools/embed.py builds in (engine_check, grass_test, the e2e); the .inc files
+# against tools/hifps_stubs.py's and tools/gamewater_table.py's output (hifps_exp_test's stubs check).
+src/render/grass.hlsl text eol=lf
+*.inc text eol=lf

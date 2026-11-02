@@ -27,7 +27,7 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /DNOMINMAX tools\ffx_sc\ffx_sc.cp
 "%OUT%\ffx_sc.exe" "%KIT%\bin\%KITVER%\x86\dxcompiler.dll" src\framegen\ffx "%OUT%\fg_shaders.inc" || goto failed
 rem AMD's code and HiFi XI's own, with fg_names.h force-included (the names FSR 2's copy also has, apart)
 set "FFX=src\framegen\ffx"
-cl /nologo /c /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DNOMINMAX /DNDEBUG /DUNICODE /D_UNICODE /DFFX_FI /DFFX_OF ^
+cl /nologo /MP /c /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DNOMINMAX /DNDEBUG /DUNICODE /D_UNICODE /DFFX_FI /DFFX_OF ^
   /D_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING /I src\framegen /FI fg_names.h ^
   /I %FFX%\include /I %FFX%\src\shared /I %FFX%\src\backends\shared /I %FFX%\src\components /I src\framegen\shim /I "%OUT%" ^
   %FFX%\src\components\frameinterpolation\ffx_frameinterpolation.cpp %FFX%\src\components\opticalflow\ffx_opticalflow.cpp ^
