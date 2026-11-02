@@ -263,6 +263,11 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   tests\zonemesh_test.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\zonemesh_test.exe" ^
   /link /NOLOGO user32.lib || exit /b 1
 echo Built build\zonemesh_test.exe
+rem The texture pack's key (src\pack\pack.hpp) on the game's own DATs: build\packkey_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\packkey_test.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\packkey_test.exe" ^
+  /link /NOLOGO user32.lib || exit /b 1
+echo Built build\packkey_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1

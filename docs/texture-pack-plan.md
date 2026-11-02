@@ -405,6 +405,16 @@ Work happens in a new worktree, `C:\code\LSB\hifixi-pack`, branch `dev-pack`.
 - **Tests:** `build.cmd quick` + `hook_test`; `zonemesh_test`; `zonedraw_test`; `zoneinject_test`; `zone_view` Giddeus; `packkey_check` matched/total.
 - **Done when:** dev-tex is committed once, dev-pack exists, the key matches 100% with a recorded span, and the ESRGAN copy is safe.
 - **Risks:** live bytes differ (narrow the span, last resort a root-file-id + name key); `draw.cpp` merge conflicts.
+- **Done 2026-11-02** (branch `dev-pack` in `C:\code\LSB\hifixi-tex`, from dev-tex 6b9e8ab = dev-hdr 9b04ee8 + the texture work, with dev-dawn 8cc6855 merged):
+  1. ESRGAN copy: already in place with `PROVENANCE.txt` (licence check still M7).
+  2. Installed build: dev-tex 6b9e8ab (plugin A7649384, d3d8 D77DB7A8, installed 14:12). Pixel baseline: `build\m0-baseline\giddeus-street-{own,overlay}.bmp` (zone_view 145 street, 2560x1440; own textures vs `HIFIXI_PIVOT_INI` = the overlay).
+  3. The zone_gpu comment was already right. The texture work went in as 120cb36 with the sampler change in the same commit (not split: it was merged and installed before M0). Suites 44/44 (zonedraw_test's address clash passes alone).
+  4. `hifixi-dawntex` holds an older copy of the same work (codec on the game thread), wholly superseded by 120cb36. Left in place for the session that made it; safe to remove.
+  5. dev-hdr and dev-dawn merged, `dev-pack` made.
+  6. **Key: the full body matches.** `packkey_check.py`: 74/74 live textures (6 captures, 29 names, 31 DATs) byte-identical to their DAT bodies over `((info>>7)&0x7FFFF)*16-16` bytes from body[0], the span `chunk_bytes()` copies. Recorded in `src\pack\pack.hpp` (`key_of`), checked by `tests\packkey_test.cpp` against the Python keys. A name is not a key (hf_shie1 in ROM\55\43 and ROM\31\43 differ). **While the overlay is listed the game holds the overlay's copies** (4x, other bytes): a key from memory misses then; one from the original file on disk still hits. See open question 16.
+  7. B1 palette: body+61 (a class dword at +57 first, layout 3). `src\chars\tex.cpp`, `zonemesh.cpp`, `chartex.py`, `bakezone.py` were right; `tools\chars.py` read +57 and is fixed. The overlay is unaffected: its only B1-to-A1 textures (5, ROM\0\104) match the +61 decode.
+  8. Overlay size, final: 26,764 DATs, 13.1 GB (zones 2x: 292, models 4x: 26,168 baked; 74 palette-only left).
+- **Rule check:** `smaller_levels` already runs only in `zm::load_dat` on the loader thread (`zonemesh.cpp`), so today's install was within the rule.
 
 ### M1 — Measure and harden today's memory paths (install)
 - **Steps:**
@@ -668,12 +678,13 @@ Work happens in a new worktree, `C:\code\LSB\hifixi-pack`, branch `dev-pack`.
 13. The three overlay-owned zones (Zi'Tah canopy, ROM3\3\82, ROM3\5\1): no pack textures (proposed), or their own bake from the overlay copies?
 14. Raise texture detail under FSR while the pack is on (proposed; the look changes at the same settings), or not?
 15. Must M5 wait for the whole model bake (proposed in Done when), or ship with partial model coverage?
+16. (from M0) While the overlay is listed, textures the game holds are the overlay's copies, so a key made from memory misses. Until M5 unlists it: key characters and model actors from the original file on disk (proposed: path + chunk ordinal, read on the loader thread), or have `texpack convert` also index each entry under the overlay copy's key (cheap: a second entry, same records)?
 
 ---
 
 ## 11. What is already done
 
-- **dev-tex** (`C:\code\LSB\hifixi-tex`, dev-hdr a4fe822 plus uncommitted work):
+- **dev-tex**, committed 120cb36 and merged with dev-hdr 9b04ee8 (6b9e8ab, installed 2026-11-02); `dev-pack` builds on it (M0):
   - `bake::overlaid`, `zm::texture::levels`;
   - the CPU BC2 codec in `zone_gpu.cpp`;
   - the zone sampler (anisotropic x8, bias -0.5);
@@ -681,7 +692,7 @@ Work happens in a new worktree, `C:\code\LSB\hifixi-pack`, branch `dev-pack`.
 
   A byte-identical staged copy sits in `C:\code\LSB\hifixi-dawntex` (resolved in M0). The codec moves to `src\pack\bc2.cpp`.
 - **Overlay installed:** `C:\Games\PhoenixXI\polplugins\DATs\hifi-textures`, `pivot.ini` `4=hifi-textures`, behind `0=EraDATs`, `1=XICombinedMaps-2048`, `2=ui-mods` and `3=zitah-canopy`. Giddeus is at 4x (B1 chunks turned into A1).
-- **Running bake** (`research\ffxi-re\tools\upscale\bakeall.py`): zones at 2x, then about 26,550 model DATs at 4x.
+- **The bake, finished 2026-11-02** (`research\ffxi-re\tools\upscale\bakeall.py`): zones at 2x, model DATs at 4x; 26,764 DATs, 13.1 GB.
   - It keeps chunk order and names, but writes template headers.
   - It resumes by checking for files in the overlay folder.
   - Logs: `work\all\bakeall-*.log`. Inventory: `work\all\dats.tsv`.
