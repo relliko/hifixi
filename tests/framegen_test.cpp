@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,19 @@ namespace
 			failures++;
 		else
 			passes++;
+	}
+
+	// The threads that called framegen::set_thread_start's function, by their names (HiFi XI quiets its hooks there)
+	std::mutex started_mutex;
+	std::vector<std::wstring> started;
+	void thread_started()
+	{
+		PWSTR name = nullptr;
+		std::wstring n = SUCCEEDED(GetThreadDescription(GetCurrentThread(), &name)) && name != nullptr ? name : L"";
+		if (name != nullptr)
+			LocalFree(name);
+		std::lock_guard<std::mutex> lock(started_mutex);
+		started.push_back(n.empty() ? L"(unnamed)" : n);
 	}
 
 	uint32_t debug_messages(ID3D12InfoQueue *q, std::string &first)
@@ -135,6 +149,7 @@ int main()
 	// Wanted: the factory's calls through ours
 	hifi::framegen::set_wanted(true);
 	hifi::framegen::set_automatic(false); // (on whatever the game's frame rate: the automatic choice has its own part, last)
+	hifi::framegen::set_thread_start(thread_started);
 	check(hifi::framegen::wanted() && hifi::framegen::install(reinterpret_cast<void *>(create_factory1), why), "the setting on: the factory's swap chain calls through ours" + (why.empty() ? "" : ": " + why));
 	{
 		HWND tiny = make_window(64, 64);
@@ -341,6 +356,34 @@ int main()
 		" made, " + std::to_string(first.failed) + " failed, " + std::to_string(first.switches) + " turned)");
 	const UINT doubled = real_presents() - presents_before;
 	check(doubled >= 116, "the real swap chain shown twice as many frames as the game presented (" + std::to_string(doubled) + " for 60)");
+	{
+		// (AMD's interpolation thread starts when generation is first turned on, its presenter thread from there; again at
+		// each turning on)
+		bool both = false;
+		std::wstring names;
+		for (int i = 0; i < 200 && !both; ++i)
+		{
+			{
+				std::lock_guard<std::mutex> lock(started_mutex);
+				names.clear();
+				bool interpolation = false, presenter = false;
+				for (const std::wstring &n : started)
+				{
+					names += (names.empty() ? L"" : L", ") + n;
+					interpolation |= n == L"AMD FSR Interpolation Thread";
+					presenter |= n == L"AMD FSR Presenter Thread";
+				}
+				both = interpolation && presenter;
+				for (const std::wstring &n : started)
+					both &= n == L"AMD FSR Interpolation Thread" || n == L"AMD FSR Presenter Thread";
+			}
+			if (!both)
+				Sleep(10);
+		}
+		char text[256];
+		std::snprintf(text, sizeof(text), "AMD's two threads call the thread start first (HiFi XI's hooks quiet there): %ls", names.empty() ? L"none" : names.c_str());
+		check(both, text);
+	}
 	wait();
 
 	// The last frame made between (frames 58 and 59: the bar from x 1328, then 1344): the bar halfway, the UI box as drawn

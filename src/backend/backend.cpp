@@ -120,10 +120,22 @@ namespace hifi::backend
 			tl_data = it->second.get();
 			return tl_data;
 		}
-		// A list's data when the core should hear of it (attached, the list known)
+		// The thread our d3d8.dll records the game's frames on (the game's), from its first frame mark. Lists recorded on
+		// any other thread (HiFi XI's own loaders' uploads, AMD's frame generation threads, DXGI's list in their Present)
+		// are none of the core's business: their events go no further, so no lock of the passes is taken there. One was:
+		// the characters' loader's upload reset a list inside the Direct3D debug layer's lock while the game's thread,
+		// holding World FX's lock in its pass, waited on that one (a deadlock, 2026-11-02)
+		std::atomic<DWORD> g_render_thread { 0 };
+		bool elsewhere()
+		{
+			const DWORD t = g_render_thread.load(std::memory_order_relaxed);
+			return t != 0 && t != GetCurrentThreadId();
+		}
+
+		// A list's data when the core should hear of it (attached, the list known, on the game's thread)
 		worldfx::list_data *live(void *list)
 		{
-			return g_attached.load(std::memory_order_acquire) ? data_of(list, false) : nullptr;
+			return g_attached.load(std::memory_order_acquire) && !elsewhere() ? data_of(list, false) : nullptr;
 		}
 
 		// The core's port
@@ -504,6 +516,8 @@ namespace hifi::backend
 		}
 		void ev_reset(ID3D12GraphicsCommandList *list)
 		{
+			if (elsewhere())
+				return;
 			upscale::on_reset(list);
 			worldfx::list_data *const d = data_of(list, true);
 			if (!g_attached.load(std::memory_order_acquire))
@@ -875,6 +889,7 @@ namespace hifi::backend
 
 		void __cdecl on_frame_mark(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *fm)
 		{
+			g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
 			// (the device removed: none of HiFi XI's passes recorded again; the game's own lists go on as d3d8.dll has them)
 			if (gpu_crash::lost())
 				return;
@@ -957,6 +972,8 @@ namespace hifi::backend
 		}
 		if (framegen::wanted())
 		{
+			// (AMD's own threads quiet: DXGI's list in their Present mustn't wait on World FX's lock)
+			framegen::set_thread_start(host::quiet_thread);
 			if (framegen::install(create_factory1, why, [](int level, const char *text) { write_log(level, text); }))
 				write_log(0, "HiFi XI: frame generation's swap chain in (upscale.framegen on): the game window's swap chain will be AMD's");
 			else

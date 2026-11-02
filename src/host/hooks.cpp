@@ -664,6 +664,7 @@ namespace hifi::host
 	quiet::quiet() { tl_quiet++; }
 	quiet::~quiet() { tl_quiet--; }
 	bool is_quiet() { return tl_quiet != 0; }
+	void quiet_thread() { tl_quiet++; }
 
 	void set_events(const events *e)
 	{

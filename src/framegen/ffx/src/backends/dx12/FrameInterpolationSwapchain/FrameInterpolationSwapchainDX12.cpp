@@ -28,6 +28,10 @@
 #include "FrameInterpolationSwapchainDX12_UiComposition.h"
 #include "FrameInterpolationSwapchainDX12_DebugPacing.h"
 #include "antilag2/ffx_antilag2_dx12.h"
+#include "fg_threads.h" // (HiFi XI)
+
+// HiFi XI: called first thing on the interpolation and presenter threads (fg_threads.h)
+extern "C" void (*ffx_fg_thread_start)() = nullptr;
 
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
@@ -414,6 +418,9 @@ void presentToSwapChain(FrameinterpolationPresentInfo* presenter, PacingData* pa
 
 DWORD WINAPI presenterThread(LPVOID param)
 {
+    if (ffx_fg_thread_start != nullptr) // (HiFi XI: fg_threads.h)
+        ffx_fg_thread_start();
+
     FrameinterpolationPresentInfo* presenter = static_cast<FrameinterpolationPresentInfo*>(param);
 
     if (presenter)
@@ -501,6 +508,9 @@ DWORD WINAPI presenterThread(LPVOID param)
 
 DWORD WINAPI interpolationThread(LPVOID param)
 {
+    if (ffx_fg_thread_start != nullptr) // (HiFi XI: fg_threads.h)
+        ffx_fg_thread_start();
+
     FrameinterpolationPresentInfo* presenter = static_cast<FrameinterpolationPresentInfo*>(param);
 
     if (presenter)

@@ -54,6 +54,9 @@ namespace hifi::host
 		quiet &operator=(const quiet &) = delete;
 	};
 	bool is_quiet();
+	// This thread quiet for good: someone else's thread that records nothing of the game's (AMD's frame generation
+	// threads: framegen::set_thread_start)
+	void quiet_thread();
 
 	// A tracer (the stream log, /hifi streamlog: src/backend/streamlog): while one is set, every hooked call is handed to
 	// it before it's made, on the thread making it, with its object and its arguments in order (pointers and handles as

@@ -14,6 +14,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "framegen.hpp"
+#include "fg_threads.h"
 #include <FidelityFX/host/backends/dx12/ffx_dx12.h>
 #include <FidelityFX/host/ffx_frameinterpolation.h>
 #include <FidelityFX/host/ffx_opticalflow.h>
@@ -720,6 +721,11 @@ namespace hifi::framegen
 	void set_refresh_for_tests(uint32_t hz)
 	{
 		g.refresh_override = hz;
+	}
+
+	void set_thread_start(void (*start)())
+	{
+		ffx_fg_thread_start = start;
 	}
 
 	bool install(void *create_factory1, std::string &why, void (*log)(int, const char *))
