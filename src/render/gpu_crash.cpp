@@ -131,6 +131,7 @@ namespace gpu_crash
 		};
 		watch_state *g_watch = nullptr;
 		std::atomic<bool> g_lost { false };
+		std::atomic<std::string (*)()> g_sections[8] = {};
 
 		void CALLBACK on_removed(void *context, BOOLEAN)
 		{
@@ -139,6 +140,9 @@ namespace gpu_crash
 			std::string text = report(w->device);
 			if (w->context != nullptr)
 				text += "\nThe add-on at that moment:\n" + w->context();
+			for (const auto &s : g_sections)
+				if (const auto section = s.load())
+					text += "\n" + section();
 			FILE *f = nullptr;
 			const bool written = _wfopen_s(&f, w->path.c_str(), L"wb") == 0 && f != nullptr;
 			if (written)
@@ -334,6 +338,16 @@ namespace gpu_crash
 	bool lost()
 	{
 		return g_lost.load(std::memory_order_relaxed);
+	}
+
+	void add_section(std::string (*section)())
+	{
+		for (auto &s : g_sections)
+		{
+			std::string (*none)() = nullptr;
+			if (s.load() == section || s.compare_exchange_strong(none, section))
+				return;
+		}
 	}
 
 	std::string gpu_name(ID3D12Device *device)

@@ -20,7 +20,7 @@ namespace hifi::hangwatch
 {
 	namespace
 	{
-		constexpr ULONGLONG kHangMs = 8000;    // (no present this long: a hang; a zone's load stalls a second or two)
+		constexpr ULONGLONG kHangMs = 4000;    // (no present this long: a hang; a zone's load stalls a second or two, a Present stuck after an alt-tab 5 s)
 		constexpr uint64_t kMinPresents = 300; // (the game running first: not the start's long shader compile)
 		constexpr int kMaxReports = 3;         // (a session's)
 		constexpr int kFrames = 32;            // (up the frame chain)

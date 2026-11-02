@@ -22,8 +22,10 @@
 #include <d3d12.h>
 #include "frame.hpp"
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace hifi::zone
 {
@@ -84,14 +86,46 @@ namespace hifi::zone
 		draw_stats record(ID3D12GraphicsCommandList *list, const draw_target &t, const draw_pass &p, const frame_object *objects, uint32_t count,
 			const draw_options &o, uint64_t frame_number);
 
+		// The GPU's breadcrumbs, for a GPU crash report: each piece's draw has a write before it (when the GPU has begun
+		// every draw before it) and one after (when it has finished it) into memory the CPU still reads once the device
+		// is lost; the last few frames' pieces (object, model, piece, lamps) and lamps kept to name them. Lines for the
+		// report; empty without breadcrumbs (Direct3D's WriteBufferImmediate not had).
+		std::string breadcrumbs() const;
+
+		struct piece_note
+		{
+			uint32_t object = 0, model = 0, piece = 0, first_index = 0, triangles = 0, flags = 0, object_flags = 0;
+			uint32_t texture = 0, normal_map = 0, lamps = 0, zone = 0;
+			char name[16] = {};
+			float at[3] = {};
+		};
+		struct frame_note
+		{
+			uint32_t tag = 0xFFFFFFFFu; // (the frame number's low 16 bits, as the breadcrumbs carry it)
+			bool per_pixel = false;
+			std::vector<piece_note> pieces;
+			std::vector<frame_lamp> lamps;
+		};
+
 	private:
 		ID3D12PipelineState *pipeline(const draw_target &t, bool blended, int cull, bool door);
+		void make_breadcrumbs(ID3D12Device *device);
+
+		static constexpr int kNotedFrames = 4;
 
 		ID3D12Device *_device = nullptr;
+		ID3D12Resource *_crumbs = nullptr;           // (a custom heap in system memory, written back: read after a loss)
+		const volatile uint32_t *_crumb_words = nullptr; // [0] begun before draw n, [1] draw n finished: frame << 16 | n
+		std::vector<piece_note> _building;
+		frame_note _notes[kNotedFrames];
+		mutable std::mutex _notes_mutex;
 		ID3D12RootSignature *_root = nullptr;
 		void *_vs = nullptr, *_ps = nullptr, *_ps_light = nullptr; // (ID3DBlob)
 		ID3D12Resource *_ring = nullptr;     // upload: kFrames slots of constants, objects, lamps
 		uint8_t *_mapped = nullptr;
 		std::unordered_map<uint64_t, ID3D12PipelineState *> _pipelines;
 	};
+
+	// Every renderer's breadcrumbs, as the GPU crash report's section has them (tests)
+	std::string breadcrumb_report();
 }

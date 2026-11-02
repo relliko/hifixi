@@ -135,6 +135,9 @@ namespace worldfx
 	void set_camera_source(camera_source_fn source, void *context);
 	// (status) Frames in the game World FX's pass drew, and the ones it didn't by reason
 	std::vector<std::string> frame_counts();
+	// The debug overlay's lines (sun shadows: the setting, open sky or not, the map's use): none while the render thread
+	// holds World FX's lock (never waited for)
+	std::vector<std::string> overlay_lines();
 	// The blades' own motion written beside them (FSR 2's: the host's upscale), and its target (grass::renderer::
 	// blade_motion: the world's size, in a shader-readable state; frames counts the frames that wrote it)
 	void set_blade_motion(bool on);

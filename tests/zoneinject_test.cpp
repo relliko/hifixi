@@ -30,6 +30,7 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "../src/bake/zonemesh.hpp"
+#include "../src/zone/draw.hpp"
 #include "../src/zone/frame.hpp"
 #include "../src/zone/inject.hpp"
 #include "../src/zone/light_split.hpp"
@@ -184,7 +185,9 @@ int main(int argc, char **argv)
 	CreateDXGIFactory1(IID_PPV_ARGS(&factory));
 	factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
 	ID3D12Device *device = nullptr;
-	if (FAILED(D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+	// (ZONE_GPU=1: the first GPU in place of WARP, for what WARP doesn't do: the breadcrumbs' writes)
+	const bool on_gpu = GetEnvironmentVariableA("ZONE_GPU", nullptr, 0) != 0;
+	if (FAILED(D3D12CreateDevice(on_gpu ? nullptr : warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
 	{
 		check(false, "a WARP device");
 		return 1;
@@ -905,6 +908,16 @@ int main(int argc, char **argv)
 		fence->SetEventOnCompletion(2, e);
 		WaitForSingleObject(e, 60000);
 		check(device->GetDeviceRemovedReason() == S_OK, "the device still there (the lamp's passes)");
+		// The breadcrumbs after the passes finished: the last frame's pieces all finished, its lamp named
+		{
+			const std::string crumbs = hifi::zone::breadcrumb_report();
+			if (crumbs.empty())
+				std::printf("      (no breadcrumbs: this device can't write them%s)\n", on_gpu ? "" : "; ZONE_GPU=1 runs this on the GPU");
+			else
+				check(crumbs.find("every zone draw the GPU began it finished") != std::string::npos && crumbs.find("1 lamps:") != std::string::npos &&
+					crumbs.find("lamp 0: at") != std::string::npos && crumbs.find("the last finished: draw") != std::string::npos,
+					"the breadcrumbs: every draw begun finished, the last named, the frame's lamp listed\n" + crumbs);
+		}
 		const uint32_t lamp_messages = debug_messages(info, first);
 		check(lamp_messages == 0, "the debug layer: nothing (" + std::to_string(lamp_messages) + (lamp_messages != 0 ? ": " + first : std::string()) + ")");
 		double lumas[4] = {};

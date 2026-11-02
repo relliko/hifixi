@@ -3999,6 +3999,21 @@ static std::vector<std::string> gpu_time_lines(const grass::renderer &r)
 	return out;
 }
 
+std::vector<std::string> worldfx::overlay_lines()
+{
+	std::vector<std::string> out;
+	std::unique_lock<std::mutex> lock(g.mutex, std::try_to_lock);
+	if (!lock.owns_lock())
+		return out;
+	const double h = vanadiel_hour();
+	char line[320];
+	std::snprintf(line, sizeof(line), "Sun shadows %.2f (moon %.2f), shown at %.2f now: zone %u %s, the sun %s; the map %s, drawn %u times (%s)", g.sun_shadows,
+		g.moon_shadows, g.look.sun_shadow, g.zone, g.zone_sunlit ? "open sky" : "no sky (none here)", h > 6.0 && h < 18.0 ? "up" : "down",
+		g.last.sun_map ? "in use" : "not in use", g.sun_map_redraws, g.shadow_status.c_str());
+	out.push_back(line);
+	return out;
+}
+
 std::vector<std::string> worldfx::gpu_times()
 {
 	std::lock_guard<std::mutex> lock(g.mutex);

@@ -156,6 +156,7 @@ namespace hifi::backend
 		// [worldfx] GpuStopped=1 with its report), so this one reads World FX's costliest parts as off. Only as read: the
 		// file keeps their values (the next start has them back) and one turned on in the menu is saved as usual.
 		bool g_safe_start = false;
+		std::atomic<bool> g_own_d3d8 { false };
 		const char *const kSafeOff[] = { "VolLight", "VolFog", "AOStrength", "WaterReflections", "Rain", "Snow", "CloudQuality", "LampShadows" };
 		bool safe_off(const char *key, std::wstring &out)
 		{
@@ -911,6 +912,7 @@ namespace hifi::backend
 		g_started = true;
 		write_log(0, "HiFi XI: Direct3D 12 hooks in, before the game's device: its lists and views followed from their making");
 		const bool direct = direct_channel(true);
+		g_own_d3d8 = direct;
 		write_log(direct ? 0 : 2, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
 			"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: its passes (native zone and characters, World FX, FSR) can't be placed and stay off; "
 			"HiFi XI needs its own d3d8.dll in bootloader");
@@ -996,6 +998,8 @@ namespace hifi::backend
 	const std::wstring &settings_file() { return g_settings; }
 
 	bool safe_start() { return g_safe_start; }
+
+	bool own_d3d8() { return g_own_d3d8.load(); }
 
 	bool setting(const char *key, std::string &value)
 	{

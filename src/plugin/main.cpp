@@ -74,6 +74,7 @@
 #include "../chars/chardraw.hpp"      // (native characters: their lamps)
 #include "../chars/charoptions.hpp"   // (native characters)
 #include "../zone/zoneoptions.hpp"
+#include "../zone/draw.hpp"
 #include "../zone/inject.hpp"
 #include "../zone/light_split.hpp"
 #include "../zone/native.hpp"
@@ -96,7 +97,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.62;
+	constexpr double kVersion = 0.63;
 	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
 	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
@@ -268,6 +269,8 @@ class hifixi final : public IPlugin
 	uint32_t m_id = 0;
 	uint64_t m_presents = 0;
 	bool m_gpu_lost = false; // (the player told the GPU stopped)
+	std::vector<std::string> m_overlay; // (the debug overlay's lines, made again every half second; empty: off)
+	std::string m_gpu_line;
 	std::string m_rate_line; // (the last status's frame-rate line: /hifi status puts it in the chat)
 	double m_since = 0.0;
 	bool m_menu = false;
@@ -783,6 +786,30 @@ class hifixi final : public IPlugin
 		return true;
 	}
 
+	// The debug overlay's lines (Advanced: "Show what's drawing on screen"), made again every half second
+	void follow_overlay()
+	{
+		m_overlay.clear();
+		if (!hifi::game::option_on("debug", "overlay", false))
+			return;
+		char line[256];
+		std::snprintf(line, sizeof(line), "HiFi XI %.2f: %s", kVersion, hifi::backend::own_d3d8() ? "Direct3D 8 -> Direct3D 12 through HiFi XI's d3d8.dll" :
+			"another d3d8.dll is loaded (not HiFi XI's): HiFi XI's drawing is off");
+		m_overlay.push_back(line);
+		if (m_gpu_line.empty())
+			if (ID3D12Device *const device = worldfx::attached())
+				m_gpu_line = "GPU: " + gpu_crash::gpu_name(device);
+		m_overlay.push_back(m_gpu_line.empty() ? std::string("GPU: not attached yet") : m_gpu_line);
+		const std::vector<std::string> fg = hifi::framegen::status();
+		m_overlay.push_back(hifi::framegen::wanted() ? "Present: AMD's swap chain (frame generation)" + (fg.size() > 1 ? ": " + fg[1].substr(18, 90) : std::string()) :
+			"Present: DXGI's swap chain (no frame generation)");
+		std::snprintf(line, sizeof(line), "FSR: %s; scenery per pixel: %s; the GPU: %s", hifi::upscale::temporal_running() ? "drawing" : "not drawing",
+			hifi::game::option_on("zone", "perpixel", hifi::zone::options::kPerPixelByDefault) ? "on" : "off", gpu_crash::lost() ? "LOST" : "running");
+		m_overlay.push_back(line);
+		for (const std::string &l : worldfx::overlay_lines())
+			m_overlay.push_back(l);
+	}
+
 	// The world upscaled to the screen (src/upscale): its options, and its passes made for the game's device (with what
 	// dgVoodoo's thread has asked for since: the screen-size texture, a pipeline for the back buffer's format)
 	void follow_upscale()
@@ -933,6 +960,7 @@ public:
 		start();
 		hifi::bake::runner::start(hifi::backend::folder());
 		hifi::hangwatch::start(hifi::backend::folder(), hifi::backend::log, hang_context);
+		gpu_crash::add_section(hifi::zone::breadcrumb_report); // (the native zone pass's breadcrumbs in a GPU crash report)
 		return true;
 	}
 
@@ -1212,6 +1240,7 @@ public:
 			for (const hifi::passes::module &m : hifi::passes::modules())
 				if (m.update != nullptr)
 					m.update(now);
+			follow_overlay();
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first
 		// time it's entered)
@@ -1253,6 +1282,17 @@ public:
 			if (g_gui->Begin("##hifixi_fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
 					ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
 				g_gui->Text("%.0f", hifi::game::hifps::fps());
+			g_gui->End();
+		}
+		if (g_gui != nullptr && !m_overlay.empty())
+		{
+			// (the debug overlay, under the frame rate)
+			g_gui->SetNextWindowPos(ImVec2(6.0f, 26.0f), ImGuiCond_Always);
+			g_gui->SetNextWindowBgAlpha(0.6f);
+			if (g_gui->Begin("##hifixi_overlay", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+					ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
+				for (const std::string &line : m_overlay)
+					g_gui->Text("%s", line.c_str());
 			g_gui->End();
 		}
 		if (m_menu && g_gui != nullptr)

@@ -392,11 +392,148 @@ light_out ps_light(v2p i)
 				out[a / 4] = (out[a / 4] & ~(0xFFu << (8 * (a % 4)))) | uint32_t(index[a]) << (8 * (a % 4));
 			}
 		}
+
+		// The renderers with breadcrumbs, for the GPU crash report's section
+		std::mutex g_renderers_mutex;
+		std::vector<const zone_renderer *> g_renderers;
+
+		std::string crash_section()
+		{
+			std::unique_lock<std::mutex> lock(g_renderers_mutex, std::defer_lock);
+			for (int i = 0; i < 50 && !lock.try_lock(); ++i)
+				Sleep(10);
+			if (!lock.owns_lock())
+				return "The native zone pass's breadcrumbs: not read (busy)\n";
+			std::string out;
+			for (const zone_renderer *r : g_renderers)
+				out += r->breadcrumbs();
+			return out;
+		}
+
+		void forget_renderer(const zone_renderer *r)
+		{
+			std::lock_guard<std::mutex> lock(g_renderers_mutex);
+			g_renderers.erase(std::remove(g_renderers.begin(), g_renderers.end(), r), g_renderers.end());
+		}
+
+		std::string note_text(const char *what, uint32_t draw, const zone_renderer::piece_note &n)
+		{
+			char line[400];
+			char name[17] = {};
+			std::memcpy(name, n.name, 16);
+			for (int i = 15; i >= 0 && (name[i] == ' ' || name[i] == 0); --i)
+				name[i] = 0;
+			std::snprintf(line, sizeof(line), "  %s: draw %u: object %u (model %u \"%s\", at %.1f %.1f %.1f, flags 0x%X, %s), its piece %u (index %u, %u triangles, "
+				"texture %d, normal map %d, shader flags 0x%X); its game lamps (bytes, 255 none): %u %u %u %u\n",
+				what, draw, n.object, n.model, name, n.at[0], n.at[1], n.at[2], n.object_flags, n.zone == 0 ? "the zone's" : "the second map's", n.piece,
+				n.first_index, n.triangles, int(n.texture), int(n.normal_map), n.flags, n.lamps & 255, (n.lamps >> 8) & 255, (n.lamps >> 16) & 255, n.lamps >> 24);
+			return line;
+		}
+	}
+
+	std::string breadcrumb_report()
+	{
+		return crash_section();
 	}
 
 	zone_renderer::~zone_renderer()
 	{
 		release();
+	}
+
+	void zone_renderer::make_breadcrumbs(ID3D12Device *device)
+	{
+		// (a device that can't write them, an older Direct3D 12 or WARP's: no breadcrumbs, everything else as before)
+		D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+		if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) ||
+			(o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT) == 0)
+			return;
+		D3D12_HEAP_PROPERTIES hp = {};
+		hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+		hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+		hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = 256;
+		bd.Height = 1;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		void *mapped = nullptr;
+		if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_crumbs))) ||
+			FAILED(_crumbs->Map(0, nullptr, &mapped)))
+		{
+			drop(_crumbs);
+			return;
+		}
+		std::memset(mapped, 0xFF, 8); // (nothing begun or finished yet)
+		_crumb_words = static_cast<const volatile uint32_t *>(mapped);
+		_crumbs->SetName(L"hifixi: the zone pass's breadcrumbs");
+		{
+			std::lock_guard<std::mutex> lock(g_renderers_mutex);
+			g_renderers.push_back(this);
+		}
+	}
+
+	std::string zone_renderer::breadcrumbs() const
+	{
+		if (_crumb_words == nullptr)
+			return std::string();
+		const uint32_t begun = _crumb_words[0], done = _crumb_words[1];
+		std::string out;
+		char line[400];
+		std::snprintf(line, sizeof(line), "The native zone pass's breadcrumbs (renderer %p): the GPU had begun every draw before frame %u's draw %u, and "
+			"finished frame %u's draw %u\n", static_cast<const void *>(this), begun >> 16, begun & 0xFFFFu, done >> 16, done & 0xFFFFu);
+		if (begun == 0xFFFFFFFFu)
+			std::snprintf(line, sizeof(line), "The native zone pass's breadcrumbs (renderer %p): no zone piece drawn yet\n", static_cast<const void *>(this));
+		out += line;
+		if (begun == 0xFFFFFFFFu)
+			return out;
+		std::lock_guard<std::mutex> lock(_notes_mutex);
+		// The frame the last finished draw was in: that draw and the one after it (the first not finished)
+		const frame_note *fn = nullptr;
+		for (const frame_note &n : _notes)
+			if (n.tag == (done >> 16))
+				fn = &n;
+		const frame_note *fb = nullptr;
+		for (const frame_note &n : _notes)
+			if (n.tag == (begun >> 16))
+				fb = &n;
+		const bool all_done = begun == done || (fn != nullptr && (done & 0xFFFFu) + 1 >= fn->pieces.size() && fb == fn);
+		out += all_done ? "  every zone draw the GPU began it finished: the stop came elsewhere\n" :
+			"  a zone draw begun and not finished: the GPU stopped in the zone pass\n";
+		if (fn != nullptr)
+		{
+			const uint32_t d = done & 0xFFFFu;
+			if (d < fn->pieces.size())
+			{
+				const piece_note &p = fn->pieces[d];
+				out += note_text("the last finished", d, p);
+			}
+			if (d + 1 < fn->pieces.size())
+			{
+				const piece_note &p = fn->pieces[d + 1];
+				out += note_text("the next, not finished", d + 1, p);
+			}
+		}
+		const frame_note *lamps_of = fb != nullptr ? fb : fn;
+		if (lamps_of != nullptr)
+		{
+			std::snprintf(line, sizeof(line), "  frame %u: %zu pieces drawn, per pixel %s, %zu lamps%s\n", lamps_of->tag, lamps_of->pieces.size(), lamps_of->per_pixel ? "on" : "off",
+				lamps_of->lamps.size(), lamps_of->lamps.empty() ? "" : ":");
+			out += line;
+			for (size_t i = 0; i < lamps_of->lamps.size(); ++i)
+			{
+				const frame_lamp &l = lamps_of->lamps[i];
+				std::snprintf(line, sizeof(line), "    lamp %zu: at %g %g %g, range %g, colour %g %g %g, attenuation 2 %g\n", i, l.pos[0], l.pos[1], l.pos[2], l.range,
+					l.colour[0], l.colour[1], l.colour[2], l.attenuation2);
+				out += line;
+			}
+		}
+		else
+			out += "  (its frame's notes are gone: older than the last few)\n";
+		return out;
 	}
 
 	void zone_renderer::release()
@@ -410,6 +547,11 @@ light_out ps_light(v2p i)
 		_mapped = nullptr;
 		drop(_ring);
 		drop(_root);
+		forget_renderer(this);
+		if (_crumbs != nullptr && _crumb_words != nullptr)
+			_crumbs->Unmap(0, nullptr);
+		_crumb_words = nullptr;
+		drop(_crumbs);
 		if (_vs != nullptr)
 			static_cast<ID3DBlob *>(_vs)->Release();
 		if (_ps != nullptr)
@@ -508,6 +650,7 @@ light_out ps_light(v2p i)
 			release();
 			return false;
 		}
+		make_breadcrumbs(device);
 		return true;
 	}
 
@@ -668,6 +811,13 @@ light_out ps_light(v2p i)
 		list->SetGraphicsRootShaderResourceView(4, base + kObjectsAt);
 		list->SetGraphicsRootShaderResourceView(5, base + kLampsAt);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		// (the breadcrumbs, when Direct3D has WriteBufferImmediate: the frame number's low 16 bits, the draw's below)
+		ID3D12GraphicsCommandList2 *l2 = nullptr;
+		if (_crumbs != nullptr && FAILED(list->QueryInterface(IID_PPV_ARGS(&l2))))
+			l2 = nullptr;
+		const uint32_t tag = uint32_t(frame_number & 0xFFFFu) << 16;
+		const D3D12_GPU_VIRTUAL_ADDRESS crumb_va = _crumbs != nullptr ? _crumbs->GetGPUVirtualAddress() : 0;
+		_building.clear();
 
 		// The objects in the game's order, each one's pieces in file order (blended ones where they come)
 		ID3D12PipelineState *bound = nullptr;
@@ -712,11 +862,52 @@ light_out ps_light(v2p i)
 				list->SetGraphicsRoot32BitConstants(1, 4, dc, 0);
 				list->SetGraphicsRootDescriptorTable(6, z->texture_srv(pc.texture));
 				list->SetGraphicsRootDescriptorTable(7, z->normal_srv(pc.normal_map));
+				// (the breadcrumbs: begun before draw n, then draw n finished)
+				const uint32_t crumb = tag | (st.draws & 0xFFFFu);
+				D3D12_WRITEBUFFERIMMEDIATE_PARAMETER wb = { crumb_va, crumb };
+				D3D12_WRITEBUFFERIMMEDIATE_MODE wm = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+				if (l2 != nullptr)
+					l2->WriteBufferImmediate(1, &wb, &wm);
 				list->DrawInstanced(pc.triangles * 3, 1, 0, 0);
+				if (l2 != nullptr)
+				{
+					wb.Dest = crumb_va + 4;
+					wm = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+					l2->WriteBufferImmediate(1, &wb, &wm);
+					piece_note n;
+					n.object = i;
+					n.model = fo.model;
+					n.piece = k - mo.first_piece;
+					n.first_index = pc.first_index;
+					n.triangles = pc.triangles;
+					n.flags = flags;
+					n.object_flags = fo.flags;
+					n.texture = pc.texture;
+					n.normal_map = pc.normal_map;
+					n.lamps = go[i].lamps[0];
+					n.zone = fo.zone;
+					std::memcpy(n.name, mo.name, sizeof(n.name));
+					n.at[0] = fo.world[3];
+					n.at[1] = fo.world[7];
+					n.at[2] = fo.world[11];
+					_building.push_back(n);
+				}
 				st.draws++;
 				st.triangles += pc.triangles;
 			}
 		}
+		if (l2 != nullptr)
+		{
+			// (this frame's pieces and lamps kept, to name a breadcrumb)
+			std::lock_guard<std::mutex> lock(_notes_mutex);
+			frame_note &fn = _notes[(frame_number & 0xFFFFu) % kNotedFrames];
+			fn.tag = uint32_t(frame_number & 0xFFFFu);
+			fn.per_pixel = o.per_pixel;
+			fn.pieces.swap(_building);
+			fn.lamps.assign(p.lamps, p.lamps + lamp_count);
+			l2->Release();
+		}
+		_building.clear();
 		return st;
 	}
 }

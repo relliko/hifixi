@@ -27,6 +27,10 @@ namespace gpu_crash
 	// nothing of HiFi XI's is recorded and AMD's code isn't called (its resources can't be made: it throws).
 	bool lost();
 
+	// A section of the report from elsewhere (the native zone pass's breadcrumbs): called on the thread pool thread
+	// that writes it, after the add-on's state. Up to 8; the same one once.
+	void add_section(std::string (*section)());
+
 	// The report for a removed device (the reason, the GPU and its video memory then, the page fault, the command
 	// lists the GPU hadn't finished)
 	std::string report(ID3D12Device *device);

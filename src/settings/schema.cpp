@@ -283,6 +283,10 @@ namespace hifi::settings
 			{ "GpuCrashReports", tab::advanced, "Diagnostics", "GPU crash reports",
 				"If the GPU stops (a hang, a page fault), what it was doing goes to worldfx-gpu-crash.txt in the bootloader folder.",
 				nullptr, nullptr, true, { _, _, _, _ } },
+			{ "debug.overlay", tab::advanced, "Diagnostics", "Show what's drawing on screen",
+				"A few lines at the top left: the graphics path (Direct3D 8 through HiFi XI's d3d8.dll to Direct3D 12, or another "
+				"d3d8.dll), the GPU and its driver, the swap chain (AMD's for frame generation, or DXGI's), FSR, per-pixel scenery "
+				"and the sun shadows' state. For screenshots in a report.", nullptr, nullptr, false, { _, _, _, _ } },
 			{ "D3D12DebugLayer", tab::advanced, "Diagnostics", "Direct3D 12 debug layer",
 				"Checks every graphics call and writes what's wrong to worldfx-d3d12-debug.txt. Slow: for tracking down a problem "
 				"(Windows' Graphics Tools must be installed).", nullptr, nullptr, true, { _, _, _, _ } },

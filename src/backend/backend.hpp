@@ -39,6 +39,8 @@ namespace hifi::backend
 	bool setting(const char *key, std::string &value);
 	// A safe start: the GPU stopped last session, so World FX's costliest parts read as off for this one (not saved)
 	bool safe_start();
+	// Whether the d3d8.dll loaded is HiFi XI's own (its passes marked for us): the debug overlay's first line
+	bool own_d3d8();
 	// The preset the settings were last set from ("off", "balanced", "high", "ultra"; "custom" once one was changed by
 	// hand, and for settings taken from elsewhere), kept in the settings file
 	std::string preset();
