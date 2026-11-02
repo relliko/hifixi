@@ -734,7 +734,7 @@ class hifixi final : public IPlugin
 		{
 			hifi::zone::inject::frame_camera c;
 			const bool known = hifi::zone::inject::last_camera(c) && GetTickCount64() - c.at <= 250;
-			hifi::chars::inject::set_sun(known ? c.sun_dir : nullptr);
+			hifi::chars::inject::set_sun(known ? c.sun_dir : nullptr, known ? c.sun_fade : 1.0f);
 			// (and its lamps, when it drew the zone itself: the characters lit by the lamps the zone is lit by)
 			static_assert(sizeof(hifi::zone::frame_lamp) == sizeof(hifi::chars::char_lamp) && hifi::zone::kMaxLamps == hifi::chars::kFrameLamps);
 			hifi::zone::frame_lamp lamps[hifi::zone::kMaxLamps];

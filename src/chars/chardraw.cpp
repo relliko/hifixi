@@ -1265,6 +1265,21 @@ float4 pps(p2p i) : SV_Target
 			}
 		}
 
+		// The model's light that's the zone's sun (as lit's share tells it: within about 10 degrees of it) faded as the
+		// zone's is about the horizon (zone::horizon_fade: the swap between the sun and the moon at 6:00 and 18:00 unseen)
+		void model_sun_fade(const char_options &o, gpu_model &g)
+		{
+			if (!o.sun_known || !(o.sun_fade < 1.0f))
+				return;
+			for (int k = 0; k < 4; ++k)
+			{
+				const float *d = g.light_dir[k];
+				if (d[3] != 0.0f && d[0] * o.sun[0] + d[1] * o.sun[1] + d[2] * o.sun[2] > 0.985f)
+					for (int i = 0; i < 3; ++i)
+						g.light_diffuse[k][i] *= o.sun_fade;
+			}
+		}
+
 		// The zone's lamps whose range reaches the model's bones' box (its instances' palette rows' places, half a yalm
 		// round for the skin), up to kModelLamps, the strongest at the box first; and the game's own lamp slots left out
 		// where they're one of those (chardraw.hpp "Lamps"): a slot not the sun's (as lit's share tells it) pointing from
@@ -1672,6 +1687,7 @@ float4 pps(p2p i) : SV_Target
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
 		{
 			model_constants(f, f.model[i], gm[i]);
+			model_sun_fade(o, gm[i]);
 			model_lamps(f, f.model[i], o, gm[i]);
 		}
 		return _ring->GetGPUVirtualAddress() + slot;

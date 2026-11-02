@@ -9,6 +9,7 @@
 // dgVoodoo's thread, a frame or so behind, reads the slot the end marker names once it's published with that seq.
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 
 namespace hifi::zone
@@ -37,6 +38,20 @@ namespace hifi::zone
 		uint32_t door_env = 0;  // a door's bit-28 pieces' (the zone's ev10, renderer +0x50)
 		uint32_t zone = 0;      // whose data its model is in: 0 the zone's, 1 the second map's (an interior)
 	};
+
+	// How much of a sun or moon that follows the time of day (its record's flag bit 0 clear, as 187720 tests it) to light
+	// by, from how high it is (up: toward it, y down, so -y): none on the horizon, all of it from kHorizonFade up (about
+	// 20 Vana'diel minutes from it). The game swaps the moon for the sun there at 6:00 and back at 18:00, from one side
+	// of the sky to the other in about half a second (187720: 10% of the way a frame, its colour x0.7 a frame while far
+	// off); faded out before and in after, the swap isn't seen (2026-11-02: Giddeus turned yellow at once at 6:00).
+	constexpr float kHorizonFade = 0.1f;
+	inline float horizon_fade(float up)
+	{
+		if (!std::isfinite(up))
+			return 1.0f;
+		const float t = up <= 0.0f ? 0.0f : up >= kHorizonFade ? 1.0f : up / kHorizonFade;
+		return t * t * (3.0f - 2.0f * t);
+	}
 
 	// A lighting environment: the sun, ambient and fog an object is lit and fogged by (17C9C0 17D3F6..: the zone's own
 	// from the renderer, an area's from its environment object)
@@ -81,6 +96,8 @@ namespace hifi::zone
 		float ambient_bump[3];          // c7 (+0x394E0)
 		float fog[3];                   // FOGCOLOR (+0x39254)
 		float fog_start = 0.0f, fog_end = 0.0f, fog_scale = 1.0f; // +0x3925C, +0x39258, +0x3954C
+		float sun_fade = 1.0f;          // the share of the sun kept (horizon_fade; 1 for one fixed in the sky): sun and
+		                                // sun_bump are already times it, the characters' sun light isn't
 		// Environments 1.. (the fields above are environment 0)
 		uint32_t env_count = 1;
 		frame_env envs[kMaxEnvs];

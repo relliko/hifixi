@@ -13,6 +13,7 @@
 #include "../zone/light_split.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -41,6 +42,7 @@ namespace hifi::chars::inject
 			std::mutex sun_mutex;
 			bool sun_known = false;
 			float sun[3] = {};
+			float sun_fade = 1.0f;
 			uint32_t lamp_count = 0; // (and its lamps: set_lamps)
 			char_lamp lamps[kFrameLamps] = {};
 			std::atomic<double> clock { -1.0 }; // (the en-spells' time: below 0, the real one)
@@ -564,6 +566,7 @@ namespace hifi::chars::inject
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;
 			std::memcpy(o.sun, g.sun, sizeof(o.sun));
+			o.sun_fade = g.sun_fade;
 			o.lamp_count = g.lamp_count;
 			std::memcpy(o.lamps, g.lamps, sizeof(char_lamp) * g.lamp_count);
 		}
@@ -617,10 +620,11 @@ namespace hifi::chars::inject
 		g.n.overlays += g.last.overlays;
 	}
 
-	void set_sun(const float *toward)
+	void set_sun(const float *toward, float fade)
 	{
 		std::lock_guard<std::mutex> lock(g.sun_mutex);
 		g.sun_known = toward != nullptr;
+		g.sun_fade = toward != nullptr && std::isfinite(fade) ? std::clamp(fade, 0.0f, 1.0f) : 1.0f;
 		for (int i = 0; i < 3; ++i)
 			g.sun[i] = toward != nullptr ? toward[i] : 0.0f;
 	}
@@ -704,6 +708,7 @@ namespace hifi::chars::inject
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;
 			std::memcpy(o.sun, g.sun, sizeof(o.sun));
+			o.sun_fade = g.sun_fade;
 			o.lamp_count = g.lamp_count;
 			std::memcpy(o.lamps, g.lamps, sizeof(char_lamp) * g.lamp_count);
 		}

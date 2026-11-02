@@ -71,6 +71,7 @@ namespace hifi::game::zonedraw
 		constexpr const char *kAmbientCall = "8B8D389103008DB5309303006A0056E8";                     // 17D5E8, call 188E00 at +0xF
 		constexpr const char *kBrightCall = "B91A0000008D7C242CF3A58B0D????????8D44242C50E8";         // 17D46E: the wrapper's global at +0xD, call 00BE50 at +0x16
 		constexpr const char *kSwayCall = "8B436885C07408568BCDE8";                                  // 17DA74, call 17A3F0 at +0xA
+		constexpr const char *kEnvGlobal = "A1????????83EC24568B701885";                             // 03D9A0, the global at +1
 
 		using fog_fn = void(__fastcall *)(uintptr_t env, uintptr_t, uint32_t *colour, float *end, float *start, int kind);
 		using light_fn = void(__fastcall *)(uintptr_t env, uintptr_t, void *light, int kind);
@@ -141,6 +142,8 @@ namespace hifi::game::zonedraw
 			if (const uintptr_t b = find(kBrightCall); b != 0)
 				c.wrapper_at = word(b + 0xD);
 			c.sway = call_at(kSwayCall, 0xA);
+			if (const uintptr_t e = find(kEnvGlobal); e != 0)
+				c.env_global = word(e + 1);
 			return c;
 		}
 
@@ -219,6 +222,23 @@ namespace hifi::game::zonedraw
 			return std::isfinite(s) && s > 0.0f ? s : 1.0f;
 		}
 
+		// How much of an environment's sun to keep (zone::horizon_fade): 1 unless its record has it follow the time of day
+		// (flag bit 0 clear: 187720 works its direction out from the hour then)
+		float sun_fade(uintptr_t env, const float toward_sun[3])
+		{
+			uint32_t record = 0;
+			uint8_t flags = 1;
+			if (env == 0 || !read(env + 0x18, record) || record == 0 || !read(record, flags) || (flags & 1) != 0)
+				return 1.0f;
+			return zone::horizon_fade(-toward_sun[1]);
+		}
+
+		void scale3(float v[3], float k)
+		{
+			for (int i = 0; i < 3; ++i)
+				v[i] *= k;
+		}
+
 		// The pass's light and camera, as 17B510 left them in the renderer
 		void snapshot(zone::frame &f, uintptr_t r)
 		{
@@ -246,6 +266,10 @@ namespace hifi::game::zonedraw
 				std::memcpy(f.sun_bump, f.sun, 12);
 				std::memcpy(f.ambient_bump, f.ambient, 12);
 			}
+			// (the zone's own environment's sun faded about the horizon, its swap between sun and moon unseen)
+			f.sun_fade = sun_fade(g.calls.env_global != 0 ? word(g.calls.env_global) : 0, f.sun_dir);
+			scale3(f.sun, f.sun_fade);
+			scale3(f.sun_bump, f.sun_fade);
 		}
 
 		// An environment's index in the pass's frame (0 the zone's own), worked out at its first use; kNone when there's
@@ -273,6 +297,9 @@ namespace hifi::game::zonedraw
 			std::memcpy(bright, light, 0x68);
 			reinterpret_cast<bright_fn>(g.calls.bright)(at<uint32_t>(g.calls.wrapper_at), 0, bright);
 			std::memcpy(e.sun_bump, bright + 4, 12);
+			const float fade = sun_fade(env, e.sun_dir);
+			scale3(e.sun, fade);
+			scale3(e.sun_bump, fade);
 			float c7[4] = {};
 			reinterpret_cast<c7_fn>(g.calls.c7)(env, 0, c7);
 			std::memcpy(e.ambient_bump, c7, 12);

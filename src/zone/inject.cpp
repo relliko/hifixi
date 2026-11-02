@@ -408,6 +408,7 @@ namespace hifi::zone::inject
 			g.camera.jitter[0] = f->jitter[0];
 			g.camera.jitter[1] = f->jitter[1];
 			std::memcpy(g.camera.sun_dir, f->sun_dir, sizeof(g.camera.sun_dir));
+			g.camera.sun_fade = f->sun_fade;
 			g.camera.seq = f->seq.load(std::memory_order_acquire);
 			g.camera.at = GetTickCount64();
 			g.have_camera = true;

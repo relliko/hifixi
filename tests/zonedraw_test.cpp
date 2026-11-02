@@ -11,6 +11,8 @@
  *     the pass's light, camera and fog from the renderer at its end, published under its seq;
  *   - area environments through stand-ins for the game's calls (worked out once a pass, each its own index), a swaying
  *     plant's keyframe from the game's sway clock (run once for it), an object of the second map from that map's data;
+ *   - the sun about the horizon (zone::horizon_fade): faded where its environment's record has it follow the time of
+ *     day (the zone's own and an area's), kept where the record fixes it in the sky;
  *   - the doors' site at 183E47 and its exit 1844A9: its stub run as 183DA0 would reach it (esi the renderer, ebp the
  *     part, the model at esp+10h, the light table at esp+2Ch): a door part recorded (the door flag, bit-28 pieces lit by
  *     renderer +0x50's environment with the zone's fog start and end), or back to the game with eax = part +0xE4;
@@ -425,6 +427,50 @@ int main()
 		zd::on_slot(1, 26, R);
 		f = hifi::zone::published(26 & 15);
 		check(f != nullptr && f->count == 1 && f->objects[0].zone == 0 && f->second == nullptr, "  (zone 0, no second map's data)");
+
+		// The sun about the horizon: the zone's own 0.05 up (half of it kept), the area's on it (none), ev10's fixed by its
+		// record (all of it)
+		check(hifi::zone::horizon_fade(0.0f) == 0.0f && hifi::zone::horizon_fade(-0.3f) == 0.0f && hifi::zone::horizon_fade(0.1f) == 1.0f &&
+				  hifi::zone::horizon_fade(0.8f) == 1.0f && std::fabs(hifi::zone::horizon_fade(0.05f) - 0.5f) < 1e-6f &&
+				  hifi::zone::horizon_fade(std::nanf("")) == 1.0f,
+			"horizon_fade: none on the horizon or under it, all of it from 0.1 up, half at 0.05");
+		{
+			std::vector<uint8_t> env_own(0x200), by_hour(0x10, 0), fixed(0x10, 1);
+			uint32_t own_global = uint32_t(uintptr_t(env_own.data()));
+			put<uint32_t>(env_own, 0x18, uint32_t(uintptr_t(by_hour.data())));
+			put<uint32_t>(env_a, 0x18, uint32_t(uintptr_t(by_hour.data())));
+			put<uint32_t>(env_door, 0x18, uint32_t(uintptr_t(fixed.data())));
+			const zd::game_calls before = zd::calls();
+			zd::game_calls c = before;
+			c.env_global = uintptr_t(&own_global);
+			zd::set_calls(c);
+			put<float>(ren, 0x391C0, -std::sqrt(1.0f - 0.0025f));
+			put<float>(ren, 0x391C4, 0.05f); // (shining down a little: toward it 0.05 up)
+			put<uint32_t>(ren, 0x50, ED);
+			zd::set_state(true, &gz, nullptr, true);
+			zd::on_slot(0, 27, R);
+			check(run(MK, OA, R, T, 0) == 2 && run_door(MK, O, R, T) == 2, "a pass with the sun near the horizon: an area's object and a door recorded");
+			zd::on_slot(1, 27, R);
+			f = hifi::zone::published(27 & 15);
+			check(f != nullptr && f->env_count == 3, "  published: 2 area environments");
+			if (f != nullptr && f->env_count == 3)
+			{
+				check(std::fabs(f->sun_fade - 0.5f) < 1e-6f && std::fabs(f->sun[0] - 0.625f) < 1e-6f && std::fabs(f->sun_bump[0] - 0.45f) < 1e-6f &&
+						  std::fabs(-f->sun_dir[1] - 0.05f) < 1e-6f,
+					"  the zone's own sun by the hour, 0.05 up: half of it (" + std::to_string(f->sun[0]) + ")");
+				const hifi::zone::frame_env &a = f->envs[f->objects[0].env], &d = f->envs[f->objects[1].door_env];
+				check(a.sun[0] == 0.0f && a.sun[1] == 0.0f && a.sun_bump[0] == 0.0f && a.ambient_bump[2] == 0.375f,
+					"  the area's by the hour, on the horizon: none of it (its ambient kept)");
+				const float red = float(ED % 1000) / 1000.0f;
+				check(d.sun[0] == red && d.sun_bump[0] == red + 0.5f, "  ev10's fixed by its record: all of it");
+			}
+			zd::set_calls(before);
+			put<float>(ren, 0x391C0, 0.0f);
+			put<float>(ren, 0x391C4, 2.0f);
+			put<uint32_t>(ren, 0x50, 0);
+			put<uint32_t>(env_a, 0x18, 0);
+			put<uint32_t>(env_door, 0x18, 0);
+		}
 
 		// Passes the gate keeps
 		zd::set_state(false, &gz, nullptr, true);
