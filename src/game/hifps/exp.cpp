@@ -4,8 +4,8 @@
  * own d3d8.dll. Its comments carried over where they still hold. (docs/frame-rate.md: what each saves, measured, and
  * why walls, sse and the device proxy went.)
  *
- * Frame-time toggles, each on in every preset; each one puts back what it changed when turned off, when hifps's frame
- * step goes off (hifps::on()) and on stop(). None of them changes the game step.
+ * Frame-time toggles, off by default (experimental: no preset turns one on); each one puts back what it changed when
+ * turned off, when hifps's frame step goes off (hifps::on()) and on stop(). None of them changes the game step.
  *   ashita    Ashita's device wrapper hands every draw call to every plugin, and the addons plugin looks the event up
  *             in every loaded addon, about 3,000 times a frame although no addon here handles d3d_dp/dip/dpup/dipup.
  *             Skips that (those four events stop firing). Before turning on it reads the loaded addons' Lua files

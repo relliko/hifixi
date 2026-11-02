@@ -1,7 +1,9 @@
 # The frame rate's speed-ups on HiFi XI's own d3d8.dll (branch dev-fps, 2026-11-02)
 
-The old hifps addon's experimental speed-ups were built to cut dgVoodoo's and Ashita's per-call cost. Since 0.11 they
-have been on in every preset, so every player runs them. HiFi XI now ships its own `d3d8.dll`. This branch measures
+The old hifps addon's experimental speed-ups were built to cut dgVoodoo's and Ashita's per-call cost. From 0.11 to
+0.64 they were on in every preset, so every player ran them. On 2026-11-02 Alex made them off by default: no preset
+turns one on, and each player's were turned off once (`speedups_off_once`, backend.cpp). A player can still turn each
+on by hand. HiFi XI now ships its own `d3d8.dll`. This branch measures
 what each one still saves, keeps the ones that pay in the simplest place, and removes the rest. The goal is fewer risky
 layers under the GPU hangs players report (DXGI_ERROR_DEVICE_HUNG). None of these speed-ups is shown to cause those
 hangs: they stop inside HiFi XI's own zone pass setup (memory: crash audit 11-01). The reports now also say what the
@@ -102,9 +104,10 @@ Game thread CPU a frame, microseconds (GPU: RTX 4070 Ti; CPU: i7-13700K; 8 round
     shader and texture; turning batch off draws the waiting quads at once.
 
 **The trade-off.** The proxy sat above Ashita's wrapper, so Ashita only saw the merged draws. Batching in the d3d8.dll
-happens below it, so Ashita's per-draw plugin dispatch sees every quad again, unless `ashita` is on (it is, in every
-preset). With `ashita` refused (a loaded addon or plugin uses `d3d_dp`/`dip`/`dpup`/`dipup`) that dispatch comes back
-for about 600 to 1,700 quads a frame. client-notes estimates it at 2 to 3 ms for 3,000 draws with 28 addons, so roughly
+happens below it, so Ashita's per-draw plugin dispatch sees every quad again, unless `ashita` is on too. Both are off by
+default now, so a player who turns batch on should turn `ashita` on with it. With `ashita` off or refused (a loaded addon
+or plugin uses `d3d_dp`/`dip`/`dpup`/`dipup`), Ashita dispatches all 600 to 1,700 quads a frame, which the proxy's
+merge used to spare it. client-notes estimates that dispatch at 2 to 3 ms for 3,000 draws with 28 addons, so roughly
 0.5 to 1.5 ms a frame (inferred, not measured).
 
 ## The characters' visibility test: one path
@@ -177,9 +180,10 @@ and compare the main thread's share in Ashita.dll and addons.dll.
 
 ## What players' reports now say
 
-- **hifixi.log**, at start and whenever it changes:
-  `HiFi XI: frame rate: frame step unlocked (N call sites), cap 240 fps; speed-ups on: ashita, occlusion (every frame:
-  VisTest answers the characters' test), batch, dedupe; off: none`. A refused toggle names why.
+- **hifixi.log**, at start and whenever it changes. By default:
+  `HiFi XI: frame rate: frame step unlocked (N call sites), cap 240 fps; speed-ups on: none; off: ashita, occlusion,
+  batch, dedupe`. With some turned on, e.g. `on: occlusion (every frame: VisTest answers the characters' test), batch;
+  off: ...`. A refused toggle names why.
 - **worldfx-gpu-crash.txt**: a section `The frame rate at that moment: ...` (`gpu_crash::add_section`), with the frame
   rate then.
 - **hifixi-hang.txt**: the same line in the hang report's context (`src/plugin/hangwatch.cpp`).
@@ -194,7 +198,8 @@ under a lock they wait on for 50 ms at most.
 
 - `src/game/hifps/step.cpp` (the frame step) was only reviewed, lightly: signature-resolved sites, only its own bytes
   put back, everything on the game's thread. Nothing was found to change.
-- The defaults: every speed-up that stays is on in every preset, as Alex decided.
+- The defaults are Alex's (2026-11-02, from the stability session): every speed-up is off by default and no preset
+  turns one on. This branch builds on that; the measurements above say what each is worth when turned on.
 - `exp_walls` and `exp_sse` left in an old settings file are ignored.
 - The one-time import of hifps's settings.lua still copies them; nothing reads them.
 
