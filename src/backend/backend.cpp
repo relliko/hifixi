@@ -17,6 +17,7 @@
 #include "../host/frameapi.hpp"
 #include "../host/shadercache.hpp"
 #include "../render/worldfx_core.hpp"
+#include "../render/gpu_crash.hpp"
 #include <share.h>
 #include <algorithm>
 #include <atomic>
@@ -57,7 +58,8 @@ namespace hifi::backend
 		std::atomic<void (*)(int, const char *)> g_log_sink { nullptr };
 		std::atomic<uint64_t> g_presents { 0 };
 
-		// The log: hifixi.log in the folder, started afresh each run, written as it comes (a crash keeps it)
+		// The log: hifixi.log in the folder, started afresh each run, written as it comes (a crash keeps it); the last run's
+		// kept as hifixi.previous.log (after a crash or a hang the game is started again before anyone sends the log)
 		std::mutex log_mutex;
 		FILE *log_file = nullptr;
 		bool log_tried = false;
@@ -69,6 +71,7 @@ namespace hifi::backend
 				if (!log_tried && !g_folder.empty())
 				{
 					log_tried = true;
+					MoveFileExW((g_folder + L"hifixi.log").c_str(), (g_folder + L"hifixi.previous.log").c_str(), MOVEFILE_REPLACE_EXISTING);
 					log_file = _wfsopen((g_folder + L"hifixi.log").c_str(), L"w", _SH_DENYWR);
 				}
 				if (log_file != nullptr)
@@ -836,8 +839,17 @@ namespace hifi::backend
 	{
 		// The direct channel's marks (src/host/frameapi.hpp): our d3d8.dll calls this on its list where the game side
 		// marks one of its passes
+		// (our d3d8.dll's HifiFrameSetWorldFormat; nullptr: an older one, the world stays 8-bit)
+		hifi_frame_set_world_format_fn g_set_world_format = nullptr;
+
 		void __cdecl on_frame_mark(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *fm)
 		{
+			// (the device removed: none of HiFi XI's passes recorded again; the game's own lists go on as d3d8.dll has them)
+			if (gpu_crash::lost())
+				return;
+			// (the world's format as the setting has it: d3d8.dll changes it at the next zone's begin mark)
+			if (g_set_world_format != nullptr)
+				g_set_world_format(worldfx::float_world() ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
 			// (the world's end comes with the resolve's targets bound, often no depth; every other mark is on a depth)
 			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || (fm->dsv.ptr == 0 && kind != slotmark::world_end))
 				return;
@@ -864,6 +876,7 @@ namespace hifi::backend
 			const auto set = d3d8 != nullptr ? reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(d3d8, kHifiFrameSetHandler)) : nullptr;
 			if (set == nullptr)
 				return false;
+			g_set_world_format = on ? reinterpret_cast<hifi_frame_set_world_format_fn>(GetProcAddress(d3d8, kHifiFrameSetWorldFormat)) : nullptr;
 			set(on ? &on_frame_mark : nullptr, nullptr);
 			return true;
 		}
@@ -901,10 +914,14 @@ namespace hifi::backend
 		write_log(direct ? 0 : 2, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
 			"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: its passes (native zone and characters, World FX, FSR) can't be placed and stay off; "
 			"HiFi XI needs its own d3d8.dll in bootloader");
-		// (frame generation: the d3d8.dll's swap chain made as AMD's, when the setting's on as the game starts)
+		// (frame generation: the d3d8.dll's swap chain made as AMD's, when the setting's on as the game starts, and FSR too:
+		// generation runs only on FSR's frames, so without it AMD's swap chain would only stand in the way of each present)
 		{
-			std::string on;
-			framegen::set_wanted(option("upscale", "framegen", on) && on != "0" && _stricmp(on.c_str(), "false") != 0);
+			const auto on = [](const char *key, bool by_default) {
+				std::string v;
+				return option("upscale", key, v) ? v != "0" && _stricmp(v.c_str(), "false") != 0 : by_default;
+			};
+			framegen::set_wanted(on("framegen", false) && on("fsr", true));
 		}
 		if (framegen::wanted())
 		{
@@ -968,7 +985,7 @@ namespace hifi::backend
 			write_log(0, "HiFi XI: World FX attached to the game's device");
 		}
 		ID3D12CommandQueue *const queue = g_queue.load(std::memory_order_acquire);
-		if (queue == nullptr)
+		if (queue == nullptr || gpu_crash::lost()) // (the device removed: World FX's own uploads and lists not sent)
 			return;
 		host::quiet q;
 		worldfx::on_present(queue);

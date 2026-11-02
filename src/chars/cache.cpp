@@ -516,12 +516,49 @@ namespace hifi::chars::cache
 					e->s = state::uploading;
 				lock.unlock();
 				double decode_ms = 0.0, upload_ms = 0.0;
+				// (anything thrown, out of memory in the 32-bit game: that entry failed, the thread goes on; an exception
+				// leaving a thread ends the game)
+				const auto thrown = [](const char *what) {
+					std::lock_guard<std::mutex> failure(g.mutex);
+					g.n.last_failure = std::string(what) + ": out of memory (or the decoder threw)";
+				};
 				for (mesh_entry *e : decode_m)
-					decode_mesh(*e, decode_ms);
+					try
+					{
+						decode_mesh(*e, decode_ms);
+					}
+					catch (...)
+					{
+						e->decoded = os2::mesh();
+						std::vector<uint8_t>().swap(e->raw);
+						e->vertices = e->corners = 0;
+						e->s = state::failed;
+						thrown("a mesh");
+					}
 				for (texture_entry *e : decode_t)
-					decode_texture(*e, decode_ms);
+					try
+					{
+						decode_texture(*e, decode_ms);
+					}
+					catch (...)
+					{
+						e->decoded = tex::texture();
+						e->detail = tex::texture();
+						std::vector<uint8_t>().swap(e->raw);
+						e->s = state::failed;
+						thrown("a texture");
+					}
 				std::string why;
-				const bool uploaded = (b.meshes.empty() && b.textures.empty()) || upload(b, upload_ms, why);
+				bool uploaded = b.meshes.empty() && b.textures.empty();
+				if (!uploaded)
+					try
+					{
+						uploaded = upload(b, upload_ms, why);
+					}
+					catch (...)
+					{
+						why = "an upload: out of memory (or it threw)";
+					}
 				// The views, still outside the lock (the entries are the worker's until they're marked)
 				if (uploaded)
 				{

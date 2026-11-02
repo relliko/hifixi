@@ -95,7 +95,17 @@ namespace hifi::fx::textures
 				entry &e = g.entries[id];
 				chars::tex::texture t;
 				std::string why;
-				const bool ok = chars::tex::decode(e.chunk.data(), e.chunk.size(), t, why) && !t.levels.empty();
+				// (anything thrown, out of memory in the 32-bit game: that texture failed, the thread goes on; an exception
+				// leaving a thread ends the game)
+				bool ok = false;
+				try
+				{
+					ok = chars::tex::decode(e.chunk.data(), e.chunk.size(), t, why) && !t.levels.empty();
+				}
+				catch (...)
+				{
+					t = chars::tex::texture();
+				}
 				e.chunk.clear();
 				e.chunk.shrink_to_fit();
 				if (ok)

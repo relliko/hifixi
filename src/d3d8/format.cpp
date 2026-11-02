@@ -400,6 +400,113 @@ namespace hifi::d3d8
 		}
 	}
 
+	float half_to_float(uint16_t h)
+	{
+		const uint32_t sign = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 31, m = h & 1023;
+		uint32_t bits;
+		if (e == 0)
+		{
+			if (m == 0)
+				bits = sign;
+			else
+			{
+				// (a subnormal: shifted up until it's normal)
+				uint32_t mm = m, ee = 113;
+				while ((mm & 1024) == 0)
+				{
+					mm <<= 1;
+					ee--;
+				}
+				bits = sign | ee << 23 | (mm & 1023) << 13;
+			}
+		}
+		else if (e == 31)
+			bits = sign | 0x7F800000 | m << 13;
+		else
+			bits = sign | (e + 112) << 23 | m << 13;
+		float f;
+		std::memcpy(&f, &bits, 4);
+		return f;
+	}
+
+	uint16_t float_to_half(float f)
+	{
+		uint32_t bits;
+		std::memcpy(&bits, &f, 4);
+		const uint16_t sign = uint16_t((bits >> 16) & 0x8000);
+		const uint32_t abs = bits & 0x7FFFFFFF;
+		if (abs >= 0x7F800000)
+			return uint16_t(sign | 0x7C00 | (abs > 0x7F800000 ? 0x200 : 0)); // (infinity, NaN)
+		if (abs >= 0x477FF000)
+			return uint16_t(sign | 0x7C00); // (past the largest half)
+		if (abs < 0x38800000)
+		{
+			// (a subnormal half, or zero)
+			if (abs < 0x33000000)
+				return sign;
+			const uint32_t e = abs >> 23, m = (abs & 0x7FFFFF) | 0x800000;
+			const uint32_t shift = 126 - e;
+			uint32_t v = m >> shift;
+			const uint32_t rest = m & ((1u << shift) - 1), half_way = 1u << (shift - 1);
+			if (rest > half_way || (rest == half_way && (v & 1) != 0))
+				v++;
+			return uint16_t(sign | v);
+		}
+		uint32_t v = ((abs >> 23) - 112) << 10 | (abs >> 13 & 1023);
+		const uint32_t rest = abs & 0x1FFF;
+		if (rest > 0x1000 || (rest == 0x1000 && (v & 1) != 0))
+			v++;
+		return uint16_t(sign | v);
+	}
+
+	void half_to_rgba8(const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h)
+	{
+		for (UINT y = 0; y < h; ++y)
+		{
+			const uint8_t *s = src + size_t(y) * src_pitch;
+			uint8_t *o = dst + size_t(y) * dst_pitch;
+			for (UINT x = 0; x < w * 4; ++x)
+			{
+				uint16_t v;
+				std::memcpy(&v, s + size_t(x) * 2, 2);
+				const float f = half_to_float(v);
+				o[x] = uint8_t(f > 0.0f ? (f < 1.0f ? UINT(f * 255.0f + 0.5f) : 255u) : 0u); // (NaN: 0)
+			}
+		}
+	}
+
+	void rgba8_to_half(const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h)
+	{
+		for (UINT y = 0; y < h; ++y)
+		{
+			const uint8_t *s = src + size_t(y) * src_pitch;
+			uint8_t *o = dst + size_t(y) * dst_pitch;
+			for (UINT x = 0; x < w * 4; ++x)
+			{
+				const uint16_t v = float_to_half(float(s[x]) / 255.0f);
+				std::memcpy(o + size_t(x) * 2, &v, 2);
+			}
+		}
+	}
+
+	void from_target(DXGI_FORMAT view, D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h)
+	{
+		if (view != kFloatTargetView)
+			return from_target(f, src, src_pitch, dst, dst_pitch, w, h);
+		std::vector<uint8_t> rgba(size_t(w) * h * 4);
+		half_to_rgba8(src, src_pitch, rgba.data(), w * 4, w, h);
+		from_target(f, rgba.data(), w * 4, dst, dst_pitch, w, h);
+	}
+
+	void to_target(DXGI_FORMAT view, D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h)
+	{
+		if (view != kFloatTargetView)
+			return to_target(f, src, src_pitch, dst, dst_pitch, w, h);
+		std::vector<uint8_t> rgba(size_t(w) * h * 4);
+		to_target(f, src, src_pitch, rgba.data(), w * 4, w, h);
+		rgba8_to_half(rgba.data(), w * 4, dst, dst_pitch, w, h);
+	}
+
 	void decode_dxt(D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h)
 	{
 		const UINT bw = (w + 3) / 4, bh = (h + 3) / 4, bytes = info(f).block_bytes;

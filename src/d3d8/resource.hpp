@@ -70,6 +70,7 @@ namespace hifi::d3d8
 			UINT sub = 0, x = 0, y = 0, w = 0, h = 0, row_pitch = 0;
 			D3DFORMAT from = D3DFMT_UNKNOWN; // the source's format
 			bool target = false;             // from a render target (RGBA8): converted
+			DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN; // (that target's GPU format: RGBA16F rows converted through RGBA8)
 		};
 		std::vector<pending_read> reads;
 
@@ -88,6 +89,10 @@ namespace hifi::d3d8
 		bool lockable() const { return kind != image_kind::depth; }
 		ID3D12Resource *sample_resource(); // the single-sample texture to read (a multisampled target resolved first)
 		void drop_gpu();
+		// A colour target (one face, one level) made again in another GPU format (kTargetView or kFloatTargetView), its
+		// views rewritten in the same descriptors, so what holds them goes on working; its pixels start black. The old
+		// texture is let go once the GPU is past it. False (nothing changed) for anything else.
+		bool retarget(DXGI_FORMAT view);
 	};
 
 	// IDirect3DResource8's shared part

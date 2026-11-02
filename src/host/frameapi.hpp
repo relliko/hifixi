@@ -30,7 +30,13 @@ struct hifi_frame_mark
 using hifi_frame_handler = void(__cdecl *)(void *context, uint32_t kind, uint32_t seq, const hifi_frame_mark *m);
 using hifi_frame_set_handler_fn = void(__cdecl *)(hifi_frame_handler handler, void *context);
 using hifi_frame_mark_fn = int(__cdecl *)(uint32_t kind, uint32_t seq);
+// HifiFrameSetWorldFormat(view): the GPU format the world's target is to be in (DXGI_FORMAT_R16G16B16A16_FLOAT: the float
+// world, light past white; DXGI_FORMAT_UNKNOWN or R8G8B8A8_UNORM: the game's 8 bits). d3d8.dll makes the target bound at
+// the next zone's begin mark again in it when it differs, before that mark's handler sees it (its pixels black that
+// frame), its views kept. Returns 0 for a format it doesn't make.
+using hifi_frame_set_world_format_fn = int(__cdecl *)(DXGI_FORMAT view);
 
 // (the exports' names in d3d8.dll)
 constexpr const char *kHifiFrameSetHandler = "HifiFrameSetHandler";
 constexpr const char *kHifiFrameMark = "HifiFrameMark";
+constexpr const char *kHifiFrameSetWorldFormat = "HifiFrameSetWorldFormat";

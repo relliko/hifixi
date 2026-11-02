@@ -55,6 +55,11 @@ namespace hifi::d3d8
 				std::wstring path = env(L"D3D8_LOG");
 				if (path.empty())
 					path = module_folder() + L"d3d8.log";
+				// (the last run's kept as d3d8.previous.log: after a crash or a hang the game is started again before
+				// anyone sends the log)
+				const size_t dot = path.rfind(L'.');
+				const std::wstring previous = (dot == std::wstring::npos ? path : path.substr(0, dot)) + L".previous.log";
+				MoveFileExW(path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING);
 				log_file = _wfsopen(path.c_str(), L"w", _SH_DENYWR);
 			}
 			if (log_file == nullptr)

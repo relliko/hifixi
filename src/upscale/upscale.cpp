@@ -14,6 +14,7 @@
 #include "../render/grass_render.hpp"
 #include "../zone/inject.hpp"
 #include "../render/worldfx_core.hpp"
+#include "../render/gpu_crash.hpp"
 #include "temporal.hpp"
 #include "masks.hpp"
 #include "fsr2_shaders.hpp"
@@ -607,6 +608,11 @@ namespace hifi::upscale
 	{
 		if (device == nullptr)
 			return false;
+		if (gpu_crash::lost())
+		{
+			why = "the GPU was lost";
+			return false;
+		}
 		UINT want_w = 0, want_h = 0, want_rw = 0, want_rh = 0;
 		bool want_v3 = false;
 		std::vector<DXGI_FORMAT> want_formats;
@@ -825,6 +831,8 @@ namespace hifi::upscale
 
 	void on_world_end(ID3D12GraphicsCommandList *list, ID3D12Resource *world, D3D12_RESOURCE_STATES state)
 	{
+		if (gpu_crash::lost()) // (nothing armed: nothing of FSR's recorded on a removed device)
+			return;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		per_list &l = g.lists[list];
 		l.world = world;

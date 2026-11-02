@@ -474,6 +474,19 @@ int main()
 		hifi::framegen::set_automatic(false);
 	}
 
+	// The device lost (the GPU hung): AMD's code not called again, the game's presents still go through
+	{
+		const counts before = counted();
+		hifi::framegen::device_lost();
+		uint32_t prepared = 0, presented = 0;
+		run(30, 1280, 720, false, prepared, presented);
+		const counts after = counted();
+		const std::vector<std::string> st = hifi::framegen::status();
+		check(prepared == 0 && presented == 30 && after.made == before.made && st.size() > 1 && st[1].find("stopped until the next start") != std::string::npos,
+			"the device lost: nothing prepared or made between, 30 frames still presented (" + std::to_string(prepared) + " prepared, " + std::to_string(presented) +
+			" presented, " + std::to_string(after.made - before.made) + " made)");
+	}
+
 	const uint32_t errors = debug_messages(info, why);
 	check(errors == 0, "no debug-layer errors" + (errors != 0 ? " (" + std::to_string(errors) + ", the first: " + why + ")" : std::string()));
 	chain->Release();

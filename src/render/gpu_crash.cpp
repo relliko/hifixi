@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <ctime>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -129,9 +130,11 @@ namespace gpu_crash
 			std::string (*context)() = nullptr;
 		};
 		watch_state *g_watch = nullptr;
+		std::atomic<bool> g_lost { false };
 
 		void CALLBACK on_removed(void *context, BOOLEAN)
 		{
+			g_lost.store(true);
 			const watch_state *const w = static_cast<const watch_state *>(context);
 			std::string text = report(w->device);
 			if (w->context != nullptr)
@@ -326,6 +329,11 @@ namespace gpu_crash
 		if (w->event != nullptr)
 			CloseHandle(w->event);
 		delete w;
+	}
+
+	bool lost()
+	{
+		return g_lost.load(std::memory_order_relaxed);
 	}
 
 	std::string gpu_name(ID3D12Device *device)

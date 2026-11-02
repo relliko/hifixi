@@ -159,6 +159,8 @@ namespace worldfx
 	// Our d3d8.dll's world end (src/host/frameapi.hpp, slotmark::world_end): the first draw or copy reading the world's
 	// target, before anything is bound for it. World FX draws into the world here.
 	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d);
+	// Whether the world is wanted as floats (the FloatWorld setting: light past white, our d3d8.dll asked for it at each mark)
+	bool float_world();
 	void on_clear_target(list_data &d, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects); // before
 	// The game side's zone marker (src/game/slotmark.hpp) through our d3d8.dll: the world is the target and depth bound
 	// there, through those views

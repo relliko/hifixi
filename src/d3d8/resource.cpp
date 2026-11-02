@@ -293,6 +293,59 @@ namespace hifi::d3d8
 		dsvs.clear();
 	}
 
+	bool image::retarget(DXGI_FORMAT view)
+	{
+		if (kind != image_kind::target || gpu.res == nullptr || view == gpu_format || faces != 1 || levels != 1 || rtvs.size() != 1 ||
+			(view != kTargetView && view != kFloatTargetView))
+			return false;
+		d3d8::gpu &g = dev->g;
+		D3D12_RESOURCE_DESC rd = gpu.res->GetDesc();
+		rd.Format = target_resource(view);
+		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+		ID3D12Resource *made = nullptr, *made_resolved = nullptr;
+		if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&made))))
+		{
+			log_once(2, "a %ux%u target couldn't be made again in format %u", width, height, unsigned(view));
+			return false;
+		}
+		if (resolved != nullptr)
+		{
+			D3D12_RESOURCE_DESC sd = rd;
+			sd.SampleDesc.Count = 1;
+			sd.SampleDesc.Quality = 0;
+			if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&made_resolved))))
+			{
+				made->Release();
+				return false;
+			}
+			g.defer_release(resolved);
+			resolved = made_resolved;
+		}
+		// (the old one may still be on lists the GPU hasn't finished)
+		g.defer_release(gpu.res);
+		gpu.res = made;
+		gpu.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		gpu_format = view;
+		D3D12_RENDER_TARGET_VIEW_DESC vd = {};
+		vd.Format = view;
+		vd.ViewDimension = rd.SampleDesc.Count > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+		g.device->CreateRenderTargetView(gpu.res, &vd, rtvs[0]);
+		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = view;
+		sd.Shader4ComponentMapping = target_mapping(format);
+		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sd.Texture2D.MipLevels = 1;
+		g.device->CreateShaderResourceView(resolved != nullptr ? resolved : gpu.res, &sd, srv);
+		g.forget_srv_table();
+		// (black, as a new target: what the game drew into the old one this frame is gone)
+		const float black[4] = {};
+		g.flush_barriers();
+		g.list()->ClearRenderTargetView(rtvs[0], black, 0, nullptr);
+		cpu_stale.assign(cpu_stale.size(), 1);
+		log(0, "a %ux%u target made again in format %u", width, height, unsigned(view));
+		return true;
+	}
+
 	image::~image()
 	{
 		for (pending_read &p : reads)
@@ -337,7 +390,7 @@ namespace hifi::d3d8
 				const UINT bpp = info(format).bpp != 0 ? info(format).bpp : 4;
 				uint8_t *dst = c.data() + size_t(p.y) * pt + size_t(p.x) * bpp;
 				if (p.target)
-					from_target(format, mapped, p.row_pitch, dst, pt, p.w, p.h);
+					from_target(p.view, format, mapped, p.row_pitch, dst, pt, p.w, p.h);
 				else
 					for (UINT y = 0; y < p.h; ++y)
 						std::memcpy(dst + size_t(y) * pt, mapped + size_t(y) * p.row_pitch, size_t(p.w) * bpp);
@@ -422,7 +475,7 @@ namespace hifi::d3d8
 		g.transition(gpu, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
 		g.transition(r, D3D12_RESOURCE_STATE_RESOLVE_DEST);
 		g.flush_barriers();
-		g.list()->ResolveSubresource(resolved, 0, gpu.res, 0, kTargetView);
+		g.list()->ResolveSubresource(resolved, 0, gpu.res, 0, gpu_format);
 		g.transition(r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		return resolved;
 	}
@@ -466,7 +519,7 @@ namespace hifi::d3d8
 		const D3D12_RANGE whole = { 0, SIZE_T(total) };
 		if (SUCCEEDED(rb.buffer->Map(0, &whole, reinterpret_cast<void **>(&mapped))))
 		{
-			from_target(format, mapped, fp.Footprint.RowPitch, cpu[sub].data(), pitch(level), level_width(level), level_height(level));
+			from_target(gpu_format, format, mapped, fp.Footprint.RowPitch, cpu[sub].data(), pitch(level), level_width(level), level_height(level));
 			const D3D12_RANGE none = { 0, 0 };
 			rb.buffer->Unmap(0, &none);
 		}
@@ -484,15 +537,15 @@ namespace hifi::d3d8
 		const UINT w = UINT(rc.right - rc.left), h = UINT(rc.bottom - rc.top);
 		if (w == 0 || h == 0)
 			return;
-		const UINT row = align_up(w * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+		const UINT row = align_up(w * target_bytes(gpu_format), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
 		upload_alloc a = g.upload(UINT64(row) * h, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
 		if (a.cpu == nullptr)
 			return;
 		const UINT bpp = info(format).bpp != 0 ? info(format).bpp : 4;
-		to_target(format, cpu[sub].data() + size_t(rc.top) * pitch(level) + size_t(rc.left) * bpp, pitch(level), a.cpu, row, w, h);
+		to_target(gpu_format, format, cpu[sub].data() + size_t(rc.top) * pitch(level) + size_t(rc.left) * bpp, pitch(level), a.cpu, row, w, h);
 		D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
 		fp.Offset = a.offset;
-		fp.Footprint.Format = kTargetView;
+		fp.Footprint.Format = gpu_format;
 		fp.Footprint.Width = w;
 		fp.Footprint.Height = h;
 		fp.Footprint.Depth = 1;

@@ -26,6 +26,21 @@ namespace grass
 				fn(list, world, state, when);
 		}
 
+		// How the world's copy is laid out for the shaders (grass.hlsl world_pixel, ground.w), by the world's format: 1
+		// RGBA8, 2 BGRA8, 3 RGBA16F (the float world our d3d8.dll makes when asked: light past white); 0 none it can read
+		constexpr uint32_t kWorldHalf = 3;
+		uint32_t world_kind(DXGI_FORMAT f)
+		{
+			if (f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+				return 1;
+			if (f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+				f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_B8G8R8X8_TYPELESS || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB)
+				return 2;
+			if (f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R16G16B16A16_TYPELESS)
+				return kWorldHalf;
+			return 0;
+		}
+
 		// Root parameters: 52 constants (b0), the blade buffer (t0), the copy of the world (t1), the actors
 		// near (t2; the water pass's parameters there) and the copy of the world's depth (t3), root SRVs, and
 		// the ground colours remembered (u0) and the sun's shadows (u1), root UAVs: no descriptor heap
@@ -2051,7 +2066,15 @@ namespace grass
 			std::atomic<size_t> next{ 0 };
 			const auto work = [&] {
 				for (size_t i; (i = next.fetch_add(1)) < kShaderEntryCount;)
-					failed[i] = !compile(source, kShaderEntries[i].entry, kShaderEntries[i].target, code.blobs[i], errors[i]);
+					try // (an exception leaving a thread ends the game)
+					{
+						failed[i] = !compile(source, kShaderEntries[i].entry, kShaderEntries[i].target, code.blobs[i], errors[i]);
+					}
+					catch (...)
+					{
+						failed[i] = 1;
+						errors[i] = std::string(kShaderEntries[i].entry) + ": out of memory compiling it (or the compiler threw)";
+					}
 			};
 			const size_t cores = std::thread::hardware_concurrency();
 			std::vector<std::thread> threads;
@@ -3288,14 +3311,13 @@ namespace grass
 		const look::look_pass &p = l.post;
 		auto finite = [](float v, float lo, float hi, float fallback) { return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback; };
 		const float bloom = finite(p.bloom, 0.0f, 2.0f, 0.0f);
-		if (l.phase == look::phase_t::blades || (!p.tonemap && bloom <= 0.0f && !p.grade))
-			return false;
 		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
-		const DXGI_FORMAT f = rt_desc.Format;
-		const bool rgba = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-		const bool bgra = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-			f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_B8G8R8X8_TYPELESS || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
-		if (!(rgba || bgra) || rt_desc.SampleDesc.Count != 1 || rt_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rt_desc.Width < 8 || rt_desc.Height < 8)
+		const uint32_t kind = world_kind(rt_desc.Format);
+		// (the float world is brought back to 0..1 here even with all of it off: past here, the upscaler and the game's
+		// resolve take the screen's values)
+		if (l.phase == look::phase_t::blades || (!p.tonemap && bloom <= 0.0f && !p.grade && kind != kWorldHalf))
+			return false;
+		if (kind == 0 || rt_desc.SampleDesc.Count != 1 || rt_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rt_desc.Width < 8 || rt_desc.Height < 8)
 			return false;
 		// The levels: a quarter of the world's width and height (rounded up), each next half of the one before
 		uint32_t sizes[kLookLevels][2] = {};
@@ -3397,7 +3419,7 @@ namespace grass
 		put(24, uint32_t(at[0]));
 		put(25, sizes[0][0]);
 		put(26, sizes[0][1]);
-		const uint32_t ground_info[4] = { pitch, static_cast<uint32_t>(rt_desc.Width), rt_desc.Height, rgba ? 1u : 2u };
+		const uint32_t ground_info[4] = { pitch, static_cast<uint32_t>(rt_desc.Width), rt_desc.Height, kind };
 		std::memcpy(&c[28], ground_info, sizeof(ground_info));
 
 		stats.bound = true;
@@ -5291,8 +5313,10 @@ namespace grass
 			vis = vis || (!only_blades && s.state == vis_slot::state_t::set);
 		// (the weather's parameters go to the passes with anything of it to draw, the grass's wind too)
 		const bool wx_any = wx_sky || shimmer || air_wanted || leaves || (grass && wx_wind > 0.0f);
-		// The look over the world as it ends (look::post), last of all; with nothing else of World FX's to draw, alone
-		const bool look_on = !only_blades && (l.post.tonemap || (std::isfinite(l.post.bloom) && l.post.bloom > 0.0f) || l.post.grade);
+		// The look over the world as it ends (look::post), last of all; with nothing else of World FX's to draw, alone (and
+		// always on the float world: it brings it back to 0..1, draw_look)
+		const bool look_on = !only_blades && (l.post.tonemap || (std::isfinite(l.post.bloom) && l.post.bloom > 0.0f) || l.post.grade ||
+			world_kind(t.rt->GetDesc().Format) == kWorldHalf);
 		auto look_alone = [&]() {
 			if (!look_on)
 				return stats;
@@ -5393,18 +5417,15 @@ namespace grass
 		_shade_end[_time_slot] = kTimingMarks;
 		section(list, L"worldfx: begin (copies of the world)");
 
-		// The world so far into a buffer, for the ground's colour under each blade (RGBA8/BGRA8, one sample)
+		// The world so far into a buffer, for the ground's colour under each blade (RGBA8/BGRA8/RGBA16F, one sample)
 		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
 		uint32_t ground_kind = 0, ground_pitch = 0;
-		const DXGI_FORMAT f = rt_desc.Format;
-		const bool rgba = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-		const bool bgra = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-			f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_B8G8R8X8_TYPELESS || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+		const uint32_t kind = world_kind(rt_desc.Format);
 		D3D12_RESOURCE_STATES rt_now = t.rt_state;
-		if ((rgba || bgra) && rt_desc.SampleDesc.Count == 1 && rt_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+		if (kind != 0 && rt_desc.SampleDesc.Count == 1 && rt_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
 			if ((ground_pitch = copy_out(list, _ground, t.rt, rt_now)) != 0)
 			{
-				ground_kind = rgba ? 1 : 2;
+				ground_kind = kind;
 				rt_now = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			}
 		transition(list, t.rt, rt_now, D3D12_RESOURCE_STATE_RENDER_TARGET);

@@ -780,6 +780,122 @@ int main(int argc, char **argv)
 					check(!l.post.grade, (what + "no grade").c_str());
 			}
 		}
+		// The float world (FloatWorld: our d3d8.dll keeps the world RGBA16F): the same values as the 8-bit one, but past 1
+		// where light adds up. A picture of 0.5 grey (left third), white (middle) and a ramp from 1 to 3 times white's value
+		// (right third), alpha 0.5 but the name's pixel (alpha 1/255, rgb 2). All off: brought back to 0..1 (grey and white
+		// as they went in within the dither's half step, the ramp white), the name's pixel left as drawn. The filmic curve
+		// (exposure held at 1): the ramp past white keeps its shading (rising from 1 to 1.5 times white's value, then white,
+		// never down) where an 8-bit world would have cut it at white
+		{
+			auto to_half = [](float f) {
+				uint32_t b;
+				std::memcpy(&b, &f, 4);
+				const uint32_t e = (b >> 23) & 255;
+				if (e < 113)
+					return uint16_t(0);
+				uint32_t v = (e - 112) << 10 | (b >> 13 & 1023);
+				v += (b & 0x1FFF) > 0x1000 || ((b & 0x1FFF) == 0x1000 && (v & 1)) ? 1 : 0;
+				return uint16_t(((b >> 16) & 0x8000) | v);
+			};
+			auto from_half = [](uint16_t h) {
+				const int e = (h >> 10) & 31, m = h & 1023;
+				const float v = e == 0 ? std::ldexp(float(m), -24) : std::ldexp(float(m | 1024), e - 25);
+				return (h & 0x8000) != 0 ? -v : v;
+			};
+			ID3D12Resource *fworld = g.texture(DXGI_FORMAT_R16G16B16A16_FLOAT, LW, LH, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+			ID3D12DescriptorHeap *frtv_heap = nullptr;
+			D3D12_DESCRIPTOR_HEAP_DESC fhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+			g.device->CreateDescriptorHeap(&fhd, IID_PPV_ARGS(&frtv_heap));
+			g.device->CreateRenderTargetView(fworld, nullptr, frtv_heap->GetCPUDescriptorHandleForHeapStart());
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT ffp = {};
+			UINT64 ftotal = 0;
+			const D3D12_RESOURCE_DESC fdesc = fworld->GetDesc();
+			g.device->GetCopyableFootprints(&fdesc, 0, 1, 0, &ffp, nullptr, nullptr, &ftotal);
+			ID3D12Resource *fup = g.buffer(D3D12_HEAP_TYPE_UPLOAD, ftotal, D3D12_RESOURCE_STATE_GENERIC_READ);
+			target ft = lt;
+			ft.rt = fworld;
+			ft.rtv = frtv_heap->GetCPUDescriptorHandleForHeapStart();
+			ft.rtv_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			auto value_at = [&](UINT x) { return x < LW / 3 ? 0.5f : x < 2 * LW / 3 ? 1.0f : 1.0f + 2.0f * float(x - 2 * LW / 3) / float(LW - 1 - 2 * LW / 3); };
+			auto ffr = [&](const look &l) {
+				void *m = nullptr;
+				fup->Map(0, nullptr, &m);
+				for (UINT y = 0; y < LH; ++y)
+					for (UINT x = 0; x < LW; ++x)
+					{
+						const bool name = x == name_x && y == name_y;
+						const float v = name ? 2.0f : value_at(x);
+						uint16_t *q = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(m) + ffp.Offset + size_t(y) * ffp.Footprint.RowPitch + size_t(x) * 8);
+						q[0] = q[1] = q[2] = to_half(v);
+						q[3] = to_half(name ? 1.0f / 255.0f : 0.5f);
+					}
+				fup->Unmap(0, nullptr);
+				barrier(g.list, fworld, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+				D3D12_TEXTURE_COPY_LOCATION dst = { fworld, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+				dst.SubresourceIndex = 0;
+				D3D12_TEXTURE_COPY_LOCATION src = { fup, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+				src.PlacedFootprint = ffp;
+				g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+				barrier(g.list, fworld, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				std::string e;
+				const draw_stats s = lr.draw(g.list, ft, lcam, l, e);
+				if (!e.empty())
+					std::printf("  draw: %s\n", e.c_str());
+				last_levels = s.look ? s.look_levels : 0;
+				barrier(g.list, fworld, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				const std::vector<uint8_t> raw = g.read(fworld, 8);
+				barrier(g.list, fworld, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				g.run();
+				lr.release_old(2);
+				std::vector<float> out(size_t(LW) * LH * 4);
+				for (size_t i = 0; i < out.size(); ++i)
+					out[i] = from_half(uint16_t(raw[i * 2] | raw[i * 2 + 1] << 8));
+				return out;
+			};
+			auto fpx = [&](const std::vector<float> &p, UINT x, UINT y, int c) { return p[(size_t(y) * LW + x) * 4 + c]; };
+			{
+				const std::vector<float> out = ffr(bare());
+				float grey_off = 0.0f, white_off = 0.0f, ramp_low = 1.0f, most = 0.0f;
+				for (UINT y = LH / 4; y < LH * 3 / 4; ++y)
+					for (UINT x = 0; x < LW; ++x)
+					{
+						const float v = fpx(out, x, y, 1);
+						most = std::max(most, v);
+						if (x < LW / 3)
+							grey_off = std::max(grey_off, std::fabs(v - 0.5f));
+						else if (x < 2 * LW / 3)
+							white_off = std::max(white_off, std::fabs(v - 1.0f));
+						else
+							ramp_low = std::min(ramp_low, v);
+					}
+				char line[200];
+				std::snprintf(line, sizeof(line), "L: float world, all off: back to 0..1 (grey off by %.4f, white by %.4f, the ramp at least %.4f, the most %.4f)",
+					grey_off, white_off, ramp_low, most);
+				check(grey_off <= 0.7f / 255.0f && white_off <= 0.7f / 255.0f && ramp_low >= 1.0f - 0.7f / 255.0f && most <= 1.0f, line); // (the dither's half step and a half's own step)
+				check(std::fabs(fpx(out, name_x, name_y, 0) - 2.0f) < 0.01f && std::fabs(fpx(out, name_x, name_y, 3) * 255.0f - 1.0f) < 0.01f,
+					"L: float world: the name's pixel (alpha 1 of 255) left as drawn, past white and all");
+			}
+			{
+				look l = bare();
+				l.post.tonemap = true;
+				l.post.exposure_min = l.post.exposure_max = 1.0f;
+				l.post.snap = true;
+				const std::vector<float> out = ffr(l);
+				auto at = [&](float v) {
+					UINT x = 2 * LW / 3;
+					while (x + 1 < LW && value_at(x) < v)
+						++x;
+					return fpx(out, x, LH / 2, 1);
+				};
+				const float w1 = at(1.0f), w15 = at(1.5f), w2 = at(2.0f), w3 = at(3.0f);
+				char line[200];
+				std::snprintf(line, sizeof(line), "L: float world, filmic: past white keeps its shading (1x %.3f, 1.5x %.3f, 2x %.3f, 3x %.3f)", w1, w15, w2, w3);
+				check(w15 > w1 + 3.0f / 255.0f && w2 >= w15 - 0.6f / 255.0f && w3 >= w2 - 0.6f / 255.0f && w3 <= 1.0f && w1 >= 238.0f / 255.0f, line);
+			}
+			release(fup);
+			release(frtv_heap);
+			release(fworld);
+		}
 		check(g.report_messages() == 0, "L: no debug-layer errors (the look)");
 		release(up);
 		release(lrtv_heap);

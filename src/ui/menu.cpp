@@ -1007,7 +1007,10 @@ namespace hifi::ui
 			for (const auto &[e, text] : g_at_start)
 				if (entry_text(*e) != text)
 					labels.push_back(e->label);
-			if (const settings::entry *fg = settings::find("upscale.framegen"); fg != nullptr && option_value(*fg) >= 0.5f && !framegen::wanted())
+			// (AMD's swap chain is put in at the start only with FSR on as well)
+			const settings::entry *fsr = settings::find("upscale.fsr");
+			if (const settings::entry *fg = settings::find("upscale.framegen"); fg != nullptr && option_value(*fg) >= 0.5f &&
+				(fsr == nullptr || option_value(*fsr) >= 0.5f) && !framegen::wanted())
 				labels.push_back(fg->label);
 			return labels;
 		}

@@ -89,6 +89,11 @@ namespace hifi::settings
 				"A filmic curve over the world: bright parts roll off smoothly into white instead of clipping, a little more "
 				"contrast through the middle, and an exposure that follows the scene slowly, so a bright noon isn't blown out "
 				"and the night stays dark. The interface isn't touched.", nullptr, nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
+			{ "FloatWorld", tab::lighting, "Tone and colour", "Light past white",
+				"The world is kept with more than 8 bits a colour, so light that adds up past white (sunlit sand and snow, "
+				"lamp cores, glowing effects over each other) keeps its shading into the highlights and its glow, instead of "
+				"flattening to a white patch, and the night sky has no bands. Needs HiFi XI's own d3d8.dll; takes effect at the "
+				"next frame.", nullptr, nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
 			{ "Bloom", tab::lighting, "Tone and colour", "Bloom",
 				"A soft glow around the brightest things: the sun, lamps, glowing effects, a bright sky and the lit edges of "
 				"clouds (0: none, 1: subtle).", "%.2f", nullptr, false, { 1.0f, 1.0f, 1.0f, 1.0f } },
@@ -263,7 +268,8 @@ namespace hifi::settings
 				"While FSR 2 draws the world, a frame is made between each two the game draws: motion as smooth as twice the "
 				"frames, the menus and text kept sharp. The game itself then runs at up to half the screen's refresh rate (122 at "
 				"244 Hz) and answers a little later, so it pays most where the game runs below that. Turning it on takes effect "
-				"the next time the game starts; off right away. (/hifi upscale framegen)", nullptr, "upscale.fsr", false,
+				"the next time the game starts (with FSR on then); off right away, and AMD's swap chain is left out from the next "
+				"start, as it is while FSR is off. (/hifi upscale framegen)", nullptr, "upscale.fsr", false,
 				{ 0.0f, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "upscale.framegen_auto", tab::upscaling, "Frame generation", "Only while the game runs below half the refresh rate",
 				"Frames are made between only while the game runs slower than half the screen's refresh rate (122 at 244 Hz), "

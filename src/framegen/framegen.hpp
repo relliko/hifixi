@@ -57,4 +57,7 @@ namespace hifi::framegen
 	std::vector<std::string> status();
 	// Frames made between since the start (the menu's frames shown)
 	uint64_t made_between();
+	// The game's device removed (the GPU hung or faulted): nothing more prepared or made between and generation never
+	// turned on or off again (AMD's code makes resources as it goes and throws when it can't)
+	void device_lost();
 }

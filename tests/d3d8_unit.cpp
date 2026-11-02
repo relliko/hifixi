@@ -113,6 +113,31 @@ namespace
 		to_target(D3DFMT_A8R8G8B8, argb, 4, t, 4, 1, 1);
 		from_target(D3DFMT_A8R8G8B8, t, 4, back, 4, 1, 1);
 		check(std::memcmp(argb, back, 4) == 0, "A8R8G8B8 through a target and back");
+		// The float world's halves (HifiFrameSetWorldFormat): exact where they must be, rounded to nearest even, and an
+		// 8-bit value through a half and back unchanged for all 256
+		check(float_to_half(1.0f) == 0x3C00 && float_to_half(0.5f) == 0x3800 && float_to_half(-2.0f) == 0xC000 && float_to_half(0.0f) == 0,
+			"halves: 1, 0.5, -2, 0");
+		check(float_to_half(65504.0f) == 0x7BFF && float_to_half(1e6f) == 0x7C00 && float_to_half(5.9604645e-8f) == 0x0001,
+			"halves: the largest, past it (infinity), the smallest subnormal");
+		check(float_to_half(1.0f + 1.0f / 2048.0f) == 0x3C00 && float_to_half(1.0f + 3.0f / 2048.0f) == 0x3C02, "halves: half way rounds to even");
+		bool bytes_kept = true;
+		for (int v = 0; v < 256; ++v)
+		{
+			const float f = half_to_float(float_to_half(float(v) / 255.0f));
+			bytes_kept = bytes_kept && int(f * 255.0f + 0.5f) == v;
+		}
+		check(bytes_kept, "every 8-bit value through a half and back unchanged (the name mark's 1 of 255 too)");
+		check(half_to_float(0x3C00) == 1.0f && half_to_float(0x0001) == 5.9604645e-8f && half_to_float(0x8000) == -0.0f, "half to float: 1, subnormal, -0");
+		// A float target's pixel (rgba 2.0 over white, 0.5, -1, alpha 1/255) to A8R8G8B8: clamped, rounded
+		uint16_t hp[4] = { float_to_half(2.0f), float_to_half(0.5f), float_to_half(-1.0f), float_to_half(1.0f / 255.0f) };
+		from_target(kFloatTargetView, D3DFMT_A8R8G8B8, reinterpret_cast<const uint8_t *>(hp), 8, b, 4, 1, 1);
+		check(b[2] == 0xFF && b[1] == 0x80 && b[0] == 0x00 && b[3] == 0x01, "RGBA16F target to A8R8G8B8 (past white clamped, below 0 clamped)");
+		uint16_t ht[4] = {};
+		to_target(kFloatTargetView, D3DFMT_A8R8G8B8, argb, 4, reinterpret_cast<uint8_t *>(ht), 8, 1, 1);
+		from_target(kFloatTargetView, D3DFMT_A8R8G8B8, reinterpret_cast<const uint8_t *>(ht), 8, back, 4, 1, 1);
+		check(std::memcmp(argb, back, 4) == 0, "A8R8G8B8 through a float target and back");
+		check(target_resource(kFloatTargetView) == DXGI_FORMAT_R16G16B16A16_TYPELESS && target_bytes(kFloatTargetView) == 8 &&
+			target_resource(kTargetView) == kTargetResource && target_bytes(kTargetView) == 4, "target formats and sizes");
 		// DXT1: a block of two colours, the third and fourth between them (or transparent)
 		const uint8_t dxt1[8] = { 0x00, 0xF8, 0x1F, 0x00, 0xE4, 0xE4, 0xE4, 0xE4 }; // red, blue; indices 0 1 2 3 per row
 		uint8_t px16[16 * 4] = {};

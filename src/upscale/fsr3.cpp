@@ -42,7 +42,7 @@ namespace hifi::upscale::fsr3
 		delete u;
 	}
 
-	upscaler *make(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, std::string &why)
+	static upscaler *make_one(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, std::string &why)
 	{
 		upscaler *u = new upscaler();
 		u->rw = render_w;
@@ -92,6 +92,21 @@ namespace hifi::upscale::fsr3
 		return u;
 	}
 
+	upscaler *make(ID3D12Device *device, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h, std::string &why)
+	{
+		// (AMD's code throws when a resource it needs can't be made: the device removed, or no memory. What it had made
+		// is left: destroying a half-made context isn't safe)
+		try
+		{
+			return make_one(device, render_w, render_h, display_w, display_h, why);
+		}
+		catch (...)
+		{
+			why = "FSR 3.1 couldn't make what it needed (the GPU lost, or no memory)";
+			return nullptr;
+		}
+	}
+
 	bool dispatch(upscaler *u, const frame &f, std::string &why)
 	{
 		if (u == nullptr || f.list == nullptr || f.color == nullptr || f.depth == nullptr || f.motion == nullptr || f.output == nullptr)
@@ -127,7 +142,16 @@ namespace hifi::upscale::fsr3
 		d.cameraFar = 65535.0f;
 		d.cameraFovAngleVertical = f.fov;
 		d.viewSpaceToMetersFactor = 1.0f;
-		const FfxErrorCode e = ffxFsr3UpscalerContextDispatch(&u->ctx, &d);
+		FfxErrorCode e = FFX_ERROR_BACKEND_API_ERROR;
+		try
+		{
+			e = ffxFsr3UpscalerContextDispatch(&u->ctx, &d);
+		}
+		catch (...)
+		{
+			why = "FSR 3.1 couldn't make what it needed (the GPU lost, or no memory)";
+			return false;
+		}
 		if (e != FFX_OK)
 		{
 			why = "FSR 3.1's dispatch failed (error " + std::to_string(int(e)) + ")";

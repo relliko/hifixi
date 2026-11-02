@@ -97,6 +97,8 @@ namespace hifi::d3d8
 		// A table of n shader views for this draw, copied from CPU descriptors (null: the null view of dims[i]); the
 		// last one made again when the views are the same and its descriptors still this frame's
 		D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const D3D12_CPU_DESCRIPTOR_HANDLE *views, uint32_t n);
+		// A CPU descriptor was written again in place (image::retarget): the last table isn't made again from the same handles
+		void forget_srv_table() { last_table = {}; }
 		// kMaxStages samplers' table (the same descriptions give the same table)
 		D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const D3D12_SAMPLER_DESC *descs);
 

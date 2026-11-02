@@ -145,7 +145,19 @@ namespace hifi::zone::native
 				slot *const p = &s;
 				s.thread = std::thread([p, map] {
 					const auto t0 = std::chrono::steady_clock::now();
-					p->read_ok = zm::load(map, p->data, p->result);
+					// (anything thrown, out of memory in the 32-bit game: the map failed; an exception leaving a thread
+					// ends the game)
+					try
+					{
+						p->read_ok = zm::load(map, p->data, p->result);
+					}
+					catch (...)
+					{
+						p->data = zm::zone();
+						p->result = bake::result();
+						p->result.why = "out of memory reading it (or the reader threw)";
+						p->read_ok = false;
+					}
 					p->read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 					p->loaded.store(true, std::memory_order_release);
 				});

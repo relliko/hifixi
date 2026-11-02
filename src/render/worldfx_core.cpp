@@ -207,6 +207,10 @@ namespace
 		// set in at once (a new zone sets it again at once)
 		bool tonemap = true;
 		float bloom = 1.0f, colour_grade = 1.0f;
+		// The world as floats (FloatWorld): our d3d8.dll keeps it in RGBA16F, so light adding up past white (the zone's
+		// sunlit ground, effects over each other) is kept for the look to roll off instead of cut at white; the look then
+		// runs every frame, bringing it back to the screen's 0..1 before the upscaler and the resolve
+		bool float_world = true;
 		uint32_t look_zone = 0xFFFFFFFF;
 		// What the grade is made of now, for the status: the share of twilight, night, rain, gloom, heat, dust, snow and mist
 		float grade_parts[8] = {};
@@ -1576,10 +1580,17 @@ namespace
 		}
 	}
 
+	// (the world's target as our d3d8.dll made it again for FloatWorld)
+	bool world_floats(ID3D12Resource *rt)
+	{
+		const DXGI_FORMAT f = rt->GetDesc().Format;
+		return f == DXGI_FORMAT_R16G16B16A16_TYPELESS || f == DXGI_FORMAT_R16G16B16A16_FLOAT;
+	}
+
 	// Whether the look (tone mapping, bloom, the colour grade) is on: it runs at the world's end with or without the rest
 	bool look_on()
 	{
-		return g.tonemap || g.bloom > 0.0f || g.colour_grade > 0.0f;
+		return g.tonemap || g.bloom > 0.0f || g.colour_grade > 0.0f || g.float_world;
 	}
 
 	// The look over the world as it ends (mutex held; after place_sun, apply_weather and apply_weather_fx): its settings,
@@ -2598,6 +2609,12 @@ namespace worldfx
 		}
 	}
 
+	bool float_world()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		return g.float_world;
+	}
+
 	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
@@ -2646,8 +2663,9 @@ namespace worldfx
 		g.world_ds = ds;
 		const D3D12_RESOURCE_DESC w = rt->GetDesc();
 		char text[160];
-		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %llux%u%s", static_cast<unsigned long long>(w.Width), w.Height,
-			g.marker_logged ? " (again: it had moved)" : "");
+		const bool floats = world_floats(rt);
+		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %llux%u%s%s", static_cast<unsigned long long>(w.Width), w.Height,
+			floats ? ", as floats (light past white)" : "", g.marker_logged ? " (again: it had moved)" : "");
 		log_message(g.marker_logged ? 1 : 0, text);
 		g.marker_logged = true;
 	}
@@ -3487,9 +3505,9 @@ static void status_lines(const worldfx::ui &u)
 	{
 		const grass::look::look_pass &p = g.look.post;
 		const float *k = g.grade_parts;
-		text(u, "The look: tone mapping %s, bloom %.2f, grade %.2f%s; last frame %s (%u levels); grade now: twilight %.2f, night %.2f, "
+		text(u, "The look: tone mapping %s, bloom %.2f, light past white %s, grade %.2f%s; last frame %s (%u levels); grade now: twilight %.2f, night %.2f, "
 			"rain %.2f, gloom %.2f, heat %.2f, dust %.2f, snow %.2f, mist %.2f (gain %.2f %.2f %.2f, saturation %.2f, contrast %.2f)",
-			g.tonemap ? "on" : "off", g.bloom, g.colour_grade, g.zone_sunlit ? "" : " (none here: no open sky)", g.last.look ? "drawn" : "not drawn",
+			g.tonemap ? "on" : "off", g.bloom, !g.float_world ? "off" : g.world_rt != nullptr && world_floats(g.world_rt) ? "on" : "asked (the world isn't floats yet)", g.colour_grade, g.zone_sunlit ? "" : " (none here: no open sky)", g.last.look ? "drawn" : "not drawn",
 			g.last.look_levels, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], p.gain[0], p.gain[1], p.gain[2], p.saturation, p.contrast);
 	}
 	if (GetTickCount64() - g.actors_at < 500)
@@ -3793,6 +3811,7 @@ namespace
 			number("Aurora", g.aurora_amount, 0.0f, 2.0f);
 			number("GloomFog", g.gloom_fog, 0.0f, 2.0f);
 			flag("Tonemap", g.tonemap);
+			flag("FloatWorld", g.float_world);
 			number("Bloom", g.bloom, 0.0f, 2.0f);
 			number("ColourGrade", g.colour_grade, 0.0f, 2.0f);
 			flag("VisTest", g.vis_option);

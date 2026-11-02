@@ -7,7 +7,7 @@ cbuffer grass : register(b0)
 	float4 eye;    // xyz: the camera, w: draw distance
 	float4 color;  // rgb: the grass's hue, w: seconds (wind)
 	float4 blade;  // x: height, y: half the base, z: blades per tuft, w: first point of this draw (uint bits)
-	uint4 ground;  // x: row pitch in uints, y, z: size, w: 0 none, 1 RGBA8, 2 BGRA8
+	uint4 ground;  // x: row pitch in uints, y, z: size, w: 0 none, 1 RGBA8, 2 BGRA8, 3 RGBA16F (the float world)
 	uint4 crowd;   // x: actors in t2 (low 16 bits), colour rules on (bits 16+: 1 only the ground, 2 outliers),
 	               // 4 characters cast sun shadows, 8 the shadow map's parameters in t2, 16 lamps in t2 (after them),
 	               // 32 the game's fog in t2 (after those); y, z, w: toward the sun, view space (float bits)
@@ -84,12 +84,27 @@ float noise_wrap(float2 p, float period)
 	return lerp(lerp(hash2(int2(a)), hash2(int2(b.x, a.y)), u.x), lerp(hash2(int2(a.x, b.y)), hash2(int2(b)), u.x), u.y);
 }
 
+// A pixel of the world's copy (p inside it), rgba as the screen shows it: 0..1 in an 8-bit world; in the float one
+// (ground.w 3) the same values, past 1 where light adds up past white (never below 0, never not a number)
+float4 world_pixel(int2 p)
+{
+	[branch] if (ground.w == 3)
+	{
+		uint2 v = world.Load2((uint(p.y) * ground.x + uint(p.x) * 2) * 4);
+		float4 c = float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+		return max(finite_or(c, float4(0.0, 0.0, 0.0, 1.0)), 0.0);
+	}
+	uint v = world.Load((uint(p.y) * ground.x + uint(p.x)) * 4);
+	float4 c = float4(v & 255, (v >> 8) & 255, (v >> 16) & 255, v >> 24) / 255.0;
+	return ground.w == 2 ? c.bgra : c;
+}
+// (alpha 1 of 255, as an 8-bit target stores it: a float world keeps what the draw wrote, rounded here the same way)
+bool name_alpha(float a) { return uint(a * 255.0 + 0.5) == 1u; }
+
 float3 texel(int2 p)
 {
 	p = clamp(p, int2(0, 0), int2(ground.yz) - 1);
-	uint v = world.Load((p.y * ground.x + p.x) * 4);
-	float3 c = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0;
-	return ground.w == 2 ? c.bgr : c;
+	return world_pixel(p).rgb;
 }
 
 // A pixel of a name facelift drew into the world (its core/namedepth marks the solid ones with alpha 1:
@@ -97,7 +112,7 @@ float3 texel(int2 p)
 bool name_at(int2 p)
 {
 	p = clamp(p, int2(0, 0), int2(ground.yz) - 1);
-	return (world.Load((p.y * ground.x + p.x) * 4) >> 24) == 1u; // (alpha is the top byte, RGBA or BGRA)
+	return name_alpha(world_pixel(p).a);
 }
 
 // How far from the camera what's drawn at a pixel is (view depth), or a long way when depth isn't known
@@ -4370,9 +4385,10 @@ void vis_ps(float4 pos : SV_Position)
 //                 look_up_ps keeps (0: none to go on)
 RWByteAddressBuffer look_buf : register(u1);
 
+// (past 1, the float world's light past white: the same curve carried on, so 2 is about 4.6 times white's light)
 float3 srgb_to_linear(float3 c)
 {
-	c = saturate(c);
+	c = clamp(c, 0.0, 64.0);
 	return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
 }
 float3 linear_to_srgb(float3 c)
@@ -4405,7 +4421,10 @@ float4 look_between(uint at, float2 q, uint2 size)
 // The filmic curve (linear in, linear out, each channel): mid-grey (0.18) kept, a little more contrast through the
 // shadows (a power of 1.06 under it) and the middle (a slope of 1.1 over it), then from 0.6 a shoulder rolling toward
 // 1.3, so what's brighter than white (the exposure or the bloom pushing it) runs smoothly into white rather than
-// clipping; white itself comes out at about 0.96 (0.98 as the screen shows it)
+// clipping; white itself comes out at about 0.96 (0.98 as the screen shows it). Over 0.9 out, the last tenth eased
+// into 1 instead of cut at it: with the float world's light past white (sunlit sand, snow, a lamp's core: 1 to 3
+// times white's light) the shoulder's top showed as a flat white patch; now it keeps its shading up to about 2.5
+// times white's light (1.5 as the screen's values go).
 float3 look_tone(float3 v)
 {
 	const float p = 0.18, c = 1.1, k = 0.6, w = 1.3;
@@ -4414,7 +4433,8 @@ float3 look_tone(float3 v)
 	float3 lo = p * pow(v / p + 1e-7, 1.06);
 	float3 mid = p + (v - p) * c;
 	float3 hi = kk + (w - kk) * (1.0 - exp(-c * (v - k) / (w - kk)));
-	return v < p ? lo : (v < k ? mid : hi);
+	float3 t = v < p ? lo : (v < k ? mid : hi);
+	return t < 0.9 ? t : 0.9 + 0.1 * (1.0 - exp((0.9 - t) / 0.1));
 }
 
 // The first level: each texel a 4 x 4 block of the world's pixels: the light over the bloom's threshold (a soft knee),
@@ -4434,21 +4454,25 @@ void look_first_ps(float4 pos : SV_Position)
 		[unroll] for (int i = 0; i < 8; ++i)
 		{
 			int2 p = clamp(base + int2(i - 2, j - 2), int2(0, 0), int2(ground.yz) - 1);
-			uint v = world.Load((uint(p.y) * ground.x + uint(p.x)) * 4);
-			if ((v >> 24) != 1u) // (not a name)
+			float4 c = world_pixel(p);
+			if (!name_alpha(c.a)) // (not a name)
 			{
-				float3 c = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0;
-				float3 l = srgb_to_linear(ground.w == 2 ? c.bgr : c);
+				float3 l = srgb_to_linear(c.rgb);
 				float y = look_luma(l);
+				// (the bloom takes light past white softly, up to twice white's at most: the float world's sunlit ground
+				// at 1.5 to 4 times white would otherwise glow nine times as much as it did, the whole day hazy; the
+				// exposure measures the real light)
+				float top = max(l.r, max(l.g, l.b));
+				float3 lb = top > 1.0 ? l * ((2.0 - 1.0 / top) / top) : l;
 				bool inner = i >= 2 && i < 6 && j >= 2 && j < 6; // (the block itself: its mean luminance, for the exposure)
 				logs += inner ? log2(y + 1e-3) : 0.0;
 				n += inner ? 1.0 : 0.0;
-				float b = max(l.r, max(l.g, l.b));
+				float b = max(lb.r, max(lb.g, lb.b));
 				float rq = clamp(b - thr + knee, 0.0, 2.0 * knee);
 				rq = rq * rq / (4.0 * knee);
 				float share = max(rq, b - thr) / max(b, 1e-4);
-				float k = tent[i] * tent[j] / (1.0 + y);
-				sum += l * share * k;
+				float k = tent[i] * tent[j] / (1.0 + look_luma(lb));
+				sum += lb * share * k;
 				weights += k;
 			}
 		}
@@ -4533,11 +4557,10 @@ void look_up_ps(float4 pos : SV_Position)
 float4 look_ps(float4 pos : SV_Position) : SV_Target
 {
 	int2 p = int2(pos.xy);
-	uint v = world.Load((uint(p.y) * ground.x + uint(p.x)) * 4);
-	if ((v >> 24) == 1u)
+	float4 c = world_pixel(p);
+	if (name_alpha(c.a))
 		discard;
-	float3 c = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0;
-	float3 l = srgb_to_linear(ground.w == 2 ? c.bgr : c);
+	float3 l = srgb_to_linear(c.rgb);
 	uint parts = asuint(color.w);
 	[branch] if ((parts & 2u) != 0u)
 	{

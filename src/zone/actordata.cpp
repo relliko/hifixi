@@ -181,7 +181,19 @@ namespace hifi::zone::actordata
 			g.loaded = false;
 			g.thread = std::thread([id] {
 				const auto t0 = std::chrono::steady_clock::now();
-				g.read_ok = zm::load_file(id, g.data, g.result);
+				// (anything thrown, out of memory in the 32-bit game: the DAT failed; an exception leaving a thread ends
+				// the game)
+				try
+				{
+					g.read_ok = zm::load_file(id, g.data, g.result);
+				}
+				catch (...)
+				{
+					g.data = zm::zone();
+					g.result = bake::result();
+					g.result.why = "out of memory reading it (or the reader threw)";
+					g.read_ok = false;
+				}
 				g.read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 				g.loaded.store(true, std::memory_order_release);
 			});

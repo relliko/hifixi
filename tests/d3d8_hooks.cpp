@@ -35,6 +35,7 @@
 #include <dxgi1_4.h>
 #include <d3d8.h>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <string>
@@ -43,6 +44,13 @@
 namespace
 {
 	int failures = 0;
+	// (a half's value: normal ones and zero are all this test reads)
+	float half_f(uint16_t h)
+	{
+		const int e = (h >> 10) & 31, m = h & 1023;
+		const float v = e == 0 ? std::ldexp(float(m), -24) : std::ldexp(float(m | 1024), e - 25);
+		return (h & 0x8000) != 0 ? -v : v;
+	}
 	void check(bool ok, const char *what)
 	{
 		std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what);
@@ -290,6 +298,58 @@ namespace
 		m->list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
 		const D3D12_VIEWPORT one = { 0, 0, 1, 1, 0, 1 };
 		m->list->RSSetViewports(1, &one);
+	}
+
+	// The float world's handler: what the zone's begin handed; at the world's end, A copied into a readback buffer of its
+	// own (read once the GPU is past it), so what the game drew is read as the GPU holds it, past white and all
+	struct float_seen
+	{
+		hifi_frame_mark begin = {}, end = {};
+		bool begun = false, ended = false;
+		ID3D12Resource *rb = nullptr;
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+	} g_float;
+	void __cdecl float_handler(void *, uint32_t kind, uint32_t, const hifi_frame_mark *m)
+	{
+		if (kind == hifi::slotmark::zone_begin)
+		{
+			g_float.begin = *m;
+			g_float.begun = true;
+			return;
+		}
+		if (kind != hifi::slotmark::world_end || m->rt == nullptr || dev12 == nullptr || g_float.ended)
+			return;
+		g_float.end = *m;
+		g_float.ended = true;
+		const D3D12_RESOURCE_DESC d = m->rt->GetDesc();
+		UINT64 total = 0;
+		dev12->GetCopyableFootprints(&d, 0, 1, 0, &g_float.fp, nullptr, nullptr, &total);
+		D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK };
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = total;
+		bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		hifi::host::quiet q;
+		if (FAILED(dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_float.rb))))
+			return;
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = m->rt;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = m->rt_state;
+		b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		m->list->ResourceBarrier(1, &b);
+		D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+		to.pResource = g_float.rb;
+		to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		to.PlacedFootprint = g_float.fp;
+		from.pResource = m->rt;
+		from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		m->list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+		std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+		m->list->ResourceBarrier(1, &b);
 	}
 
 	void tri_strip_band(float y0, float y1, float z, DWORD c, int n)
@@ -654,6 +714,100 @@ int main(int argc, char **argv)
 			std::snprintf(line, sizeof(line), "... what it drew stays (corner %06X), and the game's next draw binds A, its viewport and pipeline again "
 				"(band %06X, below it %06X)", corner, band, past);
 			check(corner == 0xFFFFFF && band == 0x808080 && past == 0, line);
+		}
+	}
+	// The float world (HifiFrameSetWorldFormat): asked for, A is made again in RGBA16F at the zone's begin mark, before
+	// the handler sees it, through the same view (the hooks see the new texture in it); the game's draws land in it and
+	// light added past white stays there (a white band with half white added over it: 1.5 on the GPU); a copy of it into
+	// memory comes back clamped, as an 8-bit target's; the resolve reads it; asked back to 8 bits, the next zone's begin
+	// makes it RGBA8 again
+	{
+		const auto set = reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(m, kHifiFrameSetHandler));
+		const auto mark = reinterpret_cast<hifi_frame_mark_fn>(GetProcAddress(m, kHifiFrameMark));
+		const auto set_format = reinterpret_cast<hifi_frame_set_world_format_fn>(GetProcAddress(m, kHifiFrameSetWorldFormat));
+		check(set_format != nullptr, "the d3d8.dll exports HifiFrameSetWorldFormat");
+		if (set != nullptr && mark != nullptr && set_format != nullptr)
+		{
+			check(set_format(DXGI_FORMAT_R32_FLOAT) == 0 && set_format(DXGI_FORMAT_R16G16B16A16_FLOAT) == 1, "... turning down a format it doesn't make, taking RGBA16F");
+			set(&float_handler, nullptr);
+			// (one frame, the band drawn twice: white, then half white added)
+			auto frame_float = [&](uint32_t s) {
+				dev->BeginScene();
+				dev->SetRenderTarget(A, Az);
+				D3DVIEWPORT8 vp = { 0, 0, AW, AH, 0.0f, 1.0f };
+				dev->SetViewport(&vp);
+				dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF000000, 1.0f, 0);
+				mark(hifi::slotmark::zone_begin, s);
+				dev->SetTexture(0, nullptr);
+				dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+				dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+				dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+				tri_strip_band(-0.5f, 0.0f, 0.5f, 0xFFFFFFFF, 4);
+				dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+				dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+				dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+				tri_strip_band(-0.5f, 0.0f, 0.5f, 0xFF808080, 4);
+				dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+				dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+				const RECT whole = { 0, 0, LONG(AW), LONG(AH) };
+				const POINT p0 = { 0, 0 };
+				dev->CopyRects(A, &whole, 1, out, &p0); // (the world's end: the handler copies A first)
+				D3DLOCKED_RECT o;
+				out->LockRect(&o, nullptr, D3DLOCK_READONLY); // (waits for the GPU)
+				const uint32_t band = *reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(o.pBits) + size_t(AH * 5 / 8) * o.Pitch + (AW / 2) * 4);
+				out->UnlockRect();
+				// The resolve: A read into the back buffer
+				dev->SetRenderTarget(bb, nullptr);
+				D3DVIEWPORT8 sv = { 0, 0, 1280, 720, 0.0f, 1.0f };
+				dev->SetViewport(&sv);
+				dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+				dev->SetTexture(0, A_tex);
+				dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+				quad_rhw(-0.5f, -0.5f, 1279.5f, 719.5f, 0xFFFFFFFF);
+				dev->SetTexture(0, nullptr);
+				dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+				dev->EndScene();
+				dev->Present(nullptr, nullptr, nullptr, nullptr);
+				return band;
+			};
+			const uint32_t band = frame_float(9);
+			float on_gpu[4] = {};
+			if (g_float.rb != nullptr)
+			{
+				uint8_t *p = nullptr;
+				const D3D12_RANGE r = { 0, SIZE_T(g_float.fp.Footprint.RowPitch) * g_float.fp.Footprint.Height };
+				if (SUCCEEDED(g_float.rb->Map(0, &r, reinterpret_cast<void **>(&p))))
+				{
+					const uint16_t *h = reinterpret_cast<const uint16_t *>(p + size_t(AH * 5 / 8) * g_float.fp.Footprint.RowPitch + (AW / 2) * 8);
+					for (int i = 0; i < 4; ++i)
+						on_gpu[i] = half_f(h[i]);
+					const D3D12_RANGE none = { 0, 0 };
+					g_float.rb->Unmap(0, &none);
+				}
+				g_float.rb->Release();
+				g_float.rb = nullptr;
+			}
+			const hifi_frame_mark &b = g_float.begin;
+			const auto v = views.find(uint64_t(b.rtv.ptr));
+			check(g_float.begun && b.rt != nullptr && b.rt != world_rt && b.rt_format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+					b.rt->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_TYPELESS && b.width == AW && b.height == AH && b.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET,
+				"... at the zone's begin, A made again: RGBA16F (a typeless resource, float views), the same size, a target");
+			check(v != views.end() && v->second.res == b.rt && v->second.format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+				"... in the same view, which the hooks saw made again with the new texture");
+			char line[200];
+			std::snprintf(line, sizeof(line), "... the band on the GPU past white: %.3f %.3f %.3f (1.5 wanted), alpha %.3f", on_gpu[0], on_gpu[1], on_gpu[2], on_gpu[3]);
+			check(g_float.ended && std::fabs(on_gpu[0] - 1.502f) < 0.01f && std::fabs(on_gpu[1] - 1.502f) < 0.01f && std::fabs(on_gpu[2] - 1.502f) < 0.01f, line);
+			std::snprintf(line, sizeof(line), "... copied into memory, clamped to white as an 8-bit target's (%08X)", band);
+			check((band & 0xFFFFFF) == 0xFFFFFF, line);
+			// Back to 8 bits
+			set_format(DXGI_FORMAT_R8G8B8A8_UNORM);
+			g_float = float_seen();
+			frame_float(10);
+			if (g_float.rb != nullptr)
+				g_float.rb->Release();
+			check(g_float.begun && g_float.begin.rt_format == DXGI_FORMAT_R8G8B8A8_UNORM && g_float.begin.rt->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_TYPELESS,
+				"... asked back to 8 bits: A RGBA8 again at the next zone's begin");
+			set(nullptr, nullptr);
 		}
 	}
 	std::printf("%s (%d failed)\n", failures == 0 ? "all passed" : "FAILED", failures);

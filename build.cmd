@@ -76,9 +76,9 @@ set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
 
 rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
-  /LD src\plugin\main.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  /LD src\plugin\main.cpp src\plugin\hangwatch.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
   %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
-  /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /DEF:src\plugin\exports.def user32.lib dxgi.lib || exit /b 1
+  /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /MAP:build\hifixi.map /DEF:src\plugin\exports.def user32.lib dxgi.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
 echo Built build\hifixi.dll
 
@@ -286,6 +286,10 @@ rem The world upscaled to the screen on a list recorded as dgVoodoo records its 
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
   tests\upscale_test.cpp %UPSCALE% %GAME% %ZONE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\upscale_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\upscale_test.exe
+rem The hang report (src\plugin\hangwatch): build\hangwatch_test.exe
+cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\hangwatch_test.cpp src\plugin\hangwatch.cpp src\render\gpu_crash.cpp /Fo"build\test\\" /Fe"build\hangwatch_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\hangwatch_test.exe
 rem The visibility tests' answers (src\render\vistest.cpp): build\vistest_test.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\vistest_test.cpp src\render\vistest.cpp /Fo"build\test\\" /Fe"build\vistest_test.exe" /link /NOLOGO || exit /b 1

@@ -51,6 +51,7 @@ namespace hifi::framegen
 			std::atomic<bool> on{ false };     // (and now)
 			std::atomic<bool> automatic{ true }; // (only while the game runs below half the refresh rate)
 			std::atomic<uint32_t> refresh_override{ 0 }; // (tests: the screen's refresh rate; 0 its monitor's)
+			std::atomic<bool> lost{ false };     // (the device removed: AMD's code not called again, it throws)
 		};
 		state g;
 		thread_local int t_inside = 0; // (AMD's code making the real swap chain: straight to DXGI)
@@ -197,7 +198,15 @@ namespace hifi::framegen
 			{
 				t_inside++;
 				FfxSwapchain made = nullptr;
-				const FfxErrorCode e = ffxCreateFrameinterpolationSwapchainForHwndDX12(hwnd, desc, fullscreen, queue, self, made);
+				FfxErrorCode e = FFX_ERROR_BACKEND_API_ERROR;
+				try
+				{
+					e = ffxCreateFrameinterpolationSwapchainForHwndDX12(hwnd, desc, fullscreen, queue, self, made);
+				}
+				catch (...)
+				{
+					made = nullptr;
+				}
 				t_inside--;
 				IDXGISwapChain4 *const chain = e == FFX_OK ? ffxGetDX12SwapchainPtr(made) : nullptr;
 				if (chain != nullptr)
@@ -227,7 +236,15 @@ namespace hifi::framegen
 			{
 				t_inside++;
 				FfxSwapchain made = nullptr;
-				const FfxErrorCode e = ffxCreateFrameinterpolationSwapchainDX12(desc, queue, self, made);
+				FfxErrorCode e = FFX_ERROR_BACKEND_API_ERROR;
+				try
+				{
+					e = ffxCreateFrameinterpolationSwapchainDX12(desc, queue, self, made);
+				}
+				catch (...)
+				{
+					made = nullptr;
+				}
 				t_inside--;
 				IDXGISwapChain4 *const chain = e == FFX_OK ? ffxGetDX12SwapchainPtr(made) : nullptr;
 				if (chain != nullptr)
@@ -346,10 +363,19 @@ namespace hifi::framegen
 			return true;
 		}
 
+		// AMD's code not called again (it throws when a resource it needs can't be made: the device removed, or no memory)
+		void stop(const std::string &why)
+		{
+			g.lost.store(true);
+			std::lock_guard<std::mutex> lock(gen.mutex);
+			gen.failed++;
+			gen.why = why;
+		}
+
 		// The frame between the last and this one, asked for by AMD's swap chain at dgVoodoo's Present (its list on the
 		// game's queue, after the frame's own): optical flow over FSR 2's pictures, then frame interpolation. Without a
 		// prepare() this frame, or made for another size of the screen, this frame again.
-		FfxErrorCode generate(const FfxFrameGenerationDispatchDescription *d, void *)
+		FfxErrorCode generate_frame(const FfxFrameGenerationDispatchDescription *d)
 		{
 			std::lock_guard<std::mutex> lock(gen.mutex);
 			ID3D12GraphicsCommandList *const list = static_cast<ID3D12GraphicsCommandList *>(d->commandList);
@@ -425,9 +451,25 @@ namespace hifi::framegen
 			gen.last_output = static_cast<ID3D12Resource *>(d->outputs[0].resource);
 			return FFX_OK;
 		}
+
+		// (after a stop: nothing recorded, the swap chain shows what's in its output; the device is gone by then)
+		FfxErrorCode generate(const FfxFrameGenerationDispatchDescription *d, void *)
+		{
+			if (g.lost.load())
+				return FFX_OK;
+			try
+			{
+				return generate_frame(d);
+			}
+			catch (...)
+			{
+				stop("stopped: AMD's frame interpolation couldn't make what it needed (the GPU lost, or no memory)");
+				return FFX_ERROR_BACKEND_API_ERROR;
+			}
+		}
 	}
 
-	bool prepare(ID3D12GraphicsCommandList *list, const frame &in, std::string &why)
+	static bool prepare_frame(ID3D12GraphicsCommandList *list, const frame &in, std::string &why)
 	{
 		std::lock_guard<std::mutex> lock(gen.mutex);
 		if (!g.installed || gen.swapchain == nullptr)
@@ -504,6 +546,31 @@ namespace hifi::framegen
 		return true;
 	}
 
+	bool prepare(ID3D12GraphicsCommandList *list, const frame &in, std::string &why)
+	{
+		if (g.lost.load())
+		{
+			why = "stopped (the GPU lost, or AMD's code failed)";
+			return false;
+		}
+		try
+		{
+			return prepare_frame(list, in, why);
+		}
+		catch (...)
+		{
+			stop("stopped: AMD's frame interpolation couldn't make its contexts (the GPU lost, or no memory)");
+			why = "AMD's frame interpolation failed";
+			return false;
+		}
+	}
+
+	void device_lost()
+	{
+		if (!g.lost.load())
+			stop("stopped: the GPU was lost");
+	}
+
 	namespace
 	{
 		// (gen.mutex held) The screen's refresh rate: the game window's monitor's, read again every 5 s; 0 unknown
@@ -554,6 +621,8 @@ namespace hifi::framegen
 
 	void present()
 	{
+		if (g.lost.load())
+			return;
 		FfxFrameGenerationConfig c = {};
 		{
 			std::lock_guard<std::mutex> lock(gen.mutex);
@@ -588,7 +657,16 @@ namespace hifi::framegen
 		// (outside every lock: turning it on or off waits for the presents in flight, whose DXGI work goes through
 		// HiFi XI's hooks and generate())
 		const ULONGLONG asked = GetTickCount64();
-		const FfxErrorCode e = ffxSetFrameGenerationConfigToSwapchainDX12(&c);
+		FfxErrorCode e = FFX_ERROR_BACKEND_API_ERROR;
+		try
+		{
+			e = ffxSetFrameGenerationConfigToSwapchainDX12(&c);
+		}
+		catch (...)
+		{
+			stop("stopped: AMD's swap chain couldn't turn generation on or off (the GPU lost, or no memory)");
+			return;
+		}
 		// (in HiFi XI's log each time, with how long the game's thread waited on it: a hang to find)
 		if (g.log != nullptr)
 		{
@@ -688,7 +766,9 @@ namespace hifi::framegen
 		{
 			std::lock_guard<std::mutex> glock(gen.mutex);
 			char state[160];
-			if (!g.on.load())
+			if (g.lost.load())
+				std::snprintf(state, sizeof(state), "stopped until the next start");
+			else if (!g.on.load())
 				std::snprintf(state, sizeof(state), "off (turned off: on again at once from the menu)");
 			else if (gen.now == nullptr)
 				std::snprintf(state, sizeof(state), "contexts not made");

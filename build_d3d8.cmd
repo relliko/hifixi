@@ -28,7 +28,7 @@ if not exist build\d3d8\test mkdir build\d3d8\test
 
 set "D3D8SRC=src\d3d8\d3d8.cpp src\d3d8\device.cpp src\d3d8\device_draw.cpp src\d3d8\resource.cpp src\d3d8\present.cpp src\d3d8\gpu.cpp src\d3d8\format.cpp src\d3d8\ffp.cpp src\d3d8\sm1.cpp src\d3d8\compile.cpp"
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /wd4100 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I "%D3D8INC%" ^
-  /LD %D3D8SRC% /Fo"build\d3d8\obj\\" /Fe"build\d3d8\d3d8.dll" /link /NOLOGO /DEF:src\d3d8\d3d8.def d3d12.lib dxgi.lib user32.lib gdi32.lib || exit /b 1
+  /LD %D3D8SRC% /Fo"build\d3d8\obj\\" /Fe"build\d3d8\d3d8.dll" /link /NOLOGO /MAP:build\d3d8\d3d8.map /DEF:src\d3d8\d3d8.def d3d12.lib dxgi.lib user32.lib gdi32.lib || exit /b 1
 del /q build\d3d8\d3d8.exp build\d3d8\d3d8.lib 2>nul
 echo Built build\d3d8\d3d8.dll
 if /i "%~1"=="dll" exit /b 0

@@ -501,6 +501,14 @@ int main()
 		draw();
 		check(fake::has("Waiting for the game's next start: Frame generation (AMD FSR 3).") && hifi::game::option_on("upscale", "framegen", false),
 			"frame generation turned on: saved, and said to wait for the next start (AMD's swap chain isn't in)");
+		fake::click = "Upscale the world with AMD FSR";
+		draw();
+		draw();
+		check(!fake::has("Frame generation (AMD FSR 3).") && !hifi::game::option_on("upscale", "fsr", true) && hifi::game::option_on("upscale", "framegen", false),
+			"FSR off with frame generation still ticked: nothing waiting (AMD's swap chain stays out at the next start too)");
+		fake::click = "Upscale the world with AMD FSR";
+		draw();
+		draw();
 		fake::click = "Frame generation (AMD FSR 3)";
 		draw();
 		bool tip = false;

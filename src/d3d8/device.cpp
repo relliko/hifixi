@@ -263,7 +263,7 @@ namespace hifi::d3d8
 			const D3D12_RANGE whole = { 0, SIZE_T(a.read.rb.size) };
 			if (SUCCEEDED(a.read.rb.buffer->Map(0, &whole, reinterpret_cast<void **>(&mapped))))
 			{
-				from_target(a.image->format, mapped, a.read.row_pitch, r.pixels.data(), r.w * bpp, r.w, r.h);
+				from_target(a.read.view, a.image->format, mapped, a.read.row_pitch, r.pixels.data(), r.w * bpp, r.w, r.h);
 				const D3D12_RANGE none = { 0, 0 };
 				a.read.rb.buffer->Unmap(0, &none);
 			}
@@ -649,7 +649,7 @@ namespace hifi::d3d8
 				single.res = res;
 				single.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			}
-			const UINT row = align_up(UINT(w) * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+			const UINT row = align_up(UINT(w) * target_bytes(si->gpu_format), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
 			image::pending_read p;
 			p.rb = g.new_readback(UINT64(row) * UINT(h));
 			if (p.rb.buffer == nullptr)
@@ -659,7 +659,7 @@ namespace hifi::d3d8
 			D3D12_TEXTURE_COPY_LOCATION to = {};
 			to.pResource = p.rb.buffer;
 			to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-			to.PlacedFootprint.Footprint = { kTargetView, UINT(w), UINT(h), 1, row };
+			to.PlacedFootprint.Footprint = { si->gpu_format, UINT(w), UINT(h), 1, row };
 			D3D12_TEXTURE_COPY_LOCATION from = {};
 			from.pResource = res;
 			from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -677,6 +677,7 @@ namespace hifi::d3d8
 			p.row_pitch = row;
 			p.from = si->format;
 			p.target = true;
+			p.view = si->gpu_format;
 			di->copy(d->sub()); // (made, and older reads done)
 			stats.readbacks++;
 			if (async_readback && !sync_copies)
@@ -706,7 +707,11 @@ namespace hifi::d3d8
 			di->reads.push_back(p);
 			return D3D_OK;
 		}
-		if (src_gpu && dst_gpu)
+		// (between targets of different GPU formats, the float world and an 8-bit one, no GPU copy can: through the source's
+		// copy read back, below, as from memory)
+		if (src_gpu && dst_gpu && si->gpu_format != di->gpu_format)
+			log_once(1, "a copy between targets of formats %u and %u goes through the CPU", unsigned(si->gpu_format), unsigned(di->gpu_format));
+		if (src_gpu && dst_gpu && si->gpu_format == di->gpu_format)
 		{
 			// Target to target: on the GPU
 			ID3D12Resource *res = si->sample_resource();
@@ -860,6 +865,7 @@ namespace hifi::d3d8
 			hold_surface(r);
 			drop_surface(rt);
 			rt = r;
+			plan_new = true;
 		}
 		if (z != ds)
 		{
@@ -871,6 +877,47 @@ namespace hifi::d3d8
 		cur.viewport = { 0, 0, rt->width(), rt->height(), 0.0f, 1.0f };
 		dirty |= d_targets | d_viewport | d_pipeline | d_ffvs | d_vsc;
 		return D3D_OK;
+	}
+
+	device::plan_target *device::plan_now()
+	{
+		if (rt == nullptr)
+			return nullptr;
+		if (plan_count == 0 || plan_new)
+		{
+			plan_new = false;
+			if (plan_count >= kPlanTargets)
+			{
+				plan_count = kPlanTargets + 1; // (more than kept: the rest not counted)
+				return nullptr;
+			}
+			plan_target &p = plan[plan_count++];
+			p = plan_target();
+			p.w = rt->width();
+			p.h = rt->height();
+			p.format = rt->img->format;
+			p.depth = ds != nullptr;
+		}
+		else if (plan_count > kPlanTargets)
+			return nullptr;
+		return &plan[plan_count - 1];
+	}
+
+	std::string device::plan_text() const
+	{
+		std::string out;
+		char one[160];
+		for (int i = 0; i < last_plan_count; ++i)
+		{
+			const plan_target &p = last_plan[i];
+			std::snprintf(one, sizeof(one), "%s%d) %ux%u format %u%s%s%s, %u draws (the first type %u, %u vertices)", i == 0 ? "" : "; ", i + 1, p.w, p.h,
+				unsigned(p.format), p.depth ? " with depth" : "", (p.cleared & D3DCLEAR_TARGET) != 0 ? ", colour cleared" : "",
+				(p.cleared & D3DCLEAR_ZBUFFER) != 0 ? ", depth cleared" : "", p.draws, unsigned(p.first_type), p.first_vertices);
+			out += one;
+		}
+		if (last_plan_more)
+			out += "; and more";
+		return out.empty() ? "none" : out;
 	}
 
 	HRESULT device::GetRenderTarget(IDirect3DSurface8 **pp)
@@ -911,6 +958,9 @@ namespace hifi::d3d8
 		const bool marker = n == 1 && rects != nullptr && flags == D3DCLEAR_STENCIL && rects[0].x2 - rects[0].x1 == 1 && rects[0].y2 - rects[0].y1 == 1;
 		timer t(perf_log, marker ? &perf.marker_ms : &perf.clear_ms);
 		const HRESULT hr = clear(n, rects, flags, color, z, stencil);
+		if (!marker)
+			if (plan_target *p = plan_now())
+				p->cleared |= flags;
 		if (marker && perf_log)
 		{
 			perf.markers++;
@@ -2002,6 +2052,9 @@ namespace hifi::d3d8
 	// The world: the target bound at the zone's begin mark; its end (kWorldEnd) sent once, at the first draw or copy that
 	// reads it after that (mark_world_read)
 	constexpr uint32_t kZoneBegin = 0, kWorldEnd = 13;
+	// The world's GPU format HiFi XI wants (HifiFrameSetWorldFormat; kTargetView until it says): the target bound at the
+	// zone's begin mark is made again in it there when it differs (never the back buffer: it's copied into the swap chain's)
+	static DXGI_FORMAT g_world_format = kTargetView;
 	static ID3D12Resource *g_world = nullptr;
 	static uint32_t g_world_seq = 0, g_world_width = 0;
 	static bool g_world_ended = true;
@@ -2024,6 +2077,9 @@ namespace hifi::d3d8
 	{
 		if (d == nullptr || g_mark_handler == nullptr || d->g.list() == nullptr)
 			return 0;
+		if (kind == kZoneBegin && d->rt != nullptr && d->rt->img != nullptr && d->rt->img->gpu_format != g_world_format &&
+			(d->chain == nullptr || d->rt->img != d->chain->back_image) && d->rt->img->retarget(g_world_format))
+			d->bound.epoch = 0; // (its view's descriptor now holds the new texture: bound again)
 		// (the targets bound and every barrier on the list, so the states handed over are the list's own at this point)
 		d->bind_targets();
 		d->g.flush_barriers();
@@ -2077,4 +2133,14 @@ namespace hifi::d3d8
 extern "C" int __cdecl HifiFrameMark(uint32_t kind, uint32_t seq)
 {
 	return hifi::d3d8::mark_now(hifi::d3d8::g_mark_device, kind, seq);
+}
+
+extern "C" int __cdecl HifiFrameSetWorldFormat(DXGI_FORMAT view)
+{
+	if (view == DXGI_FORMAT_UNKNOWN)
+		view = hifi::d3d8::kTargetView;
+	if (view != hifi::d3d8::kTargetView && view != hifi::d3d8::kFloatTargetView)
+		return 0;
+	hifi::d3d8::g_world_format = view;
+	return 1;
 }

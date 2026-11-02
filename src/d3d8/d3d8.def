@@ -6,3 +6,4 @@ EXPORTS
 	DebugSetMute
 	HifiFrameSetHandler
 	HifiFrameMark
+	HifiFrameSetWorldFormat

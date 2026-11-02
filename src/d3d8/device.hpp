@@ -171,6 +171,25 @@ namespace hifi::d3d8
 			uint64_t async_answered = 0, async_unanswered = 0; // asynchronous readbacks answered from an earlier frame, or not yet
 		} stats;
 
+		// The frame's targets in the order drawn into (the first kPlanTargets), for the log with the frame counts: a GPU
+		// crash report's operation index ("the first draw after the second clear") is then a target of the game's
+		struct plan_target
+		{
+			UINT w = 0, h = 0;
+			D3DFORMAT format = D3DFMT_UNKNOWN;
+			bool depth = false;
+			DWORD cleared = 0; // (D3DCLEAR_ flags)
+			UINT draws = 0, first_vertices = 0;
+			D3DPRIMITIVETYPE first_type = D3DPRIMITIVETYPE(0);
+		};
+		static constexpr int kPlanTargets = 8; // (the log line holds 1024 characters)
+		plan_target plan[kPlanTargets], last_plan[kPlanTargets];
+		int plan_count = 0, last_plan_count = 0;
+		bool plan_new = true; // (the target changed since the entry last drawn into)
+		bool last_plan_more = false;
+		plan_target *plan_now();
+		std::string plan_text() const;
+
 		// The calling thread's time in the device (PerfLog=1: logged every 30 frames as a frame's average): draws, clears
 		// (the slot markers' apart: HiFi XI draws inside them), Present
 		bool perf_log = false;

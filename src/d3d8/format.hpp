@@ -33,6 +33,13 @@ namespace hifi::d3d8
 	// The render target's format on the GPU (all colour targets), and its view's
 	constexpr DXGI_FORMAT kTargetResource = DXGI_FORMAT_R8G8B8A8_TYPELESS;
 	constexpr DXGI_FORMAT kTargetView = DXGI_FORMAT_R8G8B8A8_UNORM;
+	// The world's when HiFi XI asks for light past white (HifiFrameSetWorldFormat): RGBA16F, the same values as the
+	// game's 8-bit ones (0..1, as the screen shows them) but free to go over 1 where light adds up
+	constexpr DXGI_FORMAT kFloatTargetResource = DXGI_FORMAT_R16G16B16A16_TYPELESS;
+	constexpr DXGI_FORMAT kFloatTargetView = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	// A target view's resource format, and its bytes a pixel
+	inline DXGI_FORMAT target_resource(DXGI_FORMAT view) { return view == kFloatTargetView ? kFloatTargetResource : kTargetResource; }
+	inline UINT target_bytes(DXGI_FORMAT view) { return view == kFloatTargetView ? 8 : 4; }
 	// A target's shader view: alpha read as 1 for the X formats
 	UINT target_mapping(D3DFORMAT f);
 	bool is_target_format(D3DFORMAT f);
@@ -51,6 +58,16 @@ namespace hifi::d3d8
 	void from_target(D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);
 	// The game's bytes of f to RGBA8 for a render target (CopyRects from a texture or an image into a target)
 	void to_target(D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);
+	// The same for a target whose GPU format is view (kTargetView or kFloatTargetView: a float target's rows through RGBA8,
+	// each value clamped to 0..1 and rounded as an 8-bit target stores it)
+	void from_target(DXGI_FORMAT view, D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);
+	void to_target(DXGI_FORMAT view, D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);
+	// RGBA16F rows to RGBA8 (clamped, rounded) and back
+	void half_to_rgba8(const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);
+	void rgba8_to_half(const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);
+	// One half (IEEE 754 binary16) to a float and back (round to nearest even)
+	float half_to_float(uint16_t h);
+	uint16_t float_to_half(float f);
 
 	// A DXT level whose size isn't whole blocks: decoded to BGRA8
 	void decode_dxt(D3DFORMAT f, const uint8_t *src, UINT src_pitch, uint8_t *dst, UINT dst_pitch, UINT w, UINT h);

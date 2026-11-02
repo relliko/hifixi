@@ -85,7 +85,9 @@
 #include "../host/hooks.hpp"
 #include "../host/passes.hpp"
 #include "../render/worldfx_core.hpp"
+#include "../render/gpu_crash.hpp"
 #include "../ui/menu.hpp"
+#include "hangwatch.hpp"
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -94,7 +96,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.61;
+	constexpr double kVersion = 0.62;
 	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
 	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
@@ -170,6 +172,16 @@ namespace
 	{
 		if (ILogManager *const l = g_ashita_log)
 			l->Log(uint32_t(level == 2 ? Ashita::LogLevel::Error : level == 1 ? Ashita::LogLevel::Warn : Ashita::LogLevel::Info), "hifixi", text);
+	}
+
+	// The hang report's own lines (on its thread, the game's perhaps stuck holding HiFi XI's locks: only what reads
+	// without one)
+	std::string hang_context()
+	{
+		std::string out;
+		out += std::string("AMD's swap chain (frame generation) in: ") + (hifi::framegen::wanted() ? "yes" : "no") + "\n";
+		out += std::string("FSR drawing (in the last quarter second): ") + (hifi::upscale::temporal_running() ? "yes" : "no") + "\n";
+		return out;
 	}
 
 	// HiFi XI's menu through Ashita's ImGui
@@ -255,6 +267,7 @@ class hifixi final : public IPlugin
 	ILogManager *m_log = nullptr;
 	uint32_t m_id = 0;
 	uint64_t m_presents = 0;
+	bool m_gpu_lost = false; // (the player told the GPU stopped)
 	std::string m_rate_line; // (the last status's frame-rate line: /hifi status puts it in the chat)
 	double m_since = 0.0;
 	bool m_menu = false;
@@ -919,6 +932,7 @@ public:
 		hifi::game::charslot::set_listener(char_slot); // (native characters, and the model actors in the same walk)
 		start();
 		hifi::bake::runner::start(hifi::backend::folder());
+		hifi::hangwatch::start(hifi::backend::folder(), hifi::backend::log, hang_context);
 		return true;
 	}
 
@@ -961,6 +975,7 @@ public:
 		hifi::game::charslot::set_wanted(false);
 		if (!hifi::game::charslot::stop(why))
 			ashita_log(1, ("the character slot markers not taken out: " + why).c_str());
+		hifi::hangwatch::stop();
 		hifi::backend::set_log_sink(nullptr);
 		g_ashita_log = nullptr;
 		m_menu = false;
@@ -1150,6 +1165,7 @@ public:
 	void Direct3DPresent(const RECT *, const RECT *, HWND, const RGNDATA *) override
 	{
 		m_presents++;
+		hifi::hangwatch::present();
 		const double now = now_seconds();
 		// The frame rate first (the cap waits here, before the frame is shown), then the game-side parts: hifps's,
 		// and drawcull's work, each following its options every half second
@@ -1164,6 +1180,19 @@ public:
 		hifi::game::jitter::next_frame();
 		// (the tint this frame's resolve was drawn with: FSR's picture takes it too)
 		hifi::upscale::set_tint(hifi::game::resolve_tint());
+		// (the device removed: frame generation stopped before AMD's code is called again, and the player told once)
+		if (gpu_crash::lost() && !m_gpu_lost)
+		{
+			m_gpu_lost = true;
+			// (what FSR and frame generation were doing, in the log for the report)
+			for (const std::string &line : hifi::framegen::status())
+				hifi::backend::log(1, ("HiFi XI: at the GPU's stop, " + line).c_str());
+			for (const std::string &line : hifi::upscale::status())
+				hifi::backend::log(1, ("HiFi XI: at the GPU's stop, " + line).c_str());
+			hifi::framegen::device_lost();
+			say("The GPU stopped (Direct3D removed the device). HiFi XI has stopped drawing; restart the game. "
+				"Report: bootloader\\worldfx-gpu-crash.txt", true);
+		}
 		hifi::framegen::present(); // (frame generation on or off as FSR 2 runs and the setting says)
 		if (now >= m_next_update)
 		{

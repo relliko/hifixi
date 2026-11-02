@@ -117,6 +117,7 @@ namespace hifi::d3d8
 			uint8_t topology = 0, blend = 0, src = 0, dst = 0, op = 0, write_mask = 0, x_target = 0, has_ds = 0;
 			uint8_t z = 0, z_write = 0, z_func = 0, stencil = 0, s_func = 0, s_fail = 0, s_zfail = 0, s_pass = 0;
 			uint8_t s_read = 0, s_write = 0, fill = 0, cull = 0, samples = 1, ds_format = 0;
+			uint8_t rt_format = 0, spare[3] = {}; // (the target's GPU format: the float world's or 8-bit; whole bytes, no padding)
 			int32_t zbias = 0;
 		};
 	}
@@ -726,6 +727,7 @@ namespace hifi::d3d8
 		}
 		pk.write_mask = uint8_t(s.rs[D3DRS_COLORWRITEENABLE] & 15);
 		pk.x_target = rtf == D3DFMT_X8R8G8B8 || rtf == D3DFMT_X1R5G5B5 || rtf == D3DFMT_R5G6B5 || rtf == D3DFMT_X4R4G4B4 ? 1 : 0;
+		pk.rt_format = uint8_t(rt->img->gpu_format);
 		pk.has_ds = has_ds ? 1 : 0;
 		const bool z_on = has_ds && s.rs[D3DRS_ZENABLE] != D3DZB_FALSE;
 		const bool stencil_on = has_ds && info(ds->img->format).stencil && s.rs[D3DRS_STENCILENABLE];
@@ -799,7 +801,7 @@ namespace hifi::d3d8
 			pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
 			pd.PrimitiveTopologyType = topology_type(type);
 			pd.NumRenderTargets = 1;
-			pd.RTVFormats[0] = kTargetView;
+			pd.RTVFormats[0] = rt->img->gpu_format;
 			pd.DSVFormat = has_ds ? ds->img->gpu_format : DXGI_FORMAT_UNKNOWN;
 			pd.SampleDesc.Count = pk.samples;
 			LARGE_INTEGER made_at;
@@ -897,6 +899,11 @@ namespace hifi::d3d8
 			l->DrawInstanced(vcount, 1, first_vertex, 0);
 		g.draws_in_list++;
 		stats.draws++;
+		if (plan_target *p = plan_now(); p != nullptr && p->draws++ == 0)
+		{
+			p->first_type = type;
+			p->first_vertices = vcount;
+		}
 		return D3D_OK;
 	}
 
@@ -904,6 +911,11 @@ namespace hifi::d3d8
 	{
 		chain->present(override_window);
 		stats.presents++;
+		last_plan_count = std::min(plan_count, kPlanTargets);
+		last_plan_more = plan_count > kPlanTargets;
+		std::copy(plan, plan + last_plan_count, last_plan);
+		plan_count = 0;
+		plan_new = true;
 		async_index.clear();
 		if (!async_reads.empty())
 			poll_async(false);
@@ -917,6 +929,8 @@ namespace hifi::d3d8
 			log(0, "frame %llu: %llu draws, %llu clears, %llu readbacks (%llu answered from an earlier frame, %llu not yet), %llu pipelines, %u shaders compiled in play (%.0f ms), %u ahead, %u from the cache folder, %u failed",
 				static_cast<unsigned long long>(stats.presents), static_cast<unsigned long long>(stats.draws), static_cast<unsigned long long>(stats.clears),
 				static_cast<unsigned long long>(stats.readbacks), static_cast<unsigned long long>(stats.async_answered), static_cast<unsigned long long>(stats.async_unanswered), static_cast<unsigned long long>(stats.pipelines), cs.compiled, cs.ms, cs.ahead, cs.from_disk, cs.failed);
+			// (the targets in the order the frame drew into them: a GPU crash report's operations line up with these)
+			log(0, "frame %llu's targets in order: %s", static_cast<unsigned long long>(stats.presents), plan_text().c_str());
 		}
 	}
 }

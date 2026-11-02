@@ -384,7 +384,20 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 		desc.maxRenderSize = { render_w, render_h };
 		desc.displaySize = { display_w, display_h };
 		_fsr = new FfxFsr2Context();
-		const FfxErrorCode e = ffxFsr2ContextCreate(static_cast<FfxFsr2Context *>(_fsr), &desc);
+		// (AMD's code throws when a resource it needs can't be made: the device removed, or no memory. The half-made
+		// context is left: destroying it isn't safe)
+		FfxErrorCode e = FFX_ERROR_BACKEND_API_ERROR;
+		try
+		{
+			e = ffxFsr2ContextCreate(static_cast<FfxFsr2Context *>(_fsr), &desc);
+		}
+		catch (...)
+		{
+			why = "FSR 2 couldn't make what it needed (the GPU lost, or no memory)";
+			_fsr = nullptr;
+			release();
+			return false;
+		}
 		if (e != FFX_OK)
 		{
 			why = "FSR 2's context couldn't be made (error " + std::to_string(int(e)) + ")";
@@ -616,7 +629,15 @@ void mask_cs(uint3 id : SV_DispatchThreadID)
 			d.cameraFar = 65535.0f;
 			d.cameraFovAngleVertical = 2.0f * std::atan(1.0f / float(proj[5]));
 			d.viewSpaceToMetersFactor = 1.0f;
-			e = ffxFsr2ContextDispatch(fsr, &d);
+			try
+			{
+				e = ffxFsr2ContextDispatch(fsr, &d);
+			}
+			catch (...)
+			{
+				e = FFX_ERROR_BACKEND_API_ERROR;
+				fsr3_why = "FSR 2 couldn't make what it needed (the GPU lost, or no memory)";
+			}
 		}
 		// (where FSR 2 left them: its inputs compute-read, its output unordered access)
 		transition(list, color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, read, color_state);

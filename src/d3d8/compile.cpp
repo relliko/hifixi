@@ -321,10 +321,16 @@ namespace hifi::d3d8
 				SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 				for (size_t i = w->next++; i < w->keys.size(); i = w->next++)
 				{
-					std::string hlsl, why;
-					const char *target = nullptr;
-					if (hlsl_of(w->keys[i], hlsl, target))
-						compile(hlsl, target, why, true);
+					try // (an exception leaving a thread ends the game: a shader not compiled ahead is compiled when drawn)
+					{
+						std::string hlsl, why;
+						const char *target = nullptr;
+						if (hlsl_of(w->keys[i], hlsl, target))
+							compile(hlsl, target, why, true);
+					}
+					catch (...)
+					{
+					}
 				}
 				if (--w->left == 0)
 				{

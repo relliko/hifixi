@@ -23,6 +23,10 @@ namespace gpu_crash
 	// Before the device is released
 	void unwatch();
 
+	// Whether the watched device was removed (hung, faulted, reset): set before the report is written. From then on
+	// nothing of HiFi XI's is recorded and AMD's code isn't called (its resources can't be made: it throws).
+	bool lost();
+
 	// The report for a removed device (the reason, the GPU and its video memory then, the page fault, the command
 	// lists the GPU hadn't finished)
 	std::string report(ID3D12Device *device);
