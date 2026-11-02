@@ -114,7 +114,8 @@ namespace worldfx
 	void detach(ID3D12Device *device);
 	ID3D12Device *attached();
 	// Shadow casters the host draws itself into the sun's shadow map (grass::renderer::set_casters), for this renderer and
-	// any made later. Called under the core's mutex: it mustn't call back into the core.
+	// any made later. Called while the renderer records, on the game's thread, without the core's lock (its render lock
+	// held): it mustn't call back into the core.
 	void set_casters(grass::renderer::caster_fn fn, void *context);
 	// The zone's casters the host draws itself (grass::renderer::set_zone_casters), likewise
 	void set_zone_casters(grass::renderer::zone_bounds_fn bounds, grass::renderer::zone_draw_fn draw, void *context);
@@ -123,7 +124,8 @@ namespace worldfx
 	// The light split the host draws (grass::renderer::set_light_source), likewise
 	void set_light_source(grass::renderer::light_fn fn, void *context);
 	// The camera of the frame being finished (VIEW and PROJECTION, row vectors), from the host: the zone pass's
-	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called under the core's mutex.
+	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called with the core's lock
+	// held, on the game's thread: it mustn't call back into the core.
 	using camera_source_fn = bool (*)(void *context, float view[16], float proj[16]);
 	void set_camera_source(camera_source_fn source, void *context);
 	// (status) Frames in the game World FX's pass drew, and the ones it didn't by reason

@@ -52,6 +52,13 @@ namespace
 	std::atomic<uint32_t> g_told_in{ 0 };
 	// (the FloatWorld setting, for our d3d8.dll at every mark without the core's lock)
 	std::atomic<bool> g_float_world{ false };
+	// The renderer records without the core's lock (g.mutex): it's held from the frame's look till the recording starts,
+	// and again after it. While it records, the game's thread holds render_mutex instead, and owns the renderer: what
+	// reads the renderer from elsewhere takes render_mutex too (a status or a stat only tries it, and goes without the
+	// renderer's part when it's busy), always after g.mutex; the recording lets render_mutex go before it takes g.mutex
+	// again, so the two are never held the other way round. (The 11-02 deadlocks: World FX's lock held across D3D12
+	// calls that took the debug layer's lock, waited on by a list Reset from another thread.)
+	std::mutex g_render_mutex;
 	// The zone's files to be read again (worldfx::reload_zone: HiFi XI just made them)
 	std::atomic<bool> g_reload_zone{ false };
 	// The game's world found since its device was attached: World FX draws there (worldfx_drawing: HiFi XI's game side
@@ -1950,7 +1957,42 @@ namespace
 		log_people(cam, people);
 	}
 
-	void inject(ID3D12GraphicsCommandList *list, const worldfx::world_mark &m, uint64_t rtv)
+	// What the look points into, copied for the recording (the game side may send new ones while it records)
+	struct recording_arrays
+	{
+		float actors[grass::kMaxActors * 4] = {};
+		float cuts[grass::kMaxCuts * 8] = {};
+		float ripples[grass::kMaxRipples * 8] = {};
+		float lamps[grass::kMaxLamps * 8] = {};
+	};
+	recording_arrays g_recording; // (the game's thread only)
+
+	// (g.mutex held by lock) The renderer's drawing on the list, without the core's lock while it records (render_mutex
+	// held instead); the lock held again after it
+	grass::draw_stats record(std::unique_lock<std::mutex> &lock, ID3D12GraphicsCommandList *list, const grass::target &t, const grass::camera &cam,
+		grass::look l, std::string &error)
+	{
+		const auto own = [](const float *&from, float *to, size_t floats) {
+			if (from != nullptr)
+			{
+				std::memcpy(to, from, floats * sizeof(float));
+				from = to;
+			}
+		};
+		own(l.actors, g_recording.actors, grass::kMaxActors * 4);
+		own(l.cuts, g_recording.cuts, grass::kMaxCuts * 8);
+		own(l.ripples, g_recording.ripples, grass::kMaxRipples * 8);
+		own(l.lamps, g_recording.lamps, grass::kMaxLamps * 8);
+		grass::renderer *const r = g.renderer.get();
+		std::unique_lock<std::mutex> render(g_render_mutex);
+		lock.unlock();
+		const grass::draw_stats s = r->draw(list, t, cam, l, error);
+		render.unlock();
+		lock.lock();
+		return s;
+	}
+
+	void inject(std::unique_lock<std::mutex> &lock, ID3D12GraphicsCommandList *list, const worldfx::world_mark &m, uint64_t rtv)
 	{
 		g.tried = true;
 		g.passes_wanted++;
@@ -2050,7 +2092,7 @@ namespace
 			if (n != 0 && !g.renderer->set_vis_boxes(g.vis_objects, g.vis_boxes, n, g.presents, vis_error))
 				g.vis_skipped += n;
 		}
-		g.last = g.renderer->draw(list, t, cam, l, error);
+		g.last = record(lock, list, t, cam, l, error);
 		if (g.last.sun_map_cascades != 0)
 			g.sun_map_redraws++;
 		{
@@ -2217,7 +2259,8 @@ static std::string crash_context()
 	out += "  weather of its own: " + weather_fx_text() + "\n";
 	std::snprintf(line, sizeof(line), "  shading pass: %s\n", g.shading_held != nullptr ? g.shading_held : g.shading_logged ? "running" : "not run yet");
 	out += line;
-	if (g.renderer != nullptr)
+	std::unique_lock<std::mutex> render(g_render_mutex, std::try_to_lock); // (busy recording: the times left out)
+	if (g.renderer != nullptr && render.owns_lock())
 	{
 		std::snprintf(line, sizeof(line), "  GPU time a frame (smoothed): copies and shading %.2f ms, grass %.2f ms\n", g.renderer->shading_ms(), g.renderer->grass_ms());
 		out += line;
@@ -2347,6 +2390,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.casters = fn;
 		g.casters_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_casters(fn, context);
 	}
@@ -2378,6 +2422,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		texture = nullptr;
 		frames = 0;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		return g.renderer != nullptr && g.renderer->blade_motion(texture, frames);
 	}
 
@@ -2387,6 +2432,7 @@ namespace worldfx
 		g.zone_bounds = bounds;
 		g.zone_draw = draw;
 		g.zone_casters_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_zone_casters(bounds, draw, context);
 	}
@@ -2396,6 +2442,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.floor = fn;
 		g.floor_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_floor_source(fn, context);
 	}
@@ -2405,6 +2452,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.light = fn;
 		g.light_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_light_source(fn, context);
 	}
@@ -2412,6 +2460,7 @@ namespace worldfx
 	void attach(ID3D12Device *device)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
+		std::lock_guard<std::mutex> render(g_render_mutex); // (the renderer replaced)
 		if (device == nullptr || g.dev == device)
 			return;
 		g.dev = device;
@@ -2453,6 +2502,7 @@ namespace worldfx
 	void detach(ID3D12Device *device)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (device != g.dev)
 			return;
 		gpu_crash::unwatch();
@@ -2493,14 +2543,14 @@ namespace worldfx
 
 	void on_world_end(const world_mark &m)
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
+		std::unique_lock<std::mutex> lock(g.mutex);
 		// (once after each zone's begin: our d3d8.dll marks the world's end once after it)
 		if (g.world_end_done || g.world_rtv == 0 || g.world_dsv == 0)
 			return;
 		g.world_end_done = true;
 		take_fog(m);
 		if (m.rt != nullptr && m.rt == g.world_rt && m.ds == g.world_ds)
-			inject(m.list, m, g.world_rtv);
+			inject(lock, m.list, m, g.world_rtv);
 		else
 			g.skip = "the world's target and depth aren't the zone's begin's now (skipped)";
 	}
@@ -2536,7 +2586,7 @@ namespace worldfx
 
 	void on_zone_end(const world_mark &m)
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
+		std::unique_lock<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
 		ID3D12GraphicsCommandList *const list = m.list;
 		ID3D12Resource *const ds = m.ds;
@@ -2579,7 +2629,7 @@ namespace worldfx
 		if (n != 0)
 			list->ResourceBarrier(n, b);
 		std::string error;
-		g.marker_blades = g.renderer->draw(list, t, cam, l, error);
+		g.marker_blades = record(lock, list, t, cam, l, error);
 		for (UINT k = 0; k < n; ++k)
 			std::swap(b[k].Transition.StateBefore, b[k].Transition.StateAfter);
 		if (n != 0)
@@ -3124,6 +3174,7 @@ extern "C" __declspec(dllexport) uint32_t __cdecl worldfx_set_setting(const char
 extern "C" __declspec(dllexport) void __cdecl worldfx_sea_stats(uint32_t out[4])
 {
 	std::lock_guard<std::mutex> lock(g.mutex);
+	std::lock_guard<std::mutex> render(g_render_mutex);
 	out[0] = g.renderer != nullptr ? g.renderer->sea_corners() : 0u;
 	out[1] = g.last.sea_corners;
 	out[2] = g.last.water_corners;
@@ -3444,7 +3495,8 @@ static void status_lines(const worldfx::ui &u)
 		text_wrapped(u, "Shaders: %s", g.shader_status.c_str());
 		if (!g.memory_status.empty())
 			text_colored(u, warn, "Over the video memory: %s (stutters; a lower background resolution would fit).", g.memory_status.c_str());
-		if (g.renderer != nullptr)
+		std::unique_lock<std::mutex> render(g_render_mutex, std::try_to_lock); // (busy recording: left out this once)
+		if (g.renderer != nullptr && render.owns_lock())
 		{
 			text(u, "GPU time a frame: copies and shading %.2f ms, grass %.2f ms", g.renderer->shading_ms(), g.renderer->grass_ms());
 			for (const std::string &l : gpu_time_lines(*g.renderer))
@@ -3923,12 +3975,16 @@ std::vector<std::string> worldfx::gpu_times()
 	std::lock_guard<std::mutex> lock(g.mutex);
 	if (g.renderer == nullptr)
 		return { "GPU time by section: World FX isn't drawing" };
+	std::unique_lock<std::mutex> render(g_render_mutex, std::try_to_lock);
+	if (!render.owns_lock())
+		return { "GPU time by section: World FX is recording now (ask again)" };
 	return gpu_time_lines(*g.renderer);
 }
 
 void worldfx::forget_colours()
 {
 	std::lock_guard<std::mutex> lock(g.mutex);
+	std::lock_guard<std::mutex> render(g_render_mutex);
 	if (g.renderer != nullptr)
 	{
 		std::string ignored;
