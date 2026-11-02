@@ -928,7 +928,7 @@ namespace
 		// stop() with everything on: the image the dump again
 		options.clear();
 		step_on = true;
-		for (const char *n : { "exp_occlusion", "exp_batch", "exp_dedupe" })
+		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe" })
 			set_option(n, "1");
 		host_addons_known = false;
 		exp::update();
@@ -948,7 +948,7 @@ namespace
 			check(bytes_at(occl_at, 12) != every, "given back: occlusion at its rate");
 		}
 		const std::string line_on = exp::state_line();
-		// ('ashita', on by default, refused here: a fake plugin handles draw calls; the line says why)
+		// ('ashita' asked for too, refused here: a fake plugin handles draw calls; the line says why)
 		check(line_on == "on: occlusion, batch, dedupe; off: ashita (Not turned on: it would break plugin newbie (handles draw calls).)",
 			"the state line for the log and the reports: " + line_on);
 		exp::stop();
