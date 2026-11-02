@@ -1,7 +1,7 @@
 @echo off
 rem Builds build\hifixi.dll (32-bit, like the game), the render engine (build_engine.cmd: build\engine\worldfx_engine.lib)
-rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests but hook_test; "build.cmd e2e":
-rem everything and the end-to-end test's folder).
+rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests but hook_test). Every
+rem suite is run by python -I tests\run_suites.py.
 rem The Ashita v4 plugin SDK is in deps\ashita (a sparse clone of AshitaXI/Ashita-v4beta, plugins\sdk only); the Windows
 rem SDK headers and libraries are the NuGet copy reshade-worldfx uses (no Windows SDK installed on this PC).
 rem Each cl line with more than one source file has /MP: its files compiled side by side, one per core (here and in
@@ -334,17 +334,3 @@ for %%t in ("..\reshade-worldfx\tests\gamewater_cave.c" "tests\gamerain_cave.c")
     /Fo"build\test\%%~nt.obj" || exit /b 1
   echo Built build\test\%%~nt.exe
 )
-
-rem "build.cmd e2e": World FX's end-to-end test on HiFi XI (tests\e2e.cpp) in build\e2e-native: the starter as its
-rem dxgi.dll, hifixi.dll beside it, the stand-in FFXiMain.dll and zone 100's blades. Run build\e2e-native\e2e.exe from
-rem there (WFX_E2E_HOUR=22 or 3 for night).
-if /i not "%~1"=="e2e" exit /b 0
-if not exist build\e2e-native\worldfx-grass mkdir build\e2e-native\worldfx-grass
-cl /nologo /O2 /MT /W4 /DWIN32_LEAN_AND_MEAN /LD tests\fake_ffximain.cpp /Fo"build\test\\" /Fe"build\e2e-native\FFXiMain.dll" /link /NOLOGO || exit /b 1
-cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
-  tests\e2e.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\e2e-native\e2e.exe" /link /NOLOGO user32.lib || exit /b 1
-del /q build\e2e-native\FFXiMain.exp build\e2e-native\FFXiMain.lib 2>nul
-copy /y build\hifixi.dll build\e2e-native\ >nul || exit /b 1
-copy /y build\starter\dxgi.dll build\e2e-native\ >nul || exit /b 1
-copy /y build\testdata\grass\100.bin build\e2e-native\worldfx-grass\ >nul || exit /b 1
-echo Built build\e2e-native
