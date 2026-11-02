@@ -77,19 +77,25 @@ Not available here
 The +2 rule (src/host/retire.hpp)
 
 - `retire::on_present` (src/host/retire.hpp:97) signals one fence on the game's direct queue at every present and
-  frees what that fence has passed. It is called from `backend::present` (src/backend/backend.cpp:1044), skipped once
-  `gpu_crash::lost()` (src/backend/backend.cpp:1040).
+  frees what that fence has passed. It is called from `backend::present` (src/backend/backend.cpp:766), skipped once
+  `gpu_crash::lost()` (src/backend/backend.cpp:763).
 - Ashita calls the plugin's present before our d3d8.dll submits the frame. So the signal made at present N sits in the
   queue before frame N's lists. An object handed over during frame N is freed at `signalled + 2`
   (src/host/retire.hpp:63): the next present's signal is the first one behind every list that may use it.
-- New device: what the old device held is freed at once (src/host/retire.hpp:112). Device removed: the fence reads
-  `UINT64_MAX` (src/host/retire.hpp:136), so everything is freed.
-- At unload `retire::release_all` (src/host/retire.hpp:156, called at src/plugin/main.cpp:1116) signals once more and
+- What isn't a COM object or an owner goes as a closure: `retire::then(fn)` (src/host/retire.hpp:99) runs `fn` by the
+  same rule, on the game thread inside `on_present`, outside the list's own lock (so `fn` may take a lock of its own,
+  as long as `on_present` and `release_all` are never called with that lock held).
+- New device: what the old device held is freed at once (src/host/retire.hpp:124). Device removed: the fence reads
+  `UINT64_MAX` (src/host/retire.hpp:148), so everything is freed.
+- At unload `retire::release_all` (src/host/retire.hpp:168, called at src/plugin/main.cpp:1066) signals once more and
   waits at most 2 s. What was handed over since the last present may be on the open list, so it is leaked on purpose,
-  never freed under it (src/host/retire.hpp:183).
+  never freed under it, and a `then` closure is left unrun (src/host/retire.hpp:195).
 - Users: zone slots (src/zone/native.cpp:60), model-actor DATs (src/zone/actordata.cpp:98, :120), effect textures and
   upload buffers (src/fx/fxtextures.cpp:196, :350), effect distortion targets (src/fx/fxrender.cpp:494), character
-  objects (src/chars/cache.cpp:136, :1012-1015).
+  objects (src/chars/cache.cpp:176, :1194-1199), and the characters' descriptor pairs through `retire::then`
+  (src/chars/cache.cpp:178-185): a pair let go goes back to `free_slots` only behind the fence, and only while
+  `heap_generation` still matches (`make_gpu` and `stop()` make `free_slots` again for a new heap, so a late pair from
+  the last heap would otherwise be handed out twice).
 - retire.hpp covers the game's direct queue only. Anything that ran on another queue must already be finished (CPU
   wait or fence check) before it is handed to `retire::later`.
 
@@ -106,10 +112,13 @@ The zone's copy queue (src/zone/zone_gpu.cpp)
 
 The characters' cache worker (src/chars/cache.cpp)
 
-- Its own copy queue, allocator, list and fence (src/chars/cache.cpp:196-224), used from the worker thread only.
-- Every batch waits for its fence, at most 10 s (src/chars/cache.cpp:437-452). Only after that are entries marked
-  ready for the game thread, and the allocator is reset only at the start of the next batch (src/chars/cache.cpp:403).
-- When the device goes, the queue and fence go through `retire::later` (src/chars/cache.cpp:1012-1015). That is safe
+- Its own copy queue, allocator, list and fence (src/chars/cache.cpp:265-287), used from the worker thread only.
+- Every batch waits for its fence, at most 10 s (src/chars/cache.cpp:511-526). Only after that are entries marked
+  ready for the game thread, and the allocator is reset only at the start of the next batch (src/chars/cache.cpp:477).
+- A batch is at most `kBatchBytes` of upload bytes (one entry bigger than that goes alone), and the worker holds at
+  most one batch's textures decoded (`cache.hpp` `kBatchBytes`, `kEntryCap`): that bounds the upload buffer and the
+  CPU copies in the game's 32-bit memory, not any GPU lifetime.
+- When the device goes, the queue and fence go through `retire::later` (src/chars/cache.cpp:1194-1199). That is safe
   because nothing is left running on the copy queue.
 
 2D uploads (src/ui2d/render2d.cpp)
@@ -162,6 +171,11 @@ AMD frame generation (src/framegen)
 - Leaked contexts. Contexts for sizes gone are retired behind the game queue's fence (2847014). But when the swap
   chain is made again the old kits are still left, not destroyed (src/framegen/framegen.cpp:135-137; memory
   hifixi-framegen.md lists it as open).
+- Descriptor slots reused under lists in flight. Until M1 of the texture pack (2026-11-02) the characters' cache gave
+  a forgotten mesh's or texture's pair of descriptors straight back to `free_slots`, and the worker wrote the next
+  upload's views into it at once, while lists recorded with the old views could still run (the objects themselves
+  already went through `retire::later`). Now the pair waits for the fence too (`retire::then`); charinject_test lets
+  the Mithra go between a frame's recording and its run and checks a new texture gets another pair.
 - Running on after the device was removed. Before 0.62 (a923d56) HiFi XI kept recording and submitting after a GPU
   hang and ended in "abnormal program termination". Now `gpu_crash::lost()` stops our passes, FSR and frame
   generation, and `retire::on_present` is no longer called.

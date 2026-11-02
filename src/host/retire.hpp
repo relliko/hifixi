@@ -4,7 +4,7 @@
 // (backend::present: on_present), instead of each module guessing with a count of presents or milliseconds (zone data
 // kept 240 presents, effect uploads 2 s, characters' meshes released at once when their address was reused).
 //
-// later(p) / later(std::move(owner)): from any thread. What is handed over may be on lists recorded this frame or
+// later(p) / later(std::move(owner)) / then(fn): from any thread. What is handed over may be on lists recorded this frame or
 // before; those go to the GPU when the d3d8.dll presents, after the signal this present made (Ashita calls the plugin's
 // present first). So an object is let go once the fence has passed two signals after the last one made: the next
 // present's signal is the first behind all of this frame's lists.
@@ -90,6 +90,18 @@ namespace hifi::retire
 		detail::item i;
 		std::shared_ptr<T> held(std::move(owner));
 		i.owner = [held]() mutable { held.reset(); };
+		detail::hold(std::move(i));
+	}
+	// fn run once the GPU is past every list recorded so far (what isn't an object to release: a descriptor slot given
+	// back to its free list, src/chars/cache.cpp). Run on the game's thread in on_present (or in release_all), outside
+	// this list's lock; it may take a lock of its own, as long as neither is ever called with that lock held. A new device
+	// runs it at once; release_all leaves it unrun when it was handed over after the last present.
+	inline void then(std::function<void()> &&fn)
+	{
+		if (!fn)
+			return;
+		detail::item i;
+		i.owner = std::move(fn);
 		detail::hold(std::move(i));
 	}
 

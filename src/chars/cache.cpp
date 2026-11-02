@@ -6,17 +6,25 @@
  * resources made in COMMON, one upload buffer, one copy list on our own copy queue, then waits for its fence and marks
  * the batch's entries ready. Everything shared is under one mutex; decoding and uploading run outside it.
  *
+ * Textures are decoded only as far as the next batch (kBatchBytes in all, decoded and not yet on the GPU): a crowd
+ * queued at once, or before there's a device, isn't all held decoded in the game's 32-bit memory. A batch counts its
+ * entries' real upload bytes; one entry bigger than a batch goes alone (and, once held back, before any other), one
+ * over kEntryCap isn't decoded at all, and one its detail map would take over kEntryCap is decoded without one.
+ *
  * No device call is made while the mutex is held, Release included (resources let go wait in `dead` until it's left):
- * dgVoodoo's recording thread asks the cache for views inside our hooks, which with the debug layer run inside its
- * device lock, so a device call made under our mutex could wait on that lock while the recording thread waits on us.
+ * with the debug layer a device call takes the runtime's own locks, and the game's thread asks the cache for views
+ * while it records (docs/d3d12/threads-pso.md). A pair of descriptors let go goes back to `free_slots` only once the
+ * GPU is past every list recorded with it (retire::then): lists in flight still read the views it holds.
  */
 
 #include <windows.h>
 #include "cache.hpp"
 #include "charframe.hpp"
+#include "charoptions.hpp"
 #include "tex.hpp"
 #include "../host/retire.hpp"
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -55,7 +63,19 @@ namespace hifi::chars::cache
 		};
 
 		constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
-		constexpr uint64_t kBatchBytes = 48ull << 20; // (upload bytes a batch at most)
+
+		uint64_t align_up(uint64_t v, uint64_t a)
+		{
+			return (v + a - 1) & ~(a - 1);
+		}
+
+		// What a texture of w x h decodes to (RGBA8 with its mips; twice that with a detail map): what the worker plans
+		// its decoding by, before it has the levels
+		uint64_t planned_bytes(uint32_t w, uint32_t h, bool detail)
+		{
+			const uint64_t colour = uint64_t(w) * h * 4 * 4 / 3;
+			return detail ? 2 * colour : colour;
+		}
 
 		struct mesh_entry
 		{
@@ -73,6 +93,7 @@ namespace hifi::chars::cache
 			uint32_t slot = kNoSlot;
 			double seen = 0.0;
 			uint64_t gpu_bytes = 0;
+			uint64_t upload_bytes = 0; // (its share of a batch's upload buffer, known once decoded)
 		};
 
 		struct texture_entry
@@ -80,6 +101,7 @@ namespace hifi::chars::cache
 			key k;
 			std::vector<uint8_t> raw;
 			state s = state::queued;
+			bool with_detail = false; // (whether its decode makes a detail map: [chars] detail when it was picked)
 			tex::texture decoded; // (dropped once uploaded)
 			tex::texture detail;  // its detail map (tex::make_detail; dropped once uploaded)
 			ID3D12Resource *t = nullptr;
@@ -87,6 +109,8 @@ namespace hifi::chars::cache
 			uint32_t slot = kNoSlot;
 			double seen = 0.0;
 			uint64_t gpu_bytes = 0;
+			uint64_t decoded_bytes = 0; // (its levels' bytes while decoded or uploading: in g.decoded_bytes)
+			uint64_t upload_bytes = 0;  // (its share of a batch's upload buffer, colour and detail map)
 		};
 
 		struct state_all
@@ -96,6 +120,9 @@ namespace hifi::chars::cache
 			std::thread worker;
 			bool quit = false;
 			bool busy = false; // the worker is decoding or uploading outside the lock
+			bool held = false; // it waits with textures queued that the batch holds back (no GPU to upload the decoded ones to)
+			uint64_t decoded_bytes = 0; // (the textures' decoded bytes not yet on the GPU: decoded or uploading)
+			uint32_t waiting = kNone;   // (the texture the batch held back first: no other is decoded until it is)
 
 			std::vector<std::unique_ptr<mesh_entry>> meshes;
 			std::vector<std::unique_ptr<texture_entry>> textures;
@@ -113,27 +140,49 @@ namespace hifi::chars::cache
 			ID3D12DescriptorHeap *heap = nullptr;
 			UINT step = 0;
 			std::vector<uint32_t> free_slots; // (pairs of descriptors: slot s = descriptors 2s, 2s + 1)
+			uint64_t heap_generation = 0;     // (free_slots made again for a new heap: a pair let go from the last isn't given back)
 			ID3D12Resource *palette_buffer = nullptr;
 			uint8_t *palette_mapped = nullptr;
 			std::string gpu_failure;
 
 			counts n;
 			std::vector<IUnknown *> dead; // (to be released once the mutex is left)
+			std::vector<uint32_t> slots_dead; // (pairs let go: given back behind the GPU once the mutex is left)
 		};
 		state_all g;
+		std::atomic<bool> g_detail { options::kDetailByDefault };
 
-		// (the mutex held) What's been let go, to release after it's left
-		std::vector<IUnknown *> take_dead()
+		// What's been let go under the lock, handed over once it's left
+		struct dead_things
 		{
-			std::vector<IUnknown *> d;
-			d.swap(g.dead);
+			std::vector<IUnknown *> objects;
+			std::vector<uint32_t> slots;
+			uint64_t generation = 0;
+		};
+		// (the mutex held)
+		dead_things take_dead()
+		{
+			dead_things d;
+			d.objects.swap(g.dead);
+			d.slots.swap(g.slots_dead);
+			d.generation = g.heap_generation;
 			return d;
 		}
-		// (lists recorded this frame or before may still draw them: let go behind the GPU, not at once)
-		void bury(std::vector<IUnknown *> &&d)
+		// (lists recorded this frame or before may still draw them, or read the views in a pair: let go behind the GPU,
+		// not at once; a pair back to free_slots only then, and only into the heap it came from)
+		void bury(dead_things &&d)
 		{
-			for (IUnknown *p : d)
+			for (IUnknown *p : d.objects)
 				retire::later(p);
+			if (!d.slots.empty())
+				retire::then([slots = std::move(d.slots), generation = d.generation]() {
+					std::lock_guard<std::mutex> lock(g.mutex);
+					if (g.heap_generation != generation)
+						return;
+					g.free_slots.insert(g.free_slots.end(), slots.begin(), slots.end());
+					g.n.slots_retiring -= std::min(g.n.slots_retiring, uint32_t(slots.size()));
+					g.wake.notify_one(); // (decoded entries may be waiting for a pair)
+				});
 		}
 		template <typename T>
 		void later(T *&p)
@@ -143,22 +192,33 @@ namespace hifi::chars::cache
 			p = nullptr;
 		}
 
-		// (under the lock) An entry's GPU things let go
+		// (under the lock) An entry's GPU things let go, its pair of descriptors with them
+		void release_slot(uint32_t &slot)
+		{
+			if (slot != kNoSlot)
+			{
+				g.slots_dead.push_back(slot);
+				g.n.slots_retiring++;
+			}
+			slot = kNoSlot;
+		}
 		void release_mesh(mesh_entry &e)
 		{
 			later(e.vb);
 			later(e.cb);
-			if (e.slot != kNoSlot)
-				g.free_slots.push_back(e.slot);
-			e.slot = kNoSlot;
+			release_slot(e.slot);
 		}
 		void release_texture(texture_entry &e)
 		{
 			later(e.t);
 			later(e.d);
-			if (e.slot != kNoSlot)
-				g.free_slots.push_back(e.slot);
-			e.slot = kNoSlot;
+			release_slot(e.slot);
+		}
+		// (under the lock) A texture's decoded bytes no longer held (on the GPU, failed or let go)
+		void drop_decoded(texture_entry &e)
+		{
+			g.decoded_bytes -= std::min(g.decoded_bytes, e.decoded_bytes);
+			e.decoded_bytes = 0;
 		}
 
 		ID3D12Resource *make_buffer(ID3D12Device *device, D3D12_HEAP_TYPE heap, uint64_t size, D3D12_RESOURCE_STATES st)
@@ -250,6 +310,7 @@ namespace hifi::chars::cache
 			g.fence = p.fence;
 			g.heap = p.heap;
 			g.step = p.step;
+			g.heap_generation++;
 			g.free_slots.clear();
 			// (the last pairs are the renderer's own: reserved())
 			for (uint32_t s = kDescriptors / 2 - kReserved / 2; s-- > 0;)
@@ -264,15 +325,15 @@ namespace hifi::chars::cache
 			return h;
 		}
 
-		// (the worker, outside the lock) Decode one entry
-		void decode_mesh(mesh_entry &e, double &ms)
+		// (the worker, outside the lock) Decode one entry: whether it could be (its state is set under the lock after:
+		// until then the entry is the worker's)
+		bool decode_mesh(mesh_entry &e, double &ms)
 		{
 			const double t0 = seconds();
 			os2::sections s;
 			std::string why;
 			const bool ok = (e.base != 0 ? os2::sections_of_live(e.raw.data(), e.raw.size(), e.base, s) : os2::sections_of_chunk(e.raw.data(), e.raw.size(), s)) &&
 				os2::decode(e.raw.data(), e.raw.size(), s, e.decoded, why);
-			e.s = ok ? state::decoded : state::failed;
 			if (!ok)
 			{
 				std::lock_guard<std::mutex> lock(g.mutex);
@@ -280,12 +341,15 @@ namespace hifi::chars::cache
 			}
 			e.vertices = uint32_t(e.decoded.vertices.size());
 			e.corners = uint32_t(e.decoded.corners.size());
+			// (as upload() lays it out: the vertices, then the corners, each 16-aligned)
+			e.upload_bytes = align_up(uint64_t(e.vertices) * sizeof(os2::vertex), 16) + align_up(uint64_t(e.corners) * sizeof(os2::corner), 16);
 			if (ok)
 				e.blade = os2::blade_of(e.decoded, e.weapon_slot);
 			std::vector<uint8_t>().swap(e.raw);
 			ms += (seconds() - t0) * 1000.0;
+			return ok;
 		}
-		void decode_texture(texture_entry &e, double &ms)
+		bool decode_texture(texture_entry &e, double &ms)
 		{
 			const double t0 = seconds();
 			std::string why;
@@ -293,16 +357,26 @@ namespace hifi::chars::cache
 			if (ok)
 			{
 				tex::make_mips(e.decoded);
-				tex::make_detail(e.decoded, e.detail);
+				if (e.with_detail)
+					tex::make_detail(e.decoded, e.detail);
 			}
-			e.s = ok ? state::decoded : state::failed;
 			if (!ok)
 			{
 				std::lock_guard<std::mutex> lock(g.mutex);
 				g.n.last_failure = "a texture: " + why;
 			}
+			// Its bytes now, and its share of an upload buffer as GetCopyableFootprints lays it out (rows 256-aligned, each
+			// level 512-aligned): counted on the CPU, no device call under the lock when batches are picked
+			e.decoded_bytes = e.upload_bytes = 0;
+			for (const tex::texture *t : { &e.decoded, &e.detail })
+				for (const tex::level &lv : t->levels)
+				{
+					e.decoded_bytes += lv.rgba.size();
+					e.upload_bytes += align_up(align_up(uint64_t(lv.w) * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * lv.h, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+				}
 			std::vector<uint8_t>().swap(e.raw);
 			ms += (seconds() - t0) * 1000.0;
+			return ok;
 		}
 
 		// (the worker, outside the lock; the entries are its own until marked) One batch's copies, waited for
@@ -463,54 +537,109 @@ namespace hifi::chars::cache
 				std::vector<mesh_entry *> decode_m;
 				std::vector<texture_entry *> decode_t;
 				batch b;
-				uint64_t batch_bytes = 0;
+				uint64_t batch_bytes = 0, planned = 0;
+				bool full = false, held = false;
 				const bool gpu = make_gpu(lock);
-				for (auto &e : g.meshes)
-					if (e)
+				const bool detail = g_detail.load();
+				// (a decoded entry into the batch by its upload bytes: one that doesn't fit waits for the next, one bigger
+				// than a whole batch goes alone)
+				const auto take = [&](uint64_t bytes) {
+					const bool empty = b.meshes.empty() && b.textures.empty();
+					if (!gpu || full || g.free_slots.empty() || (!empty && batch_bytes + bytes > kBatchBytes))
+						return false;
+					batch_bytes += bytes;
+					full = batch_bytes >= kBatchBytes;
+					return true;
+				};
+				// (textures first: while a big one is held decoded nothing else is, so it's the only one left the next time
+				// round, however many meshes come meanwhile. One held back waits for nothing else decoded and then goes
+				// alone, before any other: textures arriving meanwhile, decoded beside the batches being uploaded, would
+				// otherwise keep it back for as long as they come)
+				if (g.waiting != kNone && (g.waiting >= g.textures.size() || !g.textures[g.waiting] || g.textures[g.waiting]->s != state::queued))
+					g.waiting = kNone;
+				for (uint32_t i = 0; i < g.textures.size(); ++i)
+					if (const auto &e = g.textures[i])
 					{
 						if (e->s == state::queued)
-							decode_m.push_back(e.get());
-						else if (e->s == state::decoded && gpu && batch_bytes < kBatchBytes && g.free_slots.size() > 0)
 						{
-							e->s = state::uploading;
-							e->slot = g.free_slots.back();
-							g.free_slots.pop_back();
-							b.meshes.push_back(e.get());
-							batch_bytes += uint64_t(e->vertices) * sizeof(os2::vertex) + uint64_t(e->corners) * sizeof(os2::corner);
+							// Decoded only as far as the next batch: what's decoded and not on the GPU yet, and what's planned
+							// now, within kBatchBytes (one at least when there's none); one over kEntryCap never (a guard: the
+							// colour alone is 85 MB at most, tex::dimensions taking 4096 x 4096 at most). With its detail map,
+							// make_detail's own buffers count too while it runs: over the cap with them, it goes without one
+							// (better than its models left to the game)
+							uint32_t w = 0, h = 0;
+							const bool known = tex::dimensions(e->raw.data(), e->raw.size(), w, h);
+							const bool with_detail = detail && known && planned_bytes(w, h, true) + tex::detail_work_bytes(w, h) <= kEntryCap;
+							const uint64_t bytes = known ? planned_bytes(w, h, with_detail) : 0;
+							if (bytes > kEntryCap)
+							{
+								std::vector<uint8_t>().swap(e->raw);
+								e->s = state::failed;
+								g.n.too_big++;
+								g.n.last_failure = "a texture: too big (" + std::to_string(w) + " x " + std::to_string(h) + ")";
+								if (g.waiting == i)
+									g.waiting = kNone;
+							}
+							else if (g.waiting != kNone && g.waiting != i)
+								held = true;
+							else if (g.decoded_bytes + planned + bytes <= kBatchBytes || (g.decoded_bytes == 0 && decode_t.empty()))
+							{
+								e->with_detail = with_detail;
+								g.n.detail_skipped += detail && known && !with_detail;
+								decode_t.push_back(e.get());
+								planned += bytes;
+								if (g.waiting == i)
+									g.waiting = kNone;
+							}
+							else
+							{
+								held = true;
+								if (g.waiting == kNone)
+									g.waiting = i;
+							}
 						}
-					}
-				for (auto &e : g.textures)
-					if (e)
-					{
-						if (e->s == state::queued)
-							decode_t.push_back(e.get());
-						else if (e->s == state::decoded && gpu && batch_bytes < kBatchBytes && g.free_slots.size() > 0)
+						else if (e->s == state::decoded && take(e->upload_bytes))
 						{
 							e->s = state::uploading;
 							e->slot = g.free_slots.back();
 							g.free_slots.pop_back();
 							b.textures.push_back(e.get());
-							batch_bytes += uint64_t(e->decoded.w) * e->decoded.h * 12; // (colour and detail map, with mips)
+						}
+					}
+				// (meshes are small: all decoded as they come)
+				for (auto &e : g.meshes)
+					if (e)
+					{
+						if (e->s == state::queued)
+							decode_m.push_back(e.get());
+						else if (e->s == state::decoded && take(e->upload_bytes))
+						{
+							e->s = state::uploading;
+							e->slot = g.free_slots.back();
+							g.free_slots.pop_back();
+							b.meshes.push_back(e.get());
 						}
 					}
 				if (decode_m.empty() && decode_t.empty() && b.meshes.empty() && b.textures.empty())
 				{
 					g.busy = false;
+					g.held = held;
 					g.idle.notify_all();
 					if (g.quit)
 						return;
+					if (dead_things d = take_dead(); !d.objects.empty() || !d.slots.empty())
 					{
-						std::vector<IUnknown *> d = take_dead();
 						lock.unlock();
 						bury(std::move(d));
 						lock.lock();
+						continue; // (the lock was left: a wake meanwhile would be missed, so look again first)
 					}
 					g.wake.wait(lock);
 					continue;
 				}
 				g.busy = true;
 				// (the entries picked are the worker's until their state changes: the game's thread doesn't touch an
-				// entry's decoded data or resources, and forgets only entries that are ready, failed or decoded)
+				// entry's decoded data or resources, and forgets only entries that are ready, failed, decoded or still queued)
 				for (mesh_entry *e : decode_m)
 					e->s = state::uploading; // (held while decoding: not forgotten under us)
 				for (texture_entry *e : decode_t)
@@ -523,30 +652,31 @@ namespace hifi::chars::cache
 					std::lock_guard<std::mutex> failure(g.mutex);
 					g.n.last_failure = std::string(what) + ": out of memory (or the decoder threw)";
 				};
-				for (mesh_entry *e : decode_m)
+				std::vector<char> mesh_ok(decode_m.size(), 0), texture_ok(decode_t.size(), 0);
+				for (size_t i = 0; i < decode_m.size(); ++i)
 					try
 					{
-						decode_mesh(*e, decode_ms);
+						mesh_ok[i] = decode_mesh(*decode_m[i], decode_ms);
 					}
 					catch (...)
 					{
+						mesh_entry *e = decode_m[i];
 						e->decoded = os2::mesh();
 						std::vector<uint8_t>().swap(e->raw);
 						e->vertices = e->corners = 0;
-						e->s = state::failed;
 						thrown("a mesh");
 					}
-				for (texture_entry *e : decode_t)
+				for (size_t i = 0; i < decode_t.size(); ++i)
 					try
 					{
-						decode_texture(*e, decode_ms);
+						texture_ok[i] = decode_texture(*decode_t[i], decode_ms);
 					}
 					catch (...)
 					{
+						texture_entry *e = decode_t[i];
 						e->decoded = tex::texture();
 						e->detail = tex::texture();
 						std::vector<uint8_t>().swap(e->raw);
-						e->s = state::failed;
 						thrown("a texture");
 					}
 				std::string why;
@@ -592,7 +722,26 @@ namespace hifi::chars::cache
 				lock.lock();
 				g.n.decode_ms += decode_ms;
 				g.n.upload_ms += upload_ms;
-				// (decode_mesh/_texture set decoded or failed; they took the lock only for the failure text)
+				// (what was decoded is decoded or failed only now, under the lock: the game's thread forgets decoded entries)
+				for (size_t i = 0; i < decode_m.size(); ++i)
+					decode_m[i]->s = mesh_ok[i] ? state::decoded : state::failed;
+				for (size_t i = 0; i < decode_t.size(); ++i)
+				{
+					texture_entry *e = decode_t[i];
+					e->s = texture_ok[i] ? state::decoded : state::failed;
+					if (texture_ok[i])
+					{
+						g.decoded_bytes += e->decoded_bytes;
+						g.n.decoded_peak = std::max(g.n.decoded_peak, g.decoded_bytes);
+					}
+					else
+						e->decoded_bytes = 0;
+				}
+				if (uploaded && !(b.meshes.empty() && b.textures.empty()))
+				{
+					g.n.batches++;
+					g.n.batch_bytes_max = std::max(g.n.batch_bytes_max, batch_bytes);
+				}
 				for (mesh_entry *e : b.meshes)
 				{
 					if (uploaded)
@@ -611,12 +760,14 @@ namespace hifi::chars::cache
 				}
 				for (texture_entry *e : b.textures)
 				{
+					// (its levels let go either way: on the GPU now, or failed for good)
+					drop_decoded(*e);
+					e->decoded.levels.clear();
+					e->decoded.levels.shrink_to_fit();
+					e->detail.levels.clear();
+					e->detail.levels.shrink_to_fit();
 					if (uploaded)
 					{
-						e->decoded.levels.clear();
-						e->decoded.levels.shrink_to_fit();
-						e->detail.levels.clear();
-						e->detail.levels.shrink_to_fit();
 						e->s = state::ready;
 						g.n.gpu_bytes += e->gpu_bytes;
 					}
@@ -676,6 +827,7 @@ namespace hifi::chars::cache
 		{
 			texture_entry &e = *g.textures[id];
 			release_texture(e);
+			drop_decoded(e);
 			if (e.s == state::ready)
 				g.n.gpu_bytes -= std::min(g.n.gpu_bytes, e.gpu_bytes);
 			auto it = g.texture_of.find(e.k.resource);
@@ -685,10 +837,11 @@ namespace hifi::chars::cache
 			g.free_textures.push_back(id);
 			g.n.forgotten++;
 		}
-		// (an entry the worker holds isn't forgotten: queued, decoded with the worker, or uploading)
+		// (an entry the worker holds isn't forgotten: decoding or uploading, both marked uploading while it holds them; one
+		// still queued is the cache's alone: the batch may hold it back a while, and it goes if it's no longer named)
 		bool forgettable(state s)
 		{
-			return s == state::ready || s == state::failed || s == state::decoded;
+			return s == state::ready || s == state::failed || s == state::decoded || s == state::queued;
 		}
 	}
 
@@ -696,14 +849,14 @@ namespace hifi::chars::cache
 	{
 		struct buried
 		{
-			std::vector<IUnknown *> d;
+			dead_things d;
 			~buried() { bury(std::move(d)); }
 		} graves;
-		std::vector<IUnknown *> &dead = graves.d;
+		dead_things &dead = graves.d;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		struct at_exit
 		{
-			std::vector<IUnknown *> &d;
+			dead_things &d;
 			~at_exit() { d = take_dead(); }
 		} keep { dead };
 		auto it = g.mesh_of.find(k.resource);
@@ -730,13 +883,13 @@ namespace hifi::chars::cache
 	{
 		struct buried
 		{
-			std::vector<IUnknown *> d;
+			dead_things d;
 			~buried() { bury(std::move(d)); }
 		} graves;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		struct at_exit
 		{
-			std::vector<IUnknown *> &d;
+			dead_things &d;
 			~at_exit() { d = take_dead(); }
 		} keep { graves.d };
 		auto it = g.texture_of.find(k.resource);
@@ -769,6 +922,7 @@ namespace hifi::chars::cache
 		g.n.bytes_in += e->raw.size();
 		const uint32_t id = add(g.meshes, g.free_meshes, g.mesh_of, std::move(e));
 		start_worker();
+		g.held = false;
 		g.wake.notify_one();
 		return id;
 	}
@@ -783,6 +937,7 @@ namespace hifi::chars::cache
 		g.n.bytes_in += e->raw.size();
 		const uint32_t id = add(g.textures, g.free_textures, g.texture_of, std::move(e));
 		start_worker();
+		g.held = false; // (settle: the worker looks again before it counts as idle)
 		g.wake.notify_one();
 		return id;
 	}
@@ -813,7 +968,7 @@ namespace hifi::chars::cache
 				buffer = nullptr;
 			}
 		}
-		std::vector<IUnknown *> dead;
+		dead_things dead;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			g.now = now;
@@ -826,20 +981,32 @@ namespace hifi::chars::cache
 				if (g.palette_buffer == nullptr)
 					g.gpu_failure = "the palettes' upload buffer couldn't be made";
 				start_worker();
+				g.held = false;
 				g.wake.notify_one();
 			}
 			// What hasn't been named for a while
+			const uint32_t forgotten = g.n.forgotten;
 			for (uint32_t i = 0; i < g.meshes.size(); ++i)
 				if (g.meshes[i] && now - g.meshes[i]->seen > kForgetSeconds && forgettable(g.meshes[i]->s))
 					forget_mesh(i);
 			for (uint32_t i = 0; i < g.textures.size(); ++i)
 				if (g.textures[i] && now - g.textures[i]->seen > kForgetSeconds && forgettable(g.textures[i]->s))
 					forget_texture(i);
+			if (g.n.forgotten != forgotten)
+			{
+				g.held = false; // (decoded ones let go make room in the batch for those held back)
+				g.wake.notify_one();
+			}
 			dead = take_dead();
 		}
 		if (buffer != nullptr)
 			buffer->Release(); // (made twice at once: not ours)
 		bury(std::move(dead));
+	}
+
+	void set_detail(bool on)
+	{
+		g_detail.store(on);
 	}
 
 	void publish_palettes(const frame &f, uint32_t from, uint32_t to)
@@ -880,8 +1047,10 @@ namespace hifi::chars::cache
 		std::lock_guard<std::mutex> lock(g.mutex);
 		if (id >= g.meshes.size() || !g.meshes[id] || g.meshes[id]->s != state::ready)
 			return false;
+		// (a texture that couldn't be read leaves the model to the game, which draws it as it can: never ready; one not
+		// found at all, kNone, is drawn without)
 		for (uint32_t t : g.meshes[id]->textures)
-			if (t != kNone && (t >= g.textures.size() || !g.textures[t] || (g.textures[t]->s != state::ready && g.textures[t]->s != state::failed)))
+			if (t != kNone && (t >= g.textures.size() || !g.textures[t] || g.textures[t]->s != state::ready))
 				return false;
 		return true;
 	}
@@ -935,6 +1104,10 @@ namespace hifi::chars::cache
 				c.meshes++;
 				c.meshes_ready += e->s == state::ready;
 				c.meshes_failed += e->s == state::failed;
+				bool left = false;
+				for (uint32_t t : e->textures)
+					left = left || (t != kNone && t < g.textures.size() && g.textures[t] && g.textures[t]->s == state::failed);
+				c.meshes_left_failed += left;
 			}
 		for (auto &e : g.textures)
 			if (e)
@@ -942,7 +1115,10 @@ namespace hifi::chars::cache
 				c.textures++;
 				c.textures_ready += e->s == state::ready;
 				c.textures_failed += e->s == state::failed;
+				c.detail_textures += e->s == state::ready && e->d != nullptr;
 			}
+		c.decoded_bytes = g.decoded_bytes;
+		c.slots_free = uint32_t(g.free_slots.size());
 		if (c.last_failure.empty())
 			c.last_failure = g.gpu_failure;
 		return c;
@@ -959,6 +1135,11 @@ namespace hifi::chars::cache
 		std::vector<std::string> out { line };
 		if (!c.last_failure.empty())
 			out.push_back("character data: the last that couldn't be: " + c.last_failure);
+		std::snprintf(line, sizeof(line), "character data: textures decoded now %.1f MB (peak %.1f), %u batches (largest %.1f MB), %u too big, %u with a detail map; "
+			"%u decoded without one (too big for it); %u descriptor pairs free (%u waiting for the GPU); %u meshes left to the game (a texture couldn't be read)",
+			double(c.decoded_bytes) / 1048576.0, double(c.decoded_peak) / 1048576.0, c.batches, double(c.batch_bytes_max) / 1048576.0, c.too_big, c.detail_textures,
+			c.detail_skipped, c.slots_free, c.slots_retiring, c.meshes_left_failed);
+		out.push_back(line);
 		return out;
 	}
 
@@ -968,13 +1149,14 @@ namespace hifi::chars::cache
 		return g.idle.wait_for(lock, std::chrono::milliseconds(ms), [] {
 			if (g.busy)
 				return false;
-			// (decoded with a device: to be uploaded, unless the GPU side couldn't be made)
+			// (decoded with a device: to be uploaded, unless the GPU side couldn't be made; queued: to be decoded, unless the
+			// worker waits with them held back by a batch it has nowhere to upload)
 			const bool uploads = g.device != nullptr && g.gpu_failure.empty();
 			for (auto &e : g.meshes)
 				if (e && (e->s == state::queued || (e->s == state::decoded && uploads)))
 					return false;
 			for (auto &e : g.textures)
-				if (e && (e->s == state::queued || (e->s == state::decoded && uploads)))
+				if (e && ((e->s == state::queued && !g.held) || (e->s == state::decoded && uploads)))
 					return false;
 			return true;
 		});
@@ -989,7 +1171,7 @@ namespace hifi::chars::cache
 		}
 		if (g.worker.joinable())
 			g.worker.join();
-		std::vector<IUnknown *> dead;
+		dead_things dead;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			for (auto &e : g.meshes)
@@ -998,6 +1180,8 @@ namespace hifi::chars::cache
 			for (auto &e : g.textures)
 				if (e)
 					release_texture(*e);
+			g.slots_dead.clear(); // (the heap goes too; pairs let go before are left out by the generation)
+			g.heap_generation++;
 			g.meshes.clear();
 			g.textures.clear();
 			g.free_meshes.clear();
@@ -1017,6 +1201,9 @@ namespace hifi::chars::cache
 			g.fence_value = 0;
 			g.free_slots.clear();
 			g.busy = false;
+			g.held = false;
+			g.decoded_bytes = 0;
+			g.waiting = kNone;
 			g.quit = false;
 			g.now = 0.0;
 			g.n = counts();

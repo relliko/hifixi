@@ -36,6 +36,9 @@ namespace hifi::chars::tex
 
 	// Level 0 only; false and why when the chunk has nothing the game would show
 	bool decode(const uint8_t *data, size_t size, texture &out, std::string &why);
+	// The size decode would give, from the header alone (the cache plans its decoding by it); false where decode would
+	// refuse the header
+	bool dimensions(const uint8_t *data, size_t size, uint32_t &w, uint32_t &h);
 	// The mips the game asks for, made from level 0 (6, or 1 when a side is under 32)
 	void make_mips(texture &t);
 	uint32_t mip_count(uint32_t w, uint32_t h);
@@ -46,4 +49,8 @@ namespace hifi::chars::tex
 	// detailed texels: trim, studs, buckles); a cavity (darker than around it: seams, crevices). Nothing in the game has
 	// these: a guess from the colours alone.
 	void make_detail(const texture &colour, texture &out);
+	// What make_detail holds at once for a w x h texture while it runs, beside the colour it reads: about 11 float images
+	// of w x h (its working images and blur's two, then the map with its mips), 44 bytes a texel (the cache counts it
+	// against kEntryCap)
+	uint64_t detail_work_bytes(uint32_t w, uint32_t h);
 }

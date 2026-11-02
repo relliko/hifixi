@@ -131,6 +131,16 @@ namespace hifi::chars::tex
 		return (w < 32 || h < 32) ? 1 : 6;
 	}
 
+	bool dimensions(const uint8_t *data, size_t size, uint32_t &w, uint32_t &h)
+	{
+		w = h = 0;
+		if (size < 57)
+			return false;
+		w = u16(data + 21);
+		h = u16(data + 25);
+		return w != 0 && h != 0 && w <= 4096 && h <= 4096;
+	}
+
 	bool decode(const uint8_t *data, size_t size, texture &out, std::string &why)
 	{
 		out = texture();
@@ -386,5 +396,12 @@ namespace hifi::chars::tex
 		}
 		out.levels.push_back(std::move(l0));
 		make_mips(out);
+	}
+
+	uint64_t detail_work_bytes(uint32_t w, uint32_t h)
+	{
+		// (lum, broad, hp, gx, gy, fine, d, sorted and around all held at the end, blur's tmp and out while around is
+		// made; the map's own bytes with its mips about one more)
+		return uint64_t(w) * h * sizeof(float) * 11;
 	}
 }

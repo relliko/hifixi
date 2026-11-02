@@ -39,7 +39,10 @@
  *                  (Enfire .. Endark, the IIs too); off; or one element always (to look at it)
  *   /hifi nativechars [perpixel|detail [on|off]]   HiFi XI drawing the characters in the game's place (src/chars;
  *                  [chars] perpixel its per-pixel lighting, [chars] detail the detail maps); the game draws any model
- *                  whose data isn't up yet
+ *                  whose data isn't up yet, and for good one with a texture that couldn't be read
+ *   /hifi textures [status]   the texture pack (src/pack; docs/texture-pack-plan.md): for now only the game's memory as
+ *                  the pack will need it (the address space and its largest free block, video memory, the characters'
+ *                  and the zone's bytes, each zone's lowest), and whether a texture bake is running
  *   /hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]   the world upscaled to the screen with AMD FSR 1 when the background
  *                  resolution is below the screen's (src/upscale; [upscale] fsr, sharpen)
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
@@ -85,6 +88,7 @@
 #include "../render/worldfx_core.hpp"
 #include "../render/gpu_crash.hpp"
 #include "../ui/menu.hpp"
+#include "../pack/memwatch.hpp"
 #include "hangwatch.hpp"
 #include <cctype>
 #include <cmath>
@@ -257,6 +261,7 @@ namespace
 		out += std::string("AMD's swap chain (frame generation) in: ") + (hifi::framegen::wanted() ? "yes" : "no") + "\n";
 		out += std::string("FSR drawing (in the last quarter second): ") + (hifi::upscale::temporal_running() ? "yes" : "no") + "\n";
 		out += "The frame rate (as of the last half second it ran): " + rate_state() + "\n";
+		out += hifi::pack::crash_section(); // (atomics only: the game's memory, whether a bake runs)
 		return out;
 	}
 
@@ -383,6 +388,8 @@ class hifixi final : public IPlugin
 	bool m_charslot_refused = false; // (native characters: likewise the character slots)
 	bool m_chardata_refused = false; // (native characters: likewise the model draw's stub)
 	bool m_nativechars_refused = false; // (native characters: likewise their renderer)
+	uint32_t m_textures_failed = 0; // (native characters: the textures that couldn't be read, as the log last said)
+	double m_textures_failed_at = -1e9;
 	bool m_char_flowing = false;     // (the characters' end markers coming through: m_char_flow's last word)
 	bool m_modelactor_refused = false; // (likewise the model actors' call: the game draws them)
 	ID3D12Device *m_pass_device = nullptr; // (the device the own-frame passes were last handed)
@@ -692,7 +699,21 @@ class hifixi final : public IPlugin
 				hifi::backend::log(1, ("HiFi XI: the character models not recorded: " + why).c_str());
 		}
 		if (cm::in())
+		{
 			hifi::chars::cache::frame_tick(hifi::backend::running() ? worldfx::attached() : nullptr, now);
+			// (a texture that couldn't be read leaves the models using it to the game for good: said in the log as more
+			// come, at most every 10 s)
+			const hifi::chars::cache::counts c = hifi::chars::cache::get_counts();
+			if (c.textures_failed > m_textures_failed && now - m_textures_failed_at >= 10.0)
+			{
+				m_textures_failed = c.textures_failed;
+				m_textures_failed_at = now;
+				hifi::backend::log(1, ("HiFi XI: " + std::to_string(c.textures_failed) + " character textures couldn't be read; models using them are left to the game: " +
+					c.last_failure).c_str());
+			}
+			else if (c.textures_failed < m_textures_failed)
+				m_textures_failed = c.textures_failed; // (let go: counted again from here)
+		}
 	}
 
 	// (native characters) The en-spell elements' names for /hifi enspell, in charframe.hpp's kEn* order
@@ -753,6 +774,8 @@ class hifixi final : public IPlugin
 		}
 		hifi::chars::inject::set_options(hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault),
 			hifi::game::option_on("chars", "detail", hifi::chars::options::kDetailByDefault));
+		// (and the cache makes detail maps only while they're on: for the textures decoded from then on)
+		hifi::chars::cache::set_detail(hifi::game::option_on("chars", "detail", hifi::chars::options::kDetailByDefault));
 		// (the zone's sun, for the light split's share of their light: the zone pass's of the last quarter second)
 		{
 			hifi::zone::inject::frame_camera c;
@@ -986,6 +1009,7 @@ public:
 		hifi::hangwatch::start(hifi::backend::folder(), hifi::backend::log, hang_context);
 		gpu_crash::add_section(hifi::zone::breadcrumb_report); // (the native zone pass's breadcrumbs in a GPU crash report)
 		gpu_crash::add_section(rate_section);                   // (and the frame rate's state: on, the cap, the speed-ups)
+		gpu_crash::add_section(hifi::pack::crash_section);      // (and the game's memory, whether a bake runs: src/pack/memwatch)
 		return true;
 	}
 
@@ -1117,7 +1141,7 @@ public:
 			hifi::game::set_option_on("chars", "detail", on);
 			follow_nativechars();
 			say(on ? (hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault)
-				? "Character detail maps on: relief, metal's shine and cavities guessed from each texture."
+				? "Character detail maps on: relief, metal's shine and cavities guessed from each texture (for those loaded from now on: change area to see them on everyone)."
 				: "Character detail maps on, but they need per-pixel lighting (/hifi nativechars perpixel on).")
 				: "Character detail maps off.");
 		}
@@ -1190,7 +1214,7 @@ public:
 				say("HiFi XI's passes can't go in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its passes off or on again.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi textures: the game's memory for the texture pack; /hifi reset: its counts again; /hifi off|on: its passes off or on again.");
 		return true;
 	}
 

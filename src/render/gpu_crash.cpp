@@ -140,9 +140,7 @@ namespace gpu_crash
 			std::string text = report(w->device);
 			if (w->context != nullptr)
 				text += "\nThe add-on at that moment:\n" + w->context();
-			for (const auto &s : g_sections)
-				if (const auto section = s.load())
-					text += "\n" + section();
+			text += sections_text();
 			FILE *f = nullptr;
 			const bool written = _wfopen_s(&f, w->path.c_str(), L"wb") == 0 && f != nullptr;
 			if (written)
@@ -350,6 +348,15 @@ namespace gpu_crash
 		}
 	}
 
+	std::string sections_text()
+	{
+		std::string text;
+		for (const auto &s : g_sections)
+			if (const auto section = s.load())
+				text += "\n" + section();
+		return text;
+	}
+
 	std::string gpu_name(ID3D12Device *device)
 	{
 		IDXGIAdapter3 *const adapter = adapter_of(device);
@@ -443,10 +450,12 @@ namespace gpu_crash
 		return out;
 	}
 
-	bool memory_over(ID3D12Device *device, std::string &line)
+	bool video_memory(ID3D12Device *device, uint64_t &usage, uint64_t &budget)
 	{
-		line.clear();
-		static std::mutex m;
+		usage = budget = 0;
+		if (device == nullptr)
+			return false;
+		static std::mutex m; // (a leaf, held across the DXGI calls: nothing else is taken under it)
 		static IDXGIAdapter3 *adapter = nullptr;
 		static LUID luid = {};
 		std::lock_guard<std::mutex> lock(m);
@@ -461,10 +470,21 @@ namespace gpu_crash
 		DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
 		if (adapter == nullptr || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) || local.Budget == 0)
 			return false;
+		usage = local.CurrentUsage;
+		budget = local.Budget;
+		return true;
+	}
+
+	bool memory_over(ID3D12Device *device, std::string &line)
+	{
+		line.clear();
+		uint64_t usage = 0, budget = 0;
+		if (!video_memory(device, usage, budget))
+			return false;
 		char text[200];
-		std::snprintf(text, sizeof(text), "the game uses %llu MB of the %llu MB Windows lets it have on the card", megabytes(local.CurrentUsage), megabytes(local.Budget));
+		std::snprintf(text, sizeof(text), "the game uses %llu MB of the %llu MB Windows lets it have on the card", megabytes(usage), megabytes(budget));
 		line = text;
-		return local.CurrentUsage > local.Budget;
+		return usage > budget;
 	}
 
 	std::string report(ID3D12Device *device)

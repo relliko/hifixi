@@ -32,6 +32,14 @@ namespace hifi::chars::cache
 	constexpr uint32_t kNone = 0xFFFFFFFFu;
 	constexpr uint32_t kDescriptors = 16384;
 	constexpr double kForgetSeconds = 20.0;
+	// The worker's batch: the upload bytes it copies at once, which is also what it holds decoded at most (it decodes
+	// only the next batch; one entry bigger than that is decoded and uploaded alone, before any other once it's been held
+	// back). A texture whose colour with its mips would be more than kEntryCap isn't decoded at all: it fails, "too big",
+	// and its models are left to the game (the game's 32-bit memory is shared with the game's own and the driver's). One
+	// whose detail map would take it over kEntryCap (the map with its mips and make_detail's working images,
+	// tex::detail_work_bytes) is decoded without one.
+	constexpr uint64_t kBatchBytes = 48ull << 20;
+	constexpr uint64_t kEntryCap = 96ull << 20;
 
 	// What tells a game resource from another one at the same address
 	struct key
@@ -55,6 +63,10 @@ namespace hifi::chars::cache
 	// The game's thread, each present: the device to upload with (nullptr: decode only, nothing on the GPU), the time;
 	// entries not named for a while let go
 	void frame_tick(ID3D12Device *device, double now);
+	// Whether textures get a detail map ([chars] detail; tex::make_detail): made only while it's on, for the textures
+	// decoded from then on (those already on the GPU keep what they have until they're let go and taken again), and only
+	// for those it keeps within kEntryCap
+	void set_detail(bool on);
 	// A frame's palette rows [from, to) into its upload slot (the game's thread, as models are published)
 	void publish_palettes(const frame &f, uint32_t from, uint32_t to);
 	// Where a frame slot's palette rows are on the GPU (0 before the upload buffer is made)
@@ -72,7 +84,8 @@ namespace hifi::chars::cache
 		D3D12_GPU_DESCRIPTOR_HANDLE views {}; // vertices' view, then the corners'
 	};
 	bool mesh_view_of(uint32_t id, mesh_view &out);
-	// Whether a mesh and the textures it found are all on the GPU (the game's thread asks before leaving a model out)
+	// Whether a mesh and the textures it found are all on the GPU (the game's thread asks before leaving a model out). A
+	// texture that couldn't be read (or was too big) never will be: its models stay the game's for good.
 	bool mesh_ready(uint32_t id);
 	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out);
 	ID3D12DescriptorHeap *heap();
@@ -89,13 +102,23 @@ namespace hifi::chars::cache
 		double decode_ms = 0.0, upload_ms = 0.0; // (totals)
 		uint32_t forgotten = 0;
 		std::string last_failure;
+		// The worker's memory: textures' bytes decoded and not yet on the GPU (now, and the most at once), the batches
+		// uploaded and the biggest's upload bytes, textures refused as too big (kEntryCap)
+		uint64_t decoded_bytes = 0, decoded_peak = 0, batch_bytes_max = 0;
+		uint32_t batches = 0, too_big = 0;
+		// Textures on the GPU with a detail map, textures decoded without one while it's on (it would have taken them
+		// over kEntryCap); meshes left to the game for good (a texture of theirs couldn't be read)
+		uint32_t detail_textures = 0, detail_skipped = 0, meshes_left_failed = 0;
+		// Descriptor pairs free, and let go but not given back yet (lists in flight may still read them: retire::then)
+		uint32_t slots_free = 0, slots_retiring = 0;
 	};
 	counts get_counts();
 	std::vector<std::string> status();
 	// For the tests: a mesh's two buffers and a texture's resource once on the GPU (nullptr otherwise)
 	void resources_of(uint32_t mesh, uint32_t texture, ID3D12Resource *&vertices, ID3D12Resource *&corners, ID3D12Resource *&tex);
 
-	// Waits until nothing is queued or being uploaded (the tests); false on timeout
+	// Waits until nothing is queued or being uploaded (the tests); false on timeout. With no device to upload to, textures
+	// the batch holds back (kBatchBytes already decoded) count as settled.
 	bool settle(uint32_t ms);
 	// Everything let go (the thread stopped, the GPU's copies waited for)
 	void stop();

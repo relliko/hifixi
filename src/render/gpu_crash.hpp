@@ -30,6 +30,8 @@ namespace gpu_crash
 	// A section of the report from elsewhere (the native zone pass's breadcrumbs): called on the thread pool thread
 	// that writes it, after the add-on's state. Up to 8; the same one once.
 	void add_section(std::string (*section)());
+	// The added sections' text as the report ends with it, each after a blank line (the tests: no removed device needed)
+	std::string sections_text();
 
 	// The report for a removed device (the reason, the GPU and its video memory then, the page fault, the command
 	// lists the GPU hadn't finished)
@@ -46,6 +48,9 @@ namespace gpu_crash
 	// Whether the game is over the video memory Windows gives it on the card now (line: as gpu_memory says it; false
 	// and line empty when DXGI can't tell). The adapter is kept between calls: cheap enough every few seconds.
 	bool memory_over(ID3D12Device *device, std::string &line);
+	// The same adapter's numbers (bytes): what the game uses on the card and the budget Windows gives it; false (both 0)
+	// when DXGI can't tell. The texture pack's reports read it every half second (src/pack/pack_module.cpp).
+	bool video_memory(ID3D12Device *device, uint64_t &usage, uint64_t &budget);
 
 	// Direct3D 12's debug layer (a diagnostic: it checks every call, the game's and the add-on's, and costs
 	// CPU time), before D3D12CreateDevice like enable(). False when it isn't installed (Windows' optional

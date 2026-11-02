@@ -14,7 +14,10 @@
  *   - dgVoodoo's own draw as it meant it; the debug layer says nothing; the counts;
  *   - the zone's lamps (set_lamps): a lamp 1.5 yalms in front of the middle one lights it (against the sun alone), and
  *     its light then stands in for the game's own lamp slot (the lamp turned directional, left out): about as bright as
- *     the game's own, not both added; without the zone's lamps the game's slot as it is.
+ *     the game's own, not both added; without the zone's lamps the game's slot as it is;
+ *   - the Mithra let go between a frame's recording and its run, a new texture uploaded meanwhile: it gets a pair of
+ *     descriptors the list doesn't read (those wait for the GPU: retire::then), the picture is unchanged, the debug layer
+ *     says nothing (HIFIXI_GBV=1: with GPU-based validation).
  *
  *   build\charinject_test.exe <pose.bin> [out.bmp]
  */
@@ -28,6 +31,7 @@
 #include "../src/chars/charframe.hpp"
 #include "../src/chars/charinject.hpp"
 #include "../src/chars/os2.hpp"
+#include "../src/host/retire.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -408,7 +412,18 @@ int main(int argc, char **argv)
 
 	ID3D12Debug *debug = nullptr;
 	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+	{
 		debug->EnableDebugLayer();
+		// (HIFIXI_GBV=1: GPU-based validation as well, as the add-on's debug layer takes it: what the shaders read, the
+		// states resources are really in)
+		ID3D12Debug1 *debug1 = nullptr;
+		if (GetEnvironmentVariableA("HIFIXI_GBV", nullptr, 0) != 0 && SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(&debug1))))
+		{
+			debug1->SetEnableGPUBasedValidation(TRUE);
+			debug1->Release();
+			std::printf("      (GPU-based validation on)\n");
+		}
+	}
 	IDXGIFactory4 *factory = nullptr;
 	IDXGIAdapter *warp = nullptr;
 	CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -428,6 +443,7 @@ int main(int argc, char **argv)
 
 	// The Mithra into the cache, on the GPU
 	const std::vector<dat_chunk> dat = read_dat("ROM2\\0\\52.DAT");
+	ch::cache::set_detail(getenv("CHARS_DETAIL") != nullptr); // (the detail maps made only with the option on, as the plugin has it)
 	const loaded L = load_into_cache(dat);
 	ch::cache::frame_tick(device, 1.0);
 	bool settled = ch::cache::settle(60000);
@@ -1157,6 +1173,107 @@ int main(int argc, char **argv)
 		check(count[1] > 1000 && mean[1] > mean[2] + 3.0, line);
 		check(mean[1] - mean[2] < 1.5 * (mean[0] - mean[2]) && mean[1] - mean[2] > 0.4 * (mean[0] - mean[2]),
 			"  the zone's lamp stands in for the game's lamp slot (about as bright: the slot left out, not added to)");
+
+		// The sun-alone frame again (seq 25), its meshes and textures let go after it's recorded and before it runs (not
+		// named for kForgetSeconds), and a red texture put on the GPU meanwhile: the pairs of descriptors the list reads
+		// aren't given to it until the GPU is past the list (retire::then, two signals of the fence on), the picture is the
+		// same as before, the debug layer says nothing
+		std::vector<UINT64> in_flight;
+		for (uint32_t id : L.meshes)
+		{
+			ch::cache::mesh_view mv;
+			if (!ch::cache::mesh_view_of(id, mv))
+				continue;
+			in_flight.push_back(mv.views.ptr);
+			for (uint32_t t : mv.textures)
+				if (D3D12_GPU_DESCRIPTOR_HANDLE th = {}; t != ch::cache::kNone && ch::cache::texture_view_of(t, th))
+					in_flight.push_back(th.ptr);
+		}
+		std::sort(in_flight.begin(), in_flight.end());
+		in_flight.erase(std::unique(in_flight.begin(), in_flight.end()), in_flight.end()); // (a texture named by several meshes: one pair)
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		list->SetDescriptorHeaps(1, &srvh);
+		lamp_frame(25, false);
+		inj::set_sun(sun_toward);
+		list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
+		list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+		inj::on_chars_end(list, w, 25 & 15);
+		inj::set_sun(nullptr);
+		ID3D12Resource *again = nullptr;
+		device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&again));
+		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		{
+			D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+			to.pResource = again;
+			to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_TYPELESS, W, H, 1, W * 4 };
+			from.pResource = A;
+			from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+		}
+		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		list->Close();
+		ch::cache::frame_tick(device, 1.0 + ch::cache::kForgetSeconds + 1.0);
+		const ch::cache::counts let_go = ch::cache::get_counts();
+		check(let_go.meshes == 0 && let_go.textures == 0 && let_go.slots_retiring == in_flight.size(),
+			"the Mithra let go after its frame was recorded: " + std::to_string(let_go.slots_retiring) + " pairs of descriptors waiting for the GPU");
+		std::vector<uint8_t> red(69 + 16 * 16 * 8, 0);
+		{
+			red[0] = 0x20; // (layout 2, DXT only: 64 x 64, every block colour 0 pure red)
+			std::memcpy(red.data() + 1, "charinject red  ", 16);
+			const uint16_t side = 64, colour = 0xF800;
+			std::memcpy(red.data() + 21, &side, 2);
+			std::memcpy(red.data() + 25, &side, 2);
+			std::memcpy(red.data() + 57, "1TXD", 4);
+			for (size_t b = 69; b < red.size(); b += 8)
+				std::memcpy(red.data() + b, &colour, 2);
+		}
+		ch::cache::key rk;
+		rk.resource = 0x7F000000u;
+		const uint32_t fresh = ch::cache::add_texture(rk, std::move(red));
+		D3D12_GPU_DESCRIPTOR_HANDLE fh = {};
+		const bool fresh_up = ch::cache::settle(60000) && ch::cache::texture_view_of(fresh, fh);
+		check(fresh_up && std::find(in_flight.begin(), in_flight.end(), fh.ptr) == in_flight.end(),
+			"  a red texture on the GPU meanwhile, in a pair the list doesn't read");
+		direct->ExecuteCommandLists(1, lists);
+		direct->Signal(fence, 3);
+		fence->SetEventOnCompletion(3, e);
+		WaitForSingleObject(e, 60000);
+		const uint32_t forget_messages = debug_messages(info, first);
+		check(device->GetDeviceRemovedReason() == S_OK && forget_messages == 0,
+			"  the frame run: the debug layer says nothing (" + std::to_string(forget_messages) + (forget_messages != 0 ? ": " + first : std::string()) + ")");
+		double again_mean = 0.0;
+		uint32_t again_count = 0;
+		{
+			uint8_t *img = nullptr;
+			again->Map(0, nullptr, reinterpret_cast<void **>(&img));
+			for (UINT y = 0; y < H; ++y)
+				for (UINT x = 0; x < W; ++x)
+				{
+					const uint8_t *p = img + (size_t(y) * W + x) * 4;
+					if (middle.inside(float(x) + 0.5f, float(y) + 0.5f, 2) && !is_sky(p))
+					{
+						again_mean += 0.3 * p[0] + 0.59 * p[1] + 0.11 * p[2];
+						again_count++;
+					}
+				}
+			again_mean /= std::max(again_count, 1u);
+			again->Unmap(0, nullptr);
+			again->Release();
+		}
+		std::snprintf(line, sizeof(line), "  the picture as before it was let go: %u pixels, brightness %.2f (before: %u, %.2f)", again_count, again_mean, count[2], mean[2]);
+		check(again_count == count[2] && std::fabs(again_mean - mean[2]) < 0.01, line);
+		hifi::retire::on_present(direct);
+		const uint32_t after_one = ch::cache::get_counts().slots_retiring;
+		int presents = 1;
+		for (; presents < 40 && ch::cache::get_counts().slots_retiring != 0; ++presents)
+		{
+			Sleep(20);
+			hifi::retire::on_present(direct);
+		}
+		check(after_one == in_flight.size() && ch::cache::get_counts().slots_retiring == 0,
+			"  the pairs not given back at the next present, all back " + std::to_string(presents) + " presents on");
 	}
 	if (argc > 2)
 	{

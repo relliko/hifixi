@@ -12,12 +12,16 @@
  *     --alpha1: the pixels whose alpha came out 1 (of 255) painted magenta and counted: World FX takes those for names
  *     facelift drew (grass.hlsl name_at) and leaves them unshaded
  *
- * Needs the game closed (the GPU; or --warp) and the FFXiMain dump (the key tables). Exit code: 0 when written.
+ * Needs the game closed (the GPU; or --warp) and the FFXiMain dump (the key tables). Exit code: 0 when written. It
+ * prints the load's memory (its peak commit above what was committed before it, the free address space and its largest
+ * block before and after) for the texture pack's baseline (docs/texture-pack-plan.md M1).
  */
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <psapi.h>
 #include "../src/bake/zonemesh.hpp"
+#include "../src/pack/memwatch.hpp"
 #include "../src/zone/draw.hpp"
 #include "../src/zone/frame.hpp"
 #include "../src/zone/zone_gpu.hpp"
@@ -173,10 +177,29 @@ int main(int argc, char **argv)
 	}
 	zm::zone z;
 	hifi::bake::result r;
+	// (the load's memory, for the texture pack's baseline: its peak commit above what the process had committed before it
+	// (the CRT, the FFXiMain dump), and the largest free block before and after)
+	const hifi::pack::memwatch::walk_result va_before = hifi::pack::memwatch::walk();
+	PROCESS_MEMORY_COUNTERS pm_before = {};
+	pm_before.cb = sizeof(pm_before);
+	GetProcessMemoryInfo(GetCurrentProcess(), &pm_before, sizeof(pm_before));
 	if (!zm::load(map, z, r))
 	{
 		std::printf("map %u: %s\n", map, r.why.c_str());
 		return 1;
+	}
+	{
+		const hifi::pack::memwatch::walk_result va_after = hifi::pack::memwatch::walk();
+		PROCESS_MEMORY_COUNTERS pm = {};
+		pm.cb = sizeof(pm);
+		GetProcessMemoryInfo(GetCurrentProcess(), &pm, sizeof(pm));
+		// (the process's peak is since it started: the load's own only when it came during the load, which it says)
+		const bool in_load = pm.PeakPagefileUsage > pm_before.PeakPagefileUsage;
+		std::printf("loaded: the load's peak commit %.0f MB above the %.0f MB before it%s (now %.0f MB above; the process's peak %.0f MB); free address space "
+			"%.0f -> %.0f MB, largest block %.0f -> %.0f MB\n", (double(pm.PeakPagefileUsage) - double(pm_before.PagefileUsage)) / 1048576.0,
+			pm_before.PagefileUsage / 1048576.0, in_load ? "" : " (at most: the process's peak came before the load)",
+			(double(pm.PagefileUsage) - double(pm_before.PagefileUsage)) / 1048576.0, pm.PeakPagefileUsage / 1048576.0, va_before.free / 1048576.0,
+			va_after.free / 1048576.0, va_before.largest / 1048576.0, va_after.largest / 1048576.0);
 	}
 
 	// The device and queues

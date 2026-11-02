@@ -5,6 +5,8 @@
  *     the GPU has caught up;
  *   - one handed over is kept past the next signal and let go once the fence passes the one after;
  *   - an owner (unique_ptr) destroyed then, not before; let_go sets the pointer to nullptr;
+ *   - then(fn): not run through the next present, run once (only once) after the fence passes the one after; run at
+ *     once at a new device's first present; left unrun by release_all when handed over after the last present;
  *   - a new device: the last one's objects let go at its first present;
  *   - release_all (the unload): one more signal waited for; one handed over before the last present let go, one since
  *     left, never freed.
@@ -151,17 +153,32 @@ int main()
 	}
 	check(destroyed == 1 && slot_object.released == 1, "  the owner destroyed and the slot's object released behind the GPU");
 
+	// then: a closure run behind the GPU, once
+	int ran = 0;
+	rt::then([&ran] { ++ran; });
+	const uint64_t then_at = rt::status().signalled;
+	rt::on_present(a.queue);
+	check(ran == 0, "then() at signal " + std::to_string(then_at) + ": not run through the next present");
+	for (int i = 0; i < 4; ++i)
+	{
+		rt::on_present(a.queue);
+		caught_up();
+	}
+	check(ran == 1, "  run once the fence passed signal " + std::to_string(then_at + 2) + ", once only");
+
 	// A new device (the GPU's): the last one's objects let go at once
 	ID3D12CommandQueue *last_queue = a.queue;
 	if (second)
 	{
 		probe old_device;
+		int old_ran = 0;
 		rt::later(&old_device);
+		rt::then([&old_ran] { ++old_ran; });
 		a.queue->Wait(gate, 2); // (held back: only the device switch can let it go)
 		rt::on_present(a.queue);
-		check(old_device.released == 0, "a new device's first present: before it, held");
+		check(old_device.released == 0 && old_ran == 0, "a new device's first present: before it, held");
 		rt::on_present(b.queue);
-		check(old_device.released == 1 && rt::status().signalled == 1, "  at it, the last device's objects let go, its own fence counting from 1");
+		check(old_device.released == 1 && old_ran == 1 && rt::status().signalled == 1, "  at it, the last device's objects let go (then() run), its own fence counting from 1");
 		gate->Signal(2);
 		last_queue = b.queue;
 	}
@@ -170,12 +187,16 @@ int main()
 
 	// release_all (the unload): one more signal waited for; what was handed over since the last present left
 	probe before, after;
+	int before_ran = 0, after_ran = 0;
 	rt::later(&before);
+	rt::then([&before_ran] { ++before_ran; });
 	rt::on_present(last_queue);
 	rt::later(&after);
+	rt::then([&after_ran] { ++after_ran; });
 	rt::release_all();
 	check(before.released == 1 && after.released == 0 && rt::status().held == 0,
 		"release_all: one handed over before the last present let go, one since left (the open list may hold it)");
+	check(before_ran == 1 && after_ran == 0, "  then(): the one before run, the one since left unrun");
 
 	gate->Release();
 	for (gpu *g : { &a, &b })

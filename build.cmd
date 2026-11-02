@@ -74,7 +74,9 @@ set "PASSES_FX=src\fx\fxframe.cpp src\fx\fxtextures.cpp src\fx\fxrender.cpp src\
 set "PASSES_WORLD=src\world\world_frames.cpp src\world\world_dome.cpp src\world\world_render.cpp src\world\world_font.cpp src\world\world_module.cpp src\game\worldmark.cpp src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp"
 set "PASSES_ACTORS="
 set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
-set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
+rem (the texture pack: docs\texture-pack-plan.md; for now its memory watch and reports only)
+set "PASSES_PACK=src\pack\memwatch.cpp src\pack\pack_module.cpp"
+set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D% %PASSES_PACK%"
 
 rem The plugin: the Ashita side, the backend (World FX's core at our d3d8.dll's marks), with the engine
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
@@ -243,6 +245,12 @@ echo Built build\chars_data_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\charmodel_test.cpp %CHARS% src\game\game.cpp /Fo"build\test\\" /Fe"build\charmodel_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\charmodel_test.exe
+rem The cache's batches (decoded only as far as the next batch, real upload bytes, an entry too big, the detail maps, the
+rem descriptor pairs behind the GPU) with made-up textures, on WARP: build\charcache_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\charcache_test.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp ^
+  /Fo"build\test\\" /Fe"build\charcache_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\charcache_test.exe
 rem The character draw on a list recorded as dgVoodoo records (WARP, debug layer), the Mithra posed by chars.py:
 rem build\charinject_test.exe build\test\chars_pose.bin [out.bmp]
 python tests\chars_pose.py build\test\chars_pose.bin || exit /b 1
@@ -268,8 +276,13 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   tests\packkey_test.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\packkey_test.exe" ^
   /link /NOLOGO user32.lib || exit /b 1
 echo Built build\packkey_test.exe
+rem The texture pack's memory watch (src\pack\memwatch) and its section in the GPU crash report: build\memwatch_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
+  tests\memwatch_test.cpp src\pack\memwatch.cpp src\render\gpu_crash.cpp /Fo"build\test\\" /Fe"build\memwatch_test.exe" ^
+  /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\memwatch_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp src\pack\memwatch.cpp /Fo"build\test\\" ^
   /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zone_view.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^

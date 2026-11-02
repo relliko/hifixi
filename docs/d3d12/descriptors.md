@@ -96,8 +96,10 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
 
 **Plugin passes with their own heaps** (each switches away from the d3d8 heaps and must hand them back):
 
-- Characters: `src/chars/cache.cpp:209-217` one shader-visible heap of `kDescriptors` 16384 (`cache.hpp:33`), the
-  last `kReserved` 4 for the renderer's own targets (`cache.hpp:81`, `cache.cpp:921`). Bound in `chardraw.cpp:1696`,
+- Characters: `src/chars/cache.cpp:269-277` one shader-visible heap of `kDescriptors` 16384 (`cache.hpp:33`), the
+  last `kReserved` 4 for the renderer's own targets (`cache.hpp:91`, `cache.cpp:1090`). A forgotten pair's slots go
+  back to `free_slots` only behind the game queue's fence (`retire::then`, `cache.cpp:173-186`), never into a heap made
+  since (`heap_generation`). Bound in `chardraw.cpp:1696`,
   `1902`, `1926`, `1954`, `2254`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1474`) and 1 for the aura
   (`chardraw.cpp:2133`).
 - Zone: `src/zone/zone_gpu.cpp:218-222` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:886-894`

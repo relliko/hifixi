@@ -75,6 +75,12 @@ The game-thread-only rule:
   or AMD's thread ever runs HiFi XI's code inside a D3D12 call. (`elsewhere()`, `host::quiet`, `quiet_thread` and the
   edit to AMD's FrameInterpolationSwapchainDX12.cpp that called it went with the hooks.)
 - `src/framegen/framegen.hpp:37-40`: `framegen::present()` runs on the game thread with no HiFi XI lock held.
+- `gpu_crash::video_memory` (src/render/gpu_crash.cpp, behind `memory_over` too) keeps one adapter under a static
+  mutex held across DXGI's `QueryVideoMemoryInfo`: a leaf, taken only on the game thread (World FX's present,
+  src/render/worldfx_core.cpp:2769, and the texture pack module's `update`). The texture pack's memory watch
+  (src/pack/memwatch.cpp) has a thread of its own that makes no D3D12 or DXGI call at all (VirtualQuery,
+  GlobalMemoryStatusEx, a process snapshot); it is joined in the module's `stop()`, raised above normal first
+  (below normal, a probe still running waited seconds for a core while the CPU was busy, the game's thread joining).
 - `src/render/worldfx_core.cpp` holds World FX's `g.mutex`. The hook paths that used to take it from any thread
   (`on_reset`, `on_barrier`, `on_targets`, `on_clear_target`) are gone since step 4: World FX is entered only at the
   marks, the present and the game side's calls, all on the game's thread. Since step 4c the renderer records without
@@ -88,7 +94,7 @@ Lists, allocators, queues:
 
 - `src/d3d8/gpu.hpp:12-27`: three frames in flight, each with its own allocator, upload pages and shader-visible
   descriptors. `src/d3d8/gpu.cpp:318-328` (`end_frame`) waits on the next set's fence before reusing its allocator.
-- Own copy queues for loaders: `src/chars/cache.cpp:205-224` (the characters' worker: queue, allocator, list, fence
+- Own copy queues for loaders: `src/chars/cache.cpp:265-287` (the characters' worker: queue, allocator, list, fence
   of its own), `src/zone/native.cpp:172`, `src/zone/actordata.cpp:109`.
 - `src/ui2d/render2d.cpp:702-704`: the 2D pass's own queue, allocator and list.
 

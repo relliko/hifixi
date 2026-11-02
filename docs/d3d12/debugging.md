@@ -95,7 +95,7 @@ When the device is lost:
   the added sections to `bootloader\worldfx-gpu-crash.txt` (`worldfx_core.cpp:2502`).
 - `report()` (`gpu_crash.cpp:470-584`): reason, GPU and video memory, page fault and the objects there, then each
   unfinished list's ops with `>` at the first one not done.
-- After `lost()` HiFi XI records nothing and calls no AMD code (`src/plugin/main.cpp:1314-1322`).
+- After `lost()` HiFi XI records nothing and calls no AMD code (`src/plugin/main.cpp:1261-1272`).
 - Our d3d8.dll logs the removed reason when Present fails (`src/d3d8/present.cpp:286`).
 
 Breadcrumbs:
@@ -105,10 +105,17 @@ Breadcrumbs:
 - Native zone pass: `src/zone/draw.cpp`. Buffer made in `make_breadcrumbs` (:444-472). Word 2 = setup steps
   (`step`, :850-855; steps in `src/zone/draw.hpp:120`). Word 0 = `MARKER_IN` before each piece's draw, word 1 =
   `MARKER_OUT` after it (:924-935). Each word is frame low 16 bits << 16 | draw. Read in `breadcrumbs()`
-  (:479-520); added to the crash report by `src/plugin/main.cpp:1060`.
+  (:479-520); added to the crash report by `src/plugin/main.cpp:1010`.
 - World FX: `src/render/grass_render.cpp:2214-2322`. `crumb()` writes both IN and OUT at every section marker;
   the report names the section the GPU stopped in, or says the stop came outside World FX.
-- `draw.cpp` must not link `gpu_crash` (tests link draw without it): hence `add_section`.
+- `draw.cpp` must not link `gpu_crash` (tests link draw without it): hence `add_section`. The sections are added at
+  `src/plugin/main.cpp:1010-1012` and written by `gpu_crash::sections_text()` (which the tests call without a removed
+  device).
+- Texture pack (`src/pack/memwatch.cpp` `crash_section`, added at `main.cpp:1012`, also at the end of the hang
+  report's lines, `main.cpp:264`): "Texture pack:" with the free address space and its lowest this zone, the largest
+  free block, the video memory and the characters' and zone's bytes as of the last half second, and whether a texture
+  bake (bakeall.py, realesrgan-ncnn-vulkan) was running: a report from a session with a bake running is kept out of
+  the hang analysis. It reads atomics only (no lock, no DXGI call). memwatch_test checks it.
 
 Hang report (the game thread, not the GPU):
 
