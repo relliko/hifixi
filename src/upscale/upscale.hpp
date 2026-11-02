@@ -64,6 +64,27 @@ namespace hifi::upscale
 		const grass::list_state &state);
 	// Before a clear or the list's close
 	void before_other(ID3D12GraphicsCommandList *list, const grass::list_state &state);
+
+	// Our d3d8.dll's resolve mark (src/host/frameapi.hpp, channel 4): right after the draw that read the world into the
+	// target bound now, on the game's thread. FSR goes in here (set_placement: true, the default), with nothing to put
+	// back: d3d8.dll binds all of its own again after a mark. The old placement (the first draw of at most 6 vertices
+	// after the world's end, through the hooks) still works out what it would have done, and where the two differ it's
+	// counted, in the status, and said in the log (set_log: the first 20).
+	struct resolve_mark
+	{
+		ID3D12GraphicsCommandList *list = nullptr;
+		ID3D12Resource *world = nullptr;  // (its target, read by the resolve)
+		D3D12_RESOURCE_STATES world_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		ID3D12Resource *target = nullptr; // (what the resolve drew into, bound now)
+		uint64_t rtv = 0;
+		DXGI_FORMAT target_format = DXGI_FORMAT_UNKNOWN;
+		D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		uint32_t vertices = 0;
+	};
+	void on_resolve(const resolve_mark &r);
+	// true: FSR placed by the resolve's mark; false: by the old way (the hooks), the mark only compared
+	void set_placement(bool by_mark);
+	void set_log(void (*log)(int level, const char *text));
 	// After barriers (the states they left)
 	void after_barrier(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RESOURCE_BARRIER *barriers, const grass::list_state &state);
 }

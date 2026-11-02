@@ -914,6 +914,11 @@ class hifixi final : public IPlugin
 		const bool fsr = hifi::game::option_on("upscale", "fsr", true);
 		hifi::upscale::set_options(fsr && !m_upscale_refused, true /* (FSR 3.1 always; the FSR 2 switch is gone since 0.59) */, hifi::game::option_number("upscale", "sharpen", 0.4f),
 			true /* (FSR 3.1, else FSR 2 when it can't be made; no switch since 0.59) */);
+		// (placed by our d3d8.dll's resolve mark; placement=guess: the old way, the first draw out of the world)
+		{
+			char v[16] = "";
+			hifi::upscale::set_placement(!(hifixi_option("upscale", "placement", v, sizeof(v)) != 0 && _stricmp(v, "guess") == 0));
+		}
 		hifi::framegen::set_on(fsr && hifi::game::option_on("upscale", "framegen", false));
 		hifi::framegen::set_automatic(hifi::game::option_on("upscale", "framegen_auto", true));
 		// (FSR's masks: the world copied at World FX's passes as well as at the characters' end)

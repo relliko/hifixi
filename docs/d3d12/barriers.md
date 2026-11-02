@@ -115,8 +115,12 @@ The direct channel (exact states, no guessing):
 
 The barrier inference still left (dgVoodoo era):
 
-- `ev_barrier` in `src/backend/backend.cpp`: FSR's resolve placement alone (`upscale::after_barrier`, and the
-  backend's `list_capture` of what's bound, for FSR's restore). It goes in step 5. World FX follows no barrier since
+- `ev_barrier` in `src/backend/backend.cpp`: FSR's old resolve placement alone (`upscale::after_barrier`, and the
+  backend's `list_capture` of what's bound, for its restore). Since step 5a FSR is placed by our d3d8.dll's resolve
+  mark (kind 14, channel 4: right after the first draw that reads the world into a target at least its width after
+  its end, a copy before it or not; `upscale::on_resolve`, nothing put back); the old placement only works out what it
+  would have done, compared at the mark, disagreements counted in the status and logged. `[upscale] placement=guess`
+  puts the old way back. The hooks go once an in-game run shows no disagreement (step 5b). World FX follows no barrier since
   step 4: the world's target and depth, their states and the fog (the world's last whole clear, channel 3) come with
   every mark (`worldfx::world_mark`, built by the backend's `world_of`).
 

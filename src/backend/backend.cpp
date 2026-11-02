@@ -553,6 +553,7 @@ namespace hifi::backend
 			worldfx::load_settings();
 			streamlog::set_views(streamlog_view);
 			streamlog::set_folder(g_folder);
+			upscale::set_log([](int level, const char *text) { write_log(level, text); }); // (FSR's placement compared)
 		}
 
 		// (the targets bound now: the call is made)
@@ -959,6 +960,21 @@ namespace hifi::backend
 				return;
 			host::quiet q;
 			world_planes(*fm); // (at every mark, one with no depth bound too)
+			// (the resolve drawn: FSR goes in over it, the resolve's target bound)
+			if (kind == slotmark::resolve)
+			{
+				upscale::resolve_mark r;
+				r.list = fm->list;
+				r.world = fm->world_rt;
+				r.world_state = fm->world_rt_state;
+				r.target = fm->rt;
+				r.rtv = uint64_t(fm->rtv.ptr);
+				r.target_format = fm->rt_format;
+				r.target_state = fm->rt_state;
+				r.vertices = fm->draw_vertices;
+				upscale::on_resolve(r);
+				return;
+			}
 			// (the world's end comes with the resolve's targets bound, often no depth; every other mark is on a depth)
 			if (fm->dsv.ptr == 0 && kind != slotmark::world_end)
 				return;

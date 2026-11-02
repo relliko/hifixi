@@ -297,7 +297,7 @@ int main(int argc, char **argv)
 	ID3D12Resource *readback = nullptr;
 	device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
 
-	enum class after_resolve { draw, close, present_barrier };
+	enum class after_resolve { draw, close, present_barrier, mark };
 	// One frame as dgVoodoo records it: the world's end, the resolve (vertices), then the UI. Returns the back buffer.
 	auto frame = [&](ID3D12Resource *world, UINT world_slot, uint64_t resolve_vertices, after_resolve how) {
 		up::on_reset(list);
@@ -335,6 +335,27 @@ int main(int argc, char **argv)
 		up::before_draw(list, resolve_vertices, B, rtv.ptr, screen_format, st);
 		list->DrawInstanced(6, 1, 0, 0);
 		D3D12_RESOURCE_STATES b_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		if (how == after_resolve::mark)
+		{
+			// (our d3d8.dll's resolve mark right after the resolve's draw, the back buffer bound; then it binds all of its
+			// own again, as after every mark)
+			up::resolve_mark r;
+			r.list = list;
+			r.world = world;
+			r.world_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			r.target = B;
+			r.rtv = rtv.ptr;
+			r.target_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			r.target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			r.vertices = uint32_t(resolve_vertices);
+			up::on_resolve(r);
+			list->SetDescriptorHeaps(1, heaps);
+			list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+			list->SetPipelineState(game_pso);
+			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			list->SetGraphicsRootSignature(game_root);
+			list->SetGraphicsRootDescriptorTable(0, table);
+		}
 		if (how == after_resolve::close)
 		{
 			up::before_other(list, st);
@@ -357,7 +378,7 @@ int main(int argc, char **argv)
 		// The UI: the same quad into the corner, nothing bound again but the viewport
 		const D3D12_VIEWPORT corner = { 0.0f, 0.0f, float(UI), float(UI), 0.0f, 1.0f };
 		const D3D12_RECT corner_rect = { 0, 0, LONG(UI), LONG(UI) };
-		if (how != after_resolve::close)
+		if (how != after_resolve::close && how != after_resolve::mark)
 			up::before_draw(list, 6, B, rtv.ptr, screen_format, st);
 		list->RSSetViewports(1, &corner);
 		list->RSSetScissorRects(1, &corner_rect);
@@ -411,6 +432,9 @@ int main(int argc, char **argv)
 	};
 	std::string why, first;
 
+	// (placed the old way first, through what the hooks see: the resolve's mark is checked against it after)
+	up::set_placement(false);
+
 	// The game's stretch: FSR off
 	up::set_options(false, false, 0.8f);
 	const std::vector<uint8_t> stretch = frame(A, 0, 6, after_resolve::draw);
@@ -437,6 +461,30 @@ int main(int argc, char **argv)
 		check(same(fsr, stretch, false) > 1000 && diff < 6.0, "FSR's picture: not the stretch's, close to it overall");
 		check(wf <= ws && wf >= 1, "its edge no wider than the stretch's");
 		check(std::abs(int(red[0]) - 200) <= 3 && std::abs(int(red[1]) - 30) <= 3 && std::abs(int(red[2]) - 30) <= 3, "colours kept (the red band)");
+	}
+	// Placed by our d3d8.dll's resolve mark: the same picture as the old way, nothing of the list's put back (d3d8.dll binds
+	// its own), the old way's guess the same as the mark's (no disagreement); a resolve of more than 6 vertices: the
+	// game's stretch both ways
+	{
+		up::set_placement(true);
+		const unsigned long long before = drawn();
+		const std::vector<uint8_t> marked = frame(A, 0, 6, after_resolve::mark);
+		std::string placement;
+		for (const std::string &l : up::status())
+			if (l.find("placed by our d3d8.dll's resolve mark") != std::string::npos)
+				placement = l;
+		check(drawn() == before + 1 && same(marked, fsr, false) == 0 && same(marked, fsr, true) == 0,
+			"the resolve's mark: FSR drawn there, the same picture as the old placement's, the UI on top as meant");
+		check(placement.find(", 1 times;") != std::string::npos && placement.find("disagreed 0 times") != std::string::npos,
+			"... the old placement's guess the same (" + placement + ")");
+		const std::vector<uint8_t> many = frame(A, 0, 7, after_resolve::mark);
+		check(drawn() == before + 1 && same(many, stretch, false) == 0, "... a resolve of 7 vertices: the game's stretch");
+		placement.clear();
+		for (const std::string &l : up::status())
+			if (l.find("placed by our d3d8.dll's resolve mark") != std::string::npos)
+				placement = l;
+		check(placement.find("disagreed 0 times") != std::string::npos, "... both ways (" + placement + ")");
+		up::set_placement(false);
 		check(same(fsr, stretch, true) == 0, "the UI drawn on top as dgVoodoo meant it (its state put back)");
 		if (argc > 1)
 			if (FILE *f = nullptr; fopen_s(&f, argv[1], "wb") == 0 && f != nullptr)
@@ -462,9 +510,9 @@ int main(int argc, char **argv)
 
 	// At the list's close, and after a barrier that moves the back buffer on
 	const std::vector<uint8_t> at_close = frame(A, 0, 6, after_resolve::close);
-	check(drawn() == 2 && same(at_close, fsr, false) == 0 && same(at_close, stretch, true) == 0, "at the list's close: the same picture, the UI as meant");
+	check(drawn() == 3 && same(at_close, fsr, false) == 0 && same(at_close, stretch, true) == 0, "at the list's close: the same picture, the UI as meant");
 	const std::vector<uint8_t> at_barrier = frame(A, 0, 6, after_resolve::present_barrier);
-	check(drawn() == 3 && same(at_barrier, fsr, false) == 0, "after a barrier moving the back buffer to PRESENT: the same picture");
+	check(drawn() == 4 && same(at_barrier, fsr, false) == 0, "after a barrier moving the back buffer to PRESENT: the same picture");
 
 	// The game's tint (its resolve's: a cutscene fade) on FSR's picture too, the UI left as drawn
 	{
@@ -484,17 +532,17 @@ int main(int argc, char **argv)
 				lit += luma(black, x, y) > 0.0f ? 1 : 0;
 		check(lit == 0 && same(black, fsr, true) == 0, "the tint 000000: the world black, the UI as drawn");
 		check(same(back, fsr, false) == 0, "the tint 808080 again: the picture as before");
-		check(drawn() == 6, "drawn each of those frames");
+		check(drawn() == 7, "drawn each of those frames");
 	}
 
 	// Not the resolve: more than 6 vertices; the world as big as the screen; FSR off again
 	const std::vector<uint8_t> many = frame(A, 0, 300, after_resolve::draw);
-	check(drawn() == 6 && same(many, stretch, false) == 0, "a first draw out of the world of 300 vertices: not taken for the resolve");
+	check(drawn() == 7 && same(many, stretch, false) == 0, "a first draw out of the world of 300 vertices: not taken for the resolve");
 	frame(big, 1, 6, after_resolve::draw);
-	check(drawn() == 6, "the world as big as the screen: the game's stretch");
+	check(drawn() == 7, "the world as big as the screen: the game's stretch");
 	up::set_options(false, false, 0.8f);
 	frame(A, 0, 6, after_resolve::draw);
-	check(drawn() == 6, "FSR off again: nothing");
+	check(drawn() == 7, "FSR off again: nothing");
 
 	// FSR 2: A's depth and the big one's (as dgVoodoo's: typeless D24S8), each frame's camera as the zone pass's
 	{

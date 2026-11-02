@@ -119,7 +119,10 @@ namespace hifi::d3d8
 
 	// (src/host/frameapi.hpp's world end: before a draw or copy that reads `read` into `into`, the first after the zone
 	// began into something at least the world's width)
-	void mark_world_read(device *d, const image *read, const image *into);
+	// (true: that was the world's end, marked now)
+	bool mark_world_read(device *d, const image *read, const image *into);
+	// After the draw that ended the world (the resolve, of `vertices`): HiFi XI's resolve mark, the target it drew into bound
+	void resolve_drawn(device *d, uint32_t vertices);
 	// A clear of the whole of img to colour (the world's: its colour goes with HiFi XI's marks)
 	void note_clear(device *d, const image *img, const float colour[4]);
 

@@ -261,8 +261,24 @@ namespace
 		if (g_mark != nullptr)
 			g_mark(kind, seq);
 	}
+	// (the resolve's marks: right after the draw that ended the world, the target it drew into bound)
+	struct resolve_seen
+	{
+		uint32_t count = 0, vertices = 0;
+		ID3D12Resource *rt = nullptr, *world = nullptr;
+		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_COMMON;
+	} g_resolves;
 	void __cdecl frame_handler(void *, uint32_t kind, uint32_t s, const hifi_frame_mark *m)
 	{
+		if (kind == hifi::slotmark::resolve)
+		{
+			g_resolves.count++;
+			g_resolves.vertices = m->draw_vertices;
+			g_resolves.rt = m->rt;
+			g_resolves.world = m->world_rt;
+			g_resolves.rt_state = m->rt_state;
+			return;
+		}
 		if (kind == hifi::slotmark::world_end)
 			return;
 		mark_seen x;
@@ -660,6 +676,10 @@ int main(int argc, char **argv)
 	// target is A's size, as in the game)
 	check(st.world.width == AW && st.world.height == AH, "the hooks' own count finds a world-sized target turning readable");
 	check(injected == 1, "HiFi XI drew in at the zone's end mark");
+	std::snprintf(line, sizeof(line), "the resolve's mark after each frame's resolve (%u of 5): its target bound (the back buffer, a target), A as the world, %u vertices",
+		g_resolves.count, g_resolves.vertices);
+	check(g_resolves.count == 5 && g_resolves.rt == resolve_target && g_resolves.world == world_rt && g_resolves.vertices == 4 &&
+			g_resolves.rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET, line);
 	size_t same = 0;
 	for (size_t i = 0; i < plain.size() && i < injected_px.size(); ++i)
 		same += plain[i] == injected_px[i] ? 1 : 0;
@@ -723,7 +743,7 @@ int main(int argc, char **argv)
 			check(corner == 0xFFFFFF && band == 0x808080 && past == 0, line);
 			// The channel's version 2: the world (A and its depth, named at the zone's begin) at every mark, bound or not
 			const auto version = reinterpret_cast<hifi_frame_version_fn>(GetProcAddress(m, kHifiFrameVersion));
-			check(version != nullptr && version() == kHifiFrameChannel, "HifiFrameVersion: 3 (the marks carry the world's states and its clear colour)");
+			check(version != nullptr && version() == kHifiFrameChannel, "HifiFrameVersion: 4 (the marks carry the world's states, its clear colour and the resolve)");
 			check(fm.world_clear_known == 1 && fm.world_clear[0] == 0.0f && fm.world_clear[1] == 0.0f && fm.world_clear[2] == 0.0f && fm.world_clear[3] == 1.0f,
 				"... the world's whole clear before the zone's begin (opaque black): its colour handed over (World FX's fog)");
 			check(fm.world_rt == world_rt && fm.world_ds == world_ds && fm.world_rt_state == fm.rt_state && fm.world_ds_plane_count == 2 &&

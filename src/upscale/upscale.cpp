@@ -85,6 +85,12 @@ namespace hifi::upscale
 			uint64_t target_rtv = 0;
 			DXGI_FORMAT target_format = DXGI_FORMAT_UNKNOWN;
 			D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			// Recorded at our d3d8.dll's resolve mark: nothing of its state to put back (it binds all of its own again)
+			bool at_mark = false;
+			// What the old placement (the first draw out of the world) would have done, for the mark to compare: guessed
+			// once the resolve's draw went by, guess_target the target FSR would have gone into (nullptr: the game's stretch)
+			bool guessed = false;
+			ID3D12Resource *guess_target = nullptr;
 		};
 
 		struct made_t
@@ -108,6 +114,12 @@ namespace hifi::upscale
 			std::atomic<bool> fsr{ true }, temporal{ true };
 			std::atomic<float> sharpen{ 0.4f };
 			std::atomic<uint32_t> tint{ 0x808080 }; // (the game's resolve's: set_tint)
+			// Placed by the resolve's mark (set_placement: [upscale] placement, "guess" for the old way); how many, how often
+			// the old way disagreed, the last of them, and where those go (set_log)
+			std::atomic<bool> by_mark{ true };
+			uint64_t marked = 0, disagreed = 0;
+			std::string disagreement;
+			std::atomic<void (*)(int, const char *)> log{ nullptr };
 			uint64_t faded = 0;                      // (frames drawn with a tint other than 0x808080)
 			made_t made;
 			// (the compiled shaders, kept for pipelines of formats asked for later)
@@ -367,7 +379,7 @@ namespace hifi::upscale
 			zone::inject::frame_camera c;
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES planes[2] = {};
-			const char *why = m.root == nullptr ? "the passes aren't made" : l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
+			const char *why = m.root == nullptr ? "the passes aren't made" : !l.at_mark && l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
 				g.fsr2 == nullptr || !g.fsr2->fits(UINT(in.Width), in.Height, out_w, out_h, g.fsr2->v3()) ? "waiting for FSR 2's context" :
 				copy == m.copy.end() ? "waiting for the screen's pipeline" :
 				!zone::inject::last_camera(c) || GetTickCount64() - c.at > 250 ? "no camera from the native zone's frame" :
@@ -455,9 +467,12 @@ namespace hifi::upscale
 				if (!tinted)
 					framegen::prepare(list, f, unused);
 			}
-			// (FSR 2 set its own heaps, root signatures and pipelines, drawn or not)
-			list->SetDescriptorHeaps(l.heap_count, l.heaps);
-			state.restore(list);
+			// (FSR 2 set its own heaps, root signatures and pipelines, drawn or not: put back, unless at a mark)
+			if (!l.at_mark)
+			{
+				list->SetDescriptorHeaps(l.heap_count, l.heaps);
+				state.restore(list);
+			}
 			if (!drawn)
 			{
 				g.fsr2_why = fail;
@@ -500,7 +515,7 @@ namespace hifi::upscale
 			}
 			if (!smaller)
 				return;
-			const char *why = m.root == nullptr ? "the passes aren't made" : l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
+			const char *why = m.root == nullptr ? "the passes aren't made" : !l.at_mark && l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
 				l.target_format == DXGI_FORMAT_UNKNOWN ? "the screen's format isn't known" :
 				m.mid == nullptr || m.mid_w != out_w || m.mid_h != out_h || rcas == m.rcas.end() ? "waiting for the screen-size texture" : nullptr;
 			if (why != nullptr)
@@ -558,9 +573,12 @@ namespace hifi::upscale
 			transition(list, l.target, D3D12_RESOURCE_STATE_RENDER_TARGET, l.target_state);
 			if (world_moved)
 				transition(list, l.world, readable_state, world_was);
-			// (its heaps before its root tables: a table must be in the heaps bound when it's set)
-			list->SetDescriptorHeaps(l.heap_count, l.heaps);
-			state.restore(list);
+			// (its heaps before its root tables: a table must be in the heaps bound when it's set; at a mark nothing)
+			if (!l.at_mark)
+			{
+				list->SetDescriptorHeaps(l.heap_count, l.heaps);
+				state.restore(list);
+			}
 			g.drawn++;
 			g.why = nullptr;
 			g.in_w = UINT(in.Width);
@@ -786,6 +804,13 @@ namespace hifi::upscale
 				static_cast<unsigned long long>(g.drawn), g.in_w, g.in_h, g.out_w, g.out_h, static_cast<unsigned long long>(g.skipped),
 				g.why != nullptr ? " (the last: " : "", g.why != nullptr ? g.why : "", g.why != nullptr ? ")" : "", static_cast<unsigned long long>(g.game_stretch));
 		lines.push_back(line);
+		if (g.by_mark.load())
+			std::snprintf(line, sizeof(line), "upscale: placed by our d3d8.dll's resolve mark, %llu times; the old placement disagreed %llu times%s%s%s",
+				static_cast<unsigned long long>(g.marked), static_cast<unsigned long long>(g.disagreed), g.disagreed != 0 ? " (the last: " : "",
+				g.disagreed != 0 ? g.disagreement.c_str() : "", g.disagreed != 0 ? ")" : "");
+		else
+			std::snprintf(line, sizeof(line), "upscale: placed the old way (the first draw out of the world, [upscale] placement=guess)");
+		lines.push_back(line);
 		if (g.temporal.load())
 		{
 			uint32_t shaders = 0;
@@ -860,6 +885,15 @@ namespace hifi::upscale
 			return;
 		// (the first draw out of the world: the resolve, when it's a quad into something bigger)
 		arm(l, false, false);
+		// (placed by the resolve's mark: only what this would have done is kept, for the mark to compare)
+		if (g.by_mark.load(std::memory_order_relaxed))
+		{
+			const bool would = g.fsr.load(std::memory_order_relaxed) && vertices <= kResolveVertices && rtv != 0 &&
+				(g.temporal.load(std::memory_order_relaxed) ? covers(rt, l.world) : bigger(rt, l.world));
+			l.guessed = true;
+			l.guess_target = would ? rt : nullptr;
+			return;
+		}
 		if (!g.fsr.load(std::memory_order_relaxed) || vertices > kResolveVertices || rtv == 0)
 			return;
 		if (!(g.temporal.load(std::memory_order_relaxed) ? covers(rt, l.world) : bigger(rt, l.world)))
@@ -874,6 +908,64 @@ namespace hifi::upscale
 		if (l.target_format == DXGI_FORMAT_UNKNOWN)
 			l.target_format = rt->GetDesc().Format;
 		l.target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	}
+
+	void on_resolve(const resolve_mark &r)
+	{
+		if (gpu_crash::lost() || r.list == nullptr || r.world == nullptr || r.target == nullptr)
+			return;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		per_list &l = g.lists[r.list];
+		const bool fsr = g.fsr.load(std::memory_order_relaxed);
+		const bool fits = g.temporal.load(std::memory_order_relaxed) ? covers(r.target, r.world) : bigger(r.target, r.world);
+		const bool would = fsr && r.vertices <= kResolveVertices && r.rtv != 0 && r.target != r.world && fits;
+		// (the old placement beside it, this build: what it would have done, where it differs said in the log. Placed the
+		// old way, it may have drawn already, at a call d3d8.dll made for the mark: nothing to compare then)
+		const bool by_mark = g.by_mark.load(std::memory_order_relaxed);
+		ID3D12Resource *const want = would ? r.target : nullptr;
+		if (by_mark && fsr && (!l.guessed || l.guess_target != want))
+		{
+			char text[200];
+			std::snprintf(text, sizeof(text), "the resolve's mark: %s (%u vertices); the old placement: %s", would ? "FSR into its target" : "the game's stretch", r.vertices,
+				!l.guessed ? "never saw the resolve's draw" : l.guess_target == nullptr ? "the game's stretch" : l.guess_target == r.target ? "FSR into it" : "FSR into another target");
+			g.disagreed++;
+			g.disagreement = text;
+			if (g.disagreed <= 20)
+				if (auto *const log = g.log.load())
+					log(1, (std::string("HiFi XI: FSR placement: ") + text).c_str());
+		}
+		l.guessed = false;
+		l.guess_target = nullptr;
+		if (!by_mark)
+			return;
+		arm(l, false, false);
+		if (!would)
+		{
+			if (fsr && r.vertices <= kResolveVertices && !fits)
+				g.game_stretch++;
+			return;
+		}
+		l.world = r.world;
+		l.world_state = r.world_state;
+		l.target = r.target;
+		l.target_rtv = r.rtv;
+		l.target_format = r.target_format != DXGI_FORMAT_UNKNOWN ? r.target_format : r.target->GetDesc().Format;
+		l.target_state = r.target_state;
+		l.at_mark = true;
+		const grass::list_state none;
+		record(r.list, l, none);
+		l.at_mark = false;
+		g.marked++;
+	}
+
+	void set_placement(bool by_mark)
+	{
+		g.by_mark.store(by_mark, std::memory_order_relaxed);
+	}
+
+	void set_log(void (*log)(int level, const char *text))
+	{
+		g.log.store(log);
 	}
 
 	void before_other(ID3D12GraphicsCommandList *list, const grass::list_state &state)
