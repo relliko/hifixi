@@ -115,7 +115,9 @@ namespace hifi::zone
 
 		ID3D12Device *_device = nullptr;
 		ID3D12Resource *_crumbs = nullptr;           // (a custom heap in system memory, written back: read after a loss)
-		const volatile uint32_t *_crumb_words = nullptr; // [0] begun before draw n, [1] draw n finished: frame << 16 | n
+		const volatile uint32_t *_crumb_words = nullptr; // [0] begun before draw n, [1] draw n finished: frame << 16 | n; [2] the setup's step
+		// (the setup's steps before the first draw, word 2's low bits; written as the command processor passes them)
+		static constexpr uint32_t kStepBegun = 1, kStepTargets = 2, kStepHeap = 3, kStepPipeline = 4;
 		std::vector<piece_note> _building;
 		frame_note _notes[kNotedFrames];
 		mutable std::mutex _notes_mutex;

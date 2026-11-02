@@ -998,8 +998,9 @@ int main(int argc, char **argv)
 				std::printf("      (no breadcrumbs: this device can't write them%s)\n", on_gpu ? "" : "; ZONE_GPU=1 runs this on the GPU");
 			else
 				check(crumbs.find("every zone draw the GPU began it finished") != std::string::npos && crumbs.find("1 lamps:") != std::string::npos &&
-					crumbs.find("lamp 0: at") != std::string::npos && crumbs.find("the last finished: draw") != std::string::npos,
-					"the breadcrumbs: every draw begun finished, the last named, the frame's lamp listed\n" + crumbs);
+					crumbs.find("lamp 0: at") != std::string::npos && crumbs.find("the last finished: draw") != std::string::npos &&
+					crumbs.find("got as far as: the first pipeline bound") != std::string::npos,
+					"the breadcrumbs: every draw begun finished, the last named, the setup's last step, the frame's lamp listed\n" + crumbs);
 		}
 		const uint32_t lamp_messages = debug_messages(info, first);
 		check(lamp_messages == 0, "the debug layer: nothing (" + std::to_string(lamp_messages) + (lamp_messages != 0 ? ": " + first : std::string()) + ")");

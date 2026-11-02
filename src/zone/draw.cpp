@@ -467,7 +467,7 @@ light_out ps_light(v2p i)
 			drop(_crumbs);
 			return;
 		}
-		std::memset(mapped, 0xFF, 8); // (nothing begun or finished yet)
+		std::memset(mapped, 0xFF, 12); // (nothing begun or finished yet, no setup step)
 		_crumb_words = static_cast<const volatile uint32_t *>(mapped);
 		_crumbs->SetName(L"hifixi: the zone pass's breadcrumbs");
 		{
@@ -480,52 +480,92 @@ light_out ps_light(v2p i)
 	{
 		if (_crumb_words == nullptr)
 			return std::string();
-		const uint32_t begun = _crumb_words[0], done = _crumb_words[1];
+		// (the starts and the setup's steps are written as the GPU's command processor passes them, ahead of the
+		// drawing; the finishes as each draw ends: a draw that hangs leaves later starts written, its finish not)
+		const uint32_t begun = _crumb_words[0], done = _crumb_words[1], setup = _crumb_words[2];
+		constexpr uint32_t kNone = 0xFFFFFFFFu;
 		std::string out;
 		char line[400];
-		std::snprintf(line, sizeof(line), "The native zone pass's breadcrumbs (renderer %p): the GPU had begun every draw before frame %u's draw %u, and "
-			"finished frame %u's draw %u\n", static_cast<const void *>(this), begun >> 16, begun & 0xFFFFu, done >> 16, done & 0xFFFFu);
-		if (begun == 0xFFFFFFFFu)
-			std::snprintf(line, sizeof(line), "The native zone pass's breadcrumbs (renderer %p): no zone piece drawn yet\n", static_cast<const void *>(this));
-		out += line;
-		if (begun == 0xFFFFFFFFu)
-			return out;
-		std::lock_guard<std::mutex> lock(_notes_mutex);
-		// The frame the last finished draw was in: that draw and the one after it (the first not finished)
-		const frame_note *fn = nullptr;
-		for (const frame_note &n : _notes)
-			if (n.tag == (done >> 16))
-				fn = &n;
-		const frame_note *fb = nullptr;
-		for (const frame_note &n : _notes)
-			if (n.tag == (begun >> 16))
-				fb = &n;
-		const bool all_done = begun == done || (fn != nullptr && (done & 0xFFFFu) + 1 >= fn->pieces.size() && fb == fn);
-		out += all_done ? "  every zone draw the GPU began it finished: the stop came elsewhere\n" :
-			"  a zone draw begun and not finished: the GPU stopped in the zone pass\n";
-		if (fn != nullptr)
+		if (begun == kNone && setup == kNone)
 		{
-			const uint32_t d = done & 0xFFFFu;
-			if (d < fn->pieces.size())
+			std::snprintf(line, sizeof(line), "The native zone pass's breadcrumbs (renderer %p): no zone pass begun yet\n", static_cast<const void *>(this));
+			return line;
+		}
+		auto at = [](uint32_t w) {
+			char s[64];
+			if (w == kNone)
+				return std::string("none");
+			std::snprintf(s, sizeof(s), "frame %u's draw %u", w >> 16, w & 0xFFFFu);
+			return std::string(s);
+		};
+		std::snprintf(line, sizeof(line), "The native zone pass's breadcrumbs (renderer %p): the command processor (ahead of the drawing) had reached %s; the drawing "
+			"had finished %s\n", static_cast<const void *>(this), at(begun).c_str(), at(done).c_str());
+		out += line;
+		if (setup != kNone)
+		{
+			const uint32_t s = setup & 0xFFFFu;
+			const char *step = s == kStepBegun ? "begun (after the light split's clear), its targets not bound yet" :
+				s == kStepTargets ? "its targets, viewport, root signature and constants bound; the zone's descriptor heap not yet" :
+				s == kStepHeap ? "the zone's descriptor heap and buffers bound; the first pipeline not yet" :
+				s == kStepPipeline ? "the first pipeline bound; then its constants, textures and the first draw's start" : "?";
+			std::snprintf(line, sizeof(line), "  the setup of frame %u's pass got as far as: %s\n", setup >> 16, step);
+			out += line;
+		}
+
+		std::lock_guard<std::mutex> lock(_notes_mutex);
+		auto note_of = [this](uint32_t w) -> const frame_note * {
+			if (w != kNone)
+				for (const frame_note &n : _notes)
+					if (n.tag == (w >> 16))
+						return &n;
+			return nullptr;
+		};
+		const frame_note *const fn = note_of(done), *const fb = note_of(begun), *const fs = note_of(setup);
+		const uint32_t d = done & 0xFFFFu;
+		const bool done_all = fn != nullptr && d + 1 >= fn->pieces.size();
+		const bool newer_setup = setup != kNone && (done == kNone || (setup >> 16) != (done >> 16));
+		const bool newer_begun = begun != kNone && (done == kNone || (begun >> 16) != (done >> 16));
+		// Where the stop was: the first piece not finished, and the frame whose lamps to list
+		const frame_note *stop = fn;
+		const piece_note *next = nullptr;
+		uint32_t next_draw = 0;
+		if ((done_all || done == kNone) && newer_setup && (!newer_begun || (begun >> 16) != (setup >> 16)))
+		{
+			std::snprintf(line, sizeof(line), "  frame %u's zone pass hadn't started its first draw: the GPU stopped in its setup (the step above)\n", setup >> 16);
+			out += line;
+			stop = fs;
+		}
+		else if ((done_all || done == kNone) && newer_begun)
+		{
+			std::snprintf(line, sizeof(line), "  no draw of frame %u finished: the GPU stopped on its first draw\n", begun >> 16);
+			out += line;
+			stop = fb;
+		}
+		else if (done_all)
+			out += "  every zone draw the GPU began it finished, and no later zone pass had begun: the stop came outside the zone pass\n";
+		else
+		{
+			out += "  a zone draw not finished: the GPU stopped in the zone pass\n";
+			if (fn != nullptr && d + 1 < fn->pieces.size())
 			{
-				const piece_note &p = fn->pieces[d];
-				out += note_text("the last finished", d, p);
-			}
-			if (d + 1 < fn->pieces.size())
-			{
-				const piece_note &p = fn->pieces[d + 1];
-				out += note_text("the next, not finished", d + 1, p);
+				next = &fn->pieces[d + 1];
+				next_draw = d + 1;
 			}
 		}
-		const frame_note *lamps_of = fb != nullptr ? fb : fn;
-		if (lamps_of != nullptr)
+		if (stop != fn && stop != nullptr && !stop->pieces.empty())
+			next = &stop->pieces[0];
+		if (fn != nullptr && d < fn->pieces.size())
+			out += note_text("the last finished", d, fn->pieces[d]);
+		if (next != nullptr)
+			out += note_text("the next, not finished", next_draw, *next);
+		if (stop != nullptr)
 		{
-			std::snprintf(line, sizeof(line), "  frame %u: %zu pieces drawn, per pixel %s, %zu lamps%s\n", lamps_of->tag, lamps_of->pieces.size(), lamps_of->per_pixel ? "on" : "off",
-				lamps_of->lamps.size(), lamps_of->lamps.empty() ? "" : ":");
+			std::snprintf(line, sizeof(line), "  frame %u: %zu pieces drawn, per pixel %s, %zu lamps%s\n", stop->tag, stop->pieces.size(), stop->per_pixel ? "on" : "off",
+				stop->lamps.size(), stop->lamps.empty() ? "" : ":");
 			out += line;
-			for (size_t i = 0; i < lamps_of->lamps.size(); ++i)
+			for (size_t i = 0; i < stop->lamps.size(); ++i)
 			{
-				const frame_lamp &l = lamps_of->lamps[i];
+				const frame_lamp &l = stop->lamps[i];
 				std::snprintf(line, sizeof(line), "    lamp %zu: at %g %g %g, range %g, colour %g %g %g, attenuation 2 %g\n", i, l.pos[0], l.pos[1], l.pos[2], l.range,
 					l.colour[0], l.colour[1], l.colour[2], l.attenuation2);
 				out += line;
@@ -799,6 +839,24 @@ light_out ps_light(v2p i)
 			std::memcpy(at + kLampsAt, p.lamps, size_t(lamp_count) * sizeof(frame_lamp));
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
 
+		// (the breadcrumbs, when Direct3D has WriteBufferImmediate: the frame number's low 16 bits, the draw's below; and
+		// the setup's steps before the first draw in word 2, as the GPU's command processor passes them: 0.63's reports
+		// stopped there, the first draw's start never written)
+		ID3D12GraphicsCommandList2 *l2 = nullptr;
+		if (_crumbs != nullptr && FAILED(list->QueryInterface(IID_PPV_ARGS(&l2))))
+			l2 = nullptr;
+		const uint32_t tag = uint32_t(frame_number & 0xFFFFu) << 16;
+		const D3D12_GPU_VIRTUAL_ADDRESS crumb_va = _crumbs != nullptr ? _crumbs->GetGPUVirtualAddress() : 0;
+		auto step = [&](uint32_t s) {
+			if (l2 == nullptr)
+				return;
+			D3D12_WRITEBUFFERIMMEDIATE_PARAMETER wb = { crumb_va + 8, tag | s };
+			D3D12_WRITEBUFFERIMMEDIATE_MODE wm = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+			l2->WriteBufferImmediate(1, &wb, &wm);
+		};
+		_building.clear();
+		step(kStepBegun);
+
 		// Targets, heaps, root
 		const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { t.rtv, t.light_rtv };
 		list->OMSetRenderTargets(t.light_rtv.ptr != 0 ? 2 : 1, rtvs, FALSE, &t.dsv);
@@ -811,13 +869,7 @@ light_out ps_light(v2p i)
 		list->SetGraphicsRootShaderResourceView(4, base + kObjectsAt);
 		list->SetGraphicsRootShaderResourceView(5, base + kLampsAt);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		// (the breadcrumbs, when Direct3D has WriteBufferImmediate: the frame number's low 16 bits, the draw's below)
-		ID3D12GraphicsCommandList2 *l2 = nullptr;
-		if (_crumbs != nullptr && FAILED(list->QueryInterface(IID_PPV_ARGS(&l2))))
-			l2 = nullptr;
-		const uint32_t tag = uint32_t(frame_number & 0xFFFFu) << 16;
-		const D3D12_GPU_VIRTUAL_ADDRESS crumb_va = _crumbs != nullptr ? _crumbs->GetGPUVirtualAddress() : 0;
-		_building.clear();
+		step(kStepTargets);
 
 		// The objects in the game's order, each one's pieces in file order (blended ones where they come)
 		ID3D12PipelineState *bound = nullptr;
@@ -838,6 +890,8 @@ light_out ps_light(v2p i)
 				list->SetDescriptorHeaps(1, heaps);
 				list->SetGraphicsRootShaderResourceView(2, z->vertices()->GetGPUVirtualAddress());
 				list->SetGraphicsRootShaderResourceView(3, z->indices()->GetGPUVirtualAddress());
+				if (bound_zone == nullptr)
+					step(kStepHeap);
 				bound_zone = z;
 			}
 			const zm::zone &d = z->data();
@@ -853,7 +907,12 @@ light_out ps_light(v2p i)
 				if (pso == nullptr)
 					continue;
 				if (pso != bound)
+				{
+					const bool first = bound == nullptr;
 					list->SetPipelineState(bound = pso);
+					if (first)
+						step(kStepPipeline);
+				}
 				// (doors take the fixed-function path, never the bump shader; their bit-28 pieces the door's environment)
 				const uint32_t flags = (pc.normal_map != zm::kNone && mo.bump && !door && !p.no_bump ? kBump : 0) | ((fo.flags & zm::kAlphaTested) != 0 ? kTested : 0) |
 					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !p.no_bump ? kMapped : 0) |
