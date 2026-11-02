@@ -417,6 +417,35 @@ namespace hifi::backend
 			write_log(0, text);
 		}
 
+		// The frame rate's six speed-ups (src/game/hifps/exp.hpp) were on in every preset until 0.64; experimental again,
+		// they're off by default, and the ones a settings file has on are turned off once (the menu turns them back on)
+		void speedups_off_once()
+		{
+			wchar_t done[8] = L"";
+			if (GetFileAttributesW(g_settings.c_str()) == INVALID_FILE_ATTRIBUTES ||
+				GetPrivateProfileStringW(L"hifixi", L"speedups_off", L"", done, 8, g_settings.c_str()) != 0)
+				return;
+			unsigned turned = 0;
+			for (const wchar_t *key : { L"exp_ashita", L"exp_occlusion", L"exp_walls", L"exp_sse", L"exp_batch", L"exp_dedupe" })
+			{
+				wchar_t v[8] = L"";
+				GetPrivateProfileStringW(L"hifps", key, L"", v, 8, g_settings.c_str());
+				if (v[0] != L'\0' && std::wcscmp(v, L"0") != 0)
+				{
+					WritePrivateProfileStringW(L"hifps", key, L"0", g_settings.c_str());
+					turned++;
+				}
+			}
+			WritePrivateProfileStringW(L"hifixi", L"speedups_off", L"1", g_settings.c_str());
+			if (turned != 0)
+			{
+				char text[200];
+				std::snprintf(text, sizeof(text), "HiFi XI: the frame rate's %u speed-ups that were on turned off once (experimental now: the Frame rate tab "
+					"turns them back on)", turned);
+				write_log(0, text);
+			}
+		}
+
 		void setup_port(const wchar_t *folder = nullptr)
 		{
 			wchar_t path[MAX_PATH] = L"";
@@ -433,6 +462,7 @@ namespace hifi::backend
 			import_settings();
 			tidy_settings();
 			import_addon_options();
+			speedups_off_once();
 			{
 				std::string where;
 				for (wchar_t c : g_settings)

@@ -5,7 +5,8 @@
  *     file HiFi XI 0.10 left (its [mine] copy, the preset Mine) tidied: the copy out, the preset custom;
  *   - every tab drawn, every ImGui begin and push matched by its end and pop (ImGui stops the game otherwise);
  *   - each tab's own settings on it; a setting that needs another greyed out while that's off;
- *   - a preset picked: its values saved and it shown picked; the frame rate's options on in every preset;
+ *   - a preset picked: its values saved and it shown picked; above 60 fps on in every preset, the six speed-ups
+ *     left as they are (off by default, turned off once in a file that had them on);
  *   - a slider moved: saved, and the preset Custom; the search finding settings by name and description;
  *   - your own presets: saved by name from the dropdown's row (a file in presets\), in the dropdown, picked back,
  *     updated under the same name, deleted; names that can't be one refused;
@@ -246,9 +247,10 @@ int main()
 			std::string v;
 			return hifi::backend::option(section, key, v) ? v : std::string("(none)");
 		};
-		check(option("hifps", "enabled") == "1" && option("hifps", "limit") == "0" && option("hifps", "counter") == "0" && option("hifps", "exp_walls") == "1" &&
-			option("hifps", "exp_sse") == "0" && option("hifps", "gfx_lamps") == "(none)" && option("hifps", "exp_glows") == "(none)",
+		check(option("hifps", "enabled") == "1" && option("hifps", "limit") == "0" && option("hifps", "counter") == "0" && option("hifps", "exp_walls") == "0" &&
+			option("hifps", "exp_ashita") == "0" && option("hifps", "exp_sse") == "0" && option("hifps", "gfx_lamps") == "(none)" && option("hifps", "exp_glows") == "(none)",
 			"hifps's settings taken ([hifps]: its exp table as exp_; its gfx table, the game's own lights, and glows toggle left out)");
+		check(option("hifixi", "speedups_off") == "1", "  then the speed-ups it had on (ashita, walls) turned off once: experimental, off by default");
 		check(option("drawcull", "world") == "5" && option("drawcull", "entity") == "10" && option("drawcull", "square") == "1",
 			"drawcull's taken from the character whose settings were saved last");
 		check(option("display", "aspect") == "(none)" && option("display", "mipmap") == "(none)", "nothing of aspect's or mipmap's (not HiFi XI's)");
@@ -300,12 +302,15 @@ int main()
 	draw();
 	check(value("Grass") == 0.0f && value("Water") == 0.0f && value("SunShadows") == 0.0f && value("GrassDistance") == 140.0f,
 		"Off: everything off, what it leaves (the grass's distance) left");
-	check(value("VisTest") == 1.0f && hifi::game::option_on("hifps", "exp_walls", false) && hifi::game::option_on("hifps", "exp_dedupe", false) &&
-		hifi::game::option_on("hifps", "enabled", false), "Off: the frame rate's options still on (on in every preset)");
+	check(value("VisTest") == 1.0f && !hifi::game::option_on("hifps", "exp_walls", false) && !hifi::game::option_on("hifps", "exp_dedupe", false) &&
+		hifi::game::option_on("hifps", "enabled", false), "Off: above 60 fps and the no-wait tests still on, the speed-ups still off (no preset turns them on)");
+	hifi::game::set_option_on("hifps", "exp_batch", true);
 	fake::click = "Balanced";
 	draw();
 	check(value("Grass") == 1.0f && value("Water") == 1.0f && value("SunShadows") == 0.5f && hifi::backend::preset() == "balanced",
 		"Balanced: its values in use");
+	check(hifi::game::option_on("hifps", "exp_batch", false), "  a speed-up turned on by hand left on by it");
+	hifi::game::set_option_on("hifps", "exp_batch", false);
 
 	// 4. A slider moved: saved, Custom
 	hifi::ui::show_tab(hifi::settings::tab::world);

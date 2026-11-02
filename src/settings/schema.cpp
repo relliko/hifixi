@@ -12,8 +12,9 @@ namespace hifi::settings
 
 		// Off: the game as it draws itself. Balanced: what costs little (grass near, the sun's shadows, water, rain).
 		// High: as much again, a little further (characters' shadows, the sky, lamp shadows, some ambient occlusion).
-		// Ultra: everything, furthest. Custom: changed by hand since one was picked. The frame rate's options (above 60 fps
-		// and its speed-ups, the no-wait visibility tests) are on in every preset, and by default.
+		// Ultra: everything, furthest. Custom: changed by hand since one was picked. Above 60 fps and the no-wait visibility
+		// tests are on in every preset, and by default; the frame rate's six speed-ups (hifps's experimental toggles) are off
+		// by default and no preset touches them (each player's were turned off once in 0.65: backend.cpp speedups_off_once).
 		constexpr option_kind flag = option_kind::flag, number = option_kind::number, whole = option_kind::whole;
 
 		const entry kEntries[] = {
@@ -28,26 +29,26 @@ namespace hifi::settings
 			{ "hifps.exp_walls", tab::frame_rate, "Waiting on the GPU", "Hide characters by walls without waiting",
 				"The game waits for the GPU to finish the frame so far to know whether a character is behind a wall (about 40% "
 				"of the frame time). This answers it from the zone's collision instead; scenery without collision no longer "
-				"hides characters, and you and your target are always shown.", nullptr, "hifps.enabled", false, { 1.0f, 1.0f, 1.0f, 1.0f },
-				flag, 0.0f, 1.0f, 1.0f },
+				"hides characters, and you and your target are always shown.", nullptr, "hifps.enabled", false, { _, _, _, _ },
+				flag, 0.0f, 1.0f, 0.0f },
 			{ "hifps.exp_occlusion", tab::frame_rate, "Waiting on the GPU", "Test hidden characters less often",
 				"Above 60 fps the behind-a-wall test runs as often as at 60 fps, not every few frames more.", nullptr,
-				"hifps.enabled", false, { 1.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+				"hifps.enabled", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "hifps.exp_ashita", tab::frame_rate, "Less work a frame", "Skip Ashita's per-draw dispatch",
 				"Ashita hands each of the frame's ~3,000 draws to every plugin and addon. Its per-draw events stop; HiFi XI "
-				"checks first that nothing loaded uses them.", nullptr, "hifps.enabled", false, { 1.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+				"checks first that nothing loaded uses them.", nullptr, "hifps.enabled", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "hifps.ashita_force", tab::frame_rate, "Less work a frame", "Even if an addon or plugin uses them",
 				"Skip them even when something loaded uses the per-draw events (it stops getting them).", nullptr, "hifps.exp_ashita",
 				false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "hifps.exp_sse", tab::frame_rate, "Less work a frame", "SSE character skinning on any CPU",
 				"The game uses its faster SSE code for characters only when the CPU says Intel; this turns it on for others.",
-				nullptr, "hifps.enabled", false, { 1.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+				nullptr, "hifps.enabled", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "hifps.exp_batch", tab::frame_rate, "Less work a frame", "Batch text and interface quads",
 				"Consecutive text and interface quads with nothing changed between them become one draw. Same picture.", nullptr,
-				"hifps.enabled", false, { 1.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+				"hifps.enabled", false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "hifps.exp_dedupe", tab::frame_rate, "Less work a frame", "Drop repeated device calls",
 				"About 40% of the game's device calls set a value already in effect; these are dropped.", nullptr, "hifps.enabled",
-				false, { 1.0f, 1.0f, 1.0f, 1.0f }, flag, 0.0f, 1.0f, 1.0f },
+				false, { _, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
 			{ "VisTest", tab::frame_rate, "Waiting on the GPU", "Answer glow, lamp, lens flare and door tests without waiting",
 				"The game asks the GPU whether glows, lamps, the lens flare and doors are hidden behind something, and waits for "
 				"the answer every frame. This answers from a copy of the depth already drawn instead, a few frames old, so "

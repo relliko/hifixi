@@ -1375,7 +1375,7 @@ namespace hifi::game::hifps::exp
 		}
 		bool wanted[kCount];
 		for (int n = 0; n < kCount; ++n)
-			wanted[n] = option_on(kSection, kOptions[n], true); // (each on unless turned off: the frame rate's options are on by default)
+			wanted[n] = option_on(kSection, kOptions[n], false); // (each off unless turned on: experimental, off by default)
 		// (walls off while World FX's VisTest answers the characters' test: the call is VisTest's then)
 		wanted[kWalls] = wanted[kWalls] && !g.actors_elsewhere;
 		const bool force = option_on(kSection, "ashita_force", false);
