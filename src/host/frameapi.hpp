@@ -33,6 +33,10 @@ struct hifi_frame_mark
 	D3D12_RESOURCE_STATES world_rt_state;
 	D3D12_RESOURCE_STATES world_ds_planes[2];
 	uint32_t world_ds_plane_count;
+	// (HifiFrameVersion() >= 3) The colour the world's target was last cleared to, the whole of it (the game clears it
+	// to the zone's fog at each frame's start); world_clear_known 0 while there's been none since the world was named
+	float world_clear[4];
+	uint32_t world_clear_known;
 };
 
 using hifi_frame_handler = void(__cdecl *)(void *context, uint32_t kind, uint32_t seq, const hifi_frame_mark *m);
@@ -54,9 +58,10 @@ using hifi_frame_set_speedups_fn = uint32_t(__cdecl *)(uint32_t flags);
 using hifi_frame_speedup_stats_fn = void(__cdecl *)(uint32_t out[4]);
 
 // HifiFrameVersion(): what this d3d8.dll's channel has (1 when the export is missing: the struct ends at width/height;
-// 2: the world's fields too). HifiFrameDevice(device, queue): its device and the direct queue the game's lists go to,
-// not AddRef'd (valid while it draws: from the device's making till the game lets it go); 0 when there's none yet.
-constexpr uint32_t kHifiFrameChannel = 2;
+// 2: the world's fields too; 3: and the world's clear colour). HifiFrameDevice(device, queue): its device and the direct
+// queue the game's lists go to, not AddRef'd (valid while it draws: from the device's making till the game lets it go);
+// 0 when there's none yet.
+constexpr uint32_t kHifiFrameChannel = 3;
 using hifi_frame_version_fn = uint32_t(__cdecl *)();
 using hifi_frame_device_fn = int(__cdecl *)(ID3D12Device **device, ID3D12CommandQueue **queue);
 

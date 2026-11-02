@@ -276,6 +276,8 @@ namespace hifi::d3d8
 			colour(c, color);
 			g.flush_barriers();
 			l->ClearRenderTargetView(rt->rtv(), c, UINT(list.size()), list.empty() ? nullptr : list.data());
+			if (list.empty())
+				note_clear(this, rt->img, c); // (the whole world cleared: the zone's fog, for HiFi XI's marks)
 		}
 		if (flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))
 		{

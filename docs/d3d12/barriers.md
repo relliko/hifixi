@@ -115,8 +115,10 @@ The direct channel (exact states, no guessing):
 
 The barrier inference still left (dgVoodoo era):
 
-- `src/backend/backend.cpp:611` (`ev_barrier`): World FX's own tracker (subresource 0 or ALL only, so a stencil-only
-  move isn't read as the depth's state) and FSR's resolve placement. Both go in steps 4 and 5.
+- `ev_barrier` in `src/backend/backend.cpp`: FSR's resolve placement alone (`upscale::after_barrier`, and the
+  backend's `list_capture` of what's bound, for FSR's restore). It goes in step 5. World FX follows no barrier since
+  step 4: the world's target and depth, their states and the fog (the world's last whole clear, channel 3) come with
+  every mark (`worldfx::world_mark`, built by the backend's `world_of`).
 
 Our own passes on the game's depth:
 

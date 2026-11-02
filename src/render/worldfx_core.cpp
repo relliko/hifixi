@@ -50,6 +50,8 @@ namespace
 	// (zone_stale: the GPU hung drawing the last zone's grass in the next, 2026-11-01/02)
 	std::atomic<uint32_t> g_told_zone{ 0 };
 	std::atomic<uint32_t> g_told_in{ 0 };
+	// (the FloatWorld setting, for our d3d8.dll at every mark without the core's lock)
+	std::atomic<bool> g_float_world{ false };
 	// The zone's files to be read again (worldfx::reload_zone: HiFi XI just made them)
 	std::atomic<bool> g_reload_zone{ false };
 	// The game's world found since its device was attached: World FX draws there (worldfx_drawing: HiFi XI's game side
@@ -71,9 +73,6 @@ namespace
 	constexpr float kShadeMaxMs = 30.0f;
 	constexpr uint32_t kZoneCheckFrames = 30;
 	constexpr uint32_t kHistory = 120;
-
-	// What's bound on one command list (worldfx_core.hpp)
-	using worldfx::list_data;
 
 	// worldfx.hlsl compiled on a thread of its own (shader_thread): compiling all the shaders takes over 11 s, and done
 	// on the game's frame it froze the game until Windows closed it (in game, 2026-10-21). The frame picks the result
@@ -131,11 +130,12 @@ namespace
 
 		// Zone and blades
 		uint32_t frames = 0;
-		// The world's views as last bound (for its end, where the resolve's targets are bound)
+		// The world's views, their formats and its size, as the zone's begin mark had them bound (for its end, where the
+		// resolve's targets are bound); whether World FX has drawn at its end since
 		uint64_t world_rtv = 0, world_dsv = 0;
-		// The states the last barrier (on any list) put the world's target and depth in
-		D3D12_RESOURCE_STATES last_rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		D3D12_RESOURCE_STATES last_ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+		DXGI_FORMAT world_rt_format = DXGI_FORMAT_UNKNOWN, world_ds_format = DXGI_FORMAT_UNKNOWN;
+		uint32_t world_width = 0, world_height = 0;
+		bool world_end_done = false;
 		bool zone_known = false;
 		uint32_t zone = 0;
 		bool zone_tried = false;
@@ -149,7 +149,6 @@ namespace
 		uint32_t passes = 0;          // world ends drawn at since the last present
 		uint32_t passes_wanted = 0;   // and wanted
 		uint32_t most_wanted = 0;     // the most wanted between two presents so far (logged when it grows past kMaxPasses)
-		bool logged_stale_views = false;
 		bool crash_reports_tried = false;
 		std::string crash_reports = "off (Direct3D 12's device was made before the add-on loaded)";
 		bool debug_layer = false;         // D3D12DebugLayer=1: its messages go to worldfx-d3d12-debug.txt
@@ -486,25 +485,6 @@ namespace
 	{
 		if (host.set_int != nullptr)
 			host.set_int(key, value);
-	}
-
-	// The resource a view is of now (nullptr: none, or not known)
-	ID3D12Resource *resource_of(uint64_t view)
-	{
-		return view != 0 && host.resource_of_view != nullptr ? host.resource_of_view(view) : nullptr;
-	}
-
-	const char *arg_name(grass::root_arg::kind_t kind)
-	{
-		switch (kind)
-		{
-		case grass::root_arg::table: return "table";
-		case grass::root_arg::root_constants: return "constants";
-		case grass::root_arg::cbv: return "CBV";
-		case grass::root_arg::srv: return "SRV";
-		case grass::root_arg::uav: return "UAV";
-		default: return "unset";
-		}
 	}
 
 	// Game memory
@@ -1016,39 +996,15 @@ namespace
 		log_message(0, "FFXI World FX: worldfx.hlsl changed: compiling it in the background");
 	}
 
-	DXGI_FORMAT view_format(uint64_t view, ID3D12Resource *res)
-	{
-		DXGI_FORMAT fmt = view != 0 && host.format_of_view != nullptr ? host.format_of_view(view) : DXGI_FORMAT_UNKNOWN;
-		if (fmt == DXGI_FORMAT_UNKNOWN && res != nullptr)
-			fmt = res->GetDesc().Format;
-		return fmt;
-	}
-
-	// The first draw goes to the log with dgVoodoo's root signature, so a crash can be traced
-	void log_first(const list_data &d, const grass::target &t)
+	// The first draw goes to the log with the world as our d3d8.dll handed it, so a crash can be traced
+	void log_first(const grass::target &t)
 	{
 		g.logged_first = true;
-		std::string text = "FFXI World FX: first grass draw. Root parameters of the game's root signature:";
-		const size_t known = host.root_param_count != nullptr ? host.root_param_count(d.state.root) : 0;
-		const size_t count = known != 0 ? known : d.state.args.size();
-		for (size_t i = 0; i < count; ++i)
-		{
-			const char *const param = known != 0 && host.root_param != nullptr ? host.root_param(d.state.root, i) : nullptr;
-			char item[64];
-			std::snprintf(item, sizeof(item), " [%zu] %s (%s)", i, param != nullptr ? param : "?",
-				i < d.state.args.size() ? arg_name(d.state.args[i].kind) : "unset");
-			text += item;
-		}
-		char tail[320];
-		const D3D12_VIEWPORT &vp = d.state.viewports[0];
-		const D3D12_RESOURCE_DESC rd = t.rt->GetDesc(), dd = t.ds->GetDesc();
-		std::snprintf(tail, sizeof(tail), ". World formats %u/%u (resources %u/%u, %llux%u / %llux%u), states 0x%X/0x%X, %u viewport(s) (first %.0f,%.0f %.0fx%.0f depth %.3f..%.3f), topology %u.",
-			static_cast<unsigned>(t.rtv_format), static_cast<unsigned>(t.dsv_format), static_cast<unsigned>(rd.Format), static_cast<unsigned>(dd.Format),
-			static_cast<unsigned long long>(rd.Width), rd.Height, static_cast<unsigned long long>(dd.Width), dd.Height,
-			static_cast<unsigned>(t.rt_state), static_cast<unsigned>(t.ds_state),
-			d.state.viewport_count, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth, static_cast<unsigned>(d.state.topology));
-		text += tail;
-		log_message(0, text.c_str());
+		char text[240];
+		std::snprintf(text, sizeof(text), "FFXI World FX: first grass draw. The world: %ux%u, views' formats %u/%u, states 0x%X/0x%X (depth plane 0).",
+			g.world_width, g.world_height, static_cast<unsigned>(t.rtv_format), static_cast<unsigned>(t.dsv_format), static_cast<unsigned>(t.rt_state),
+			static_cast<unsigned>(t.ds_state));
+		log_message(0, text);
 	}
 
 	// Lit lights from the game's light table are this fresh at most (ms): older, the worldfx Ashita addon is gone,
@@ -1994,7 +1950,7 @@ namespace
 		log_people(cam, people);
 	}
 
-	void inject(ID3D12GraphicsCommandList *list, list_data &d, uint64_t rtv, uint64_t dsv)
+	void inject(ID3D12GraphicsCommandList *list, const worldfx::world_mark &m, uint64_t rtv)
 	{
 		g.tried = true;
 		g.passes_wanted++;
@@ -2045,12 +2001,12 @@ namespace
 		t.rt = g.world_rt;
 		t.ds = g.world_ds;
 		t.rtv = { static_cast<SIZE_T>(rtv) };
-		t.rtv_format = view_format(rtv, g.world_rt);
-		t.dsv_format = view_format(dsv, g.world_ds);
-		t.rt_state = d.world_rt_state;
-		t.ds_state = d.world_ds_state;
+		t.rtv_format = g.world_rt_format;
+		t.dsv_format = g.world_ds_format;
+		t.rt_state = m.rt_state;
+		t.ds_state = m.ds_planes[0]; // (the renderer copies and moves plane 0 alone)
 		if (!g.logged_first)
-			log_first(d, t);
+			log_first(t);
 
 		std::string error;
 		// (the frame's look: worked out at the zone's end when the blades went in there, else here)
@@ -2342,18 +2298,6 @@ static void pace_present(ID3D12CommandQueue *q)
 	q->Signal(g.pace_fence, ++g.presents);
 }
 
-// Whether a clear's rectangles (none: all of it) cover the whole of res
-static bool covers_all(ID3D12Resource *res, uint32_t rect_count, const D3D12_RECT *rects)
-{
-	if (rect_count == 0)
-		return true;
-	const D3D12_RESOURCE_DESC rd = res->GetDesc();
-	for (uint32_t i = 0; i < rect_count; ++i)
-		if (rects[i].left <= 0 && rects[i].top <= 0 && rects[i].right >= int32_t(rd.Width) && rects[i].bottom >= int32_t(rd.Height))
-			return true;
-	return false;
-}
-
 namespace worldfx
 {
 	void set_port(const port &p)
@@ -2531,176 +2475,77 @@ namespace worldfx
 		g.dev = nullptr;
 	}
 
-	void on_reset(list_data &d)
-	{
-		d = list_data();
-		// A list starts with the world in the states the last barrier on any list left it in: dgVoodoo may
-		// change them on one list and draw on the next (the depth, before the resolve)
-		std::lock_guard<std::mutex> lock(g.mutex);
-		d.world_rt_state = g.last_rt_state;
-		d.world_ds_state = g.last_ds_state;
-	}
-
-	void on_targets(ID3D12GraphicsCommandList *, list_data &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv)
-	{
-		// The new binding (already made: this comes after the call)
-		count = std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
-		d.state.rtv_count = count;
-		for (uint32_t i = 0; i < count; ++i)
-			d.state.rtvs[i] = { static_cast<SIZE_T>(rtvs[i]) };
-		d.state.dsv = { static_cast<SIZE_T>(dsv) };
-		d.rt0 = count != 0 && rtvs[0] != 0 ? resource_of(rtvs[0]) : nullptr;
-		d.ds = dsv != 0 ? resource_of(dsv) : nullptr;
-		if (d.rt0 != nullptr && d.rt0 == g.world_rt && d.ds == g.world_ds)
-		{
-			std::lock_guard<std::mutex> lock(g.mutex);
-			g.world_rtv = rtvs[0];
-			g.world_dsv = dsv;
-		}
-	}
-
-	void on_pipeline(list_data &d, ID3D12PipelineState *pso)
-	{
-		d.state.pipeline = pso;
-	}
-
-	void on_topology(list_data &d, D3D12_PRIMITIVE_TOPOLOGY topology)
-	{
-		d.state.topology = topology;
-	}
-
-	void on_viewports(list_data &d, uint32_t first, uint32_t count, const D3D12_VIEWPORT *viewports)
-	{
-		const uint32_t total = std::min<uint32_t>(first + count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
-		for (uint32_t i = first; i < total; ++i)
-			std::memcpy(&d.state.viewports[i], &viewports[i - first], sizeof(D3D12_VIEWPORT));
-		d.state.viewport_count = count != 0 ? total : 0;
-	}
-
-	void on_scissors(list_data &d, uint32_t first, uint32_t count, const D3D12_RECT *rects)
-	{
-		const uint32_t total = std::min<uint32_t>(first + count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
-		for (uint32_t i = first; i < total; ++i)
-			std::memcpy(&d.state.scissors[i], &rects[i - first], sizeof(D3D12_RECT));
-		d.state.scissor_count = count != 0 ? total : 0;
-	}
-
-	void on_root_tables(list_data &d, ID3D12RootSignature *root, uint32_t first, uint32_t count, const uint64_t *tables)
-	{
-		// No tables: the root signature was set (or the list reset)
-		d.state.set_root(root);
-		for (uint32_t i = 0; i < count; ++i)
-		{
-			grass::root_arg &a = d.state.arg(first + i);
-			a = grass::root_arg();
-			a.kind = grass::root_arg::table;
-			a.value = tables[i];
-		}
-	}
-
-	void on_root_constants(list_data &d, ID3D12RootSignature *root, uint32_t param, uint32_t first, uint32_t count, const void *values)
-	{
-		d.state.set_root(root);
-		d.state.set_constants(param, first, count, static_cast<const uint32_t *>(values));
-	}
-
-	void on_root_descriptor(list_data &d, ID3D12RootSignature *root, uint32_t param, grass::root_arg::kind_t kind, uint64_t address)
-	{
-		d.state.set_root(root);
-		grass::root_arg &a = d.state.arg(param);
-		a = grass::root_arg();
-		if (kind == grass::root_arg::cbv || kind == grass::root_arg::srv || kind == grass::root_arg::uav)
-		{
-			a.kind = kind;
-			a.value = address;
-		}
-	}
-
-	void on_barrier(ID3D12GraphicsCommandList *, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		for (uint32_t i = 0; i < count; ++i)
-		{
-			if (resources[i] == nullptr)
-				continue;
-			if (resources[i] == g.world_rt)
-				g.last_rt_state = d.world_rt_state = after[i];
-			else if (resources[i] == g.world_ds)
-				g.last_ds_state = d.world_ds_state = after[i];
-		}
-	}
-
 	bool float_world()
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		return g.float_world;
+		return g_float_world.load(std::memory_order_relaxed);
 	}
 
-	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d)
+	// (g.mutex held) The zone's fog: the colour the world's target was last cleared to, the whole of it (the water's sky
+	// along the horizon), as our d3d8.dll says it at the marks
+	void take_fog(const world_mark &m)
+	{
+		if (!m.fog_known)
+			return;
+		for (int i = 0; i < 3; ++i)
+			g.look.fog[i] = std::clamp(m.fog[i], 0.0f, 1.0f);
+		g.look.fog_known = true;
+	}
+
+	void on_world_end(const world_mark &m)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
-		if (d.grass_done || g.world_rtv == 0 || g.world_dsv == 0)
+		// (once after each zone's begin: our d3d8.dll marks the world's end once after it)
+		if (g.world_end_done || g.world_rtv == 0 || g.world_dsv == 0)
 			return;
-		d.grass_done = true;
-		d.world_ended = g.world_rt;
-		if (resource_of(g.world_rtv) == g.world_rt && resource_of(g.world_dsv) == g.world_ds)
-			inject(list, d, g.world_rtv, g.world_dsv);
+		g.world_end_done = true;
+		take_fog(m);
+		if (m.rt != nullptr && m.rt == g.world_rt && m.ds == g.world_ds)
+			inject(m.list, m, g.world_rtv);
 		else
-			g.skip = "the world's views hold something else now (skipped)";
+			g.skip = "the world's target and depth aren't the zone's begin's now (skipped)";
 	}
 
-	// The world's colour (the sky/fog clear) is cleared once, at the frame's start, to the zone's fog
-	void on_clear_target(list_data &, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects)
+	void on_world_marker(const world_mark &m)
 	{
-		ID3D12Resource *const res = resource_of(rtv);
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (res == nullptr || res != g.world_rt)
-			return;
-		if (!covers_all(res, rect_count, rects))
-			return;
-		// (the colour it's cleared to is the zone's fog: the water's sky along the horizon)
-		if (color != nullptr)
-		{
-			for (int i = 0; i < 3; ++i)
-				g.look.fog[i] = std::clamp(color[i], 0.0f, 1.0f);
-			g.look.fog_known = true;
-		}
-	}
-
-	void on_world_marker(ID3D12Resource *rt, ID3D12Resource *ds, uint64_t rtv, uint64_t dsv)
-	{
-		if (rt == nullptr || ds == nullptr || rtv == 0 || dsv == 0)
+		if (m.rt == nullptr || m.ds == nullptr || m.rtv == 0 || m.dsv == 0)
 			return;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
 		g.look_at_marker = false;
+		g.world_end_done = false;
 		g.markers++;
 		g.marker_present = g.presents;
-		g.world_rtv = rtv;
-		g.world_dsv = dsv;
-		if (rt == g.world_rt && ds == g.world_ds)
+		g.world_rtv = m.rtv;
+		g.world_dsv = m.dsv;
+		g.world_rt_format = m.rt_format;
+		g.world_ds_format = m.ds_format;
+		g.world_width = m.width;
+		g.world_height = m.height;
+		take_fog(m);
+		if (m.rt == g.world_rt && m.ds == g.world_ds)
 			return;
-		g.world_rt = rt;
-		g.world_ds = ds;
-		const D3D12_RESOURCE_DESC w = rt->GetDesc();
+		g.world_rt = m.rt;
+		g.world_ds = m.ds;
 		char text[160];
-		const bool floats = world_floats(rt);
-		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %llux%u%s%s", static_cast<unsigned long long>(w.Width), w.Height,
+		const bool floats = world_floats(m.rt);
+		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %ux%u%s%s", m.width, m.height,
 			floats ? ", as floats (light past white)" : "", g.marker_logged ? " (again: it had moved)" : "");
 		log_message(g.marker_logged ? 1 : 0, text);
 		g.marker_logged = true;
 	}
 
-	void on_zone_end(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, const D3D12_RESOURCE_STATES planes[2])
+	void on_zone_end(const world_mark &m)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
-		ID3D12Resource *const ds = resource_of(dsv);
+		ID3D12GraphicsCommandList *const list = m.list;
+		ID3D12Resource *const ds = m.ds;
+		const D3D12_RESOURCE_STATES *const planes = m.ds_planes;
 		if (!g.in_game || zone_stale() || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
 			return;
-		// (the world the markers named, its views still its own, D24S8 as the blades' depth)
-		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || g.world_rtv == 0 || resource_of(g.world_rtv) != g.world_rt ||
-			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT)
+		// (the world the zone's begin named, bound now, D24S8 as the blades' depth)
+		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || m.rt != g.world_rt || g.world_rtv == 0 || m.dsv == 0 ||
+			m.ds_format != DXGI_FORMAT_D24_UNORM_S8_UINT)
 			return;
 		grass::camera cam;
 		if (read_camera(cam) != nullptr)
@@ -2713,9 +2558,9 @@ namespace worldfx
 		t.rt = g.world_rt;
 		t.ds = ds;
 		t.rtv = { static_cast<SIZE_T>(g.world_rtv) };
-		t.rtv_format = view_format(g.world_rtv, g.world_rt);
-		t.dsv_format = view_format(dsv, ds);
-		t.rt_state = d.world_rt_state;
+		t.rtv_format = g.world_rt_format;
+		t.dsv_format = m.ds_format;
+		t.rt_state = m.rt_state;
 		t.ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 		t.blades_into_world_depth = true;
 		// Both planes DEPTH_WRITE while the blades write the depth (and test it), then back as dgVoodoo had them
@@ -3962,6 +3807,7 @@ void worldfx::load_settings()
 	std::lock_guard<std::mutex> lock(g.mutex);
 	for (setting_slot &s : slots())
 		read_setting(s);
+	g_float_world.store(g.float_world, std::memory_order_relaxed);
 }
 
 size_t worldfx::setting_count()
@@ -4012,6 +3858,7 @@ bool worldfx::set_setting(const char *key, const float value[3])
 			s->number[k] = value[k];
 	keep_in_range(*s);
 	save_setting(*s);
+	g_float_world.store(g.float_world, std::memory_order_relaxed);
 	return true;
 }
 

@@ -102,14 +102,55 @@ namespace hifi::backend
 		std::unordered_map<uint64_t, view_entry> views;
 		std::atomic<uint64_t> views_made { 0 }, views_copied { 0 }, views_unknown { 0 };
 
-		// Each list's data for the core (made with the list or at its first reset since the start; never freed: a list
-		// at the same address later is made or reset before it records)
-		std::mutex lists_mutex;
-		std::unordered_map<void *, std::unique_ptr<worldfx::list_data>> lists;
-		thread_local void *tl_list = nullptr;
-		thread_local worldfx::list_data *tl_data = nullptr;
+		// What's bound on one of our d3d8.dll's lists, followed by the hooks, for FSR alone: it draws in the middle of
+		// d3d8.dll's stream (at the resolve's draw) and binds all of it again after (list_state::restore), till a mark
+		// places it (step 5 of docs' re-architecture). World FX takes nothing from here: it draws at the marks.
+		struct list_capture
+		{
+			grass::list_state state;
+			ID3D12Resource *rt0 = nullptr; // (the first target bound)
+		};
+		namespace capture
+		{
+			void targets(list_capture &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv);
+			void viewports(list_capture &d, uint32_t count, const D3D12_VIEWPORT *viewports)
+			{
+				const uint32_t total = std::min<uint32_t>(count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+				for (uint32_t i = 0; i < total; ++i)
+					d.state.viewports[i] = viewports[i];
+				d.state.viewport_count = total;
+			}
+			void scissors(list_capture &d, uint32_t count, const D3D12_RECT *rects)
+			{
+				const uint32_t total = std::min<uint32_t>(count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+				for (uint32_t i = 0; i < total; ++i)
+					d.state.scissors[i] = rects[i];
+				d.state.scissor_count = total;
+			}
+			void table(list_capture &d, uint32_t param, uint64_t table)
+			{
+				grass::root_arg &a = d.state.arg(param);
+				a = grass::root_arg();
+				a.kind = grass::root_arg::table;
+				a.value = table;
+			}
+			void descriptor(list_capture &d, uint32_t param, grass::root_arg::kind_t kind, uint64_t address)
+			{
+				grass::root_arg &a = d.state.arg(param);
+				a = grass::root_arg();
+				a.kind = kind;
+				a.value = address;
+			}
+		}
 
-		worldfx::list_data *data_of(void *list, bool make)
+		// Each list's capture (made with the list, at its first reset since the start, or at its first mark; never freed:
+		// a list at the same address later is made or reset before it records)
+		std::mutex lists_mutex;
+		std::unordered_map<void *, std::unique_ptr<list_capture>> lists;
+		thread_local void *tl_list = nullptr;
+		thread_local list_capture *tl_data = nullptr;
+
+		list_capture *data_of(void *list, bool make)
 		{
 			if (list == tl_list && tl_data != nullptr)
 				return tl_data;
@@ -119,7 +160,7 @@ namespace hifi::backend
 			{
 				if (!make)
 					return nullptr;
-				it = lists.emplace(list, std::make_unique<worldfx::list_data>()).first;
+				it = lists.emplace(list, std::make_unique<list_capture>()).first;
 			}
 			tl_list = list;
 			tl_data = it->second.get();
@@ -138,7 +179,7 @@ namespace hifi::backend
 		}
 
 		// A list's data when the core should hear of it (attached, the list known, on the game's thread)
-		worldfx::list_data *live(void *list)
+		list_capture *live(void *list)
 		{
 			return g_attached.load(std::memory_order_acquire) && !elsewhere() ? data_of(list, false) : nullptr;
 		}
@@ -507,8 +548,6 @@ namespace hifi::backend
 			p.set_bool = port_set_bool;
 			p.set_float = port_set_float;
 			p.set_int = port_set_int;
-			p.resource_of_view = port_resource_of_view;
-			p.format_of_view = port_format_of_view;
 			p.folder = g_folder;
 			worldfx::set_port(p);
 			worldfx::load_settings();
@@ -516,28 +555,32 @@ namespace hifi::backend
 			streamlog::set_folder(g_folder);
 		}
 
+		// (the targets bound now: the call is made)
+		void capture::targets(list_capture &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv)
+		{
+			count = std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+			d.state.rtv_count = count;
+			for (uint32_t i = 0; i < count; ++i)
+				d.state.rtvs[i] = { static_cast<SIZE_T>(rtvs[i]) };
+			d.state.dsv = { static_cast<SIZE_T>(dsv) };
+			d.rt0 = count != 0 && rtvs[0] != 0 ? port_resource_of_view(rtvs[0]) : nullptr;
+		}
+
 		// The hooks' events
 		void ev_created(ID3D12GraphicsCommandList *list)
 		{
-			*data_of(list, true) = worldfx::list_data();
+			*data_of(list, true) = list_capture();
 		}
 		void ev_reset(ID3D12GraphicsCommandList *list)
 		{
 			if (elsewhere())
 				return;
 			upscale::on_reset(list);
-			worldfx::list_data *const d = data_of(list, true);
-			if (!g_attached.load(std::memory_order_acquire))
-			{
-				*d = worldfx::list_data();
-				return;
-			}
-			host::quiet q;
-			worldfx::on_reset(*d);
+			*data_of(list, true) = list_capture();
 		}
 		void ev_close(ID3D12GraphicsCommandList *list)
 		{
-			if (worldfx::list_data *const d = live(list))
+			if (list_capture *const d = live(list))
 			{
 				host::quiet q;
 				upscale::before_other(list, d->state); // (the screen upscaled before the list closes, when it's waiting)
@@ -545,100 +588,72 @@ namespace hifi::backend
 		}
 		void ev_targets(ID3D12GraphicsCommandList *list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL single_range, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv)
 		{
-			worldfx::list_data *const d = live(list);
+			list_capture *const d = live(list);
 			if (d == nullptr)
 				return;
 			const uint32_t n = rtvs != nullptr ? std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) : 0;
 			uint64_t v[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
 			for (uint32_t i = 0; i < n; ++i)
 				v[i] = single_range ? uint64_t(rtvs[0].ptr) + uint64_t(i) * g_rtv_increment : uint64_t(rtvs[i].ptr);
-			host::quiet q;
-			worldfx::on_targets(list, *d, n, v, dsv != nullptr ? uint64_t(dsv->ptr) : 0);
+			capture::targets(*d, n, v, dsv != nullptr ? uint64_t(dsv->ptr) : 0);
 		}
 		void ev_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pso)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_pipeline(*d, pso);
+			if (list_capture *const d = live(list))
+				d->state.pipeline = pso;
 		}
 		void ev_topology(ID3D12GraphicsCommandList *list, D3D12_PRIMITIVE_TOPOLOGY topology)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_topology(*d, topology);
+			if (list_capture *const d = live(list))
+				d->state.topology = topology;
 		}
 		void ev_viewports(ID3D12GraphicsCommandList *list, UINT count, const D3D12_VIEWPORT *viewports)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_viewports(*d, 0, viewports != nullptr ? count : 0, viewports);
+			if (list_capture *const d = live(list))
+				capture::viewports(*d, viewports != nullptr ? count : 0, viewports);
 		}
 		void ev_scissors(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RECT *rects)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_scissors(*d, 0, rects != nullptr ? count : 0, rects);
+			if (list_capture *const d = live(list))
+				capture::scissors(*d, rects != nullptr ? count : 0, rects);
 		}
 		void ev_root_signature(ID3D12GraphicsCommandList *list, ID3D12RootSignature *root)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_tables(*d, root, 0, 0, nullptr);
+			if (list_capture *const d = live(list))
+				d->state.set_root(root);
 		}
 		void ev_root_table(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE table)
 		{
-			if (worldfx::list_data *const d = live(list))
-			{
-				const uint64_t t = table.ptr;
-				worldfx::on_root_tables(*d, d->state.root, param, 1, &t);
-			}
+			if (list_capture *const d = live(list))
+				capture::table(*d, param, table.ptr);
 		}
 		void ev_root_constants(ID3D12GraphicsCommandList *list, UINT param, UINT count, const void *values, UINT first)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_constants(*d, d->state.root, param, first, count, values);
+			if (list_capture *const d = live(list))
+				d->state.set_constants(param, first, count, static_cast<const uint32_t *>(values));
 		}
 		void ev_root_cbv(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_VIRTUAL_ADDRESS address)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_descriptor(*d, d->state.root, param, grass::root_arg::cbv, address);
+			if (list_capture *const d = live(list))
+				capture::descriptor(*d, param, grass::root_arg::cbv, address);
 		}
 		void ev_root_srv(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_VIRTUAL_ADDRESS address)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_descriptor(*d, d->state.root, param, grass::root_arg::srv, address);
+			if (list_capture *const d = live(list))
+				capture::descriptor(*d, param, grass::root_arg::srv, address);
 		}
 		void ev_root_uav(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_VIRTUAL_ADDRESS address)
 		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_descriptor(*d, d->state.root, param, grass::root_arg::uav, address);
+			if (list_capture *const d = live(list))
+				capture::descriptor(*d, param, grass::root_arg::uav, address);
 		}
 		void ev_barrier(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RESOURCE_BARRIER *barriers)
 		{
-			worldfx::list_data *const d = live(list);
+			list_capture *const d = live(list);
 			if (d == nullptr)
 				return;
-			// (transitions only, as ReShade reports them: the resource and where it went. Of a subresource other than the
-			// first only when it's all of them: the core follows the world's depth plane, and a move of the stencil plane
-			// (subresource 1) on its own would otherwise read as the depth's state)
+			// (FSR follows the world and its target from the resolve on; World FX takes its states from the marks)
 			host::quiet q;
-			for (UINT done = 0; done < count;)
-			{
-				ID3D12Resource *res[32];
-				D3D12_RESOURCE_STATES after[32];
-				uint32_t n = 0;
-				for (; done < count && n < 32; ++done)
-					if (barriers[done].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
-						(barriers[done].Transition.Subresource == 0 || barriers[done].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))
-					{
-						res[n] = barriers[done].Transition.pResource;
-						after[n] = barriers[done].Transition.StateAfter;
-						n++;
-					}
-				if (n != 0)
-					worldfx::on_barrier(list, *d, n, res, after);
-			}
-			// (the world's end on this list: the upscale's resolve is the next draw out of it)
-			if (d->world_ended != nullptr)
-			{
-				upscale::on_world_end(list, d->world_ended, d->world_rt_state);
-				d->world_ended = nullptr;
-			}
 			upscale::after_barrier(list, count, barriers, d->state);
 		}
 		// The game side's slot markers (src/game/slotmark.hpp) as our d3d8.dll hands them on: how many of each kind, how
@@ -650,10 +665,34 @@ namespace hifi::backend
 		ID3D12Resource *zone_rt = nullptr;
 		DXGI_FORMAT zone_rt_format = DXGI_FORMAT_UNKNOWN;
 
-		// fm: our d3d8.dll's word at the mark (src/host/frameapi.hpp): what's bound and the states, exactly
-		void on_mark(ID3D12GraphicsCommandList *list, worldfx::list_data &d, const slotmark::mark &m, const hifi_frame_mark &fm)
+		// The world as World FX takes it at a mark: our d3d8.dll's word (channel 3), the views and formats when it's bound
+		worldfx::world_mark world_of(const hifi_frame_mark &fm)
 		{
-			const uint64_t dsv = uint64_t(fm.dsv.ptr);
+			worldfx::world_mark w;
+			w.list = fm.list;
+			w.rt = fm.world_rt;
+			w.ds = fm.world_ds;
+			w.rt_state = fm.world_rt_state;
+			w.ds_planes[0] = fm.world_ds_planes[0];
+			w.ds_planes[1] = fm.world_ds_plane_count > 1 ? fm.world_ds_planes[1] : fm.world_ds_planes[0];
+			if (fm.rt != nullptr && fm.rt == fm.world_rt && fm.ds != nullptr && fm.ds == fm.world_ds)
+			{
+				w.rtv = uint64_t(fm.rtv.ptr);
+				w.dsv = uint64_t(fm.dsv.ptr);
+				w.rt_format = fm.rt_format;
+				w.ds_format = fm.ds_format;
+				w.width = fm.width;
+				w.height = fm.height;
+			}
+			w.fog_known = fm.world_clear_known != 0;
+			for (int i = 0; i < 3; ++i)
+				w.fog[i] = fm.world_clear[i];
+			return w;
+		}
+
+		// fm: our d3d8.dll's word at the mark (src/host/frameapi.hpp): what's bound and the states, exactly
+		void on_mark(ID3D12GraphicsCommandList *list, list_capture &d, const slotmark::mark &m, const hifi_frame_mark &fm)
+		{
 			ID3D12Resource *const depth = fm.ds;
 			// (the depth's planes, after the trackers have taken the depth in)
 			const auto exact_planes = [&]() {
@@ -665,10 +704,9 @@ namespace hifi::backend
 			};
 			// (the world's target's state: our d3d8.dll's, bound or not (version 2); an older one's only when it's bound, else
 			// as the barriers left it)
+			// (the world's target's state: our d3d8.dll's, bound or not)
 			const auto world_rt_state = [&]() {
-				if (g_frame_version >= 2 && fm.world_rt != nullptr && fm.world_rt == zone_rt)
-					return fm.world_rt_state;
-				return fm.rt != nullptr && fm.rt == zone_rt ? fm.rt_state : d.world_rt_state;
+				return fm.world_rt != nullptr && fm.world_rt == zone_rt ? fm.world_rt_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
 			};
 			marks_seen[m.kind].fetch_add(1, std::memory_order_relaxed);
 			// (the own-frame passes: their module draws at its marker, src/host/passes.hpp)
@@ -719,7 +757,7 @@ namespace hifi::backend
 			{
 				zone_rt = fm.rt;
 				zone_rt_format = fm.rt_format;
-				worldfx::on_world_marker(fm.rt, depth, uint64_t(fm.rtv.ptr), dsv);
+				worldfx::on_world_marker(world_of(fm));
 			}
 			if (m.kind == slotmark::zone_end && depth != nullptr)
 			{
@@ -731,9 +769,7 @@ namespace hifi::backend
 				w.rt_state = world_rt_state();
 				zone::inject::on_zone_end(list, w, m.seq);
 				// (then World FX's blades, written into the world's depth before the characters and effects)
-				D3D12_RESOURCE_STATES planes[2];
-				if (zone::inject::depth_planes(depth, planes))
-					worldfx::on_zone_end(list, d, dsv, planes);
+				worldfx::on_zone_end(world_of(fm));
 			}
 			// (native characters: the opaque models at their end marker, a see-through one at its own)
 			if ((m.kind == slotmark::chars_end || m.kind == slotmark::see_through) && depth != nullptr)
@@ -765,7 +801,7 @@ namespace hifi::backend
 
 		void ev_clear_depth(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS, UINT, const D3D12_RECT *)
 		{
-			worldfx::list_data *const d = live(list);
+			list_capture *const d = live(list);
 			if (d == nullptr || port_resource_of_view(dsv.ptr) == nullptr)
 				return;
 			// (the upscaled world, when it waits for the next call after the resolve, goes in before the clear)
@@ -774,12 +810,15 @@ namespace hifi::backend
 		}
 		void ev_clear_target(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT count, const D3D12_RECT *rects)
 		{
-			if (worldfx::list_data *const d = live(list))
+			if (list_capture *const d = live(list))
 			{
 				host::quiet q;
 				upscale::before_other(list, d->state);
-				worldfx::on_clear_target(*d, rtv.ptr, color, rects != nullptr ? count : 0, rects);
 			}
+			(void)rtv;
+			(void)color;
+			(void)count;
+			(void)rects;
 		}
 		void ev_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps)
 		{
@@ -790,7 +829,7 @@ namespace hifi::backend
 		}
 		void ev_draw(ID3D12GraphicsCommandList *list, uint64_t vertices)
 		{
-			if (worldfx::list_data *const d = live(list))
+			if (list_capture *const d = live(list))
 			{
 				host::quiet q;
 				upscale::before_draw(list, vertices, d->rt0, uint64_t(d->state.rtvs[0].ptr), port_format_of_view, d->state);
@@ -924,11 +963,14 @@ namespace hifi::backend
 			if (fm->dsv.ptr == 0 && kind != slotmark::world_end)
 				return;
 			// (the list's data made here when the hooks haven't seen it: the mark is the game's thread, its list d3d8.dll's)
-			worldfx::list_data *const d = data_of(fm->list, true);
+			list_capture *const d = data_of(fm->list, true);
 			// (the world's end: World FX draws into it there, before the resolve reads it)
 			if (kind == slotmark::world_end)
 			{
-				worldfx::on_world_end(fm->list, *d);
+				worldfx::on_world_end(world_of(*fm));
+				// (and FSR's resolve is the next draw out of it: armed here, its state followed from the barriers on)
+				if (fm->world_rt != nullptr)
+					upscale::on_world_end(fm->list, fm->world_rt, fm->world_rt_state);
 				return;
 			}
 			slotmark::mark m;

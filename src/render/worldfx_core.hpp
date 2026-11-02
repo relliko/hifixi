@@ -32,14 +32,6 @@ namespace worldfx
 		void (*set_bool)(const char *key, bool value) = nullptr;
 		void (*set_float)(const char *key, float value) = nullptr;
 		void (*set_int)(const char *key, int value) = nullptr;
-		// The resource a render target or depth view (a CPU descriptor handle) is of now, nullptr when not known;
-		// and the view's format (DXGI_FORMAT_UNKNOWN when not known: the resource's is used)
-		ID3D12Resource *(*resource_of_view)(uint64_t view) = nullptr;
-		DXGI_FORMAT (*format_of_view)(uint64_t view) = nullptr;
-		// A root signature's parameters, for the log: how many (0: not known) and each one's kind ("constants",
-		// "table", "root descriptor")
-		size_t (*root_param_count)(ID3D12RootSignature *root) = nullptr;
-		const char *(*root_param)(ID3D12RootSignature *root, size_t index) = nullptr;
 		// Where the zone files, worldfx.hlsl, the shader cache, worldfx-sunlit.txt and the crash report are (with a
 		// slash at the end): the add-on's folder, which is the game's bootloader folder
 		std::wstring folder;
@@ -95,20 +87,21 @@ namespace worldfx
 	// and that weather
 	void weather_look_now(grass::look::weather_fx &out, grass::weather *drawn = nullptr);
 
-	// What's bound on one command list (our d3d8.dll's, followed by the hooks): the host keeps one for each list, reset
-	// with the list
-	struct list_data
+
+	// The world as our d3d8.dll hands it at a mark (src/host/frameapi.hpp, channel 3): its target and depth (named at the
+	// zone's begin) and the states they're in now, bound or not; their views, formats and size when they're the ones bound
+	// (the zone's begin and end); the colour the target was last cleared to, the whole of it (the zone's fog)
+	struct world_mark
 	{
-		grass::list_state state;
-		ID3D12Resource *rt0 = nullptr;
-		ID3D12Resource *ds = nullptr;
-		// The world's states on this list, from its barriers (what they are while it's being drawn into, until one says otherwise)
-		D3D12_RESOURCE_STATES world_rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		D3D12_RESOURCE_STATES world_ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-		bool grass_done = false; // grass went in on this list at the world's end
-		// The world's end came on this list (on_world_end: the resolve reads it next), for the host to take and clear at the
-		// barrier that makes it readable
-		ID3D12Resource *world_ended = nullptr;
+		ID3D12GraphicsCommandList *list = nullptr;
+		ID3D12Resource *rt = nullptr, *ds = nullptr;
+		D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		D3D12_RESOURCE_STATES ds_planes[2] = { D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE }; // (depth, stencil)
+		uint64_t rtv = 0, dsv = 0; // (0: not bound at this mark)
+		DXGI_FORMAT rt_format = DXGI_FORMAT_UNKNOWN, ds_format = DXGI_FORMAT_UNKNOWN; // (the views')
+		uint32_t width = 0, height = 0;
+		bool fog_known = false;
+		float fog[3] = {};
 	};
 
 	// Before the game's Direct3D 12 device is made: the GPU crash record (GpuCrashReports) and, where the host can
@@ -145,33 +138,19 @@ namespace worldfx
 	// At process exit: the device may be gone, its objects are left to the process's end
 	void shutdown();
 
-	// The events, for lists of the attached device: "after" once the call is made, "before" ahead of it. The core
-	// records on the list only at the marks (on_world_end, on_zone_end): the host mustn't see those calls as the game's.
-	void on_reset(list_data &d);                                                       // after Reset
-	void on_targets(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv); // after
-	void on_pipeline(list_data &d, ID3D12PipelineState *pso);
-	void on_topology(list_data &d, D3D12_PRIMITIVE_TOPOLOGY topology);
-	void on_viewports(list_data &d, uint32_t first, uint32_t count, const D3D12_VIEWPORT *viewports);
-	void on_scissors(list_data &d, uint32_t first, uint32_t count, const D3D12_RECT *rects);
-	// Root arguments, each with the root signature they're for (no tables: the signature was set, or the list reset)
-	void on_root_tables(list_data &d, ID3D12RootSignature *root, uint32_t first, uint32_t count, const uint64_t *tables);
-	void on_root_constants(list_data &d, ID3D12RootSignature *root, uint32_t param, uint32_t first, uint32_t count, const void *values);
-	void on_root_descriptor(list_data &d, ID3D12RootSignature *root, uint32_t param, grass::root_arg::kind_t kind, uint64_t address);
-	// Transitions, each resource and the state it's moved to (after)
-	void on_barrier(ID3D12GraphicsCommandList *list, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after);
-	// Our d3d8.dll's world end (src/host/frameapi.hpp, slotmark::world_end): the first draw or copy reading the world's
-	// target, before anything is bound for it. World FX draws into the world here.
-	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d);
+	// The marks, on the game's thread (the core records on the mark's list only there; our d3d8.dll binds all of its own
+	// again after). Our d3d8.dll's world end (slotmark::world_end): the first draw or copy reading the world's target,
+	// before anything is bound for it; World FX draws into the world here, once after each zone's begin.
+	void on_world_end(const world_mark &m);
 	// Whether the world is wanted as floats (the FloatWorld setting: light past white, our d3d8.dll asked for it at each mark)
 	bool float_world();
-	void on_clear_target(list_data &d, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects); // before
 	// The game side's zone marker (src/game/slotmark.hpp) through our d3d8.dll: the world is the target and depth bound
 	// there, through those views
-	void on_world_marker(ID3D12Resource *rt, ID3D12Resource *ds, uint64_t rtv, uint64_t dsv);
-	// The game side's zone end marker (the world's depth through dsv; its planes' states as our d3d8.dll has them, depth
-	// and stencil): the blades drawn there, into the world with its depth written, before the characters and effects
-	// (the world's end then draws the rest without them)
-	void on_zone_end(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, const D3D12_RESOURCE_STATES planes[2]);
+	void on_world_marker(const world_mark &m);
+	// The game side's zone end marker (the world bound, its planes' states as our d3d8.dll has them): the blades drawn
+	// there, into the world with its depth written, before the characters and effects (the world's end then draws the
+	// rest without them)
+	void on_zone_end(const world_mark &m);
 	// Each present, on the queue it's presented from (before it)
 	void on_present(ID3D12CommandQueue *queue);
 

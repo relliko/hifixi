@@ -723,7 +723,9 @@ int main(int argc, char **argv)
 			check(corner == 0xFFFFFF && band == 0x808080 && past == 0, line);
 			// The channel's version 2: the world (A and its depth, named at the zone's begin) at every mark, bound or not
 			const auto version = reinterpret_cast<hifi_frame_version_fn>(GetProcAddress(m, kHifiFrameVersion));
-			check(version != nullptr && version() == kHifiFrameChannel, "HifiFrameVersion: 2 (the marks carry the world's states)");
+			check(version != nullptr && version() == kHifiFrameChannel, "HifiFrameVersion: 3 (the marks carry the world's states and its clear colour)");
+			check(fm.world_clear_known == 1 && fm.world_clear[0] == 0.0f && fm.world_clear[1] == 0.0f && fm.world_clear[2] == 0.0f && fm.world_clear[3] == 1.0f,
+				"... the world's whole clear before the zone's begin (opaque black): its colour handed over (World FX's fog)");
 			check(fm.world_rt == world_rt && fm.world_ds == world_ds && fm.world_rt_state == fm.rt_state && fm.world_ds_plane_count == 2 &&
 					fm.world_ds_planes[0] == fm.ds_planes[0] && fm.world_ds_planes[1] == fm.ds_planes[1],
 				"... at the zone's begin, the world is what's bound: the same resources and states");

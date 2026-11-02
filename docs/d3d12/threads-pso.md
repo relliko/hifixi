@@ -81,8 +81,9 @@ The game-thread-only rule:
   `FrameInterpolationSwapchainDX12.cpp:421` and `:511` call it; `src/backend/backend.cpp:979` sets it to
   `host::quiet_thread`.
 - `src/framegen/framegen.hpp:37-40`: `framegen::present()` runs on the game thread with no HiFi XI lock held.
-- `src/render/worldfx_core.cpp:95` is World FX's `g.mutex`; `on_reset` (2534), `on_barrier` (2619) and
-  `on_world_end` (2639) are the hook paths that used to take it from any thread.
+- `src/render/worldfx_core.cpp` holds World FX's `g.mutex`. The hook paths that used to take it from any thread
+  (`on_reset`, `on_barrier`, `on_targets`, `on_clear_target`) are gone since step 4: World FX is entered only at the
+  marks, the present and the game side's calls, all on the game's thread.
 
 Lists, allocators, queues:
 

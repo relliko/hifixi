@@ -115,6 +115,17 @@ namespace hifi::d3d8
 	// (the world's target and depth as bound at the last zone's begin mark: every mark tells HiFi XI their states;
 	// forgotten when the game lets them go, device::forget)
 	static image *g_world_rt_img = nullptr, *g_world_ds_img = nullptr;
+	// (the colour the world's target was last cleared to, the whole of it: World FX's fog)
+	static float g_world_clear[4] = {};
+	static bool g_world_clear_known = false;
+
+	void note_clear(device *d, const image *img, const float colour[4])
+	{
+		if (img == nullptr || img != g_world_rt_img || d != g_mark_device)
+			return;
+		std::memcpy(g_world_clear, colour, sizeof(g_world_clear));
+		g_world_clear_known = true;
+	}
 
 	bool device::unchanged(bool equal)
 	{
@@ -340,7 +351,10 @@ namespace hifi::d3d8
 			async_results.clear();
 		async_index.erase(img);
 		if (img == g_world_rt_img)
+		{
 			g_world_rt_img = nullptr;
+			g_world_clear_known = false;
+		}
 		if (img == g_world_ds_img)
 			g_world_ds_img = nullptr;
 		const auto it = std::find(images.begin(), images.end(), img);
@@ -2219,13 +2233,21 @@ namespace hifi::d3d8
 		// (the world: the zone's begin names it; its states now, bound or not)
 		if (kind == kZoneBegin)
 		{
-			g_world_rt_img = d->rt != nullptr ? d->rt->img : nullptr;
+			image *const rt_img = d->rt != nullptr ? d->rt->img : nullptr;
+			if (rt_img != g_world_rt_img)
+				g_world_clear_known = false; // (another world: its clears not seen yet)
+			g_world_rt_img = rt_img;
 			g_world_ds_img = d->ds != nullptr ? d->ds->img : nullptr;
 		}
 		if (g_world_rt_img != nullptr)
 		{
 			m.world_rt = g_world_rt_img->gpu.res;
 			m.world_rt_state = g_world_rt_img->gpu.state;
+			if (g_world_clear_known)
+			{
+				std::memcpy(m.world_clear, g_world_clear, sizeof(m.world_clear));
+				m.world_clear_known = 1;
+			}
 		}
 		if (g_world_ds_img != nullptr)
 		{

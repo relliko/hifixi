@@ -2,8 +2,9 @@
  * World FX's core (src\render\worldfx_core.cpp) pinned on WARP with the debug layer and GPU-based validation, fed as
  * HiFi XI's backend feeds it (src\backend\backend.cpp), minus the hooks: a characterization test, so that the core can
  * be rewritten against it. The test records frames as our d3d8.dll does (src\host\frameapi.hpp's marks: the zone's
- * begin, the zone's end, the world's end) and goes through one adapter to the core's API (WFX_CORE_API 1: today's
- * events; 2: the rewrite's, a stub till then). A stand-in FFXiMain.dll (tests\fake_ffximain.cpp) holds the game's
+ * begin, the zone's end, the world's end) and goes through one adapter to the core's API (WFX_CORE_API: how far the
+ * re-architecture's step 4 has come: 1 the stream events, 2 the marks, 3 no lock while recording, 4 the shaders compiled
+ * on their own thread at attach; each level's changes on purpose behind it). A stand-in FFXiMain.dll (tests\fake_ffximain.cpp) holds the game's
  * camera (looking away from every blade); the host's camera source gives the grass's.
  *
  *   build\worldfx_core_test.exe [--quick]      (from this folder; --quick: no GPU-based validation, for working on it)
@@ -20,7 +21,8 @@
  *   C7  the zone guard: nothing drawn till the new zone's files are read; zone 104's statuses; "no blades for this zone"
  *   C8  Grass off: "off"; get_setting and the port at once; on again: drawn
  *   C10 a D32 world depth: no blades at the zone's end, all of it at the world's end
- *   C11 three world ends on one list (today: the second and third ignored); three lists: the kMaxPasses warning
+ *   C11 three world ends on one list: the second and third ignored; three lists (level 1: the kMaxPasses warning; 2 on:
+ *       one zone's begin before them, drawn at the first alone)
  *   C12 (today) the world's view held by another resource: skipped
  *   C13 no zone markers: the world's end not marked; marked() for 8 presents
  *   C14 worldfx.hlsl the same as the built-in shaders: said so within 31 presents
@@ -640,14 +642,53 @@ namespace
 	}
 	bool a_float_world() { return worldfx::float_world(); }
 #else
-	// v2 (the rewrite): STUB, to be written with it. One entry for every mark (worldfx::on_mark(kind, seq, m) or whatever
-	// it is named), the fog in the mark (channel v3: the test's kFog, d3d8.dll filling it from its Clear); list Reset,
-	// barriers and clears are no-ops; the float world is asked as the rewrite has it.
+	// v2 and on (the marks): as backend.cpp feeds the core now (world_of: the world from the mark, its views and formats
+	// when it's the one bound; the fog as our d3d8.dll says it, the colour of the world's last whole clear). List Reset
+	// and barriers are no-ops: the core follows no stream.
+	float g_fog[4] = {};
+	bool g_fog_known = false;
 	void a_reset(ID3D12GraphicsCommandList *) {}
 	void a_barrier(ID3D12GraphicsCommandList *, ID3D12Resource *, UINT, D3D12_RESOURCE_STATES) {}
-	void a_clear(ID3D12GraphicsCommandList *, uint64_t, const float *) {}
-	void a_mark(uint32_t, uint32_t, const hifi_frame_mark &) { /* worldfx::on_mark(kind, seq, m): the rewrite's entry */ }
-	bool a_float_world() { return false; }
+	void a_clear(ID3D12GraphicsCommandList *, uint64_t, const float *c)
+	{
+		std::memcpy(g_fog, c, sizeof(g_fog));
+		g_fog_known = true;
+	}
+	worldfx::world_mark world_of(const hifi_frame_mark &fm)
+	{
+		worldfx::world_mark w;
+		w.list = fm.list;
+		w.rt = fm.world_rt;
+		w.ds = fm.world_ds;
+		w.rt_state = fm.world_rt_state;
+		w.ds_planes[0] = fm.world_ds_planes[0];
+		w.ds_planes[1] = fm.world_ds_plane_count > 1 ? fm.world_ds_planes[1] : fm.world_ds_planes[0];
+		if (fm.rt != nullptr && fm.rt == fm.world_rt && fm.ds != nullptr && fm.ds == fm.world_ds)
+		{
+			w.rtv = uint64_t(fm.rtv.ptr);
+			w.dsv = uint64_t(fm.dsv.ptr);
+			w.rt_format = fm.rt_format;
+			w.ds_format = fm.ds_format;
+			w.width = fm.width;
+			w.height = fm.height;
+		}
+		w.fog_known = g_fog_known;
+		for (int i = 0; i < 3; ++i)
+			w.fog[i] = g_fog[i];
+		return w;
+	}
+	void a_mark(uint32_t kind, uint32_t, const hifi_frame_mark &m)
+	{
+		if (m.dsv.ptr == 0 && kind != 13)
+			return;
+		if (kind == 13)
+			worldfx::on_world_end(world_of(m));
+		else if (kind == 0 && m.ds != nullptr && m.rt != nullptr)
+			worldfx::on_world_marker(world_of(m));
+		else if (kind == 1 && m.ds != nullptr)
+			worldfx::on_zone_end(world_of(m));
+	}
+	bool a_float_world() { return worldfx::float_world(); }
 #endif
 
 	// A barrier the test records (and the adapter sees), one subresource
@@ -1207,7 +1248,7 @@ int main(int argc, char **argv)
 	}
 	DeleteFileW((folder + L"worldfx.hlsl").c_str());
 	check(copied, "the zone files copied from build\\testdata into build\\test\\worldfx_core");
-#if WFX_CORE_API >= 2
+#if WFX_CORE_API >= 4
 	// (C1 after the rewrite: attach doesn't wait for the shaders, the cache emptied first)
 	{
 		WIN32_FIND_DATAW fd;
@@ -1304,7 +1345,7 @@ int main(int argc, char **argv)
 		worldfx::attach(g.device);
 		const double s = seconds_since(t0);
 		std::printf("  attach took %.2f s\n", s);
-#if WFX_CORE_API >= 2
+#if WFX_CORE_API >= 4
 		check(s < 0.5, "C1 attach returns within 0.5 s, the shader cache empty (the shaders compiled on their own thread)");
 #endif
 		uint32_t out[4] = { 9, 9, 9, 9 };
@@ -1399,13 +1440,9 @@ int main(int argc, char **argv)
 		const counts d = delta(before, counts_now());
 		const std::vector<std::string> s = status();
 		std::printf("  %s; %s\n", describe(d).c_str(), line_of(s, "Last frame: ").c_str());
-#if WFX_CORE_API == 1
-		// (today a world's end that drew nothing still counts as drawn: the skip reason is set, passes counted)
+		// (a world's end that drew nothing still counts as drawn: the skip reason is set, passes counted)
 		check(d.drawn == 1 && d.skipped_total() == 0 && line_of(s, "Last frame: ") == "Last frame: not drawn: no blades near the camera.",
-			"C4 (today) the game's camera: counted as drawn, the status \"not drawn: no blades near the camera\"");
-#else
-		check(one_skip(d, "no blades near the camera"), "C4 the game's camera: +1 \"no blades near the camera\"");
-#endif
+			"C4 the game's camera: counted as drawn, the status \"not drawn: no blades near the camera\"");
 		check(same_as_reference(px), "C4 the world as cleared (the game's camera sees no blades)");
 		source_on = true;
 		check(g.take_errors() == 0, "C4 no debug-layer errors");
@@ -1551,7 +1588,8 @@ int main(int argc, char **argv)
 		check(d.drawn == 1 && d.skipped_total() == 0 && !logged_since(from, "the world ended"),
 			"C11 (today) three world ends on one list: the second and third ignored (no warning), drawn once");
 #else
-		check(d.drawn == 1 && d.skipped_total() == 0, "C11 three world ends on one list: drawn once (the rewrite's rule: TODO pin it)");
+		check(d.drawn == 1 && d.skipped_total() == 0 && !logged_since(from, "the world ended"),
+			"C11 three world ends on one list: drawn at the first alone (once after each zone's begin), no warning");
 #endif
 		from = log_count();
 		before = counts_now();
@@ -1559,8 +1597,13 @@ int main(int argc, char **argv)
 		o.world_end_lists = 3;
 		frame(g, w, o);
 		d = delta(before, counts_now());
+#if WFX_CORE_API == 1
 		check(logged_since(from, "FFXI World FX: the world ended 3 times between two presents (drawn at the first 2)"),
 			"C11 three lists, a world end each: \"the world ended 3 times between two presents (drawn at the first 2)\"");
+#else
+		// (one zone's begin before them: drawn at the first world's end alone, wherever it is; kMaxPasses never reached)
+		check(!logged_since(from, "the world ended"), "C11 three lists, a world end each, one zone's begin: drawn at the first alone, no warning");
+#endif
 		check(d.drawn == 1 && d.skipped_total() == 0, "C11 three lists: +1 frame drawn (" + describe(d) + ")");
 		g.idle();
 		check(g.take_errors() == 0, "C11 no debug-layer errors");
@@ -1625,9 +1668,7 @@ int main(int argc, char **argv)
 	{
 		const float on[3] = { 1.0f, 0.0f, 0.0f }, off[3] = { 0.0f, 0.0f, 0.0f };
 		worldfx::set_setting("FloatWorld", on);
-#if WFX_CORE_API == 1
 		check(worldfx::float_world(), "C16 float_world() true");
-#endif
 		counts before = counts_now();
 		frame(g, w);
 		counts d = delta(before, counts_now());
@@ -1753,7 +1794,7 @@ int main(int argc, char **argv)
 				if (reached)
 				{
 					probes_reached++;
-#if WFX_CORE_API == 1
+#if WFX_CORE_API < 3
 					probe_ok_all = probe_ok_all && !probe_ok;
 					overlay_all = overlay_all && probe_overlay_empty[gen];
 #else
@@ -1783,7 +1824,7 @@ int main(int argc, char **argv)
 		check(b_pushing_seen > 0 && b_bad_pushing == 0, "threads: the feed thread's status: \"Pushing the grass: k characters ...\", k from 1 to 3");
 		check(b_bad_glows == 0 && b_bad_height == 0, "threads: glow stats one of the counts sent (3 or 5); GrassHeight one of the values set");
 		check(probes_reached == kProbes, "threads: the probe reached inside the blades' draw at each of frames 30..34 (" + std::to_string(probes_reached) + ")");
-#if WFX_CORE_API == 1
+#if WFX_CORE_API < 3
 		check(probe_ok_all && overlay_all, "threads: (today) inside the blades' draw a feed call waits for the core's lock (ok false); the overlay empty meanwhile");
 #else
 		check(probe_ok_all && overlay_all, "threads: inside the blades' draw a feed call completes (no lock while recording); the overlay has its line");
