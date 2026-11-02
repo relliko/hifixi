@@ -36,7 +36,18 @@ using hifi_frame_mark_fn = int(__cdecl *)(uint32_t kind, uint32_t seq);
 // frame), its views kept. Returns 0 for a format it doesn't make.
 using hifi_frame_set_world_format_fn = int(__cdecl *)(DXGI_FORMAT view);
 
+// HifiFrameSetSpeedups(flags): the frame-rate speed-ups done in d3d8.dll (docs/frame-rate.md), on the game's thread:
+// kHifiDedupe, a Set* call that sets what's already in effect returns at once; kHifiBatch, consecutive DrawPrimitiveUP
+// quads (the interface's and the text's, a two-triangle strip each) are drawn as one triangle list. Returns what was on;
+// kHifiSpeedupsAsk only asks. HifiFrameSpeedupStats(out): running counts of Set* calls dropped, quads batched, the draws
+// they became, and every draw the device made.
+constexpr uint32_t kHifiDedupe = 1, kHifiBatch = 2, kHifiSpeedupsAsk = 0xFFFFFFFFu;
+using hifi_frame_set_speedups_fn = uint32_t(__cdecl *)(uint32_t flags);
+using hifi_frame_speedup_stats_fn = void(__cdecl *)(uint32_t out[4]);
+
 // (the exports' names in d3d8.dll)
 constexpr const char *kHifiFrameSetHandler = "HifiFrameSetHandler";
 constexpr const char *kHifiFrameMark = "HifiFrameMark";
 constexpr const char *kHifiFrameSetWorldFormat = "HifiFrameSetWorldFormat";
+constexpr const char *kHifiFrameSetSpeedups = "HifiFrameSetSpeedups";
+constexpr const char *kHifiFrameSpeedupStats = "HifiFrameSpeedupStats";

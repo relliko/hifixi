@@ -644,6 +644,7 @@ namespace hifi::d3d8
 	{
 		if (lr == nullptr || locked || !img->lockable())
 			return D3DERR_INVALIDCALL;
+		dev->flush_quads(); // (quads batched before the lock drawn with what it had: device::kBatch)
 		std::vector<uint8_t> &c = img->copy(sub());
 		const UINT pt = img->pitch(level);
 		const format_info &fi = info(img->format);
@@ -726,6 +727,7 @@ namespace hifi::d3d8
 	{
 		if (lb == nullptr || locked)
 			return D3DERR_INVALIDCALL;
+		dev->flush_quads();
 		std::vector<uint8_t> &c = img->copy(level);
 		const UINT pt = img->pitch(level), sl = img->slice(level);
 		const UINT bpp = info(img->format).bpp != 0 ? info(img->format).bpp : 4;

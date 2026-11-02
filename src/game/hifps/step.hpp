@@ -34,6 +34,8 @@ namespace hifi::game::hifps
 	double fps();
 	// The frame step is unlocked now
 	bool on();
+	// One line for the log and the crash and hang reports: on or off (or why not), the cap
+	std::string state_line();
 
 	// For the tests: what's patched now (all 0 and empty while off)
 	struct patched

@@ -29,7 +29,8 @@ from lupa import luajit21
 
 ADDON = r'C:\Games\PhoenixXI\addons\hifps'
 LIBS = r'C:\Games\PhoenixXI\addons\libs'
-NAMES = ['ashita', 'occlusion', 'walls', 'sse', 'batch', 'dedupe']
+# (the toggles HiFi XI still has as the addon does: walls, sse and the device proxy's batch and dedupe aren't compared)
+NAMES = ['ashita', 'occlusion']
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 k32.VirtualAlloc.restype = ctypes.c_void_p

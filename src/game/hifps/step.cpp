@@ -1131,6 +1131,17 @@ namespace hifi::game::hifps
 		return g.mem != 0;
 	}
 
+	std::string state_line()
+	{
+		if (g.mem != 0)
+			return "unlocked (" + std::to_string(g.sites.size()) + " call sites), cap " + (g.limit > 0.0 ? std::to_string(int(g.limit)) + " fps" : std::string("none"));
+		if (!g.want)
+			return "off (the game's own step, 60 fps at most)";
+		if (!g.why.empty())
+			return "not on: " + g.why;
+		return "not on yet";
+	}
+
 	patched where()
 	{
 		patched p;
