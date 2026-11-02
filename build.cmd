@@ -131,6 +131,16 @@ cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEA
   tests\grass_test.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\grass_test.exe" /link /NOLOGO || exit /b 1
 echo Built build\grass_test.exe
 
+rem World FX's core pinned before its rewrite (WARP, debug layer and GPU-based validation; fed as the backend feeds it,
+rem the game's camera from a stand-in FFXiMain.dll, tests\fake_ffximain.cpp, x86 only): build\worldfx_core_test.exe.
+rem WFX_CORE_API: 1 today's core API, 2 the rewrite's
+if not exist build\test\fake mkdir build\test\fake
+cl /nologo /O2 /MT /W4 /DWIN32_LEAN_AND_MEAN /LD tests\fake_ffximain.cpp /Fo"build\test\\" /Fe"build\test\fake\FFXiMain.dll" /link /NOLOGO || exit /b 1
+del /q build\test\fake\FFXiMain.exp build\test\fake\FFXiMain.lib 2>nul
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /DWFX_CORE_API=1 /I src\render /I src\host ^
+  tests\worldfx_core_test.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\worldfx_core_test.exe" /link /NOLOGO d3d12.lib dxgi.lib || exit /b 1
+echo Built build\worldfx_core_test.exe
+
 rem The shading pass timed on the real GPU (see its header): build\shade_bench.exe <width> <height> [shader file] ...
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\shade_bench.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\shade_bench.exe" /link /NOLOGO || exit /b 1
