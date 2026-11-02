@@ -59,7 +59,8 @@ namespace
 			passes++;
 	}
 
-	constexpr UINT W = 800, H = 450;
+	// (ZONE_SIZE=3840x2160: a player's background resolution, for the timed passes below; the checks are 800x450's)
+	UINT W = 800, H = 450;
 
 	// dgVoodoo's stand-in: a textured quad from a vertex buffer, through a root table
 	const char *kGame = R"(
@@ -167,6 +168,10 @@ int main(int argc, char **argv)
 	// (the zone's shaders through the shader cache, as in game: the first run compiles them and writes them down, a run
 	// after reads them back; the pictures below are checked either way)
 	hifi::shadercache::set_folder(L"build\\shadercache_test\\");
+	char size_text[32] = {};
+	const bool big = GetEnvironmentVariableA("ZONE_SIZE", size_text, sizeof(size_text)) != 0 && std::sscanf(size_text, "%ux%u", &W, &H) == 2 && W >= 64 && H >= 64;
+	if (big)
+		std::printf("ZONE_SIZE: the zone pass timed at %ux%u (the checks after the first picture are left out)\n", W, H);
 	uintptr_t base = 0;
 	if (dump::map(dump::kDumps[0], base) == 0)
 	{
@@ -649,6 +654,84 @@ int main(int argc, char **argv)
 	std::string first;
 	const uint32_t messages = debug_messages(info, first);
 	check(messages == 0, "the debug layer: nothing (" + std::to_string(messages) + (messages != 0 ? ": " + first : std::string()) + ")");
+
+	// ZONE_SIZE (best with ZONE_GPU=1): the zone pass at that size, per pixel with the light split, under a load of lamps
+	// as a town at night has (64, four of them named by every object, a ring of them round the street), 20 times, each
+	// timed on its own; the device must stay and no pass come near the 2 s Windows gives the GPU. Then out: the checks
+	// after this read 800x450's pixels. Not part of a normal run.
+	if (big)
+	{
+		double worst = 0.0, sum = 0.0;
+		int drawn = 0;
+		bool alive = true;
+		for (uint32_t pass = 0; pass < 20 && alive; ++pass)
+		{
+			const uint32_t seq = 40 + pass;
+			fill(seq, true);
+			hifi::zone::frame &f = hifi::zone::frame_slot(seq);
+			f.lamp_count = hifi::zone::kMaxLamps;
+			for (uint32_t i = 0; i < f.lamp_count; ++i)
+			{
+				hifi::zone::frame_lamp &l = f.lamps[i];
+				const float a = 0.7f * float(i), r = 3.0f + 4.0f * float(i % 8);
+				l.pos[0] = eye[0] + r * std::cos(a);
+				l.pos[1] = eye[1] + 1.5f - float(i % 3);
+				l.pos[2] = eye[2] + r * std::sin(a);
+				l.range = 6.0f + 2.0f * float(i % 4);
+				l.colour[0] = 1.0f;
+				l.colour[1] = 0.8f;
+				l.colour[2] = 0.5f;
+				l.attenuation2 = 0.5f;
+			}
+			for (uint32_t o = 0; o < f.count; ++o)
+				for (uint32_t k = 0; k < 4; ++k)
+					f.objects[o].lamps[k] = (o * 4 + k) % hifi::zone::kMaxLamps;
+			hifi::zone::publish(f, seq); // (frame_slot took it back to fill: published again)
+			hifi::light::take(); // (the light split wanted, as World FX asks each frame)
+			alloc->Reset();
+			list->Reset(alloc, nullptr);
+			list->SetDescriptorHeaps(1, &srvh);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			inj::set_options(true);
+			list->ClearRenderTargetView(rtv, sky, 0, nullptr);
+			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			inj::on_zone_end(list, w, seq);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			list->Close();
+			LARGE_INTEGER t0, t1, fq;
+			QueryPerformanceFrequency(&fq);
+			QueryPerformanceCounter(&t0);
+			direct->ExecuteCommandLists(1, lists);
+			const UINT64 v = fence->GetCompletedValue() + 1;
+			direct->Signal(fence, v);
+			fence->SetEventOnCompletion(v, e);
+			const bool done = WaitForSingleObject(e, 60000) == WAIT_OBJECT_0;
+			QueryPerformanceCounter(&t1);
+			const double ms = 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(fq.QuadPart);
+			alive = done && device->GetDeviceRemovedReason() == S_OK;
+			if (pass != 0) // (the first makes the pipelines and the light split's texture)
+			{
+				worst = std::max(worst, ms);
+				sum += ms;
+				drawn++;
+			}
+		}
+		const uint32_t big_messages = debug_messages(info, first);
+		char line[256];
+		std::snprintf(line, sizeof(line), "%ux%u, per pixel, 64 lamps: %d passes timed, %.2f ms each on average, %.2f ms the longest; the device %s; %u debug messages", W, H,
+			drawn, drawn != 0 ? sum / drawn : 0.0, worst, alive ? "still there" : "LOST", big_messages);
+		check(alive && worst < 500.0 && big_messages == 0, line + (big_messages != 0 ? ": " + first : std::string()));
+		std::printf("%s", hifi::zone::breadcrumb_report().c_str());
+		for (const std::string &s : inj::status())
+			std::printf("  %s\n", s.c_str());
+		if (failures == 0)
+			std::printf("\nall passed (%d)\n", passes);
+		else
+			std::printf("\n%d failed\n", failures);
+		return failures == 0 ? 0 : 1;
+	}
 
 	// What came out
 	uint8_t *px = nullptr;
