@@ -2,11 +2,7 @@
 
 One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
 
-- **Above 60 fps** with game speed tied to real time, a frame cap, and speed-ups. Each speed-up removes a stall or repeated work from a frame:
-  - hidden characters found from what's drawn (with the richer world on) instead of waiting on the GPU, and tested no more often than at 60 fps otherwise;
-  - Ashita's per-draw dispatch skipped;
-  - batched text and interface;
-  - repeated device calls dropped.
+- **Above 60 fps** with game speed tied to real time, and a frame cap. The game's visibility tests (glows, lamps, the lens flare, doors, characters) are answered from what's already drawn, so it never stops to wait on the GPU for them.
 - **Longer view distance:**
   - the world, characters and the zone's finer meshes drawn further;
   - the zone's visibility lists ignored, so far terrain doesn't pop in;

@@ -433,17 +433,7 @@ namespace hifi::ui
 		void draw_frame_rate(const gui &g)
 		{
 			draw_tab_settings(g, settings::tab::frame_rate);
-			static std::vector<std::string> checked;
-			if (g.button("Check what uses Ashita's per-draw events"))
-				checked = game::hifps::exp::ashita_check();
-			g.tooltip("The plugins loaded now that would stop getting Ashita's per-draw events with \"Skip Ashita's per-draw "
-				"dispatch\" on (Lua addons can't be listed from a plugin).");
-			for (const std::string &line : checked)
-				g.text_wrapped(line.c_str());
-			std::vector<std::string> lines = game::hifps::status();
-			for (const std::string &line : game::hifps::exp::status())
-				lines.push_back(line);
-			draw_lines(g, "What it's doing", lines);
+			draw_lines(g, "What it's doing", game::hifps::status());
 		}
 
 		void draw_distance(const gui &g)

@@ -1,5 +1,11 @@
 # The frame rate's speed-ups on HiFi XI's own d3d8.dll (branch dev-fps, 2026-11-02)
 
+**Since 0.66 none of them is in the menu.** Alex tried each in game on 0.65 and saw no difference: with the zone and
+characters drawn by HiFi XI, the game sends about 115 draws a frame through the d3d8.dll (d3d8.log: 412,103 draws in
+3,600 frames), so batch, dedupe and ashita have next to nothing to save, and occlusion turned the game's own GPU
+readbacks back on (none in normal play, 255 in the three seconds it was on). The code stays, off: a settings file can
+still turn one on, and `/hifi status` still reports them. What follows is the 0.65 work.
+
 The old hifps addon's experimental speed-ups were built to cut dgVoodoo's and Ashita's per-call cost. From 0.11 to
 0.64 they were on in every preset, so every player ran them. On 2026-11-02 Alex made them off by default: no preset
 turns one on, and each player's were turned off once (`speedups_off_once`, backend.cpp). A player can still turn each

@@ -9,8 +9,9 @@
 //              VisTest answers it (set_actors_elsewhere)
 //   batch      consecutive text and UI quads drawn as one draw, in HiFi XI's d3d8.dll (HifiFrameSetSpeedups)
 //   dedupe     device calls that set a value already in effect dropped, in the same d3d8.dll
-// The options are [hifps] ashita_force and exp_<name>, all off by default (experimental; no preset turns them on;
-// each player's were turned off once in 0.65). docs/frame-rate.md has what each saves, measured, and why hifps's
+// The options are [hifps] ashita_force and exp_<name>, all off by default and out of the menu since 0.66 (with the
+// zone and characters drawn by HiFi XI the game sends ~115 draws a frame: nothing for them to save; a settings file
+// can still turn one on). docs/frame-rate.md has what each saves, measured, and why hifps's
 // walls, sse and its asm device proxy aren't here any more.
 
 #include "../game.hpp"
