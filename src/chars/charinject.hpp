@@ -30,8 +30,9 @@ namespace hifi::chars::inject
 	// the view depth, 0 where no character is; NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE between frames) and how
 	// many frames it's been drawn in. False when there's none.
 	void set_motion_wanted(bool wanted);
-	// Toward the zone's sun (world; nullptr: not known), for the light split's share of the sun (light_split.hpp)
-	void set_sun(const float *toward);
+	// Toward the zone's sun (world; nullptr: not known), for the light split's share of the sun (light_split.hpp), and
+	// the share of it the zone's lit by (zone::horizon_fade), the models' sun light faded the same
+	void set_sun(const float *toward, float fade = 1.0f);
 	// The native zone's lamps of its last pass (8 floats each: chardraw.hpp's char_lamp; nullptr or 0: none known), the
 	// models' lamp light (chardraw.hpp "Lamps")
 	void set_lamps(const float *lamps, uint32_t count);

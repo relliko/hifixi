@@ -77,6 +77,8 @@ namespace hifi::game::zonedraw
 		uintptr_t bright = 0;     // 00BE50(D3DLIGHT8*) on the device wrapper
 		uintptr_t wrapper_at = 0; // the device wrapper's global (0x45666C)
 		uintptr_t sway = 0;       // 17A3F0(object) on the renderer
+		uintptr_t env_global = 0; // the zone's own environment's global (0x65CB04): its record says whether its sun
+		                          // follows the time of day (horizon_fade)
 	};
 	game_calls calls();
 	void set_calls(const game_calls &c);
