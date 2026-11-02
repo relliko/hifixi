@@ -100,20 +100,23 @@ The direct channel (exact states, no guessing):
 - `src/host/frameapi.hpp:18-28`: `hifi_frame_mark` carries `rt_state`, `ds_planes[2]` (plane 1 = stencil) and
   `ds_plane_count`.
 - `src/d3d8/device.cpp:2190-2211`: where the d3d8.dll fills them from its own tracking.
-- `src/backend/backend.cpp:658-663`: `exact_planes` hands both planes to `zone::inject::set_depth_planes` and
+- `src/backend/backend.cpp:659` (`exact_planes`): the bound depth's planes to `zone::inject::set_depth_planes` and
   `chars::inject::set_depth_planes`. A one-plane depth repeats plane 0.
+- Channel version 2 (`src/host/frameapi.hpp:32`, `kHifiFrameChannel` at :59): every mark also carries the world's
+  target and depth (named at the zone's begin) and their states now, bound or not (`src/d3d8/device.cpp:2219`; the
+  images forgotten when the game frees them, `device::forget`). `world_planes` (`src/backend/backend.cpp:901`) hands the
+  world depth's planes over at every mark, the world's end and the back buffer's marks included: FSR at the resolve
+  and the world module after it read them there. An older d3d8.dll (channel 1, no world fields) is refused by
+  `direct_channel`: its passes stay off rather than read planes nothing keeps current.
+- Since step 3 of the re-architecture nothing follows barriers for the zone or the characters: `on_barrier` is gone
+  from both. `on_marker` (`src/zone/inject.cpp:330`, `src/chars/charinject.cpp:511`) still resets a NEW depth's planes
+  to unknown; the mark's exact planes come right after, or the pass refuses ("the world's depth planes' states aren't
+  known yet").
 
-The old barrier inference (dgVoodoo era, still present):
+The barrier inference still left (dgVoodoo era):
 
-- `src/backend/backend.cpp:613-614`: every barrier seen on the game's lists goes to `zone::inject::on_barrier` and
-  `chars::inject::on_barrier`, which follow the depth's planes from `StateAfter` (`src/zone/inject.cpp:320`,
-  `src/chars/charinject.cpp:501`).
-- `src/backend/backend.cpp:615-626`: World FX's tracker takes only subresource 0 or ALL, so a stencil-only move isn't read
-  as the depth's state.
-- `src/zone/inject.cpp:349`, `src/chars/charinject.cpp:530`: a new depth at a mark resets both planes to unknown. The
-  exact planes must come right after, or the pass refuses: `src/zone/inject.cpp:159`, `src/chars/charinject.cpp:269`
-  ("the world's depth planes' states aren't known yet").
-- Memory (rearchitecture): the plan is to delete this plane tracking once only the direct channel is left.
+- `src/backend/backend.cpp:611` (`ev_barrier`): World FX's own tracker (subresource 0 or ALL only, so a stencil-only
+  move isn't read as the depth's state) and FSR's resolve placement. Both go in steps 4 and 5.
 
 Our own passes on the game's depth:
 

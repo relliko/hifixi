@@ -25,6 +25,14 @@ struct hifi_frame_mark
 	D3D12_RESOURCE_STATES ds_planes[2]; // (plane 1: the stencil's, when the depth has one)
 	uint32_t ds_plane_count;
 	uint32_t width, height;             // (the target's)
+	// (HifiFrameVersion() >= 2 only; an older d3d8.dll's struct ends above) The world: the target and depth bound at the
+	// last zone's begin mark, bound now or not, and the states they're in at this mark (nullptr: no zone begun yet, or
+	// the game has let it go). Every mark has them, the world's end and the back buffer's too: nothing has to follow
+	// barriers to know them.
+	ID3D12Resource *world_rt, *world_ds;
+	D3D12_RESOURCE_STATES world_rt_state;
+	D3D12_RESOURCE_STATES world_ds_planes[2];
+	uint32_t world_ds_plane_count;
 };
 
 using hifi_frame_handler = void(__cdecl *)(void *context, uint32_t kind, uint32_t seq, const hifi_frame_mark *m);
@@ -45,7 +53,16 @@ constexpr uint32_t kHifiDedupe = 1, kHifiBatch = 2, kHifiSpeedupsAsk = 0xFFFFFFF
 using hifi_frame_set_speedups_fn = uint32_t(__cdecl *)(uint32_t flags);
 using hifi_frame_speedup_stats_fn = void(__cdecl *)(uint32_t out[4]);
 
+// HifiFrameVersion(): what this d3d8.dll's channel has (1 when the export is missing: the struct ends at width/height;
+// 2: the world's fields too). HifiFrameDevice(device, queue): its device and the direct queue the game's lists go to,
+// not AddRef'd (valid while it draws: from the device's making till the game lets it go); 0 when there's none yet.
+constexpr uint32_t kHifiFrameChannel = 2;
+using hifi_frame_version_fn = uint32_t(__cdecl *)();
+using hifi_frame_device_fn = int(__cdecl *)(ID3D12Device **device, ID3D12CommandQueue **queue);
+
 // (the exports' names in d3d8.dll)
+constexpr const char *kHifiFrameVersion = "HifiFrameVersion";
+constexpr const char *kHifiFrameDevice = "HifiFrameDevice";
 constexpr const char *kHifiFrameSetHandler = "HifiFrameSetHandler";
 constexpr const char *kHifiFrameMark = "HifiFrameMark";
 constexpr const char *kHifiFrameSetWorldFormat = "HifiFrameSetWorldFormat";

@@ -317,25 +317,6 @@ namespace hifi::zone::inject
 		return lines;
 	}
 
-	void on_barrier(UINT count, const D3D12_RESOURCE_BARRIER *b)
-	{
-		if (b == nullptr)
-			return;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (g.depth == nullptr)
-			return;
-		for (UINT i = 0; i < count; ++i)
-		{
-			if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || b[i].Transition.pResource != g.depth)
-				continue;
-			const UINT sub = b[i].Transition.Subresource;
-			if (sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
-				g.plane[0] = g.plane[1] = b[i].Transition.StateAfter;
-			else if (sub < 2)
-				g.plane[sub] = b[i].Transition.StateAfter;
-		}
-	}
-
 	void set_depth_planes(ID3D12Resource *depth, const D3D12_RESOURCE_STATES planes[2])
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);

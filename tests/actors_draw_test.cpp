@@ -36,6 +36,7 @@
 
 namespace
 {
+	const D3D12_RESOURCE_STATES kDepthWrite[2] = { D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE };
 	namespace ch = hifi::chars;
 	namespace inj = hifi::chars::inject;
 
@@ -816,12 +817,7 @@ int main(int argc, char **argv)
 		ID3D12DescriptorHeap *heap = ch::cache::heap();
 		begin_list(g);
 		inj::on_marker(ds);
-		D3D12_RESOURCE_BARRIER planes[1] = {};
-		planes[0].Transition.pResource = ds;
-		planes[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		planes[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-		planes[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-		inj::on_barrier(1, planes);
+		inj::set_depth_planes(ds, kDepthWrite); // (as our d3d8.dll hands them at the mark)
 		g.list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
 		g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 		ch::frame &f = make_frame(47, now, 0x40808080u, ch::kNative | ch::kFromFlush, ch::kPassCloak | ch::kPassOverlay);
@@ -859,12 +855,7 @@ int main(int argc, char **argv)
 			ID3D12DescriptorHeap *heap = ch::cache::heap();
 			begin_list(g);
 			inj::on_marker(ds);
-			D3D12_RESOURCE_BARRIER planes[1] = {};
-			planes[0].Transition.pResource = ds;
-			planes[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-			planes[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-			planes[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-			inj::on_barrier(1, planes);
+			inj::set_depth_planes(ds, kDepthWrite); // (as our d3d8.dll hands them at the mark)
 			g.list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
 			g.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			ch::frame &f = make_frame(seq, now, 0x80808080u, ch::kNative | ch::kFromFlush, 0);

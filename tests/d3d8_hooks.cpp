@@ -281,7 +281,8 @@ namespace
 	struct direct_seen
 	{
 		uint32_t calls = 0, kinds[4] = {}, seqs[4] = {};
-		hifi_frame_mark m = {}; // (the first call's)
+		hifi_frame_mark m = {};   // (the first call's)
+		hifi_frame_mark end = {}; // (the second's: the world's end)
 	} g_direct;
 	void __cdecl direct_handler(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *m)
 	{
@@ -290,8 +291,11 @@ namespace
 			g_direct.kinds[g_direct.calls] = kind;
 			g_direct.seqs[g_direct.calls] = seq;
 		}
-		if (g_direct.calls++ == 0)
+		if (g_direct.calls == 0)
 			g_direct.m = *m;
+		else if (g_direct.calls == 1)
+			g_direct.end = *m;
+		g_direct.calls++;
 		if (m->rt != nullptr && m->rt_state == D3D12_RESOURCE_STATE_RENDER_TARGET)
 		{
 			const float white[4] = { 1, 1, 1, 1 };
@@ -717,6 +721,46 @@ int main(int argc, char **argv)
 			std::snprintf(line, sizeof(line), "... what it drew stays (corner %06X), and the game's next draw binds A, its viewport and pipeline again "
 				"(band %06X, below it %06X)", corner, band, past);
 			check(corner == 0xFFFFFF && band == 0x808080 && past == 0, line);
+			// The channel's version 2: the world (A and its depth, named at the zone's begin) at every mark, bound or not
+			const auto version = reinterpret_cast<hifi_frame_version_fn>(GetProcAddress(m, kHifiFrameVersion));
+			check(version != nullptr && version() == kHifiFrameChannel, "HifiFrameVersion: 2 (the marks carry the world's states)");
+			check(fm.world_rt == world_rt && fm.world_ds == world_ds && fm.world_rt_state == fm.rt_state && fm.world_ds_plane_count == 2 &&
+					fm.world_ds_planes[0] == fm.ds_planes[0] && fm.world_ds_planes[1] == fm.ds_planes[1],
+				"... at the zone's begin, the world is what's bound: the same resources and states");
+			const hifi_frame_mark &fe = g_direct.end;
+			check(fe.world_rt == world_rt && fe.world_ds == world_ds && fe.world_ds_plane_count == 2,
+				"... at the world's end, A and its depth named as the world");
+			// (a mark with only a small target bound, no depth: the world's depth and planes handed all the same, as the
+			// back buffer's marks need them)
+			g_direct = direct_seen();
+			set(&direct_handler, nullptr);
+			dev->BeginScene();
+			dev->SetRenderTarget(A, Az);
+			dev->SetViewport(&vp);
+			tri_strip_band(0.5f, 0.75f, 0.5f, 0xFF404040, 4);
+			mark(hifi::slotmark::zone_begin, 8);
+			dev->SetRenderTarget(tiny, nullptr);
+			mark(hifi::slotmark::ui_begin, 8);
+			dev->SetRenderTarget(A, Az);
+			dev->EndScene();
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+			set(nullptr, nullptr);
+			const hifi_frame_mark &zb = g_direct.m, &ui = g_direct.end;
+			std::snprintf(line, sizeof(line), "... at a mark with no depth bound, the world's depth and its planes all the same (planes %u, %u)",
+				unsigned(ui.world_ds_planes[0]), unsigned(ui.world_ds_planes[1]));
+			check(g_direct.calls == 2 && ui.ds == nullptr && ui.rt != world_rt && ui.world_ds == world_ds && ui.world_rt == world_rt &&
+					ui.world_ds_planes[0] == zb.ds_planes[0] && ui.world_ds_planes[1] == zb.ds_planes[1], line);
+			// HifiFrameDevice: the device the world was made on, and a direct queue
+			const auto device_of = reinterpret_cast<hifi_frame_device_fn>(GetProcAddress(m, kHifiFrameDevice));
+			ID3D12Device *d12 = nullptr, *made_on = nullptr;
+			ID3D12CommandQueue *queue = nullptr;
+			const bool named = device_of != nullptr && device_of(&d12, &queue) != 0;
+			if (world_rt != nullptr)
+				world_rt->GetDevice(IID_PPV_ARGS(&made_on));
+			check(named && d12 != nullptr && d12 == made_on && queue != nullptr && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT,
+				"HifiFrameDevice: the world's device and a direct queue (no submit has to be watched for them)");
+			if (made_on != nullptr)
+				made_on->Release();
 		}
 	}
 	// The float world (HifiFrameSetWorldFormat): asked for, A is made again in RGBA16F at the zone's begin mark, before

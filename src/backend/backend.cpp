@@ -54,6 +54,10 @@ namespace hifi::backend
 		bool g_early = false;
 		std::atomic<ID3D12Device *> g_device { nullptr };     // the game's (its queue's)
 		std::atomic<ID3D12CommandQueue *> g_queue { nullptr }; // its direct queue (the last lists were submitted on)
+		// (our d3d8.dll's HifiFrameDevice: where the device and the game's queue come from; nullptr: an older one, they're
+		// found through the hooked ExecuteCommandLists) and its channel's version (1: the marks without the world's fields)
+		hifi_frame_device_fn g_frame_device = nullptr;
+		uint32_t g_frame_version = 1;
 		std::atomic<bool> g_attached { false };
 		UINT g_rtv_increment = 0;
 		std::atomic<void (*)(int, const char *)> g_log_sink { nullptr };
@@ -609,9 +613,6 @@ namespace hifi::backend
 			worldfx::list_data *const d = live(list);
 			if (d == nullptr)
 				return;
-			// (the native zone renderer follows the world depth's planes, each of them)
-			zone::inject::on_barrier(count, barriers);
-			chars::inject::on_barrier(count, barriers); // (native characters: the same)
 			// (transitions only, as ReShade reports them: the resource and where it went. Of a subresource other than the
 			// first only when it's all of them: the core follows the world's depth plane, and a move of the stencil plane
 			// (subresource 1) on its own would otherwise read as the depth's state)
@@ -662,8 +663,13 @@ namespace hifi::backend
 				zone::inject::set_depth_planes(depth, planes);
 				chars::inject::set_depth_planes(depth, planes);
 			};
-			// (the world's target's state: our d3d8.dll's when it's the one bound, else as the barriers left it)
-			const auto world_rt_state = [&]() { return fm.rt != nullptr && fm.rt == zone_rt ? fm.rt_state : d.world_rt_state; };
+			// (the world's target's state: our d3d8.dll's, bound or not (version 2); an older one's only when it's bound, else
+			// as the barriers left it)
+			const auto world_rt_state = [&]() {
+				if (g_frame_version >= 2 && fm.world_rt != nullptr && fm.world_rt == zone_rt)
+					return fm.world_rt_state;
+				return fm.rt != nullptr && fm.rt == zone_rt ? fm.rt_state : d.world_rt_state;
+			};
 			marks_seen[m.kind].fetch_add(1, std::memory_order_relaxed);
 			// (the own-frame passes: their module draws at its marker, src/host/passes.hpp)
 			if (m.kind >= slotmark::first_pass)
@@ -792,7 +798,8 @@ namespace hifi::backend
 		}
 		void ev_execute(ID3D12CommandQueue *queue, UINT, ID3D12CommandList *const *)
 		{
-			if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+			// (our d3d8.dll names its device and queue itself, backend::present: only an older one's are learnt here)
+			if (g_frame_device != nullptr || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
 				return;
 			g_queue.store(queue, std::memory_order_release);
 			if (g_device.load(std::memory_order_acquire) == nullptr)
@@ -889,6 +896,16 @@ namespace hifi::backend
 		// marks one of its passes
 		// (our d3d8.dll's HifiFrameSetWorldFormat; nullptr: an older one, the world stays 8-bit)
 		hifi_frame_set_world_format_fn g_set_world_format = nullptr;
+		// The world's depth planes, exactly as our d3d8.dll has them at this mark (version 2: at every mark, the world's
+		// end and the back buffer's too), for the renderers that draw on it: nothing follows barriers for them
+		void world_planes(const hifi_frame_mark &fm)
+		{
+			if (g_frame_version < 2 || fm.world_ds == nullptr)
+				return;
+			const D3D12_RESOURCE_STATES planes[2] = { fm.world_ds_planes[0], fm.world_ds_plane_count > 1 ? fm.world_ds_planes[1] : fm.world_ds_planes[0] };
+			zone::inject::set_depth_planes(fm.world_ds, planes);
+			chars::inject::set_depth_planes(fm.world_ds, planes);
+		}
 
 		void __cdecl on_frame_mark(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *fm)
 		{
@@ -899,13 +916,15 @@ namespace hifi::backend
 			// (the world's format as the setting has it: d3d8.dll changes it at the next zone's begin mark)
 			if (g_set_world_format != nullptr)
 				g_set_world_format(worldfx::float_world() ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
-			// (the world's end comes with the resolve's targets bound, often no depth; every other mark is on a depth)
-			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || (fm->dsv.ptr == 0 && kind != slotmark::world_end))
-				return;
-			worldfx::list_data *const d = live(fm->list);
-			if (d == nullptr)
+			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || !g_attached.load(std::memory_order_acquire))
 				return;
 			host::quiet q;
+			world_planes(*fm); // (at every mark, one with no depth bound too)
+			// (the world's end comes with the resolve's targets bound, often no depth; every other mark is on a depth)
+			if (fm->dsv.ptr == 0 && kind != slotmark::world_end)
+				return;
+			// (the list's data made here when the hooks haven't seen it: the mark is the game's thread, its list d3d8.dll's)
+			worldfx::list_data *const d = data_of(fm->list, true);
 			// (the world's end: World FX draws into it there, before the resolve reads it)
 			if (kind == slotmark::world_end)
 			{
@@ -918,14 +937,26 @@ namespace hifi::backend
 			on_mark(fm->list, *d, m, *fm);
 		}
 
-		// Our d3d8.dll told where to call (nullptr: let go, at stop); false when it isn't the one loaded
+		// Our d3d8.dll told where to call (nullptr: let go, at stop); false when it isn't the one loaded, or is an older
+		// HiFi XI's (channel 1: its marks don't carry the world's states, and nothing follows barriers for them any more,
+		// so its passes would read stale states: they stay off, as with another d3d8.dll)
+		const char *g_channel_refused = nullptr;
 		bool direct_channel(bool on)
 		{
 			HMODULE d3d8 = GetModuleHandleW(L"d3d8.dll");
 			const auto set = d3d8 != nullptr ? reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(d3d8, kHifiFrameSetHandler)) : nullptr;
 			if (set == nullptr)
 				return false;
+			const auto version = reinterpret_cast<hifi_frame_version_fn>(GetProcAddress(d3d8, kHifiFrameVersion));
+			g_frame_version = version != nullptr ? version() : 1;
+			if (on && g_frame_version < kHifiFrameChannel)
+			{
+				g_channel_refused = "the d3d8.dll in bootloader is an older HiFi XI's (its marks don't carry the world's states): its passes (native zone and "
+					"characters, World FX, FSR) stay off; put this release's d3d8.dll (and d3d8-shader-cache) in bootloader";
+				return false;
+			}
 			g_set_world_format = on ? reinterpret_cast<hifi_frame_set_world_format_fn>(GetProcAddress(d3d8, kHifiFrameSetWorldFormat)) : nullptr;
+			g_frame_device = on ? reinterpret_cast<hifi_frame_device_fn>(GetProcAddress(d3d8, kHifiFrameDevice)) : nullptr;
 			set(on ? &on_frame_mark : nullptr, nullptr);
 			return true;
 		}
@@ -961,9 +992,12 @@ namespace hifi::backend
 		write_log(0, "HiFi XI: Direct3D 12 hooks in, before the game's device: its lists and views followed from their making");
 		const bool direct = direct_channel(true);
 		g_own_d3d8 = direct;
-		write_log(direct ? 0 : 2, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
-			"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: its passes (native zone and characters, World FX, FSR) can't be placed and stay off; "
-			"HiFi XI needs its own d3d8.dll in bootloader");
+		if (g_channel_refused != nullptr)
+			write_log(2, (std::string("HiFi XI: ") + g_channel_refused).c_str());
+		else
+			write_log(direct ? 0 : 2, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
+				"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: its passes (native zone and characters, World FX, FSR) can't be placed and stay off; "
+				"HiFi XI needs its own d3d8.dll in bootloader");
 		// (frame generation: the d3d8.dll's swap chain made as AMD's, when the setting's on as the game starts, and FSR too:
 		// generation runs only on FSR's frames, so without it AMD's swap chain would only stand in the way of each present)
 		{
@@ -1023,6 +1057,18 @@ namespace hifi::backend
 		if (!g_started.load() || !host::installed())
 			return;
 		g_presents.fetch_add(1, std::memory_order_relaxed);
+		// (the device and the game's queue: our d3d8.dll says them, nothing to learn from its submits)
+		if (g_frame_device != nullptr)
+		{
+			ID3D12Device *device = nullptr;
+			ID3D12CommandQueue *queue = nullptr;
+			if (g_frame_device(&device, &queue) != 0)
+			{
+				if (g_device.load(std::memory_order_acquire) == nullptr)
+					g_device.store(device, std::memory_order_release);
+				g_queue.store(queue, std::memory_order_release);
+			}
+		}
 		if (!g_attached.load(std::memory_order_acquire))
 		{
 			ID3D12Device *const device = g_device.load(std::memory_order_acquire);

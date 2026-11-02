@@ -112,6 +112,9 @@ namespace hifi::d3d8
 	static hifi_frame_handler g_mark_handler = nullptr;
 	static void *g_mark_context = nullptr;
 	uint32_t g_speedups = 0;
+	// (the world's target and depth as bound at the last zone's begin mark: every mark tells HiFi XI their states;
+	// forgotten when the game lets them go, device::forget)
+	static image *g_world_rt_img = nullptr, *g_world_ds_img = nullptr;
 
 	bool device::unchanged(bool equal)
 	{
@@ -336,6 +339,10 @@ namespace hifi::d3d8
 		if (!async_results.empty() && async_index.count(img) != 0)
 			async_results.clear();
 		async_index.erase(img);
+		if (img == g_world_rt_img)
+			g_world_rt_img = nullptr;
+		if (img == g_world_ds_img)
+			g_world_ds_img = nullptr;
 		const auto it = std::find(images.begin(), images.end(), img);
 		if (it != images.end())
 			images.erase(it);
@@ -2209,6 +2216,24 @@ namespace hifi::d3d8
 			m.ds_planes[0] = d->ds->img->gpu.plane[0];
 			m.ds_planes[1] = d->ds->img->gpu.plane[1];
 		}
+		// (the world: the zone's begin names it; its states now, bound or not)
+		if (kind == kZoneBegin)
+		{
+			g_world_rt_img = d->rt != nullptr ? d->rt->img : nullptr;
+			g_world_ds_img = d->ds != nullptr ? d->ds->img : nullptr;
+		}
+		if (g_world_rt_img != nullptr)
+		{
+			m.world_rt = g_world_rt_img->gpu.res;
+			m.world_rt_state = g_world_rt_img->gpu.state;
+		}
+		if (g_world_ds_img != nullptr)
+		{
+			m.world_ds = g_world_ds_img->gpu.res;
+			m.world_ds_plane_count = g_world_ds_img->gpu.planes;
+			m.world_ds_planes[0] = g_world_ds_img->gpu.plane[0];
+			m.world_ds_planes[1] = g_world_ds_img->gpu.plane[1];
+		}
 		LARGE_INTEGER called_at;
 		QueryPerformanceCounter(&called_at);
 		g_mark_handler(g_mark_context, kind, seq, &m);
@@ -2239,6 +2264,21 @@ namespace hifi::d3d8
 extern "C" int __cdecl HifiFrameMark(uint32_t kind, uint32_t seq)
 {
 	return hifi::d3d8::mark_now(hifi::d3d8::g_mark_device, kind, seq);
+}
+
+extern "C" uint32_t __cdecl HifiFrameVersion()
+{
+	return kHifiFrameChannel;
+}
+
+extern "C" int __cdecl HifiFrameDevice(ID3D12Device **device, ID3D12CommandQueue **queue)
+{
+	const hifi::d3d8::device *d = hifi::d3d8::g_mark_device;
+	if (device == nullptr || queue == nullptr || d == nullptr || d->g.device == nullptr || d->g.queue == nullptr)
+		return 0;
+	*device = d->g.device;
+	*queue = d->g.queue;
+	return 1;
 }
 
 extern "C" uint32_t __cdecl HifiFrameSetSpeedups(uint32_t flags)

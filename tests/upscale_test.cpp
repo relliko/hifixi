@@ -538,7 +538,8 @@ int main(int argc, char **argv)
 				b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ;
 			}
 			list->ResourceBarrier(2, b);
-			zi::on_barrier(2, b);
+			const D3D12_RESOURCE_STATES planes[2] = { b[0].Transition.StateAfter, b[1].Transition.StateAfter };
+			zi::set_depth_planes(z, planes); // (as our d3d8.dll hands them at the mark)
 			g.run();
 		};
 		ID3D12Resource *Az = make_depth(IW, IH), *bigz = make_depth(OW, OH);

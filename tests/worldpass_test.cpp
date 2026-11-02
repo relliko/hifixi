@@ -236,15 +236,10 @@ int main()
 	const float black[4] = { 0, 0, 0, 0 };
 	g_list->ClearRenderTargetView(g_bound.rtvs[0], black, 0, nullptr);
 	g_list->ClearDepthStencilView(g_bound.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-	// (zone/inject follows the depth's planes from dgVoodoo's barriers: one that leaves both in DEPTH_WRITE)
+	// (the depth's planes as our d3d8.dll hands them at a mark: both in DEPTH_WRITE)
 	hifi::zone::inject::on_marker(ds);
-	D3D12_RESOURCE_BARRIER seen = {};
-	seen.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	seen.Transition.pResource = ds;
-	seen.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	seen.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_READ;
-	seen.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-	hifi::zone::inject::on_barrier(1, &seen);
+	const D3D12_RESOURCE_STATES both_write[2] = { D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE };
+	hifi::zone::inject::set_depth_planes(ds, both_write);
 
 	// The device: the renderer made, the font read
 	sky->device(device);
