@@ -6,6 +6,7 @@
  */
 
 #include "zonemesh.hpp"
+#include "bc2.hpp"
 #include "dat.hpp"
 #include "mmb.hpp"
 #include <algorithm>
@@ -238,16 +239,28 @@ namespace hifi::bake::zonemesh
 	static bool load_dat(uint32_t dat_id, uint32_t bump_id, bool with_placements, zone &z, result &r)
 	{
 		std::string why;
-		const std::wstring path = dat_path(dat_id, why);
-		if (path.empty())
+		const std::wstring own = dat_path(dat_id, why);
+		if (own.empty())
 		{
 			r.none = true;
 			r.why = why;
 			return false;
 		}
+		const std::wstring path = overlaid(own);
 		std::vector<uint8_t> dat;
 		if (!read_file(path, dat))
 			return fail(r, "the map's DAT can't be read");
+		// (an overlay's copy: the game's own textures' sizes by name, for the bigger ones' mip levels)
+		std::unordered_map<std::string, uint32_t> own_width;
+		std::vector<uint8_t> own_dat;
+		if (path != own && read_file(own, own_dat))
+			for (const chunk &c : chunks(own_dat))
+				if (c.type == 0x20 && c.size >= 69 && (c.body[0] == 0xA1 || c.body[0] == 0xB1))
+				{
+					int32_t w = 0;
+					std::memcpy(&w, c.body + 21, 4);
+					own_width.emplace(std::string(reinterpret_cast<const char *>(c.body + 1), 16), uint32_t(std::max(w, 0)));
+				}
 		const uint8_t *first = nullptr, *second = nullptr;
 		if (!key_tables(first, second))
 			return fail(r, "the game's key tables weren't found");
@@ -393,6 +406,9 @@ namespace hifi::bake::zonemesh
 						t.w = im.w;
 						t.h = im.h;
 						t.format = im.format;
+						if (auto o = own_width.find(tex); o != own_width.end() && o->second != 0)
+							for (uint32_t w = im.w; w > o->second && w % 2 == 0 && t.levels < 5 && (im.h >> t.levels) % 4 == 0; w /= 2)
+								++t.levels;
 						if (im.format == kBC2)
 							t.data.assign(im.body + 69, im.body + 69 + size_t(im.w / 4) * (im.h / 4) * 16);
 						else
@@ -402,6 +418,7 @@ namespace hifi::bake::zonemesh
 							for (size_t i = 0; i < size_t(im.w) * im.h; ++i)
 								std::memcpy(t.data.data() + i * 4, pal + size_t(px[i]) * 4, 4);
 						}
+						t.mips = bc2::smaller_levels(t.data, t.w, t.h, t.format == kBC2, t.levels);
 						known = texture_of.emplace(tex, uint32_t(z.textures.size())).first;
 						z.textures.push_back(std::move(t));
 					}

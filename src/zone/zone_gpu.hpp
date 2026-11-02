@@ -8,7 +8,8 @@
 //   vertices      one buffer, 48 bytes a vertex (zonemesh::vertex)
 //   indices       one buffer, 32-bit, absolute
 //   textures      DXT3 as BC2_UNORM, palettized as B8G8R8A8_UNORM, one mip (the game draws the zone without mips:
-//                 MIPFILTER NONE), rows as stored
+//                 MIPFILTER NONE), rows as stored; a bigger texture from an XIPivot overlay also gets its smaller
+//                 levels down to the game's size (zonemesh::texture::mips, made on the loader's thread)
 //   normal maps   B8G8R8A8_UNORM, as the game makes them (zonemesh::sobel)
 //   descriptors   a shader-visible heap of its own: the textures, then the normal maps, then two stand-ins: white (a
 //                 piece without a texture) and flat (one without a normal map)

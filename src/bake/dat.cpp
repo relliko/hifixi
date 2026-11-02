@@ -2,6 +2,7 @@
 #include "dat.hpp"
 #include "../game/game.hpp"
 #include <cstdio>
+#include <cwchar>
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -67,6 +68,52 @@ namespace hifi::bake
 		if (!ok)
 			out.clear();
 		return ok;
+	}
+
+	std::wstring overlaid(const std::wstring &path)
+	{
+		const std::wstring &ffxi = ffxi_folder();
+		if (path.size() <= ffxi.size() + 1 || CompareStringOrdinal(path.c_str(), int(ffxi.size()), ffxi.c_str(), int(ffxi.size()), TRUE) != CSTR_EQUAL)
+			return path;
+		const std::wstring rel = path.substr(ffxi.size() + 1);
+
+		// pivot.ini: HIFIXI_PIVOT_INI's, else config\pivot\pivot.ini in Ashita's folder (this module is in its plugins)
+		wchar_t ini[MAX_PATH] = L"";
+		if (GetEnvironmentVariableW(L"HIFIXI_PIVOT_INI", ini, MAX_PATH) == 0)
+		{
+			HMODULE self = nullptr;
+			if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&overlaid), &self) ||
+				GetModuleFileNameW(self, ini, MAX_PATH) == 0)
+				return path;
+			std::wstring p = ini;
+			for (int up = 0; up < 2; ++up)
+				p = p.substr(0, p.find_last_of(L"\\/") == std::wstring::npos ? 0 : p.find_last_of(L"\\/"));
+			std::swprintf(ini, MAX_PATH, L"%s\\config\\pivot\\pivot.ini", p.c_str());
+		}
+		if (GetFileAttributesW(ini) == INVALID_FILE_ATTRIBUTES)
+			return path;
+		wchar_t root[MAX_PATH] = L"";
+		GetPrivateProfileStringW(L"settings", L"root_path", L"", root, MAX_PATH, ini);
+		std::vector<wchar_t> section(16384);
+		const DWORD got = GetPrivateProfileSectionW(L"overlays", section.data(), DWORD(section.size()), ini);
+		if (root[0] == 0 || got == 0)
+			return path;
+		std::vector<std::pair<int, std::wstring>> overlays; // (N=name, by N)
+		for (const wchar_t *e = section.data(); *e != 0; e += std::wcslen(e) + 1)
+		{
+			const std::wstring line = e;
+			const size_t eq = line.find(L'=');
+			if (eq != std::wstring::npos && eq > 0)
+				overlays.emplace_back(_wtoi(line.substr(0, eq).c_str()), line.substr(eq + 1));
+		}
+		std::sort(overlays.begin(), overlays.end());
+		for (const auto &o : overlays)
+		{
+			const std::wstring candidate = std::wstring(root) + L"\\" + o.second + L"\\" + rel;
+			if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+				return candidate;
+		}
+		return path;
 	}
 
 	std::wstring dat_path(uint32_t id, std::string &why)

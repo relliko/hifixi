@@ -22,6 +22,10 @@ namespace hifi::bake
 	std::wstring dat_path(uint32_t id, std::string &why);
 	// A zone's DAT (file id 100 + zone)
 	inline std::wstring zone_dat_path(uint32_t zone, std::string &why) { return dat_path(100 + zone, why); }
+	// XIPivot's copy of a game file when one of its overlays has it (Ashita's config\pivot\pivot.ini beside the
+	// plugins folder, or the one HIFIXI_PIVOT_INI names: [settings] root_path, [overlays] N=name, the lowest N first),
+	// else the path as given. The game loads that copy, so what's drawn natively from its textures reads it too.
+	std::wstring overlaid(const std::wstring &path);
 	// A whole file; false when it can't be read
 	bool read_file(const std::wstring &path, std::vector<uint8_t> &out);
 

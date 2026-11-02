@@ -83,6 +83,10 @@ namespace hifi::bake::zonemesh
 		char name[16] = {};
 		uint32_t w = 0, h = 0, format = kBC2;
 		std::vector<uint8_t> data; // (rows top first, as stored)
+		// Its mip levels: 1, or for a bigger copy from an XIPivot overlay as many as step it back down to the game's own
+		// size (4x: 3), so it's sharper close up and unchanged at the distance the game's own was seen at
+		uint32_t levels = 1;
+		std::vector<std::vector<uint8_t>> mips; // (the levels after the first, made by load on the loader's thread)
 	};
 
 	struct normal_map

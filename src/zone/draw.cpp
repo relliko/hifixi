@@ -5,7 +5,9 @@
  *   2  SRV t0      the zone's vertices (48 bytes)        3  SRV t1  its indices (32-bit) (the second map's for its objects)
  *   4  SRV t2      the frame's objects (80 bytes)        5  SRV t3  its lamps (32 bytes)
  *   6  table t4    the piece's texture                   7  table t5  its normal map
- *   s0             linear, wrapping (the zone pass draws without mips: MIPFILTER NONE)
+ *   s0             anisotropic x8, wrapping, mip bias -0.5 (the zone pass draws without mips: MIPFILTER NONE; the
+ *                  game's textures have one level, an overlay's bigger copies step down to the game's size:
+ *                  zm::texture::levels)
  * Pipelines are made as targets of new formats or sample counts come, one for each (blended, cull, door) set, and with
  * the light split as a second target when it's given (light_split.hpp; blended pieces leave it as it is).
  */
@@ -652,7 +654,11 @@ light_out ps_light(v2p i)
 			p[6 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		}
 		D3D12_STATIC_SAMPLER_DESC s = {};
-		s.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+		// (anisotropic, a little toward the sharper level: an overlay's bigger textures keep their detail on ground seen
+		// at a slant instead of blurring to a smaller level; the game's own one-level textures just alias less)
+		s.Filter = D3D12_FILTER_ANISOTROPIC;
+		s.MaxAnisotropy = 8;
+		s.MipLODBias = -0.5f;
 		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
 		s.MaxLOD = D3D12_FLOAT32_MAX;
 		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;

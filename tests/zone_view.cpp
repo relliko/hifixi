@@ -34,7 +34,7 @@ namespace
 {
 	namespace zm = hifi::bake::zonemesh;
 
-	constexpr UINT W = 1600, H = 900;
+	UINT W = 1600, H = 900; // (ZONE_VIEW_SIZE=WxH: another size, e.g. a player's 2560x1440)
 
 	struct mat4
 	{
@@ -134,6 +134,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	const uint32_t map = uint32_t(std::strtoul(argv[1], nullptr, 10));
+	if (const char *size = std::getenv("ZONE_VIEW_SIZE"); size != nullptr && std::sscanf(size, "%ux%u", &W, &H) != 2)
+		W = 1600, H = 900;
 	const char *out = argv[2];
 	bool warp = false, per_pixel = false, night = false, top = true, street = false, alpha1 = false;
 	float eye[3] = {}, yaw = 0, tilt = 0;

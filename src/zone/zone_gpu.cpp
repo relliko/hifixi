@@ -55,14 +55,14 @@ namespace hifi::zone
 			return r;
 		}
 
-		D3D12_RESOURCE_DESC texture_desc(uint32_t w, uint32_t h, DXGI_FORMAT format)
+		D3D12_RESOURCE_DESC texture_desc(uint32_t w, uint32_t h, DXGI_FORMAT format, uint32_t levels = 1)
 		{
 			D3D12_RESOURCE_DESC d = {};
 			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 			d.Width = w;
 			d.Height = h;
 			d.DepthOrArraySize = 1;
-			d.MipLevels = 1;
+			d.MipLevels = UINT16(levels);
 			d.Format = format;
 			d.SampleDesc.Count = 1;
 			return d;
@@ -76,11 +76,15 @@ namespace hifi::zone
 			DXGI_FORMAT format;
 			uint32_t row_bytes, rows;
 		};
+		image image_of(const uint8_t *data, uint32_t w, uint32_t h, uint32_t format)
+		{
+			if (format == zm::kBC2)
+				return { data, w, h, DXGI_FORMAT_BC2_UNORM, (w / 4) * 16, h / 4 };
+			return { data, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, w * 4, h };
+		}
 		image image_of(const zm::texture &t)
 		{
-			if (t.format == zm::kBC2)
-				return { t.data.data(), t.w, t.h, DXGI_FORMAT_BC2_UNORM, (t.w / 4) * 16, t.h / 4 };
-			return { t.data.data(), t.w, t.h, DXGI_FORMAT_B8G8R8A8_UNORM, t.w * 4, t.h };
+			return image_of(t.data.data(), t.w, t.h, t.format);
 		}
 	}
 
@@ -130,17 +134,30 @@ namespace hifi::zone
 			images.push_back({ reinterpret_cast<const uint8_t *>(n.texels.data()), n.w, n.h, DXGI_FORMAT_B8G8R8A8_UNORM, n.w * 4, n.h });
 		images.push_back({ reinterpret_cast<const uint8_t *>(&kWhite), 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, 4, 1 });
 		images.push_back({ reinterpret_cast<const uint8_t *>(&kFlat), 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, 4, 1 });
+		// Each image's levels: the first as above, then a bigger overlay texture's smaller ones (zm::texture::mips, made
+		// by the loader's thread: this runs on the game's)
+		std::vector<std::vector<image>> levels(images.size());
+		for (size_t i = 0; i < images.size(); ++i)
+			levels[i].push_back(images[i]);
+		for (size_t i = 0; i < _z.textures.size(); ++i)
+		{
+			const zm::texture &t = _z.textures[i];
+			for (size_t l = 0; l < t.mips.size(); ++l)
+				levels[i].push_back(image_of(t.mips[l].data(), t.w >> (l + 1), t.h >> (l + 1), t.format));
+		}
 
 		// Where each goes in the upload buffer
 		const uint64_t vbytes = uint64_t(_z.vertices.size()) * sizeof(zm::vertex), ibytes = uint64_t(_z.indices.size()) * 4;
 		uint64_t at = (vbytes + ibytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~uint64_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
-		std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> spots(images.size());
+		std::vector<std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>> spots(images.size());
 		for (size_t i = 0; i < images.size(); ++i)
 		{
-			const D3D12_RESOURCE_DESC d = texture_desc(images[i].w, images[i].h, images[i].format);
+			const UINT n = UINT(levels[i].size());
+			const D3D12_RESOURCE_DESC d = texture_desc(images[i].w, images[i].h, images[i].format, n);
+			spots[i].resize(n);
 			UINT64 size = 0;
-			device->GetCopyableFootprints(&d, 0, 1, at, &spots[i], nullptr, nullptr, &size);
-			at = (spots[i].Offset + size + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~uint64_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+			device->GetCopyableFootprints(&d, 0, n, at, spots[i].data(), nullptr, nullptr, &size);
+			at = (spots[i][0].Offset + size + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~uint64_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
 		}
 		_upload = make_buffer(device, D3D12_HEAP_TYPE_UPLOAD, at, D3D12_RESOURCE_STATE_GENERIC_READ);
 		_vb = make_buffer(device, D3D12_HEAP_TYPE_DEFAULT, vbytes, D3D12_RESOURCE_STATE_COMMON);
@@ -152,7 +169,7 @@ namespace hifi::zone
 		{
 			D3D12_HEAP_PROPERTIES hp = {};
 			hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-			const D3D12_RESOURCE_DESC d = texture_desc(images[i].w, images[i].h, images[i].format);
+			const D3D12_RESOURCE_DESC d = texture_desc(images[i].w, images[i].h, images[i].format, uint32_t(levels[i].size()));
 			ID3D12Resource *t = nullptr;
 			if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t))))
 				return failed("a zone texture couldn't be made (video memory?)");
@@ -168,11 +185,13 @@ namespace hifi::zone
 		std::memcpy(mapped, _z.vertices.data(), size_t(vbytes));
 		std::memcpy(mapped + vbytes, _z.indices.data(), size_t(ibytes));
 		for (size_t i = 0; i < images.size(); ++i)
-		{
-			const image &im = images[i];
-			for (uint32_t row = 0; row < im.rows; ++row)
-				std::memcpy(mapped + spots[i].Offset + uint64_t(row) * spots[i].Footprint.RowPitch, im.data + size_t(row) * im.row_bytes, im.row_bytes);
-		}
+			for (size_t l = 0; l < levels[i].size(); ++l)
+			{
+				const image &im = levels[i][l];
+				const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &s = spots[i][l];
+				for (uint32_t row = 0; row < im.rows; ++row)
+					std::memcpy(mapped + s.Offset + uint64_t(row) * s.Footprint.RowPitch, im.data + size_t(row) * im.row_bytes, im.row_bytes);
+			}
 		_upload->Unmap(0, nullptr);
 
 		// The copies, on the given queue
@@ -183,15 +202,17 @@ namespace hifi::zone
 		_list->CopyBufferRegion(_vb, 0, _upload, 0, vbytes);
 		_list->CopyBufferRegion(_ib, 0, _upload, vbytes, ibytes);
 		for (size_t i = 0; i < images.size(); ++i)
-		{
-			D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-			dst.pResource = _textures[i];
-			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			src.pResource = _upload;
-			src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-			src.PlacedFootprint = spots[i];
-			_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-		}
+			for (size_t l = 0; l < levels[i].size(); ++l)
+			{
+				D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+				dst.pResource = _textures[i];
+				dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				dst.SubresourceIndex = UINT(l);
+				src.pResource = _upload;
+				src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				src.PlacedFootprint = spots[i][l];
+				_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			}
 		if (FAILED(_list->Close()))
 			return failed("the upload's command list couldn't be closed");
 		ID3D12CommandList *lists[] = { _list };
@@ -214,7 +235,7 @@ namespace hifi::zone
 			v.Format = images[i].format;
 			v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 			v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-			v.Texture2D.MipLevels = 1;
+			v.Texture2D.MipLevels = UINT(levels[i].size());
 			device->CreateShaderResourceView(_textures[i], &v, h);
 			h.ptr += _srv_step;
 		}
@@ -225,7 +246,10 @@ namespace hifi::zone
 		std::vector<zm::vertex>().swap(_z.vertices);
 		std::vector<uint32_t>().swap(_z.indices);
 		for (zm::texture &t : _z.textures)
+		{
 			std::vector<uint8_t>().swap(t.data);
+			std::vector<std::vector<uint8_t>>().swap(t.mips);
+		}
 		for (zm::normal_map &n : _z.normal_maps)
 			std::vector<uint32_t>().swap(n.texels);
 		return true;
