@@ -4289,6 +4289,13 @@ int main(int argc, char **argv)
 		std::printf("  GPU time (WARP, 640 x 360): AO alone %.2f ms, sun shadows alone %.2f ms (smoothed)\n", ao_ms, sun_ms);
 		check(ticks != 0 && ao_ms > 0.0f && sun_ms > 0.0f, "the timer reports the shading pass's GPU time");
 		check(g.report_messages() == 0, "no debug-layer errors (timing)");
+		// The breadcrumbs (a GPU crash report's: where in World FX's pass the GPU got to): every drawing run to its end,
+		// so the stop would be outside World FX's pass (a device without WriteBufferImmediate: none)
+		const std::string crumbs = r.breadcrumbs();
+		std::printf("%s", crumbs.empty() ? "  (no breadcrumbs on this device)\n" : crumbs.c_str());
+		check(crumbs.empty() || (crumbs.find("outside World FX's pass") != std::string::npos && crumbs.find("\"worldfx: end\"") != std::string::npos),
+			"the breadcrumbs: every World FX drawing begun finished, at its end marker");
+		check(g.report_messages() == 0, "no debug-layer errors (breadcrumbs)");
 	}
 
 	// 1b. The colour memory: blades seen on light ground, then a frame on dark ground (darkened that frame:

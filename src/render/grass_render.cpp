@@ -1907,6 +1907,8 @@ namespace grass
 
 	renderer::~renderer()
 	{
+		_crumb_words = nullptr;
+		release(_crumbs);
 		unload();
 		unload_water();
 		unload_sea();
@@ -2107,6 +2109,7 @@ namespace grass
 		if (_root != nullptr)
 			return true;
 		_device = device;
+		make_breadcrumbs();
 		{
 			const auto start = std::chrono::steady_clock::now();
 			shader_code code;
@@ -2200,11 +2203,134 @@ namespace grass
 		return true;
 	}
 
+	// The breadcrumbs (grass_render.hpp: breadcrumbs()). A drawing's sections, and the shadow maps and tests drawn before
+	// it, are one drawing's markers; "worldfx: end" closes it.
+	namespace
+	{
+		const wchar_t kEndMark[] = L"worldfx: end";
+		constexpr uint32_t kNoCrumb = 0xFFFFFFFFu;
+	}
+
+	void renderer::make_breadcrumbs()
+	{
+		// (a device that can't write them, an older Direct3D 12 or WARP's: no breadcrumbs, everything else as before)
+		D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+		if (_device == nullptr || _crumbs != nullptr || FAILED(_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) ||
+			(o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT) == 0)
+			return;
+		D3D12_HEAP_PROPERTIES hp = {};
+		hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+		hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+		hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = 256;
+		bd.Height = 1;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		void *mapped = nullptr;
+		if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_crumbs))) ||
+			FAILED(_crumbs->Map(0, nullptr, &mapped)))
+		{
+			release(_crumbs);
+			return;
+		}
+		std::memset(mapped, 0xFF, 8); // (nothing reached or finished yet)
+		_crumb_words = static_cast<const volatile uint32_t *>(mapped);
+		_crumbs->SetName(L"worldfx: breadcrumbs");
+	}
+
+	void renderer::crumb(ID3D12GraphicsCommandList *list, const wchar_t *name)
+	{
+		if (_crumbs == nullptr)
+			return;
+		uint32_t word = 0;
+		{
+			std::lock_guard<std::mutex> lock(_crumb_mutex);
+			const uint32_t slot = _crumb_run % kCrumbRuns;
+			if (_crumb_tag[slot] != (_crumb_run & 0xFFFFu) || _crumb_count[slot] == 0)
+			{
+				_crumb_tag[slot] = _crumb_run & 0xFFFFu;
+				_crumb_count[slot] = 0;
+			}
+			uint32_t &n = _crumb_count[slot];
+			if (n < kCrumbMarks)
+				_crumb_names[slot][n] = name; // (past kCrumbMarks: counted, not named)
+			word = (_crumb_run & 0xFFFFu) << 16 | (n & 0xFFFFu);
+			++n;
+			if (name == kEndMark)
+			{
+				++_crumb_run;
+				_crumb_count[_crumb_run % kCrumbRuns] = 0;
+			}
+		}
+		ID3D12GraphicsCommandList2 *l2 = nullptr;
+		if (FAILED(list->QueryInterface(IID_PPV_ARGS(&l2))))
+			return;
+		// (reached: as the command processor passes it, ahead of the drawing; finished before it: once every draw before
+		// it has ended)
+		const D3D12_GPU_VIRTUAL_ADDRESS va = _crumbs->GetGPUVirtualAddress();
+		D3D12_WRITEBUFFERIMMEDIATE_PARAMETER wb[2] = { { va, word }, { va + 4, word } };
+		D3D12_WRITEBUFFERIMMEDIATE_MODE wm[2] = { D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT };
+		l2->WriteBufferImmediate(2, wb, wm);
+		l2->Release();
+	}
+
+	void renderer::mark_end(ID3D12GraphicsCommandList *list)
+	{
+		gpu_crash::mark(list, kEndMark);
+		crumb(list, kEndMark);
+	}
+
+	std::string renderer::breadcrumbs() const
+	{
+		if (_crumb_words == nullptr)
+			return std::string();
+		const uint32_t reached = _crumb_words[0], done = _crumb_words[1];
+		std::unique_lock<std::mutex> lock(_crumb_mutex, std::defer_lock);
+		for (int i = 0; i < 50 && !lock.try_lock(); ++i)
+			Sleep(10);
+		auto name_of = [&](uint32_t w) -> std::string {
+			if (w == kNoCrumb)
+				return "none";
+			const uint32_t run = w >> 16, n = w & 0xFFFFu, slot = run % kCrumbRuns;
+			std::string text = "drawing " + std::to_string(run) + "'s marker " + std::to_string(n);
+			if (lock.owns_lock() && _crumb_tag[slot] == run && n < _crumb_count[slot] && n < kCrumbMarks && _crumb_names[slot][n] != nullptr)
+			{
+				text += " \"";
+				for (const wchar_t *c = _crumb_names[slot][n]; *c != 0; ++c)
+					text += char(*c < 128 ? *c : '?');
+				text += "\"";
+			}
+			return text;
+		};
+		auto is_end = [&](uint32_t w) {
+			if (w == kNoCrumb || !lock.owns_lock())
+				return false;
+			const uint32_t run = w >> 16, n = w & 0xFFFFu, slot = run % kCrumbRuns;
+			return _crumb_tag[slot] == run && n < _crumb_count[slot] && n < kCrumbMarks && _crumb_names[slot][n] == kEndMark;
+		};
+		std::string out = "  World FX's breadcrumbs: the command processor (ahead of the drawing) had reached " + name_of(reached) +
+			"; everything before " + name_of(done) + " had finished\n";
+		if (reached == kNoCrumb)
+			out += "    no World FX drawing begun yet\n";
+		else if (done == reached && is_end(done))
+			out += "    every World FX drawing the GPU began it finished: the stop came outside World FX's pass\n";
+		else if (done != kNoCrumb)
+			out += "    the GPU stopped in that section: " + name_of(done) + " (from its marker to the next)\n";
+		if (!lock.owns_lock())
+			out += "    (the section names couldn't be read: busy)\n";
+		return out;
+	}
+
 	// A section starting (see grass_render.hpp): the GPU crash report's marker, and a timestamp (the last place kept for
 	// the end's)
 	void renderer::section(ID3D12GraphicsCommandList *list, const wchar_t *name)
 	{
 		gpu_crash::mark(list, name);
+		crumb(list, name);
 		if (_queries == nullptr || _times == nullptr)
 			return;
 		UINT &n = _mark_count[_time_slot];
@@ -5325,7 +5451,7 @@ namespace grass
 			transition(list, t.rt, t.rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			draw_look(list, t, l, stats, error);
 			transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
-			gpu_crash::mark(list, L"worldfx: end");
+			mark_end(list);
 			finish_timing(list, false);
 			return stats;
 		};
@@ -6271,7 +6397,7 @@ namespace grass
 			if (look_on)
 				draw_look(list, t, l, stats, error);
 			transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
-			gpu_crash::mark(list, L"worldfx: end");
+			mark_end(list);
 			finish_timing(list, true);
 			return stats;
 		}
@@ -6597,7 +6723,7 @@ namespace grass
 		if (look_on)
 			draw_look(list, t, l, stats, error);
 		transition(list, t.rt, D3D12_RESOURCE_STATE_RENDER_TARGET, t.rt_state);
-		gpu_crash::mark(list, L"worldfx: end");
+		mark_end(list);
 		finish_timing(list, true);
 		return stats;
 	}

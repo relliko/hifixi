@@ -331,6 +331,32 @@ namespace
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			check(env("FFXI_WORLDFX_ZONE") == "101", "out again: the party's zone (101)");
+
+			// Zoning, the party's zone still the last one after (Windurst, 2026-11-02 03:17): "in" waits for the zone-in packet
+			p.in_game = false;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			check(env("FFXI_WORLDFX_INGAME") == "0", "zoning: out");
+			p.in_game = true;
+			now += 0.5;
+			hifi::game::feed::frame(e, p, now);
+			check(env("FFXI_WORLDFX_INGAME") == "0" && env("FFXI_WORLDFX_ZONE") == "101", "  in again, the party's zone the last one: not told in yet");
+			zone_in[0x30] = 238;
+			hifi::game::feed::packet_in(0x00A, zone_in.data(), uint32_t(zone_in.size()), e);
+			now += 0.02;
+			hifi::game::feed::frame(e, p, now);
+			check(env("FFXI_WORLDFX_ZONE") == "238" && env("FFXI_WORLDFX_INGAME") == "1", "  the zone-in packet's zone (238), then in, the same frame");
+			p.zone = 238;
+			p.in_game = false;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			p.in_game = true;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			const bool held = env("FFXI_WORLDFX_INGAME") == "0";
+			now += 3.0;
+			hifi::game::feed::frame(e, p, now);
+			check(held && env("FFXI_WORLDFX_INGAME") == "1", "  no zone-in packet: in after 3 s all the same");
 		}
 
 		// 3. A weapon skill's action packet: user 6, skill 20 (an area skill, radius 10), targets 5 (3 yalms off) and 9 (57)
@@ -685,7 +711,7 @@ namespace
 		// 11. Status, then everything put back
 		{
 			const std::vector<std::string> s = hifi::game::feed::status();
-			check(s.size() >= 8 && s[0].find("zone 101") != std::string::npos, "the status lines (the zone first)");
+			check(s.size() >= 8 && s[0].find("zone 238") != std::string::npos, "the status lines (the zone first)");
 		}
 		hifi::game::feed::stop();
 		check(env("FFXI_WORLDFX_ZONE") == "(none)" && env("FFXI_WORLDFX_INGAME") == "(none)", "stopped: the zone and in game taken out of the environment");
