@@ -93,6 +93,7 @@ namespace
 		bool ok = false, from_cache = false;
 		std::string error;
 		double seconds = 0.0;
+		bool built_in = false; // (the built-in shaders at attach, not in the cache: none in use till they're in)
 		std::atomic<bool> done { false };
 	};
 
@@ -912,6 +913,34 @@ namespace
 		FreeLibraryAndExitThread(module, 0);
 	}
 
+	// (mutex held) A job compiling source on a thread of its own, below normal (the game's frames first): false when no
+	// thread could be made
+	bool start_shader_job(std::string source, bool built_in)
+	{
+		auto job = std::make_shared<shader_job>();
+		job->source = std::move(source);
+		job->cache = shader_cache_folder();
+		job->built_in = built_in;
+		HANDLE thread = nullptr;
+		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&shader_thread), &job->module))
+		{
+			auto *const held = new std::shared_ptr<shader_job>(job);
+			thread = CreateThread(nullptr, 0, shader_thread, held, CREATE_SUSPENDED, nullptr);
+			if (thread == nullptr)
+			{
+				delete held;
+				FreeLibrary(job->module);
+			}
+		}
+		if (thread == nullptr)
+			return false;
+		SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+		ResumeThread(thread);
+		CloseHandle(thread);
+		g.shader_compiling = std::move(job);
+		return true;
+	}
+
 	// Shaders from worldfx.hlsl next to the add-on, compiled again whenever the file changes (its time or size): edits
 	// show while the game runs. The shaders in use stay while it compiles, on a thread of its own (one at a time: a
 	// change meanwhile is seen once it's done); then it's swapped in on a frame. The same source as the shaders in use
@@ -925,6 +954,26 @@ namespace
 			if (!job.done.load(std::memory_order_acquire))
 				return;
 			const std::string when = clock_now();
+			if (job.built_in)
+			{
+				// (the built-in shaders, compiled at attach: World FX draws from now on)
+				if (job.ok && g.renderer != nullptr)
+				{
+					g.renderer->set_shader_code(std::move(job.code));
+					char how[96];
+					std::snprintf(how, sizeof(how), "compiled in the background in %.1f s (kept in the shader cache)", job.seconds);
+					g.shader_status = std::string("built in, ") + how;
+					log_message(0, (std::string("FFXI World FX: the built-in shaders, ") + how).c_str());
+				}
+				else if (!job.ok)
+				{
+					g.error = "the built-in shaders don't compile: " + job.error.substr(0, 300);
+					g.shader_status = g.error;
+					log_message(2, ("FFXI World FX: grass renderer: the built-in shaders: " + job.error).c_str());
+				}
+				g.shader_compiling.reset();
+				return;
+			}
 			if (job.ok)
 			{
 				char how[64];
@@ -945,6 +994,8 @@ namespace
 			g.shader_compiling.reset();
 			return;
 		}
+		if (g.renderer == nullptr || !g.renderer->has_shaders())
+			return; // (the built-in ones first)
 		const std::wstring path = addon_folder() + L"worldfx.hlsl";
 		WIN32_FILE_ATTRIBUTE_DATA a = {};
 		if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a))
@@ -976,29 +1027,12 @@ namespace
 			log_message(0, "FFXI World FX: worldfx.hlsl is the same as the shaders in use");
 			return;
 		}
-		auto job = std::make_shared<shader_job>();
-		job->source = std::move(source);
-		job->cache = shader_cache_folder();
-		HANDLE thread = nullptr;
-		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&shader_thread), &job->module))
-		{
-			auto *const held = new std::shared_ptr<shader_job>(job);
-			thread = CreateThread(nullptr, 0, shader_thread, held, 0, nullptr);
-			if (thread == nullptr)
-			{
-				delete held;
-				FreeLibrary(job->module);
-			}
-		}
-		if (thread == nullptr)
+		if (!start_shader_job(std::move(source), false))
 		{
 			g.shader_status = "worldfx.hlsl couldn't be compiled (" + when + ": no thread for it); the last good shaders stay";
 			log_message(2, "FFXI World FX: worldfx.hlsl: no thread to compile it on");
 			return;
 		}
-		SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
-		CloseHandle(thread);
-		g.shader_compiling = std::move(job);
 		g.shader_status = "worldfx.hlsl changed at " + when + ": compiling in the background (the shaders in use stay until it's done)";
 		log_message(0, "FFXI World FX: worldfx.hlsl changed: compiling it in the background");
 	}
@@ -1996,10 +2030,20 @@ namespace
 	{
 		g.tried = true;
 		g.passes_wanted++;
-		g_has_drawn = true; // (the world found: World FX draws into it here, whatever is on this frame)
+		// (the world found: World FX draws into it here, whatever is on this frame; said to the game side only once the
+		// renderer has its shaders, else it would leave out its own water and weather with nothing drawn for them)
+		if (g.renderer != nullptr && g.renderer->ready())
+			g_has_drawn = true;
 		if (!g.in_game)
 		{
 			g.skip = "not in the game (login, character select, zoning; or the worldfx Ashita addon isn't loaded)";
+			return;
+		}
+		// (before the zone guard: the zone's files are read only once the renderer is ready, so it would take the blame)
+		if (g.renderer == nullptr || !g.renderer->ready())
+		{
+			g.skip = g.shader_compiling != nullptr && g.shader_compiling->built_in ? "the renderer isn't ready (its shaders compiling in the background)" :
+				"the renderer isn't ready";
 			return;
 		}
 		if (zone_stale())
@@ -2018,11 +2062,6 @@ namespace
 		if (!g.enabled && !shading_on() && !water_on && g.look.fireflies <= 0.0f && !rain_on && !g.vis_on && !look_on())
 		{
 			g.skip = "off";
-			return;
-		}
-		if (g.renderer == nullptr || !g.renderer->ready())
-		{
-			g.skip = "the renderer isn't ready";
 			return;
 		}
 		if (!g.renderer->loaded() && !shading_on() && !water_on && !rain_on && !g.vis_on && !look_on())
@@ -2474,20 +2513,30 @@ namespace worldfx
 		g.shader_status = "built in";
 		g.error.clear();
 		std::string error;
-		if (!g.renderer->init(device, error, shader_cache_folder()))
+		// (the shaders from the cache now; not there, compiled on a thread of their own: the game's thread waited
+		// seconds for them, frozen, at the first start after each release)
+		g.shader_compiling.reset();
+		if (!g.renderer->init(device, error, shader_cache_folder(), false))
 		{
 			g.error = error;
 			log_message(2, ("FFXI World FX: grass renderer: " + error).c_str());
 		}
-		else
+		else if (g.renderer->has_shaders())
 		{
 			char how[96];
-			if (g.renderer->shaders_from_cache())
-				std::snprintf(how, sizeof(how), "from the shader cache (%.2f s)", g.renderer->shader_seconds());
-			else
-				std::snprintf(how, sizeof(how), "compiled in %.1f s (kept in the shader cache)", g.renderer->shader_seconds());
+			std::snprintf(how, sizeof(how), "from the shader cache (%.2f s)", g.renderer->shader_seconds());
 			g.shader_status = std::string("built in, ") + how;
 			log_message(0, (std::string("FFXI World FX: the built-in shaders, ") + how).c_str());
+		}
+		else if (start_shader_job(grass::built_in_shader_source(), true))
+		{
+			g.shader_status = "built in: compiling in the background (World FX draws once they're in)";
+			log_message(0, "FFXI World FX: the built-in shaders aren't in the shader cache: compiling them in the background");
+		}
+		else
+		{
+			g.error = "the built-in shaders couldn't be compiled (no thread for it)";
+			log_message(2, ("FFXI World FX: grass renderer: " + g.error).c_str());
 		}
 		g.zone_tried = false;
 		g.world_rt = nullptr;
@@ -2683,6 +2732,9 @@ namespace worldfx
 			for (int i = 0; i < 4 && done != UINT64_MAX && (n = g.renderer->read_vis(done, g.vis_objects, g.vis_points)) != 0; ++i)
 				vistest::answer(g.vis_objects, g.vis_points, n, now);
 		}
+		// (a shader job polled at every present: the built-in shaders compiled at attach make the renderer ready)
+		if (g.shader_compiling != nullptr)
+			check_shaders();
 		if (g.renderer != nullptr && g.renderer->ready())
 		{
 			static bool frequency_known = false;

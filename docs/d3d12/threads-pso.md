@@ -83,7 +83,12 @@ The game-thread-only rule:
 - `src/framegen/framegen.hpp:37-40`: `framegen::present()` runs on the game thread with no HiFi XI lock held.
 - `src/render/worldfx_core.cpp` holds World FX's `g.mutex`. The hook paths that used to take it from any thread
   (`on_reset`, `on_barrier`, `on_targets`, `on_clear_target`) are gone since step 4: World FX is entered only at the
-  marks, the present and the game side's calls, all on the game's thread.
+  marks, the present and the game side's calls, all on the game's thread. Since step 4c the renderer records without
+  `g.mutex`: `record()` in worldfx_core.cpp holds `g_render_mutex` instead while it records (the look's arrays copied
+  first). Order: `g.mutex`, then `g_render_mutex`, never the other way (the recording lets `g_render_mutex` go before
+  taking `g.mutex` again). Readers off the recording path that need the renderer take `g_render_mutex` after
+  `g.mutex`; the crash report, the status and `gpu_times` only try it. `tests/worldfx_core_test.cpp` pins this with a
+  probe: a feed call made from another thread while the blades record completes.
 
 Lists, allocators, queues:
 
@@ -103,8 +108,13 @@ Shader and PSO creation:
   ones on up to 4 below-normal worker threads at device creation (`src/d3d8/device.cpp:233`). A shipped cache covers
   the first session.
 - `src/render/grass_render.cpp:2081-2087`: World FX compiles its shader entries on every core but two at once.
-  `src/render/worldfx_core.cpp:902-999`: World FX's own HLSL is compiled on a CreateThread worker, cached in
-  `worldfx-shader-cache`, and the worker pins the DLL (`FreeLibraryAndExitThread`, line 925).
+  World FX's HLSL is compiled on a CreateThread worker (`shader_thread`, started by `start_shader_job` in
+  worldfx_core.cpp, below normal; its helpers take its priority), cached in `worldfx-shader-cache`, and the worker
+  pins the DLL (`FreeLibraryAndExitThread`). Since step 4d that includes the built-in shaders at attach when the cache
+  hasn't them (the first start after a release): `renderer::init(..., shaders_now = false)` takes them from the cache
+  or leaves the renderer not `ready()` till `check_shaders` hands them over at a present (polled at every present).
+  Nothing draws and no zone's files are read till then; `worldfx_drawing()` stays 0, so the game keeps its own water
+  and weather meanwhile.
 - `src/d3d8/device_draw.cpp:759-818`: our d3d8.dll makes PSOs lazily at the draw that needs one, keyed by state, and
   times each (`lf.pso_ms`, `lf.psos`; PerfLog=1 reports them). No `CachedPSO` or pipeline library is used anywhere:
   only the driver's own cache saves the DXBC -> GPU step on the next start.

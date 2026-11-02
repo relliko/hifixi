@@ -1353,6 +1353,22 @@ int main(int argc, char **argv)
 		check(worldfx::attached() == g.device && worldfx_drawing() == 0 && out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0,
 			"C1 attached; nothing drawn and no world before any mark");
 	}
+#if WFX_CORE_API >= 4
+	// (the built-in shaders compiled on their own thread: presents till one takes them in, at most 3 minutes on WARP)
+	{
+		const auto t0 = std::chrono::steady_clock::now();
+		bool in = false;
+		while (!in && seconds_since(t0) < 180.0)
+		{
+			present(g);
+			in = line_of(status(), "Shaders: ").find("compiled in the background") != std::string::npos;
+			if (!in)
+				Sleep(20);
+		}
+		std::printf("  the built-in shaders in after %.1f s\n", seconds_since(t0));
+		check(in, "C1 the built-in shaders compiled in the background, taken in at a present");
+	}
+#endif
 
 	// The reference: a frame with no marks before the game side has said anything (nothing of World FX's): the cleared bytes
 	frame(g, w, { true, false, false, true });

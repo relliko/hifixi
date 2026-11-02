@@ -2079,9 +2079,14 @@ namespace grass
 					}
 			};
 			const size_t cores = std::thread::hardware_concurrency();
+			// (the helpers at the caller's priority: a background job's below normal, so the game's frames come first)
+			const int priority = GetThreadPriority(GetCurrentThread());
 			std::vector<std::thread> threads;
 			for (size_t t = 1; t < std::min(kShaderEntryCount, cores > 3 ? cores - 2 : size_t(1)); ++t)
-				threads.emplace_back(work);
+				threads.emplace_back([&work, priority] {
+					SetThreadPriority(GetCurrentThread(), priority);
+					work();
+				});
 			work();
 			for (std::thread &t : threads)
 				t.join();
@@ -2098,13 +2103,22 @@ namespace grass
 		return true;
 	}
 
+	bool cached_shaders(const std::string &source, const std::wstring &cache_folder, shader_code &out)
+	{
+		const uint64_t key = shader_key(source);
+		if (cache_folder.empty() || key == 0 || !read_shader_cache(shader_cache_file(cache_folder, key), key, out))
+			return false;
+		touch(shader_cache_file(cache_folder, key));
+		return true;
+	}
+
 	const std::string &built_in_shader_source()
 	{
 		static const std::string source(kShader);
 		return source;
 	}
 
-	bool renderer::init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache)
+	bool renderer::init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache, bool shaders_now)
 	{
 		if (_root != nullptr)
 			return true;
@@ -2113,9 +2127,17 @@ namespace grass
 		{
 			const auto start = std::chrono::steady_clock::now();
 			shader_code code;
-			if (!compile_shaders(built_in_shader_source(), shader_cache, code, _shaders_from_cache, error))
-				return false;
-			set_shader_code(std::move(code));
+			if (shaders_now)
+			{
+				if (!compile_shaders(built_in_shader_source(), shader_cache, code, _shaders_from_cache, error))
+					return false;
+				set_shader_code(std::move(code));
+			}
+			else if (cached_shaders(built_in_shader_source(), shader_cache, code))
+			{
+				_shaders_from_cache = true;
+				set_shader_code(std::move(code));
+			}
 			_shader_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 		}
 
@@ -2550,6 +2572,7 @@ namespace grass
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
 			into[i]->swap(code.blobs[i]);
 		_shader_key = code.key;
+		_has_shaders = true;
 		if (_sun_pso != nullptr)
 			keep_old(_sun_pso);
 		_sun_pso = nullptr;

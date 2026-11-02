@@ -612,6 +612,8 @@ namespace grass
 	// the compiler's messages in error, when the source doesn't compile (nothing is written then).
 	constexpr size_t kShaderCacheKeep = 4;
 	bool compile_shaders(const std::string &source, const std::wstring &cache_folder, shader_code &out, bool &from_cache, std::string &error);
+	// The shaders of this source from the cache folder alone (false: not there; nothing compiled)
+	bool cached_shaders(const std::string &source, const std::wstring &cache_folder, shader_code &out);
 	// The built-in shaders' source (src/render/grass.hlsl, as the engine was built with it)
 	const std::string &built_in_shader_source();
 
@@ -622,12 +624,14 @@ namespace grass
 
 		// Compiles the built-in shaders and makes the root signature (once per device). With a cache folder the
 		// shaders come from there when it has them (compile_shaders); shaders_from_cache and shader_seconds then say
-		// how they came and how long it took.
-		bool init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache = std::wstring());
+		// how they came and how long it took. shaders_now false: only from the cache; when it hasn't them, none (the
+		// caller compiles them on a thread of its own and hands them over, set_shader_code), and not ready() till then.
+		bool init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache = std::wstring(), bool shaders_now = true);
+		bool has_shaders() const { return _has_shaders; }
 		bool shaders_from_cache() const { return _shaders_from_cache; }
 		double shader_seconds() const { return _shader_seconds; }
 		uint64_t shader_key() const { return _shader_key; } // (the source of the shaders in use)
-		bool ready() const { return _root != nullptr; }
+		bool ready() const { return _root != nullptr && _has_shaders; }
 		// GPU time (ms, smoothed) of the copies and the shading pass, and of the grass; 0 until known
 		void set_timestamp_frequency(uint64_t ticks_per_second) { _frequency = ticks_per_second; }
 		float shading_ms() const { return _shading_ms; }
@@ -862,6 +866,7 @@ namespace grass
 		ID3D12Resource *_look_history_buf = nullptr;
 		bool _look_history_bloom = false; // (the last frame drew the bloom, keeping each level's light)
 		uint64_t _shader_key = 0;
+		bool _has_shaders = false;
 		bool _shaders_from_cache = false;
 		double _shader_seconds = 0.0;
 		// The rain map (whole, on the CPU) and its window around the camera (an upload buffer, a uint a square: the
