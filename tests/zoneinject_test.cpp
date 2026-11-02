@@ -184,7 +184,18 @@ int main(int argc, char **argv)
 
 	ID3D12Debug *debug = nullptr;
 	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+	{
 		debug->EnableDebugLayer();
+		// (HIFIXI_GBV=1: GPU-based validation as well, as the add-on's debug layer takes it: what the shaders read, the
+		// states resources are really in)
+		ID3D12Debug1 *debug1 = nullptr;
+		if (GetEnvironmentVariableA("HIFIXI_GBV", nullptr, 0) != 0 && SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(&debug1))))
+		{
+			debug1->SetEnableGPUBasedValidation(TRUE);
+			debug1->Release();
+			std::printf("      (GPU-based validation on)\n");
+		}
+	}
 	IDXGIFactory4 *factory = nullptr;
 	IDXGIAdapter *warp = nullptr;
 	CreateDXGIFactory1(IID_PPV_ARGS(&factory));

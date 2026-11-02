@@ -1,10 +1,11 @@
 /*
  * hifps's experimental frame-time toggles (exp.hpp): hifps.lua's /hifps exp (exp_set, exp_toggle, restore_exp,
- * exp_tick, exp_stat and what they use: ashita_*, occlusion_*, walls_*, sse_*, proxy_*), in C++. Its comments
- * carried over where they still hold.
+ * exp_tick, exp_stat and what they use: ashita_*, occlusion_*), in C++, with batch and dedupe now done in HiFi XI's
+ * own d3d8.dll. Its comments carried over where they still hold. (docs/frame-rate.md: what each saves, measured, and
+ * why walls, sse and the device proxy went.)
  *
- * Experimental frame-time toggles. All off by default; each one puts back what it changed when turned off, when
- * hifps's frame step goes off (hifps::on()) and on stop(). None of them changes the game step.
+ * Frame-time toggles, off by default (experimental: no preset turns one on); each one puts back what it changed when
+ * turned off, when hifps's frame step goes off (hifps::on()) and on stop(). None of them changes the game step.
  *   ashita    Ashita's device wrapper hands every draw call to every plugin, and the addons plugin looks the event up
  *             in every loaded addon, about 3,000 times a frame although no addon here handles d3d_dp/dip/dpup/dipup.
  *             Skips that (those four events stop firing). Before turning on it reads the loaded addons' Lua files
@@ -14,30 +15,24 @@
  *   occlusion Characters test whether they are hidden behind walls with a GPU readback that stalls the frame; the
  *             client tests each one every 4th frame. Above 60fps this tests every 4m-th frame instead, m = fps/60
  *             rounded down to a power of two, so a result is never older than at stock 60fps. Targeting reads the
- *             result, so this keeps it that fresh.
- *   walls     Answers that test from the zone's collision instead, with no readback: the actor draw's call of it goes
- *             to walls.asm's stub (stubs.inc), which runs the game's own segment test (the one the camera keeps out
- *             of walls with) from the camera's eye to up to 9 points of the character's screen box at the client's
- *             test depth; hidden only when every one is blocked. Scenery without collision no longer hides
- *             characters, nor do characters each other; you and your target are always shown. At most kWallsMs of
- *             segments a frame (the rest of the frame's tests answer shown); in cutscenes and with no collision
- *             loaded the client's own test runs. Works with occlusion (which still decides how often each character
- *             is tested).
- *   sse       The client skins characters on the CPU and only uses its SSE code when the CPU says "Intel"; other CPUs
- *             get the x87 code. Turns the SSE code on for them.
- *   batch     The text and UI draw one quad per draw call; consecutive quads with nothing changed in between become
- *             one draw. Same triangles, same order, same state.
- *   dedupe    About 40% of the client's device calls set a value already in effect; drops those.
- *   batch and dedupe replace the client device's vtable with proxy.asm's stub (stubs.inc).
+ *             result, so this keeps it that fresh. While World FX's VisTest answers the characters' test (from its
+ *             depth copy, without waiting: src/game/feed.cpp, set_actors_elsewhere) every character is tested every
+ *             frame instead: an answer costs nothing there. That is the one path for "is this character hidden":
+ *             VisTest while World FX draws, else the game's own test at this rate.
+ *   batch     The text and UI draw one quad per draw call; our d3d8.dll draws consecutive quads with nothing changed
+ *             in between as one draw. Same triangles, same order, same state (HifiFrameSetSpeedups).
+ *   dedupe    Many of the client's device calls set a value already in effect; our d3d8.dll returns from those at
+ *             once.
  *
  * The toggles follow HiFi XI's options ([hifps] exp_<name>, ashita_force) instead of hifps's settings file: a toggle
  * whose option goes on is turned on (once: one that can't be says why, and isn't tried again until its option goes
  * off and on, or hifps's frame step does); the saved ones are turned on once the client's device exists. Unlike the
  * addon, our memory is freed on stop() when nothing points into it any more, and nothing is put back over bytes that
- * aren't ours (the addon wrote the occlusion test's and the SSE flag's stock bytes back regardless).
+ * aren't ours (the addon wrote the occlusion test's stock bytes back regardless).
  */
 
-#include "../../../deps/ashita/plugins/sdk/Ashita.h" // (IAshitaCore: the actors, the plugins, Ashita's folder)
+#include "../../../deps/ashita/plugins/sdk/Ashita.h" // (IAshitaCore: the plugins, Ashita's folder)
+#include "../../host/frameapi.hpp" // (our d3d8.dll's HifiFrameSetSpeedups)
 #include "exp.hpp"
 #include "step.hpp" // (hifps::on(), hifps::fps())
 #include <algorithm>
@@ -56,33 +51,21 @@ namespace hifi::game::hifps::exp
 {
 	namespace
 	{
-#include "stubs.inc"
-
-		namespace px = stubs::proxy;
-		namespace wl = stubs::walls;
-
-		constexpr uint32_t kProxyBuf = 0x20000; // bytes of merged vertices: 780 text quads a draw
-		constexpr double kWallsMs = 1.0;        // milliseconds of segment tests a frame, then the frame's other tests answer shown
-
 		enum toggle_id
 		{
 			kAshita,
 			kOcclusion,
-			kWalls,
-			kSse,
 			kBatch,
 			kDedupe,
 			kCount
 		};
-		constexpr const char *kNames[kCount] = { "ashita", "occlusion", "walls", "sse", "batch", "dedupe" };
-		constexpr const char *kOptions[kCount] = { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" };
+		constexpr const char *kNames[kCount] = { "ashita", "occlusion", "batch", "dedupe" };
+		constexpr const char *kOptions[kCount] = { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe" };
 		constexpr const char *kDesc[kCount] = {
 			"skip Ashita's per-draw plugin dispatch (d3d_dp/dip/dpup/dipup stop firing)",
 			"test hidden characters less often above 60fps, as fresh as stock at 60fps (within 3%)",
-			"tell hidden characters from the zone's walls on the CPU instead of waiting on the GPU",
-			"SSE character skinning on non-Intel CPUs",
-			"merge consecutive text and UI quads into one draw",
-			"drop device calls that set a value already in effect",
+			"merge consecutive text and UI quads into one draw (in HiFi XI's d3d8.dll)",
+			"drop device calls that set a value already in effect (in HiFi XI's d3d8.dll)",
 		};
 		constexpr const char *kSection = "hifps";
 
@@ -100,66 +83,22 @@ namespace hifi::game::hifps::exp
 		constexpr const char *kOcclPat = "8BBEF0090000E8????????250300008079054883C8FC403BC7";
 		constexpr uint8_t kOcclStock[12] = { 0x25, 0x03, 0x00, 0x00, 0x80, 0x79, 0x05, 0x48, 0x83, 0xC8, 0xFC, 0x40 };
 
-		// The occlusion test's start: mov eax, [renderer]; push ebx; push esi; mov esi, ecx; mov bl, [eax+828h] (walls
-		// checks its call still goes there).
-		constexpr const char *kVisTest = "A1????????53568BF18A9828080000";
-		// The actor update's call to the frame count getter, whose code is kVisGetter (the 'occlusion' toggle changes
-		// the bytes after this call, not these).
-		constexpr const char *kVisFrame = "8BBEF0090000E8";
-		constexpr const char *kVisGetter = "A1????????8B4034C3";
-
-		// walls: the actor draw's call of the occlusion test, pointed at walls.asm's entry. kWallsAt is the call's
-		// offset in the pattern.
-		// lea ecx, [esi+8F0h]; call test; cmp eax, ebp; mov [esi+9F4h], eax (the character's test object, its result)
-		constexpr const char *kWallsCall = "8D8EF0080000E8????????3BC58986F4";
-		constexpr intptr_t kWallsAt = 6;
-		// add ecx, 178h; jmp ...: the segment test, thiscall on the world renderer (from, to, hit), the collision map
-		// at +178h
-		constexpr const char *kWallsSeg = "81C178010000E9????????90909090908A442404A2????????C3";
-		// mov ecx, [renderer]; ...; call segment test; test al, al; jne (the camera's own test: the renderer global at
-		// +2, the call at +17h)
-		constexpr const char *kWallsRenderer = "8B0D????????8D94248C0000008D6F44528D4424605550E8????????84C07517";
-		// sub esp, 0D0h; ...; mov eax, [edi+60h]; ...; test eax, eax; jz (the collision core: the map's grid field, 0
-		// while no collision is loaded, is the byte at +14)
-		constexpr const char *kWallsGrid = "81ECD0000000535556578BF98B4760C7877C8001000000000085C00F84";
-		// mov eax, [gGame]; add eax, 94h / 154h; ret (the camera's view and projection; walls.asm reads them there,
-		// and the frame count at +34h)
-		constexpr const char *kWallsView = "A1????????0594000000C3";
-		constexpr const char *kWallsProj = "A1????????0554010000C3";
-		constexpr uint32_t kWallsCounters[7] = { wl::S_TESTS, wl::S_SEGS, wl::S_HIDDEN, wl::S_SHOWN, wl::S_OVER, wl::S_FALLBACK, wl::S_TICKS };
-
-		// sse: the CPU feature object (getter 'mov eax, [obj]; mov al, [eax+9]; ret'); +9 = SSE skinning.
-		constexpr const char *kSsePat = "A1????????8A4009C3";
-
-		struct walls_state
+		// batch and dedupe: in our d3d8.dll (HifiFrameSetSpeedups); its counts once a second
+		struct speedup_state
 		{
-			uintptr_t base = 0; // walls.asm's copy, kept once made (freed by stop() when nothing calls into it)
-			uintptr_t site = 0; // while on: the call
-			uint8_t backup[4] = {};
-			bool held = false;  // something else repointed the call since: the copy stays
+			uint32_t flags = 0;      // as last set (kHifiDedupe, kHifiBatch)
 			bool have_prev = false, have_rate = false;
-			uint32_t prev[7] = {}, rate[7] = {}; // tests, segments, hidden, shown, over, fallback, ticks (a second)
-		};
-
-		struct proxy_state
-		{
-			uintptr_t base = 0;         // proxy.asm's copy, kept once made
-			uintptr_t dev = 0, vt = 0;  // the client device while the proxy is on, its own vtable
-			bool held = false;          // something else replaced our vtable since: the copy stays
-			bool have_prev = false, have_rate = false;
-			uint32_t prev[3] = {}, rate[3] = {}; // skipped, merged, batches (a second)
+			uint32_t prev[4] = {}, rate[4] = {}; // dropped, quads, their draws, every draw (a second)
 		};
 
 		// The draw tap (draw_tap): the client device's four draw slots pointed at the stream log's for a few frames
 		struct tap_state
 		{
 			bool on = false;
-			bool in_proxy = false;      // in the proxy's own vtable (it's on); else our copy of the device's in front
-			uintptr_t dev = 0;          // (our copy: the device whose vtable it is, and the one it had)
+			uintptr_t dev = 0;          // the device whose vtable our copy stands in for, and the one it had
 			uint32_t vt = 0;
 			uint32_t taps[4] = {};      // what the slots hold while on
-			uint32_t saved[4] = {};     // (in the proxy: what they held)
-			uint32_t *copy = nullptr;   // (our copy: vtable[-1] then 128 slots; never freed while the device may use it)
+			uint32_t *copy = nullptr;   // (vtable[-1] then 128 slots; never freed while the device may use it)
 			bool held = false;          // something else replaced our copy on the device since: it stays
 		};
 
@@ -171,10 +110,7 @@ namespace hifi::game::hifps::exp
 			bool occl = false;                // the occlusion test's bytes (and the m written, 0: none yet; kEveryFrame)
 			uintptr_t occl_addr = 0;
 			uint32_t occl_m = 0;
-			walls_state walls;
-			bool sse = false;                 // the flag byte we set (0: it was on already)
-			uintptr_t sse_addr = 0;
-			proxy_state proxy;
+			speedup_state speed;
 			tap_state tap;
 			bool force = false;             // 'ashita' turned on although something uses the draw events
 			uintptr_t dp = 0;                 // the device wrapper's DrawPrimitive (for the plugin check)
@@ -186,7 +122,7 @@ namespace hifi::game::hifps::exp
 			uintptr_t renderer_ptr = 0;
 			// Once a second (exp_tick), from present()
 			bool timer = false;
-			double tick_at = 0.0, freq = 0.0;
+			double tick_at = 0.0;
 			// hifps on (its frame step: hifps::on()), the options as last followed
 			bool enabled = false, restore_pending = false;
 			bool wanted[kCount] = {};
@@ -245,20 +181,7 @@ namespace hifi::game::hifps::exp
 			return read(p, b.data(), n);
 		}
 
-		// Our own memory (the stubs' copies)
-		void set32(uintptr_t at, uint32_t v)
-		{
-			std::memcpy(reinterpret_cast<void *>(at), &v, 4);
-		}
-
-		uint32_t get32(uintptr_t at)
-		{
-			uint32_t v = 0;
-			std::memcpy(&v, reinterpret_cast<const void *>(at), 4);
-			return v;
-		}
-
-		// The game's data (the device's vtable pointer, the CPU flag): written as its code is
+		// The game's data (the device's vtable pointer): written as its code is
 		bool write32(uintptr_t at, uint32_t v)
 		{
 			return write_code(at, &v, 4);
@@ -289,43 +212,6 @@ namespace hifi::game::hifps::exp
 		int find_bytes(const uint8_t *t, size_t n, const int (&pat)[N])
 		{
 			return find_bytes(t, n, pat, N);
-		}
-
-		// True if the bytes at addr match a hex pattern with ?? wildcards.
-		bool bytes_match(uintptr_t addr, const char *pat)
-		{
-			const size_t n = std::strlen(pat) / 2;
-			std::vector<uint8_t> t(n);
-			if (!read(addr, t.data(), n))
-				return false;
-			for (size_t i = 0; i < n; ++i)
-			{
-				if (pat[2 * i] == '?')
-					continue;
-				const char two[3] = { pat[2 * i], pat[2 * i + 1], 0 };
-				if (t[i] != uint8_t(std::strtoul(two, nullptr, 16)))
-					return false;
-			}
-			return true;
-		}
-
-		// A stub's copy in memory of our own: its bytes, the copy's base added to every relocated word
-		uintptr_t lay_down(const uint8_t *bytes, uint32_t size, const uint32_t *relocs, size_t count, size_t alloc)
-		{
-			const uintptr_t base = alloc_code(alloc);
-			if (base == 0)
-				return 0;
-			std::memcpy(reinterpret_cast<void *>(base), bytes, size);
-			for (size_t i = 0; i < count; ++i)
-				set32(base + relocs[i], get32(base + relocs[i]) + uint32_t(base));
-			return base;
-		}
-
-		double qpc_freq()
-		{
-			LARGE_INTEGER f;
-			QueryPerformanceFrequency(&f);
-			return double(f.QuadPart);
 		}
 
 		// The client's IDirect3DDevice8 (Ashita's wrapper object): [renderer + 8]; 0 while it doesn't exist
@@ -661,7 +547,8 @@ namespace hifi::game::hifps::exp
 			const uintptr_t dev = client_device();
 			if (dev == 0)
 				return "the client device was not found";
-			const uint32_t vt = g.proxy.vt != 0 ? uint32_t(g.proxy.vt) : word(dev);
+			// (the device's own vtable: the stream log's tap may have a copy of it in front)
+			const uint32_t vt = g.tap.on && g.tap.dev == dev ? g.tap.vt : word(dev);
 			uintptr_t base = 0;
 			size_t size = 0;
 			if (!ashita_module(base, size))
@@ -818,228 +705,38 @@ namespace hifi::game::hifps::exp
 			return std::string();
 		}
 
-		// ---------------------------------------------------------------- walls
+		// ---------------------------------------------------------------- batch / dedupe: in our d3d8.dll
 
-		uintptr_t wsym(uint32_t offset)
+		// Our d3d8.dll's speed-up calls (src/host/frameapi.hpp; the host's when the tests give their own); false when the
+		// d3d8.dll loaded isn't HiFi XI's
+		bool speedup_calls(hifi_frame_set_speedups_fn &set, hifi_frame_speedup_stats_fn &stats)
 		{
-			return g.walls.base + offset;
-		}
-
-		// The player's and the target's actors (walls always shows them), and the player's status.
-		bool walls_actors(uint32_t &a, uint32_t &b, uint32_t &status)
-		{
-			a = b = status = 0;
 			if (g_host != nullptr)
-				return g_host->actors != nullptr && g_host->actors(a, b, status);
-			if (g_core == nullptr)
-				return false;
-			IMemoryManager *mm = g_core->GetMemoryManager();
-			IEntity *ent = mm != nullptr ? mm->GetEntity() : nullptr;
-			IParty *party = mm != nullptr ? mm->GetParty() : nullptr;
-			ITarget *target = mm != nullptr ? mm->GetTarget() : nullptr;
-			if (ent == nullptr || party == nullptr || target == nullptr)
-				return false;
-			const uint32_t me = party->GetMemberTargetIndex(0);
-			const uint32_t t = target->GetTargetIndex(0);
-			a = uint32_t(ent->GetActorPointer(me));
-			b = t != 0 ? uint32_t(ent->GetActorPointer(t)) : 0;
-			status = ent->GetStatus(me);
-			return true;
-		}
-
-		// Every frame while walls is on. In a cutscene (status 4) the client's own test runs: an event camera can sit
-		// inside a wall, where every line from it would be blocked.
-		void walls_keep()
-		{
-			uint32_t a = 0, b = 0, status = 0;
-			const bool known = walls_actors(a, b, status);
-			if (!known)
-				a = b = status = 0;
-			set32(wsym(wl::KEEP_A), a);
-			set32(wsym(wl::KEEP_B), b);
-			set32(wsym(wl::USE_STOCK), known && status == 4 ? 1 : 0);
-		}
-
-		std::string walls_on()
-		{
-			const uintptr_t p = find(kWallsCall);
-			if (p == 0)
-				return "the characters' test call was not found (changed client, or another addon patched it)";
-			const uintptr_t site = p + kWallsAt;
-			const uint32_t test = rel_target(site);
-			if (!bytes_match(test, kVisTest))
-				return "the characters' test call goes somewhere else (another addon hooks it)";
-			const uintptr_t seg = find(kWallsSeg), rp = find(kWallsRenderer), core = find(kWallsGrid);
-			if (seg == 0 || rp == 0 || core == 0)
-				return "the game's wall test was not found";
-			if (rel_target(rp + 0x17) != uint32_t(seg) || byte_at(core + 14) != 0x60)
-				return "the game's wall test is not as expected";
-			const uintptr_t vp = find(kWallsView), pp = find(kWallsProj), fp = find(kVisFrame);
-			if (vp == 0 || pp == 0 || fp == 0)
-				return "the camera was not found";
-			const uint32_t game = word(vp + 1);
-			const uint32_t getter = rel_target(fp + 6);
-			if (word(pp + 1) != game || !bytes_match(getter, kVisGetter) || word(getter + 1) != game)
-				return "the camera is not as expected";
-			const HMODULE k32 = GetModuleHandleA("kernel32.dll");
-			const FARPROC qpc = k32 != nullptr ? GetProcAddress(k32, "QueryPerformanceCounter") : nullptr;
-			if (qpc == nullptr)
-				return "QueryPerformanceCounter was not found";
-			if (g.walls.base == 0)
 			{
-				g.walls.base = lay_down(wl::bytes, wl::size, wl::relocs, std::size(wl::relocs), wl::size);
-				if (g.walls.base == 0)
-					return "could not allocate memory";
+				set = g_host->set_speedups;
+				stats = g_host->speedup_stats;
 			}
-			set32(wsym(wl::ORIG_TEST), test);
-			set32(wsym(wl::SEG_TEST), uint32_t(seg));
-			set32(wsym(wl::RENDERER), word(rp + 2));
-			set32(wsym(wl::GRID_OFF), 0x178 + 0x60);
-			set32(wsym(wl::GAME), game);
-			set32(wsym(wl::QPC), uint32_t(reinterpret_cast<uintptr_t>(qpc)));
-			set32(wsym(wl::BUDGET), uint32_t(std::floor(g.freq * kWallsMs / 1000)));
-			set32(wsym(wl::KEEP_A), 0);
-			set32(wsym(wl::KEEP_B), 0);
-			set32(wsym(wl::USE_STOCK), 0);
-			for (const uint32_t c : kWallsCounters)
-				set32(wsym(c), 0);
-			g.walls.have_prev = g.walls.have_rate = false;
-			uint8_t backup[4];
-			if (!read(site + 1, backup, 4))
-				return "could not write the client's code";
-			uint8_t rel[4];
-			put32(rel, uint32_t(wsym(wl::ENTRY) - (site + 5)));
-			if (!write_code(site + 1, rel, 4))
-				return "could not write the client's code";
-			std::memcpy(g.walls.backup, backup, 4);
-			g.walls.site = site;
-			walls_keep();
-			return std::string();
-		}
-
-		std::string walls_off()
-		{
-			if (g.walls.base == 0 || g.walls.site == 0)
-				return std::string();
-			// Put the call back unless something else has repointed it since.
-			if (rel_target(g.walls.site) == wsym(wl::ENTRY))
-				write_code(g.walls.site + 1, g.walls.backup, 4);
 			else
 			{
-				g.walls.held = true;
-				say("walls: something else has repointed the characters' test call since: left as it is");
+				const HMODULE d3d8 = GetModuleHandleA("d3d8.dll");
+				set = d3d8 != nullptr ? reinterpret_cast<hifi_frame_set_speedups_fn>(GetProcAddress(d3d8, kHifiFrameSetSpeedups)) : nullptr;
+				stats = d3d8 != nullptr ? reinterpret_cast<hifi_frame_speedup_stats_fn>(GetProcAddress(d3d8, kHifiFrameSpeedupStats)) : nullptr;
 			}
-			g.walls.site = 0;
-			return std::string();
+			return set != nullptr && stats != nullptr;
 		}
 
-		// ---------------------------------------------------------------- sse
-
-		std::string sse_on()
+		// The d3d8.dll told what's on now (g.on: batch, dedupe)
+		std::string speedups_follow()
 		{
-			const uintptr_t p = find(kSsePat);
-			if (p == 0)
-				return "the CPU feature flags were not found";
-			const uint32_t obj = word(word(p + 1));
-			if (obj == 0)
-				return "the CPU feature object does not exist yet";
-			if (byte_at(obj + 9) != 0)
-			{
-				g.sse = true;
-				g.sse_addr = 0;
-				say("sse: the client already uses its SSE skinning on this CPU (Intel); nothing to change.");
-				return std::string();
-			}
-			const uint8_t one = 1;
-			write_code(obj + 9, &one, 1);
-			g.sse = true;
-			g.sse_addr = obj + 9;
-			return std::string();
-		}
-
-		std::string sse_off()
-		{
-			if (g.sse && g.sse_addr != 0)
-			{
-				const uint8_t zero = 0;
-				if (byte_at(g.sse_addr) == 1)
-					write_code(g.sse_addr, &zero, 1);
-				else
-					say("sse: something else has changed the CPU's SSE flag since: left as it is");
-			}
-			g.sse = false;
-			g.sse_addr = 0;
-			return std::string();
-		}
-
-		// ---------------------------------------------------------------- batch / dedupe: the device proxy
-
-		uintptr_t psym(uint32_t offset)
-		{
-			return g.proxy.base + offset;
-		}
-
-		void proxy_flags()
-		{
-			*reinterpret_cast<volatile uint8_t *>(psym(px::F_BATCH)) = g.on[kBatch] ? 1 : 0;
-			*reinterpret_cast<volatile uint8_t *>(psym(px::F_DEDUPE)) = g.on[kDedupe] ? 1 : 0;
-		}
-
-		uintptr_t proxy_make()
-		{
-			const size_t size = px::size + 16 + kProxyBuf;
-			const uintptr_t base = lay_down(px::bytes, px::size, px::relocs, std::size(px::relocs), size);
-			if (base == 0)
-				return 0;
-			const uintptr_t buf = base + px::size + 15 - (base + px::size + 15) % 16;
-			set32(base + px::D_BUF, uint32_t(buf));
-			set32(base + px::D_BUFSIZE, kProxyBuf);
-			return base;
-		}
-
-		void tap_off();
-
-		std::string proxy_on()
-		{
-			if (g.proxy.dev != 0)
-			{
-				proxy_flags();
-				return std::string();
-			}
-			tap_off(); // (the proxy copies the device's vtable as it is now: not with the tap in it)
-			const uintptr_t dev = client_device();
-			if (dev == 0)
-				return "the client device was not found";
-			if (g.proxy.base == 0)
-			{
-				g.proxy.base = proxy_make();
-				if (g.proxy.base == 0)
-					return "could not allocate memory";
-			}
-			const uint32_t vt = word(dev);
-			const uintptr_t orig = psym(px::ORIG), vtab = psym(px::VTABLE), thunks = psym(px::THUNK_TABLE);
-			// Fresh state: nothing known, nothing pending, counters at 0.
-			std::memset(reinterpret_cast<void *>(psym(px::VALID_START)), 0, px::VALID_END - px::VALID_START);
-			for (const uint32_t n : { px::D_PENDING, px::S_SKIPPED, px::S_MERGED, px::S_BATCHES })
-				set32(psym(n), 0);
-			*reinterpret_cast<volatile uint8_t *>(psym(px::F_REC)) = 0;
-			for (uint32_t i = 0; i < 128; ++i)
-			{
-				const uint32_t f = word(vt + 4 * i);
-				const uint32_t t = get32(thunks + 4 * i);
-				set32(orig + 4 * i, f);
-				set32(vtab + 4 * i, t != 0 ? t : f);
-			}
-			set32(psym(px::VT_RTTI), word(vt - 4));
-			proxy_flags();
-			g.proxy.dev = dev;
-			g.proxy.vt = vt;
-			g.proxy.have_prev = g.proxy.have_rate = false;
-			if (!write32(dev, uint32_t(vtab)))
-			{
-				g.proxy.dev = g.proxy.vt = 0;
-				return "could not write the client device";
-			}
+			hifi_frame_set_speedups_fn set = nullptr;
+			hifi_frame_speedup_stats_fn stats = nullptr;
+			const uint32_t flags = (g.on[kDedupe] ? kHifiDedupe : 0) | (g.on[kBatch] ? kHifiBatch : 0);
+			if (!speedup_calls(set, stats))
+				return flags != 0 ? "it's done in HiFi XI's own d3d8.dll, and the game's d3d8.dll isn't it" : std::string();
+			set(flags);
+			if (flags != g.speed.flags)
+				g.speed.have_prev = g.speed.have_rate = false;
+			g.speed.flags = flags;
 			return std::string();
 		}
 
@@ -1051,17 +748,7 @@ namespace hifi::game::hifps::exp
 		{
 			if (!g.tap.on)
 				return;
-			if (g.tap.in_proxy)
-			{
-				// (the proxy's vtable is ours: its slots back, unless something else wrote them since)
-				for (uint32_t i = 0; i < 4; ++i)
-				{
-					const uintptr_t slot = psym(px::VTABLE) + 4 * (kTapFirst + i);
-					if (g.proxy.base != 0 && get32(slot) == g.tap.taps[i])
-						set32(slot, g.tap.saved[i]);
-				}
-			}
-			else if (g.tap.copy != nullptr)
+			if (g.tap.copy != nullptr)
 			{
 				// (the device's own vtable back, unless something else has replaced ours since: then our copy stays)
 				if (word(g.tap.dev) == uint32_t(reinterpret_cast<uintptr_t>(g.tap.copy + 1)))
@@ -1082,20 +769,6 @@ namespace hifi::game::hifps::exp
 			tap_off();
 			for (uint32_t i = 0; i < 4; ++i)
 				g.tap.taps[i] = uint32_t(reinterpret_cast<uintptr_t>(taps[i]));
-			if (g.proxy.dev != 0 && word(g.proxy.dev) == uint32_t(psym(px::VTABLE)))
-			{
-				// The proxy is the device's vtable: its own slots swapped (our memory, the game's thread: no write to the game)
-				for (uint32_t i = 0; i < 4; ++i)
-				{
-					const uintptr_t slot = psym(px::VTABLE) + 4 * (kTapFirst + i);
-					g.tap.saved[i] = get32(slot);
-					originals[i] = reinterpret_cast<void *>(uintptr_t(g.tap.saved[i]));
-					set32(slot, g.tap.taps[i]);
-				}
-				g.tap.in_proxy = true;
-				g.tap.on = true;
-				return true;
-			}
 			const uintptr_t dev = client_device();
 			if (dev == 0)
 			{
@@ -1113,7 +786,7 @@ namespace hifi::game::hifps::exp
 				why = "an earlier copy of the device's vtable is still in use";
 				return false;
 			}
-			// Else a copy of the device's vtable (as the proxy makes its own), the four slots ours, put in front
+			// A copy of the device's vtable, the four slots ours, put in front
 			if (g.tap.copy == nullptr)
 				g.tap.copy = static_cast<uint32_t *>(std::calloc(129, sizeof(uint32_t)));
 			if (g.tap.copy == nullptr)
@@ -1134,32 +807,10 @@ namespace hifi::game::hifps::exp
 				why = "could not write the client device";
 				return false;
 			}
-			g.tap.in_proxy = false;
 			g.tap.dev = dev;
 			g.tap.vt = vt;
 			g.tap.on = true;
 			return true;
-		}
-
-		std::string proxy_off()
-		{
-			tap_off(); // (the tap goes first: it may be in the vtable going)
-			if (g.proxy.base == 0)
-				return std::string();
-			proxy_flags();
-			if (g.on[kBatch] || g.on[kDedupe] || g.proxy.dev == 0)
-				return std::string();
-			// Put the device's own vtable back unless something else has replaced ours since.
-			if (word(g.proxy.dev) == uint32_t(psym(px::VTABLE)))
-				write32(g.proxy.dev, uint32_t(g.proxy.vt));
-			else
-			{
-				g.proxy.held = true;
-				say("batch/dedupe: something else has replaced the client device's vtable since: left as it is");
-			}
-			set32(psym(px::D_PENDING), 0);
-			g.proxy.dev = g.proxy.vt = 0;
-			return std::string();
 		}
 
 		// ---------------------------------------------------------------- the toggles
@@ -1170,9 +821,7 @@ namespace hifi::game::hifps::exp
 			{
 			case kAshita: return ashita_on();
 			case kOcclusion: return occlusion_on();
-			case kWalls: return walls_on();
-			case kSse: return sse_on();
-			default: return proxy_on();
+			default: return speedups_follow();
 			}
 		}
 
@@ -1182,9 +831,7 @@ namespace hifi::game::hifps::exp
 			{
 			case kAshita: ashita_off(); break;
 			case kOcclusion: occlusion_off(); break;
-			case kWalls: walls_off(); break;
-			case kSse: sse_off(); break;
-			default: proxy_off(); break;
+			default: speedups_follow(); break;
 			}
 		}
 
@@ -1240,32 +887,21 @@ namespace hifi::game::hifps::exp
 		{
 			if (g.occl)
 				occl_set(occl_m());
-			if (g.walls.base != 0 && g.walls.site != 0)
-			{
-				uint32_t now_w[7];
-				for (size_t i = 0; i < 7; ++i)
-					now_w[i] = get32(wsym(kWallsCounters[i]));
-				if (g.walls.have_prev)
-				{
-					for (size_t i = 0; i < 7; ++i)
-						g.walls.rate[i] = now_w[i] - g.walls.prev[i];
-					g.walls.have_rate = true;
-				}
-				std::memcpy(g.walls.prev, now_w, sizeof(now_w));
-				g.walls.have_prev = true;
-			}
 			ashita_watch();
-			if (g.proxy.dev != 0)
+			hifi_frame_set_speedups_fn set = nullptr;
+			hifi_frame_speedup_stats_fn stats = nullptr;
+			if (g.speed.flags != 0 && speedup_calls(set, stats))
 			{
-				const uint32_t now_c[3] = { get32(psym(px::S_SKIPPED)), get32(psym(px::S_MERGED)), get32(psym(px::S_BATCHES)) };
-				if (g.proxy.have_prev)
+				uint32_t now_c[4] = {};
+				stats(now_c);
+				if (g.speed.have_prev)
 				{
-					for (size_t i = 0; i < 3; ++i)
-						g.proxy.rate[i] = now_c[i] - g.proxy.prev[i];
-					g.proxy.have_rate = true;
+					for (size_t i = 0; i < 4; ++i)
+						g.speed.rate[i] = now_c[i] - g.speed.prev[i];
+					g.speed.have_rate = true;
 				}
-				std::memcpy(g.proxy.prev, now_c, sizeof(now_c));
-				g.proxy.have_prev = true;
+				std::memcpy(g.speed.prev, now_c, sizeof(now_c));
+				g.speed.have_prev = true;
 			}
 		}
 
@@ -1283,34 +919,15 @@ namespace hifi::game::hifps::exp
 			else if (n == kOcclusion && g.occl)
 				return g.occl_m == kEveryFrame ? std::string("every frame (World FX's VisTest answers the characters' test)")
 												: fmt("every %u frames at %.0f fps", 4 * (g.occl_m != 0 ? g.occl_m : 1), hifps::fps());
-			else if (n == kWalls && g.walls.base != 0 && g.walls.site != 0)
+			else if (g.speed.have_rate && hifps::fps() > 0)
 			{
-				// r: tests, segments, hidden, shown without a clear segment, over budget, the client's test, ticks (a second)
-				const uint32_t *r = g.walls.rate;
+				// (rates a second: dropped, quads, their draws, every draw)
 				const double f = hifps::fps();
-				if (!g.walls.have_rate || f <= 0)
-					return std::string();
-				const double ms = double(r[6]) * 1000 / g.freq;
-				std::string s = fmt("%.1f tests a frame, %.1f segments, %.2f ms a frame", r[0] / f, r[1] / f, ms / f);
-				if (r[1] > 0)
-					s += fmt(" (%.0f us a segment)", ms * 1000 / r[1]);
-				if (r[0] > 0)
-					s += fmt("; %.0f%% hidden", 100.0 * r[2] / r[0]);
-				if (r[4] > 0)
-					s += fmt("; %u a second over the %.1f ms budget", r[4], kWallsMs);
-				if (r[5] > 0)
-					s += fmt("; %u a second on the GPU (a cutscene, or no collision)", r[5]);
-				return s;
-			}
-			else if (n == kSse && g.sse && g.sse_addr == 0)
-				return "already on (Intel CPU)";
-			else if (g.proxy.have_rate && hifps::fps() > 0)
-			{
-				const double f = hifps::fps();
+				const uint32_t *r = g.speed.rate;
 				if (n == kBatch)
-					return fmt("%.0f quads a frame in %.0f draws", g.proxy.rate[1] / f, g.proxy.rate[2] / f);
+					return fmt("%.0f quads a frame in %.0f draws; %.0f draws a frame in all", r[1] / f, r[2] / f, r[3] / f);
 				if (n == kDedupe)
-					return fmt("%.0f calls a frame dropped", g.proxy.rate[0] / f);
+					return fmt("%.0f calls a frame dropped", r[0] / f);
 			}
 			return std::string();
 		}
@@ -1329,19 +946,8 @@ namespace hifi::game::hifps::exp
 		if (g.actors_elsewhere == on)
 			return;
 		g.actors_elsewhere = on;
-		if (on && g.on[kWalls])
-		{
-			// (at once: VisTest waits for the call)
-			g.wanted[kWalls] = false;
-			exp_toggle(kWalls, false, false);
-		}
 		if (g.occl)
 			occl_set(occl_m());
-	}
-
-	bool walls_holding()
-	{
-		return g.walls.site != 0;
 	}
 
 	void set_ashita(void *ashita_core)
@@ -1371,13 +977,10 @@ namespace hifi::game::hifps::exp
 			g.enabled = true;
 			g.restore_pending = true;
 			g.timer = false;
-			g.freq = qpc_freq();
 		}
 		bool wanted[kCount];
 		for (int n = 0; n < kCount; ++n)
-			wanted[n] = option_on(kSection, kOptions[n], true); // (each on unless turned off: the frame rate's options are on by default)
-		// (walls off while World FX's VisTest answers the characters' test: the call is VisTest's then)
-		wanted[kWalls] = wanted[kWalls] && !g.actors_elsewhere;
+			wanted[n] = option_on(kSection, kOptions[n], false); // (each off unless turned on: experimental, off by default)
 		const bool force = option_on(kSection, "ashita_force", false);
 		if (g.restore_pending)
 		{
@@ -1432,8 +1035,6 @@ namespace hifi::game::hifps::exp
 	{
 		if (!g.enabled)
 			return;
-		if (g.walls.base != 0 && g.walls.site != 0)
-			walls_keep();
 		if (!g.timer)
 		{
 			g.timer = true;
@@ -1452,10 +1053,6 @@ namespace hifi::game::hifps::exp
 		tap_off();
 		if (g.tap.copy != nullptr && !g.tap.held)
 			std::free(g.tap.copy);
-		if (g.walls.base != 0 && !g.walls.held)
-			free_code(g.walls.base);
-		if (g.proxy.base != 0 && !g.proxy.held)
-			free_code(g.proxy.base);
 		g = state();
 	}
 
@@ -1530,7 +1127,7 @@ namespace hifi::game::hifps::exp
 			lines.push_back("ashita check: the client device was not found.");
 			return lines;
 		}
-		const uintptr_t dp = word((g.proxy.vt != 0 ? uint32_t(g.proxy.vt) : word(dev)) + 4 * 70);
+		const uintptr_t dp = word((g.tap.on && g.tap.dev == dev ? g.tap.vt : word(dev)) + 4 * 70);
 		g.scan.clear();
 		std::vector<std::string> users, notes;
 		std::string checked;
@@ -1544,17 +1141,34 @@ namespace hifi::game::hifps::exp
 		return lines;
 	}
 
+	std::string state_line()
+	{
+		if (!g.enabled)
+			return "none (the frame step is off)";
+		if (g.restore_pending)
+			return "waiting for the client's device";
+		std::string on, off;
+		for (int n = 0; n < kCount; ++n)
+		{
+			std::string one = kNames[n];
+			if (n == kOcclusion && g.on[n] && g.occl_m == kEveryFrame)
+				one += " (every frame: VisTest answers the characters' test)";
+			else if (n == kAshita && g.on[n] && g.force)
+				one += " (forced)";
+			else if (!g.on[n] && !g.err[n].empty())
+				one += " (" + g.err[n] + ")";
+			std::string &list = g.on[n] ? on : off;
+			list += (list.empty() ? "" : ", ") + one;
+		}
+		return "on: " + (on.empty() ? std::string("none") : on) + "; off: " + (off.empty() ? std::string("none") : off);
+	}
+
 	sites where()
 	{
 		sites s;
-		s.walls = g.walls.base;
-		s.proxy = g.proxy.base;
-		s.walls_site = g.walls.site;
 		s.occlusion = g.occl ? g.occl_addr : 0;
-		s.sse = g.sse_addr;
-		s.device = g.proxy.dev;
-		s.vtable = g.proxy.base != 0 && g.proxy.dev != 0 ? g.proxy.base + px::VTABLE : 0;
 		s.ashita = g.ashita;
+		s.speedups = g.speed.flags;
 		return s;
 	}
 }

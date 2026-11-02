@@ -2199,6 +2199,8 @@ static std::string crash_context()
 	char line[256];
 	if (!lock.owns_lock())
 		out += "  (busy: its state couldn't be read)\n";
+	if (g.renderer != nullptr) // (where in World FX's pass the GPU got to: the renderer's own lock, not g.mutex)
+		out += g.renderer->breadcrumbs();
 	const ULONGLONG now = GetTickCount64();
 	std::snprintf(line, sizeof(line), "  in the game: %s (for %.1f s); zone %u; frame %u\n", g.in_game ? "yes" : "no",
 		g.in_game ? (now - g.in_game_since) / 1000.0 : 0.0, g.zone, g.frames);
@@ -2760,11 +2762,11 @@ namespace worldfx
 			g.renderer->release_old();
 			if (g.debug_layer)
 				gpu_crash::write_debug_messages(g.dev, addon_folder() + L"worldfx-d3d12-debug.txt");
+			// (the zone at every present, after end_frame read "in game": the frame after a character comes in never draws
+			// the last zone's grass, water or sea; the GPU hung on that in Windurst, 2026-11-02)
+			check_zone();
 			if (g.frames++ % kZoneCheckFrames == 0)
-			{
-				check_zone();
 				check_shaders();
-			}
 			constexpr uint64_t kMemoryCheckMs = 5000;
 			const uint64_t now = GetTickCount64();
 			if (now - g.memory_checked >= kMemoryCheckMs)

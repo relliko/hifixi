@@ -93,6 +93,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 namespace
@@ -175,13 +176,42 @@ namespace
 			l->Log(uint32_t(level == 2 ? Ashita::LogLevel::Error : level == 1 ? Ashita::LogLevel::Warn : Ashita::LogLevel::Info), "hifixi", text);
 	}
 
+	// The frame rate's state (hifps's frame step and speed-ups: on, the cap, which are on, the frame rate), made on the
+	// game's thread every half second (follow_frame_rate) for the GPU crash and hang reports, which are written on threads
+	// of their own: read under a lock the game's thread only holds to copy a string in, never waited on for long (the
+	// game's thread may be stopped holding it)
+	std::mutex g_rate_mutex;
+	std::string g_rate_state;
+
+	std::string rate_state()
+	{
+		for (int i = 0; i < 50; ++i)
+		{
+			if (g_rate_mutex.try_lock())
+			{
+				const std::string s = g_rate_state.empty() ? std::string("not known yet (HiFi XI's first half second)") : g_rate_state;
+				g_rate_mutex.unlock();
+				return s;
+			}
+			Sleep(1);
+		}
+		return "not read (being written as the report was)";
+	}
+
+	// The GPU crash report's section
+	std::string rate_section()
+	{
+		return "The frame rate at that moment: " + rate_state() + "\n";
+	}
+
 	// The hang report's own lines (on its thread, the game's perhaps stuck holding HiFi XI's locks: only what reads
-	// without one)
+	// without one, or waits on one a moment at most)
 	std::string hang_context()
 	{
 		std::string out;
 		out += std::string("AMD's swap chain (frame generation) in: ") + (hifi::framegen::wanted() ? "yes" : "no") + "\n";
 		out += std::string("FSR drawing (in the last quarter second): ") + (hifi::upscale::temporal_running() ? "yes" : "no") + "\n";
+		out += "The frame rate (as of the last half second it ran): " + rate_state() + "\n";
 		return out;
 	}
 
@@ -272,6 +302,7 @@ class hifixi final : public IPlugin
 	std::vector<std::string> m_overlay; // (the debug overlay's lines, made again every half second; empty: off)
 	std::string m_gpu_line;
 	std::string m_rate_line; // (the last status's frame-rate line: /hifi status puts it in the chat)
+	std::string m_rate_logged; // (the frame rate's state as hifixi.log last had it)
 	double m_since = 0.0;
 	bool m_menu = false;
 	double m_next_update = 0.0;  // (the game-side parts follow their options every half second)
@@ -786,6 +817,22 @@ class hifixi final : public IPlugin
 		return true;
 	}
 
+	// The frame rate's state (hifps's frame step: on, the cap; its speed-ups: which are on, why one isn't) into hifixi.log
+	// at start and whenever it changes, and kept with the frame rate now for the GPU crash and hang reports
+	void follow_frame_rate()
+	{
+		const std::string state = "frame step " + hifi::game::hifps::state_line() + "; speed-ups " + hifi::game::hifps::exp::state_line();
+		if (state != m_rate_logged)
+		{
+			m_rate_logged = state;
+			hifi::backend::log(0, ("HiFi XI: frame rate: " + state).c_str());
+		}
+		char now[48];
+		std::snprintf(now, sizeof(now), "; %.0f fps", hifi::game::hifps::fps());
+		const std::lock_guard<std::mutex> lock(g_rate_mutex);
+		g_rate_state = state + now;
+	}
+
 	// The debug overlay's lines (Advanced: "Show what's drawing on screen"), made again every half second
 	void follow_overlay()
 	{
@@ -806,6 +853,7 @@ class hifixi final : public IPlugin
 		std::snprintf(line, sizeof(line), "FSR: %s; scenery per pixel: %s; the GPU: %s", hifi::upscale::temporal_running() ? "drawing" : "not drawing",
 			hifi::game::option_on("zone", "perpixel", hifi::zone::options::kPerPixelByDefault) ? "on" : "off", gpu_crash::lost() ? "LOST" : "running");
 		m_overlay.push_back(line);
+		m_overlay.push_back("Frame rate: " + m_rate_logged);
 		for (const std::string &l : worldfx::overlay_lines())
 			m_overlay.push_back(l);
 	}
@@ -950,9 +998,9 @@ public:
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&now_seconds), &self);
 		hifi::backend::set_log_sink(ashita_log);
 		hifi::game::hifps::exp::set_ashita(core);
-		// (the characters' visibility test: World FX's VisTest takes it from walls, and gives it back)
-		hifi::game::feed::set_actor_handoff(hifi::game::hifps::exp::set_actors_elsewhere, hifi::game::hifps::exp::walls_holding);
-		// (the stream log's view of the game's draws: a tap on the client device, the hifps proxy's slots when it's in)
+		// (the characters' visibility test: answered by World FX's VisTest, occlusion tests every frame then)
+		hifi::game::feed::set_actor_handoff(hifi::game::hifps::exp::set_actors_elsewhere);
+		// (the stream log's view of the game's draws: a tap on the client device, a copy of its vtable in front)
 		hifi::backend::streamlog::set_d3d8_tap(hifi::game::hifps::exp::draw_tap, hifi::game::hifps::exp::draw_untap);
 		// (the zone pass's begin and end to the native zone draw)
 		hifi::game::zoneslot::set_listener(hifi::game::zonedraw::on_slot);
@@ -961,6 +1009,7 @@ public:
 		hifi::bake::runner::start(hifi::backend::folder());
 		hifi::hangwatch::start(hifi::backend::folder(), hifi::backend::log, hang_context);
 		gpu_crash::add_section(hifi::zone::breadcrumb_report); // (the native zone pass's breadcrumbs in a GPU crash report)
+		gpu_crash::add_section(rate_section);                   // (and the frame rate's state: on, the cap, the speed-ups)
 		return true;
 	}
 
@@ -1227,6 +1276,7 @@ public:
 			m_next_update = now + 0.5;
 			hifi::game::hifps::update();
 			hifi::game::hifps::exp::update();
+			follow_frame_rate();
 			hifi::game::drawcull::update();
 			follow_zoneslot();
 			follow_charslot(); // (native characters)

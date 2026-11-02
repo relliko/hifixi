@@ -25,6 +25,9 @@
  * And HiFi XI drawing into the frame: at the zone's end marker, inside the hook (the thread quiet, as backend.cpp
  * draws), other heaps, root signature, targets, viewport and topology are set, then the state the hooks saw put back
  * (as grass::list_state does). The frame read back must be the same, pixel for pixel, as without it.
+ * Then the direct channel (HifiFrameMark), the float world (HifiFrameSetWorldFormat) and the frame-rate speed-ups
+ * (HifiFrameSetSpeedups): an interface-like run of quads the same, pixel for pixel, with dedupe and batch on, in fewer
+ * draws.
  */
 
 #include "../src/host/hooks.hpp"
@@ -808,6 +811,151 @@ int main(int argc, char **argv)
 			check(g_float.begun && g_float.begin.rt_format == DXGI_FORMAT_R8G8B8A8_UNORM && g_float.begin.rt->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_TYPELESS,
 				"... asked back to 8 bits: A RGBA8 again at the next zone's begin");
 			set(nullptr, nullptr);
+		}
+	}
+	// The frame-rate speed-ups (HifiFrameSetSpeedups): an interface-like run of quads drawn with them off, with dedupe
+	// and batch, and with batch alone must read back the same, pixel for pixel; batched, it takes fewer draws on the list.
+	// In the run: quads that overlap (blended: order shows), the same shader and texture set again before each (dropped
+	// by dedupe), a stage op changed mid-run, the texture locked and rewritten mid-run (the quads before keep its old
+	// texels), flat shading (not batched), a fan (not a quad), a stencil-only marker clear, two quads reading a render
+	// target as the resolve does (not batched)
+	{
+		const auto set_speedups = reinterpret_cast<hifi_frame_set_speedups_fn>(GetProcAddress(m, kHifiFrameSetSpeedups));
+		const auto speedup_stats = reinterpret_cast<hifi_frame_speedup_stats_fn>(GetProcAddress(m, kHifiFrameSpeedupStats));
+		check(set_speedups != nullptr && speedup_stats != nullptr, "the d3d8.dll exports HifiFrameSetSpeedups and HifiFrameSpeedupStats");
+		IDirect3DTexture8 *ui = nullptr;
+		dev->CreateTexture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &ui);
+		auto fill_ui = [&](uint32_t c) {
+			D3DLOCKED_RECT lr;
+			if (ui != nullptr && SUCCEEDED(ui->LockRect(0, &lr, nullptr, 0)))
+			{
+				for (int y = 0; y < 16; ++y)
+					for (int x = 0; x < 16; ++x)
+						reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(lr.pBits) + size_t(y) * lr.Pitch)[x] = (x + y) % 3 == 0 ? 0x40FFFFFFu : c;
+				ui->UnlockRect(0);
+			}
+		};
+		auto glyphs = [&](int n, float y, uint32_t seed) {
+			for (int i = 0; i < n; ++i)
+			{
+				const DWORD c = 0x80000000u | ((seed * 2654435761u + uint32_t(i) * 40503u) & 0xFFFFFFu);
+				dev->SetTexture(0, ui);
+				quad_rhw(30.0f + 23.0f * i, y, 70.0f + 23.0f * i, y + 50.0f, c); // (40 wide, 23 apart: each over the last)
+			}
+		};
+		auto run = [&](uint32_t flags, uint32_t &d3d12_draws, uint32_t stats_out[4]) {
+			if (set_speedups != nullptr)
+				set_speedups(flags);
+			uint32_t s0[4] = {};
+			if (speedup_stats != nullptr)
+				speedup_stats(s0);
+			fill_ui(0xC040C080);
+			const uint32_t d0 = uint32_t(draws);
+			dev->BeginScene();
+			dev->SetRenderTarget(A, Az);
+			D3DVIEWPORT8 vp = { 0, 0, AW, AH, 0.0f, 1.0f };
+			dev->SetViewport(&vp);
+			dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF101820, 1.0f, 0);
+			dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+			dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+			dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+			glyphs(30, 40, 1);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+			glyphs(10, 100, 2);
+			dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+			glyphs(10, 160, 3);
+			fill_ui(0xC0E04020); // (mid-run: the ten before keep the old texels)
+			glyphs(10, 160, 4);
+			dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_FLAT);
+			glyphs(5, 220, 5);
+			dev->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+			glyphs(5, 280, 6);
+			const VR fan[5] = { { 400, 400, 0, 1, 0xC0FF8000, 0.5f, 0.5f }, { 340, 340, 0, 1, 0xC000FF80, 0, 0 }, { 460, 340, 0, 1, 0xC08000FF, 1, 0 },
+				{ 460, 460, 0, 1, 0xC0FFFFFF, 1, 1 }, { 340, 460, 0, 1, 0xC0404040, 0, 1 } };
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 3, fan, sizeof(VR));
+			glyphs(8, 340, 7);
+			const D3DRECT pixel = { 1000, 10, 1001, 11 };
+			dev->Clear(1, &pixel, D3DCLEAR_STENCIL, 0, 1.0f, 3); // (a slot marker's clear: the quads before it drawn first)
+			glyphs(8, 400, 8);
+			// (two quads reading a render target, as the resolve does: drawn as they are, never batched)
+			dev->SetTexture(0, test_tex);
+			quad_rhw(600, 300, 700, 380, 0xC0FFFFFF);
+			quad_rhw(650, 320, 750, 400, 0xC0FFFFFF);
+			dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+			dev->SetTexture(0, nullptr);
+			dev->EndScene();
+			const RECT whole = { 0, 0, LONG(AW), LONG(AH) };
+			const POINT p0 = { 0, 0 };
+			dev->CopyRects(A, &whole, 1, out, &p0);
+			std::vector<uint32_t> px(size_t(AW) * AH);
+			D3DLOCKED_RECT o;
+			if (SUCCEEDED(out->LockRect(&o, nullptr, D3DLOCK_READONLY)))
+			{
+				for (UINT y = 0; y < AH; ++y)
+					std::memcpy(px.data() + size_t(y) * AW, static_cast<const uint8_t *>(o.pBits) + size_t(y) * o.Pitch, AW * 4);
+				out->UnlockRect();
+			}
+			d3d12_draws = uint32_t(draws) - d0;
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+			if (speedup_stats != nullptr)
+			{
+				speedup_stats(stats_out);
+				for (int i = 0; i < 4; ++i)
+					stats_out[i] -= s0[i];
+			}
+			return px;
+		};
+		if (set_speedups != nullptr && speedup_stats != nullptr && ui != nullptr)
+		{
+			check(set_speedups(kHifiSpeedupsAsk) == 0, "... off until asked");
+			uint32_t n_off = 0, n_both = 0, n_batch = 0, s_off[4] = {}, s_both[4] = {}, s_batch[4] = {};
+			const std::vector<uint32_t> off = run(0, n_off, s_off);
+			const std::vector<uint32_t> both = run(kHifiDedupe | kHifiBatch, n_both, s_both);
+			const std::vector<uint32_t> batch = run(kHifiBatch, n_batch, s_batch);
+			size_t same_both = 0, same_batch = 0;
+			for (size_t i = 0; i < off.size(); ++i)
+			{
+				same_both += off[i] == both[i];
+				same_batch += off[i] == batch[i];
+			}
+			char said[240];
+			std::snprintf(said, sizeof(said), "... the quads read back the same with dedupe and batch (%zu of %zu pixels) and with batch alone (%zu)", same_both, off.size(), same_batch);
+			check(same_both == off.size() && same_batch == off.size(), said);
+			std::snprintf(said, sizeof(said), "... batched: %u draws on the list against %u (quads batched %u, in %u draws; flat-shaded ones, the fan and "
+				"the render target's drawn as they are)", n_both, n_off, s_both[1], s_both[2]);
+			// (88 quads, 5 of them flat and 2 reading a render target: 81 batched in 7 draws, cut by the two op changes, the
+			// lock, flat shading, the fan, the marker and the render target's texture)
+			check(s_off[1] == 0 && s_both[1] == 81 && s_both[2] == 7 && n_both + 74 == n_off && n_batch == n_both, said);
+			std::snprintf(said, sizeof(said), "... dedupe dropped the shader and texture set again (%u calls; %u without it)", s_both[0], s_batch[0]);
+			check(s_both[0] >= 2 * 86 - 10 && s_batch[0] == 0 && s_off[0] == 0, said);
+			// Batch turned off with quads waiting: they're drawn there and then
+			set_speedups(kHifiBatch);
+			dev->BeginScene();
+			dev->SetRenderTarget(A, Az);
+			dev->SetTexture(0, ui);
+			const uint32_t before = uint32_t(draws);
+			uint32_t stats_before[4] = {};
+			speedup_stats(stats_before);
+			glyphs(3, 40, 9);
+			const uint32_t waiting = uint32_t(draws) - before;
+			set_speedups(0);
+			const uint32_t after = uint32_t(draws) - before;
+			uint32_t stats_after[4] = {};
+			speedup_stats(stats_after);
+			dev->SetTexture(0, nullptr);
+			dev->EndScene();
+			dev->Present(nullptr, nullptr, nullptr, nullptr);
+			std::snprintf(said, sizeof(said), "... turned off with 3 quads waiting: drawn at once (%u draws before, %u after; %u batches)", waiting, after, stats_after[2] - stats_before[2]);
+			check(waiting == 0 && after == 1 && stats_after[2] - stats_before[2] == 1, said);
+			ui->Release();
 		}
 	}
 	std::printf("%s (%d failed)\n", failures == 0 ? "all passed" : "FAILED", failures);

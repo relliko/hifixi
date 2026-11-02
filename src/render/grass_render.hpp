@@ -17,6 +17,7 @@
 #include "vistest.hpp"
 #include <d3d12.h>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -643,6 +644,11 @@ namespace grass
 		const std::vector<gpu_section> &gpu_sections() const { return _sections; }
 		uint32_t frames_timed() const { return _frames_timed; }
 		void reset_timing() { _shading_ms = _grass_ms = 0.0f; _sections.clear(); _frames_timed = 0; }
+		// The GPU's breadcrumbs, for a GPU crash report (the native zone pass's way: zone_renderer::breadcrumbs): at each
+		// section's marker one write as the GPU's command processor reaches it and one once everything before it has
+		// finished, into memory the CPU still reads after the device is lost; the section names of the last few
+		// drawings kept to name them. Lines for the report; empty without them (no WriteBufferImmediate, WARP's).
+		std::string breadcrumbs() const;
 		// Replaces the shaders with ones compiled from this source (the built-in ones: src/render/grass.hlsl); false
 		// and the compiler's messages in error, keeping the ones in use, when it doesn't compile
 		bool set_shader_source(const std::string &source, std::string &error);
@@ -1006,8 +1012,21 @@ namespace grass
 		UINT _mark_count[kTimingSlots] = {}, _shade_end[kTimingSlots] = {};
 		std::vector<gpu_section> _sections;
 		uint32_t _frames_timed = 0;
-		// A section starting: the GPU crash report's marker, and a timestamp
+		// A section starting: the GPU crash report's marker, a timestamp and a breadcrumb
 		void section(ID3D12GraphicsCommandList *list, const wchar_t *name);
+		// The drawing's end: its marker and breadcrumb ("worldfx: end"); the next section starts the next drawing's
+		void mark_end(ID3D12GraphicsCommandList *list);
+		// The breadcrumbs (breadcrumbs()): made in init when the device can write them; one at a marker
+		void make_breadcrumbs();
+		void crumb(ID3D12GraphicsCommandList *list, const wchar_t *name);
+		static constexpr uint32_t kCrumbRuns = 8, kCrumbMarks = 64; // (drawings kept, sections named in each)
+		ID3D12Resource *_crumbs = nullptr;               // (a custom heap in system memory, written back)
+		const volatile uint32_t *_crumb_words = nullptr; // [0] reached, [1] everything before it finished: drawing << 16 | marker
+		uint32_t _crumb_run = 0;                         // (the drawing the markers go to now, counted)
+		uint32_t _crumb_tag[kCrumbRuns] = {};            // (each slot's drawing's low 16 bits)
+		uint32_t _crumb_count[kCrumbRuns] = {};
+		const wchar_t *_crumb_names[kCrumbRuns][kCrumbMarks] = {};
+		mutable std::mutex _crumb_mutex;
 		static constexpr UINT kActorSlots = 8; // upload buffers for the actors, used in turn (frames in flight; two draws a frame)
 		ID3D12Resource *_actors[kActorSlots] = {}; // the actors near, a draw's in each in turn (upload heaps, mapped)
 		float *_actor_data[kActorSlots] = {};

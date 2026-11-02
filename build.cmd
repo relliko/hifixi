@@ -301,18 +301,12 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   tests\hifps_step_test.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\hifps_step_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\hifps_step_test.exe
-rem hifps's speed-ups against hifps.lua under lupa (tests\hifps_exp_lua.py), with the addon's own walls stub harness
-rem (read from its folder, 32-bit, no CRT): build\hifps_exp_test.exe, build\test_hifps_exp\walls_harness.exe
+rem hifps's speed-ups against hifps.lua under lupa (tests\hifps_exp_lua.py): build\hifps_exp_test.exe
 if not exist build\test_hifps_exp mkdir build\test_hifps_exp
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\hifps_exp_test.cpp src\game\hifps\exp.cpp src\game\game.cpp /Fo"build\test_hifps_exp\\" ^
   /Fe"build\hifps_exp_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\hifps_exp_test.exe
-set "HIFPS=C:\Games\PhoenixXI\addons\hifps\proxy"
-cl /nologo /O1 /GS- /W3 /wd4164 /c "%HIFPS%\walls_harness.c" /Fo"build\test_hifps_exp\walls_harness.obj" || exit /b 1
-link /nologo /subsystem:console /entry:main /nodefaultlib build\test_hifps_exp\walls_harness.obj kernel32.lib user32.lib ^
-  /out:build\test_hifps_exp\walls_harness.exe || exit /b 1
-echo Built build\test_hifps_exp\walls_harness.exe
 rem The zone files made on their thread as zones are entered, into a folder of the test's own: build\runner_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\runner_test.cpp %BAKE% src\game\game.cpp /Fo"build\test\\" /Fe"build\runner_test.exe" /link /NOLOGO user32.lib || exit /b 1

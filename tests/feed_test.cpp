@@ -331,6 +331,32 @@ namespace
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			check(env("FFXI_WORLDFX_ZONE") == "101", "out again: the party's zone (101)");
+
+			// Zoning, the party's zone still the last one after (Windurst, 2026-11-02 03:17): "in" waits for the zone-in packet
+			p.in_game = false;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			check(env("FFXI_WORLDFX_INGAME") == "0", "zoning: out");
+			p.in_game = true;
+			now += 0.5;
+			hifi::game::feed::frame(e, p, now);
+			check(env("FFXI_WORLDFX_INGAME") == "0" && env("FFXI_WORLDFX_ZONE") == "101", "  in again, the party's zone the last one: not told in yet");
+			zone_in[0x30] = 238;
+			hifi::game::feed::packet_in(0x00A, zone_in.data(), uint32_t(zone_in.size()), e);
+			now += 0.02;
+			hifi::game::feed::frame(e, p, now);
+			check(env("FFXI_WORLDFX_ZONE") == "238" && env("FFXI_WORLDFX_INGAME") == "1", "  the zone-in packet's zone (238), then in, the same frame");
+			p.zone = 238;
+			p.in_game = false;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			p.in_game = true;
+			now += 1.0;
+			hifi::game::feed::frame(e, p, now);
+			const bool held = env("FFXI_WORLDFX_INGAME") == "0";
+			now += 3.0;
+			hifi::game::feed::frame(e, p, now);
+			check(held && env("FFXI_WORLDFX_INGAME") == "1", "  no zone-in packet: in after 3 s all the same");
 		}
 
 		// 3. A weapon skill's action packet: user 6, skill 20 (an area skill, radius 10), targets 5 (3 yalms off) and 9 (57)
@@ -542,32 +568,26 @@ namespace
 					test = hifi::game::rel_target(sites[i]);
 			}
 			check(found && hifi::game::rel_target(sites[4]) == test, "the five visibility test calls found (the characters' too, to the same test)");
-			static std::vector<int> told; // (the stand-in walls: what it was told; holding while g_holding)
-			static bool g_holding = true;
+			static std::vector<int> told; // (the stand-in occlusion: what it was told)
 			told.clear();
-			hifi::game::feed::set_actor_handoff([](bool on) { told.push_back(on ? 1 : 0); }, []() { return g_holding; });
+			hifi::game::feed::set_actor_handoff([](bool on) { told.push_back(on ? 1 : 0); });
 			g_settings["VisTest"] = "1";
-			now += 1.0;
-			hifi::game::feed::frame(e, p, now);
-			const bool waited = found && hifi::game::rel_target(sites[0]) == test && hifi::game::rel_target(sites[4]) == test && !told.empty() && told.back() == 1;
-			g_holding = false;
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			bool pointed = found;
 			for (int i = 0; i < 5 && found; ++i)
 				pointed = pointed && hifi::game::rel_target(sites[i]) == 0x31000000u + uint32_t(i) * 0x10;
-			check(waited, "VisTest on while walls holds the characters' call: walls told to let go, nothing pointed yet");
-			check(pointed && g_sent.vis_original == test && g_sent.vis_on == 1 && told.back() == 1,
-				"once it has: each call pointed at World FX's entry for its kind (the characters' as actors), World FX told the game's test");
+			check(pointed && g_sent.vis_original == test && g_sent.vis_on == 1 && told.size() == 1 && told.back() == 1,
+				"VisTest on: each call pointed at World FX's entry for its kind (the characters' as actors) at once, World FX told the game's "
+				"test, occlusion told the characters' test is answered elsewhere");
 			g_settings["VisTest"] = "0";
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			bool back = found;
 			for (int i = 0; i < 5 && found; ++i)
 				back = back && hifi::game::rel_target(sites[i]) == test;
-			check(back && g_sent.vis_on == 0 && told.back() == 0, "VisTest off: the calls back to the game's test, the characters' given back to walls");
-			hifi::game::feed::set_actor_handoff(nullptr, nullptr);
-			g_holding = true;
+			check(back && g_sent.vis_on == 0 && told.back() == 0, "VisTest off: the calls back to the game's test, occlusion told so");
+			hifi::game::feed::set_actor_handoff(nullptr);
 		}
 
 		// 8. The game's water and rain: routed as their settings say (their own tests check the routines and lists)
@@ -685,7 +705,7 @@ namespace
 		// 11. Status, then everything put back
 		{
 			const std::vector<std::string> s = hifi::game::feed::status();
-			check(s.size() >= 8 && s[0].find("zone 101") != std::string::npos, "the status lines (the zone first)");
+			check(s.size() >= 8 && s[0].find("zone 238") != std::string::npos, "the status lines (the zone first)");
 		}
 		hifi::game::feed::stop();
 		check(env("FFXI_WORLDFX_ZONE") == "(none)" && env("FFXI_WORLDFX_INGAME") == "(none)", "stopped: the zone and in game taken out of the environment");

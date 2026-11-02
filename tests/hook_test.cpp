@@ -548,6 +548,41 @@ int main(int argc, char **argv)
 		alloc_e->Release();
 	}
 
+	// A thread quiet for good (AMD's frame generation threads: framegen::set_thread_start): its resets and barriers not
+	// told, so nothing of the backend's (World FX's lock) is taken there; other threads told as before
+	{
+		static int resets = 0, barriers = 0;
+		static hifi::host::events e;
+		e.reset = [](ID3D12GraphicsCommandList *) { resets++; };
+		e.barrier = [](ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *) { barriers++; };
+		hifi::host::set_events(&e);
+		auto reset_and_barrier = [&]() {
+			ID3D12CommandAllocator *a = nullptr;
+			ID3D12GraphicsCommandList *l = nullptr;
+			device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+			device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
+			l->Close();
+			l->Reset(a, nullptr);
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+			l->ResourceBarrier(1, &b);
+			l->Close();
+			l->Release();
+			a->Release();
+		};
+		bool quiet_there = false;
+		std::thread amd([&]() {
+			hifi::host::quiet_thread();
+			quiet_there = hifi::host::is_quiet();
+			reset_and_barrier();
+		});
+		amd.join();
+		check(quiet_there && resets == 0 && barriers == 0, "a thread quiet for good: its reset and barrier not told");
+		reset_and_barrier();
+		check(!hifi::host::is_quiet() && resets == 1 && barriers == 1, "  this thread told as before");
+		hifi::host::set_events(nullptr);
+	}
+
 	// List A again, reset now: known from here on
 	hifi::host::reset_stats();
 	alloc_a->Reset();

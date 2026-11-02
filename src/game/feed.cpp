@@ -177,9 +177,10 @@ namespace hifi::game::feed
 		// frame. With World FX's VisTest setting on, these calls go to its entries (worldfx_vis_entry), which answer
 		// from its copy of the world's depth a few frames late, without waiting; the game's own test still runs while
 		// none come in. Characters' and monsters' too (0CC688, the actor draw; their test every frame then, as hifps's
-		// occlusion has it: set_actor_handoff), in place of hifps's walls, which guessed from the zone's collision and
-		// hid characters behind walls that weren't drawn there (in game, 2026-10-26): optional, the other four work
-		// without it. Put back when the setting goes off, and on unload.
+		// occlusion has it: set_actor_handoff): the one way HiFi XI answers it (hifps's walls, which guessed from the
+		// zone's collision and hid characters behind walls that weren't drawn there, in game 2026-10-26, is gone:
+		// docs/frame-rate.md); optional, the other four work without it. While World FX doesn't draw, the game's own
+		// test, at occlusion's rate. Put back when the setting goes off, and on unload.
 		struct vis_site_info
 		{
 			const char *name, *pattern;
@@ -218,7 +219,6 @@ namespace hifi::game::feed
 		};
 		vis_state g_vis;
 		void (*g_actors_elsewhere)(bool) = nullptr;
-		bool (*g_walls_holding)() = nullptr;
 
 		// The Mog House: the party data keeps the town's zone there, so World FX drew the town's grass, water and
 		// shadows in the room (in game, 2026-10-21). The zone-in packet (0x00A, read only) says where you are: its login
@@ -226,9 +226,19 @@ namespace hifi::game::feed
 		// model, past every zone id, a zone it has nothing baked for; lamps still glow, and the game keeps its own water
 		// and rain.
 		constexpr uint32_t kMogHouseZone = 1000;
+		// After zoning the party data kept the last zone for seconds: World FX drew West Sarutabaruta's grass in Windurst
+		// 2.4 s after the character was in, and the GPU hung on it (Alex, 2026-11-02 03:17). So the zone comes from the
+		// zone-in packet (+0x30, ZoneNo) when there's one, and after a zone change World FX is told the character is in
+		// only once that packet has come (or kZoneInWait seconds have gone by: the party's zone then, as before).
+		constexpr double kZoneInWait = 3.0;
 		struct zone_state
 		{
 			uint32_t mog_house = 0; // (the room's model + 1, while in one; 0 not)
+			uint32_t packet = 0;    // (the last zone-in packet's zone; 0 none yet)
+			uint32_t packets = 0;   // (zone-in packets seen)
+			uint32_t packets_out = 0; // (... when the character was last out: a newer one says where they're in)
+			bool waiting = false;   // (out since the last zone-in packet: World FX not told "in" until it comes)
+			double in_since = -1.0; // (when the game said in, while waiting)
 			uint32_t last = 0;      // (told to World FX; 0 none yet)
 			int in_game = -1;       // (told: 1, 0; -1 not yet)
 			double next_check = 0.0;
@@ -842,7 +852,7 @@ namespace hifi::game::feed
 			g_vis.sites.clear();
 			g_vis.actors = false;
 			if (g_actors_elsewhere != nullptr)
-				g_actors_elsewhere(false); // (walls may have it again)
+				g_actors_elsewhere(false); // (the game's own test again, at occlusion's rate)
 		}
 
 		bool vis_on(std::string &why)
@@ -920,16 +930,12 @@ namespace hifi::game::feed
 			const bool want = setting_on("VisTest", true) && worldfx_drawing() != 0;
 			if (want && g_vis.sites.empty() && !g_vis.tried)
 			{
-				// (the characters' call: walls told to let go, the calls taken once it has, a half second on at most)
-				if (g_actors_elsewhere != nullptr)
-					g_actors_elsewhere(true);
-				if (g_walls_holding != nullptr && g_walls_holding())
-					return;
 				g_vis.tried = true;
 				std::string why;
 				g_vis.why = vis_on(why) ? std::string() : why;
-				if (g_actors_elsewhere != nullptr && !g_vis.actors)
-					g_actors_elsewhere(false); // (not VisTest's after all: walls may have it again)
+				// (the characters' test answered here: occlusion has every character tested every frame)
+				if (g_actors_elsewhere != nullptr)
+					g_actors_elsewhere(g_vis.actors);
 			}
 			else if (!want)
 			{
@@ -955,7 +961,7 @@ namespace hifi::game::feed
 				std::snprintf(since, sizeof(since), "%u ms ago", b[6]);
 			std::snprintf(line, sizeof(line), "answered from World FX's depth copy %u times, by the game's own test %u; %u boxes tested on the GPU, %u answers back (last %s), %u objects known, %u dropped; asked by glows %u, fades %u, the flare %u, doors %u; characters: %s",
 				b[0], b[1], b[2], b[3], since, b[4], b[5], b[7], b[8], b[9], b[10],
-				g_vis.actors ? "answered here too (every frame)" : ("left to hifps (" + (g_vis.actors_why.empty() ? std::string("not taken") : g_vis.actors_why) + ")").c_str());
+				g_vis.actors ? "answered here too (every frame)" : ("the game's own (" + (g_vis.actors_why.empty() ? std::string("not taken") : g_vis.actors_why) + ")").c_str());
 			return line;
 		}
 
@@ -1018,7 +1024,35 @@ namespace hifi::game::feed
 
 	void frame(const entities &e, const party &p, double now)
 	{
-		publish_in_game(p.in_game);
+		// The zone first, every frame (World FX reads it before it draws); 0 while zoning: the last zone stays, so World
+		// FX doesn't load its files again for nothing
+		uint32_t zone = g_zone.packet != 0 ? g_zone.packet : p.zone;
+		if (zone != 0 && g_zone.mog_house != 0)
+			zone = kMogHouseZone + (g_zone.mog_house - 1);
+		if (zone != 0 && zone != g_zone.last)
+		{
+			g_zone.last = zone;
+			publish_zone(zone);
+			glows::zone_changed(); // (the last zone's entities: looked for again)
+		}
+		// In game: after being out, once the zone-in packet has said where (World FX draws nothing till then)
+		bool in = p.in_game;
+		if (!p.in_game && g_zone.in_game == 1)
+		{
+			g_zone.waiting = true;
+			g_zone.packets_out = g_zone.packets;
+			g_zone.in_since = -1.0;
+		}
+		if (in && g_zone.waiting)
+		{
+			if (g_zone.in_since < 0.0)
+				g_zone.in_since = now;
+			if (g_zone.packets != g_zone.packets_out || now - g_zone.in_since >= kZoneInWait)
+				g_zone.waiting = false;
+			else
+				in = false;
+		}
+		publish_in_game(in);
 		send_actors(e, p, now);
 		send_lamps();
 		glows::frame(e, now);
@@ -1033,16 +1067,6 @@ namespace hifi::game::feed
 		glows::find_code();
 		find_weather();
 		find_moon();
-		// (0 while zoning: the last zone stays, so World FX doesn't load its files again for nothing)
-		uint32_t zone = p.zone;
-		if (zone != 0 && g_zone.mog_house != 0)
-			zone = kMogHouseZone + (g_zone.mog_house - 1);
-		if (zone != 0 && zone != g_zone.last)
-		{
-			g_zone.last = zone;
-			publish_zone(zone);
-			glows::zone_changed(); // (the last zone's entities: looked for again)
-		}
 		follow_settings();
 		gamewater::update(g_zone.last);
 		gamerain::update(g_zone.last);
@@ -1061,12 +1085,15 @@ namespace hifi::game::feed
 		if (id != 0x00A || size < 0xAC)
 			return;
 		g_zone.mog_house = data[0x80] == 1 ? uint32_t(data[0xAA] | (data[0xAB] << 8)) + 1 : 0;
+		const uint32_t zone = uint32_t(data[0x30] | (data[0x31] << 8)); // (ZoneNo: a 32-bit field, zone ids fit 16)
+		if (zone != 0 && zone < kMogHouseZone)
+			g_zone.packet = zone;
+		++g_zone.packets;
 	}
 
-	void set_actor_handoff(void (*elsewhere)(bool on), bool (*walls_holding)())
+	void set_actor_handoff(void (*elsewhere)(bool on))
 	{
 		g_actors_elsewhere = elsewhere;
-		g_walls_holding = walls_holding;
 	}
 
 	void stop()

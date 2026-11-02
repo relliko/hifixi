@@ -5,13 +5,13 @@
 // off (hifps::on(), step.hpp: nothing of this while it's off, as the addon's "Enable hifps first") and on stop().
 //   ashita     Ashita's per-draw plugin dispatch skipped (its four draw methods' je to jmp), refused while a loaded
 //              addon or plugin uses the draw events unless ashita_force; turned off again by a newcomer that does
-//   occlusion  the characters' behind-a-wall readback every 4m-th frame above 60fps
-//   walls      that test answered from the zone's collision (walls.asm) instead of the GPU readback
-//   sse        the client's SSE skinning on non-Intel CPUs
-//   batch      consecutive text and UI quads merged into one draw (proxy.asm, the client device's vtable)
-//   dedupe     device calls that set a value already in effect dropped (the same proxy)
-// The options are [hifps] ashita_force (off by default) and exp_<name> (all on by default: the frame rate's options
-// are on in every preset).
+//   occlusion  the characters' behind-a-wall readback every 4m-th frame above 60fps; every frame while World FX's
+//              VisTest answers it (set_actors_elsewhere)
+//   batch      consecutive text and UI quads drawn as one draw, in HiFi XI's d3d8.dll (HifiFrameSetSpeedups)
+//   dedupe     device calls that set a value already in effect dropped, in the same d3d8.dll
+// The options are [hifps] ashita_force and exp_<name>, all off by default (experimental; no preset turns them on;
+// each player's were turned off once in 0.65). docs/frame-rate.md has what each saves, measured, and why hifps's
+// walls, sse and its asm device proxy aren't here any more.
 
 #include "../game.hpp"
 #include <cstddef>
@@ -21,34 +21,32 @@
 
 namespace hifi::game::hifps::exp
 {
-	// IAshitaCore* from the plugin (the player's and the target's actors for walls; the plugin count and Ashita's
-	// folder for the 'ashita' check); may be nullptr
+	// IAshitaCore* from the plugin (the plugin count and Ashita's folder for the 'ashita' check); may be nullptr
 	void set_ashita(void *ashita_core);
 	// Every half second (after hifps::update()): follows hifps::on() and the options, turning toggles on and off (the
 	// saved ones once the client's device exists, as hifps's restore_exp)
 	void update();
-	// Every present (now: seconds): walls' kept actors each frame; once a second the occlusion rate (from
-	// hifps::fps()), the counters, the 'ashita' watch (exp_tick)
+	// Every present (now: seconds): once a second the occlusion rate (from hifps::fps()), the counters, the 'ashita'
+	// watch (exp_tick)
 	void present(double now);
-	// The characters' visibility test answered elsewhere (World FX's VisTest, from its depth copy: src/game/feed.cpp): walls
-	// is kept off while so (its call is VisTest's then), and occlusion has every character tested every frame (an answer
-	// costs nothing there) instead of every 4m-th. walls_holding: whether walls still has the call (VisTest waits for it).
+	// The characters' visibility test answered elsewhere (World FX's VisTest, from its depth copy: src/game/feed.cpp):
+	// occlusion has every character tested every frame then (an answer costs nothing there) instead of every 4m-th
 	void set_actors_elsewhere(bool on);
-	bool walls_holding();
 	// Everything put back (only over our own bytes), the memory freed when nothing points into it, all forgotten
 	void stop();
 	// The stream log's tap on the game's draws (src/backend/streamlog): the client device's DrawPrimitive,
 	// DrawIndexedPrimitive, DrawPrimitiveUP and DrawIndexedPrimitiveUP (slots 70-73) pointed at taps[0..3], each
-	// calling on to originals[i] (filled here): in the proxy's own vtable while batch or dedupe has it in, else in a
-	// copy of the device's vtable put in front of it. On the game's thread only (a present); false and why when it
-	// can't. draw_untap puts the slots (or the device's own vtable) back; turning the proxy on or off does too.
+	// calling on to originals[i] (filled here), in a copy of the device's vtable put in front of it. On the game's
+	// thread only (a present); false and why when it can't. draw_untap puts the device's own vtable back.
 	bool draw_tap(const void *const taps[4], void *originals[4], std::string &why);
 	void draw_untap();
 	// For /hifi status and the menu: a line a toggle (as /hifps exp lists them), then why not and notes
 	std::vector<std::string> status();
+	// One line for the log and the crash and hang reports: which are on and off, and why one isn't
+	std::string state_line();
 
 	// One toggle as the menu shows it: on, what it's doing (exp_stat, empty when nothing to say), why it isn't on
-	// (exp.err, empty when none). name: ashita, occlusion, walls, sse, batch, dedupe
+	// (exp.err, empty when none). name: ashita, occlusion, batch, dedupe
 	struct toggle_state
 	{
 		bool on = false;
@@ -68,7 +66,8 @@ namespace hifi::game::hifps::exp
 	// /hifps exp ashita check: what uses the draw events now, changing nothing (lines to show)
 	std::vector<std::string> ashita_check();
 
-	// What the plugin reads through Ashita's interfaces, given instead (the tests); nullptr: Ashita's again
+	// What the plugin reads through Ashita's interfaces and finds in the game's d3d8.dll, given instead (the tests);
+	// nullptr: Ashita's and the d3d8.dll's again
 	struct host
 	{
 		// The loaded addons other than hifps (false: not known; a plugin can't list them)
@@ -77,19 +76,19 @@ namespace hifi::game::hifps::exp
 		int plugins = -1;          // plugins loaded (-1: not known)
 		uintptr_t ashita_base = 0; // Ashita.dll's image
 		size_t ashita_size = 0;
-		// The player's actor, the target's (0: none), the player's status (false: not known: all 0, the stock test off)
-		bool (*actors)(uint32_t &me, uint32_t &target, uint32_t &status) = nullptr;
+		// HiFi XI's d3d8.dll's HifiFrameSetSpeedups and HifiFrameSpeedupStats (src/host/frameapi.hpp; nullptr: a d3d8.dll
+		// that isn't ours)
+		uint32_t(__cdecl *set_speedups)(uint32_t flags) = nullptr;
+		void(__cdecl *speedup_stats)(uint32_t out[4]) = nullptr;
 	};
 	void set_host(const host *h);
 
-	// For the tests: our memory (0 while none) and the sites found
+	// For the tests: the sites patched and what the d3d8.dll was told
 	struct sites
 	{
-		uintptr_t walls = 0, proxy = 0;            // the walls and proxy stubs' copies
-		uintptr_t walls_site = 0, occlusion = 0;   // the actor draw's call, the occlusion test's 12 bytes
-		uintptr_t sse = 0;                         // the CPU feature flag set (0: none, or already on)
-		uintptr_t device = 0, vtable = 0;          // the client device while the proxy is on, its own vtable
+		uintptr_t occlusion = 0;                   // the occlusion test's 12 bytes
 		std::vector<uintptr_t> ashita;             // the jumps written in Ashita.dll
+		uint32_t speedups = 0;                     // the d3d8.dll's speed-ups as last set (kHifiDedupe, kHifiBatch)
 	};
 	sites where();
 }
