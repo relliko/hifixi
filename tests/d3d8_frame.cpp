@@ -8,6 +8,8 @@
  *   d3d8_frame.exe <d3d8.dll> caps                         the caps and formats it reports
  *   d3d8_frame.exe <d3d8.dll> scenes <out folder> [name]   every scene (or one) -> <out>\<scene>.bmp
  *   d3d8_frame.exe <d3d8.dll> replay <capture> <out.bmp>   a d3dlog capture's frame replayed (d3d8_replay.hpp)
+ *   d3d8_frame.exe <d3d8.dll> bench <capture> [all|today] [rounds]   the game thread's CPU a frame of a capture, with and
+ *                                                          without hifps's batch and dedupe (d3d8_bench.hpp)
  *   d3d8_frame.exe compare <a.bmp> <b.bmp> [diff.bmp]      mean / 99th percentile / largest channel difference,
  *                                                          share of pixels within 2 and within 8 (of 255)
  *
@@ -2061,6 +2063,7 @@ namespace
 }
 
 #include "d3d8_replay.hpp"
+#include "d3d8_bench.hpp"
 
 int main(int argc, char **argv)
 {
@@ -2074,7 +2077,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	const std::string cmd = argv[2];
-	const bool replay = cmd == "replay";
+	const bool replay = cmd == "replay" || cmd == "bench";
 	if (!make_device(argv[1], replay ? 1280 : W, replay ? 720 : H))
 		return 1;
 	int r = 0;
@@ -2084,6 +2087,8 @@ int main(int argc, char **argv)
 		r = run_scenes(argv[3], argc > 4 ? argv[4] : nullptr);
 	else if (cmd == "front" && argc > 3)
 		r = run_front(argv[3]);
+	else if (cmd == "bench" && argc > 3)
+		r = bench::run(argv[1], argv[3], argc > 4 ? argv[4] : "all", argc > 5 ? std::atoi(argv[5]) : 15);
 	else if (replay && argc > 4)
 		r = replay::run(argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 3);
 	else

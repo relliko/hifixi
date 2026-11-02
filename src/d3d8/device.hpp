@@ -121,6 +121,9 @@ namespace hifi::d3d8
 	// began into something at least the world's width)
 	void mark_world_read(device *d, const image *read, const image *into);
 
+	// The speed-ups HiFi XI asked for (HifiFrameSetSpeedups: device::kDedupe, device::kBatch), for every device
+	extern uint32_t g_speedups;
+
 	class device final : public IDirect3DDevice8
 	{
 	public:
@@ -169,7 +172,28 @@ namespace hifi::d3d8
 		{
 			uint64_t draws = 0, clears = 0, readbacks = 0, presents = 0, pipelines = 0, uploads = 0, upload_bytes = 0;
 			uint64_t async_answered = 0, async_unanswered = 0; // asynchronous readbacks answered from an earlier frame, or not yet
+			uint64_t dropped = 0, quads = 0, batches = 0;      // the speed-ups': Set* calls dropped, quads batched, the draws they made
 		} stats;
+
+		// HiFi XI's frame-rate speed-ups (HifiFrameSetSpeedups; docs/frame-rate.md), off until it asks, read from g_speedups:
+		// kDedupe: a Set* call that sets what's already in effect returns at once (no constants uploaded again for it);
+		// kBatch: consecutive DrawPrimitiveUP quads (a two-triangle strip: the interface's sprites and text, a glyph a call)
+		// wait here and go to the GPU as one triangle list. They're drawn before anything else the device does that could
+		// change what they look like: a value that changes, another draw, a clear, a copy, a lock, a mark, Present.
+		static constexpr uint32_t kDedupe = 1, kBatch = 2;
+		static constexpr size_t kQuadBytes = 0x20000; // (780 text quads a draw, as hifps's proxy had)
+		struct quad_batch
+		{
+			std::vector<uint8_t> vertices; // (the list's: six a quad)
+			UINT stride = 0, count = 0;
+		} quads;
+		// A DrawPrimitiveUP the batch takes (false: draw it as it is, after the waiting ones)
+		bool take_quad(D3DPRIMITIVETYPE type, UINT count, const void *vertices, UINT stride);
+		// The waiting quads drawn now (nothing when none)
+		void flush_quads();
+		// A setter's first step when not recording, equal: its value already in effect. True: dedupe drops it, return.
+		// Otherwise the waiting quads are drawn first when the value changes (they keep the state they were given in).
+		bool unchanged(bool equal);
 
 		// The frame's targets in the order drawn into (the first kPlanTargets), for the log with the frame counts: a GPU
 		// crash report's operation index ("the first draw after the second clear") is then a target of the game's

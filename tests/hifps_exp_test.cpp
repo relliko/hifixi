@@ -1,33 +1,30 @@
 /*
  * Offline test of hifps's experimental toggles in C++ (src/game/hifps/exp.cpp: ashita and its check and force,
- * occlusion, walls, sse, batch, dedupe), held against the hifps addon itself (C:\Games\PhoenixXI\addons\hifps\
- * hifps.lua) step by step, byte for byte. (The addon's graphics settings, lamps and night lighting, aren't HiFi XI's:
- * the addon's stay stock here.)
- *   - stubs.inc is what tools/hifps_stubs.py makes of the addon's proxy/*.blob and *_code.lua now;
+ * occlusion; batch and dedupe, now told to HiFi XI's d3d8.dll), held against the hifps addon itself
+ * (C:\Games\PhoenixXI\addons\hifps\hifps.lua) step by step, byte for byte, where they're still the addon's. (The
+ * addon's walls, sse and its device proxy for batch and dedupe aren't HiFi XI's any more: docs/frame-rate.md; nor its
+ * graphics settings, lamps and night lighting: the addon's stay stock here.)
  *   - an image without the game's code: the toggles wait, nothing taken;
- *   - each FFXiMain dump mapped at its own base (game_dump.hpp), our memory from 0x30000000; its sites checked to
- *     be the game's own (both dumps are, at every site here); fakes of what the dump only points at, at 0x38000000:
- *     the client's renderer and device (its vtable), Ashita's four draw methods, the code its per-draw loop calls
- *     and its plugin list (8 plugins: named, unnamed, faulted, flags read and not...), the CPU feature object; the
- *     dump's renderer and CPU feature pointers pointed at them (in the mapped copy, put back at the end); addons'
- *     Lua files in a folder of the test's own;
- *   - a scenario of 34 steps (the 'ashita' check refusing, forced, a newcomer kept and one turning it off, on with
- *     the proxy's vtable in; occlusion at 256, 128, 1024 and 64fps; walls refused while its call goes elsewhere,
- *     on, its kept actors and stats, left alone when repointed; sse on AMD and Intel; batch and dedupe with their
- *     stats; hifps off and on again, the saved toggles restored; unload), run by the addon under lupa
- *     (tests/hifps_exp_lua.py) and by the port: after each step the image (where it isn't the dump file), the
- *     fakes and our memory (the stubs as laid down, their fields) the same byte for byte, and the addon's state
- *     (on, why not, what each is doing) the same text;
+ *   - each FFXiMain dump mapped at its own base (game_dump.hpp); its sites checked to be the game's own (both dumps are,
+ *     at every site here); fakes of what the dump only points at, at 0x38000000: the client's renderer and device (its
+ *     vtable), Ashita's four draw methods, the code its per-draw loop calls and its plugin list (8 plugins: named,
+ *     unnamed, faulted, flags read and not...); the dump's renderer pointer pointed at them (in the mapped copy, put
+ *     back at the end); addons' Lua files in a folder of the test's own;
+ *   - a scenario of 16 steps (the 'ashita' check refusing, forced, a newcomer kept and one turning it off; occlusion at
+ *     256, 128, 1024 and 256fps; hifps off and on again, the saved toggles restored; unload), run by the addon under
+ *     lupa (tests/hifps_exp_lua.py) and by the port: after each step the image (where it isn't the dump file) and the
+ *     fakes the same byte for byte, and the addon's state (on, why not, what each is doing) the same text;
  *   - what only the port does: the toggles wait for the client's device; nothing put back over bytes that aren't
- *     ours (occlusion, sse, the device's vtable), the memory kept then; stop() frees our memory, and the image is
- *     the dump again, byte for byte;
- *   - the walls stub as the port laid it down, run by the addon's own harness (proxy/walls_harness.c, built 32-bit
- *     by build.cmd into build\test_hifps_exp\).
+ *     ours (occlusion); batch and dedupe told to the d3d8.dll (a fake of its HifiFrameSetSpeedups and
+ *     HifiFrameSpeedupStats), refused without one, its counts in the status, off again with the frame step and at
+ *     stop(); occlusion every frame while VisTest answers the characters' test; the stream log's draw tap; stop()
+ *     leaves the image the dump again, byte for byte.
  *
  *   build\hifps_exp_test.exe     (built by build.cmd)
  */
 
 #include "../src/game/hifps/exp.hpp"
+#include "../src/host/frameapi.hpp"
 #include "game_dump.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -39,8 +36,6 @@
 
 namespace
 {
-#include "../src/game/hifps/stubs.inc"
-
 	namespace exp = hifi::game::hifps::exp;
 
 	int failures = 0, passes = 0;
@@ -68,14 +63,22 @@ namespace
 		names = host_addons;
 		return host_addons_known;
 	}
-	uint32_t actor_me = 0, actor_target = 0, actor_status = 0;
-	bool actors_known = false;
-	bool get_actors(uint32_t &me, uint32_t &target, uint32_t &status)
+	// HiFi XI's d3d8.dll's speed-ups, faked: what it was told, how often, its running counts
+	uint32_t d3d8_flags = 0, d3d8_told = 0;
+	uint32_t d3d8_counts[4] = {};
+	uint32_t __cdecl fake_set_speedups(uint32_t flags)
 	{
-		me = actor_me;
-		target = actor_target;
-		status = actor_status;
-		return actors_known;
+		const uint32_t was = d3d8_flags;
+		if (flags != kHifiSpeedupsAsk)
+		{
+			d3d8_flags = flags;
+			d3d8_told++;
+		}
+		return was;
+	}
+	void __cdecl fake_speedup_stats(uint32_t out[4])
+	{
+		std::memcpy(out, d3d8_counts, sizeof(d3d8_counts));
 	}
 	exp::host host;
 	// hifps's frame step (step.hpp), stubbed: on, and its frames a second
@@ -159,10 +162,6 @@ namespace
 		return ok;
 	}
 
-	bool starts(const std::string &s, const char *part)
-	{
-		return s.compare(0, std::strlen(part), part) == 0;
-	}
 	bool contains(const std::string &s, const char *part)
 	{
 		return s.find(part) != std::string::npos;
@@ -229,7 +228,6 @@ namespace
 	constexpr uintptr_t kDevice = kFakes + 0x0100;   // +0: its vtable
 	constexpr uintptr_t kRtti = kFakes + 0x0400;     // vtable[-1]
 	constexpr uintptr_t kVtable = kFakes + 0x0404;   // 128 methods
-	constexpr uintptr_t kCpu = kFakes + 0x0700;      // +9: SSE skinning
 	// Ashita.dll: its four draw methods, the core getter and the plugins' draw loop they call, the core, the plugin
 	// manager, its entries, the plugins, their vtables, their functions, their names
 	constexpr uintptr_t kAsh = kFakes + 0x1000;
@@ -293,7 +291,6 @@ namespace
 		put32(kRtti, 0x12345678);
 		for (uint32_t i = 0; i < 128; ++i)
 			put32(kVtable + 4 * i, i >= 70 && i <= 73 ? uint32_t(kMethods[i - 70]) : 0x7E000000 + 0x10 * i);
-		std::memset(reinterpret_cast<void *>(kCpu), 0, 0x20);
 		// The draw methods: 'cmp dword [eax+10Ch], 0; je; mov ecx, [eax+134h]; test ecx, ecx; je' in each; the first
 		// (DrawPrimitive) calls the core's getter before it and the plugins' draw loop after it
 		for (int m = 0; m < 4; ++m)
@@ -374,7 +371,7 @@ namespace
 	struct edit
 	{
 		int step;
-		std::string where; // abs, walls, proxy
+		std::string where; // abs
 		uint32_t off;
 		std::string bytes;
 	};
@@ -394,11 +391,10 @@ namespace
 	const char *const kHelper = "  -- \"d3d_dpup\"\nashita.events.register(\"d3d_dipup\", 'h', function () end);\n";
 	const char *const kQuiet = "-- nothing here\nlocal y = 'd3d_dp_not'\n";
 
-	// The sites the scenario changes in the dump (as another addon would)
+	// The dump's pointer the scenario points at the fakes
 	struct dump_sites
 	{
-		uintptr_t walls_call = 0, renderer_global = 0, cpu_global = 0;
-		std::string walls_rel;
+		uintptr_t renderer_global = 0;
 	};
 
 	scenario make_scenario(const dump_sites &d, const std::string &install)
@@ -409,9 +405,8 @@ namespace
 		const auto add = [&](const std::string &action) { cur.action = action; s.steps.push_back(cur); };
 		const auto edit_at = [&](const std::string &where, uintptr_t off, const std::string &b) { s.edits.push_back({ next(), where, uint32_t(off), b }); };
 		const auto file_at = [&](const std::string &rel, const char *content) { s.files.push_back({ next(), install + "addons\\" + rel, content }); };
-		// (before the first step: the dump's pointers to the renderer and the CPU feature object at the fakes)
+		// (before the first step: the dump's pointer to the renderer at the fakes)
 		s.edits.push_back({ -1, "abs", uint32_t(d.renderer_global), word_bytes(uint32_t(kRenderer)) });
-		s.edits.push_back({ -1, "abs", uint32_t(d.cpu_global), word_bytes(uint32_t(kCpu)) });
 
 		file_at("alpha\\alpha.lua", kAlpha);
 		file_at("alpha\\lib\\helper.lua", kHelper);
@@ -440,43 +435,10 @@ namespace
 		add("tick");
 		cur.fps = 1024;
 		add("tick");
-		edit_at("abs", d.walls_call + 1, word_bytes(uint32_t(d.walls_call + 0x40 - (d.walls_call + 5))));
-		add("on walls");                                    // refused: its call goes elsewhere
-		edit_at("abs", d.walls_call + 1, d.walls_rel);
-		add("off walls");
-		add("on walls");
-		cur.fps = 64;
-		cur.actors = "0A001000,0,4";
-		add("tick");                                        // a cutscene, no target
-		const uint32_t walls_counts[7] = { 640, 1280, 320, 64, 5, 3, 640000 };
-		for (int i = 0; i < 7; ++i)
-			edit_at("walls", stubs::walls::S_TESTS + 4 * i, word_bytes(walls_counts[i]));
-		add("tick");
-		add("on sse");                                      // an AMD CPU
-		add("off sse");
-		edit_at("abs", kCpu + 9, "\x01");
-		add("on sse");                                      // an Intel CPU: nothing to change
-		edit_at("abs", kCpu + 9, std::string(1, '\0'));
-		add("off sse");
-		add("on batch");
-		add("on dedupe");
-		add("on ashita");                                   // with the proxy's vtable in: refused, newbie draws
-		add("off ashita");
-		cur.fps = 256;
-		add("tick");
-		edit_at("proxy", stubs::proxy::S_SKIPPED, word_bytes(25600));
-		edit_at("proxy", stubs::proxy::S_MERGED, word_bytes(51200));
-		edit_at("proxy", stubs::proxy::S_BATCHES, word_bytes(2560));
-		add("tick");
-		add("off batch");
-		add("off dedupe");
 		add("disable");
-		add("enable");                                      // occlusion and walls back on
+		add("enable");                                      // occlusion back on
 		cur.fps = 256;
-		cur.actors = "none";
 		add("tick");
-		edit_at("abs", d.walls_call + 1, word_bytes(uint32_t(d.walls_call + 0x40 - (d.walls_call + 5))));
-		add("off walls");                                   // its call repointed by something else since: left
 		add("unload");
 		return s;
 	}
@@ -553,7 +515,7 @@ namespace
 	// ---------------------------------------------------------------- the port's run
 
 	// The image where it isn't the dump file, the fakes, our memory (as the addon's run lists them)
-	snapshot take(const std::string &file, uintptr_t base, size_t size, bool memory)
+	snapshot take(const std::string &file, uintptr_t base, size_t size)
 	{
 		snapshot s;
 		const auto live = reinterpret_cast<const uint8_t *>(base);
@@ -583,18 +545,8 @@ namespace
 			}
 		}
 		s.chunks.push_back({ uint32_t(kFakes), bytes_at(kFakes, kFakesSize) });
-		if (memory)
-		{
-			std::vector<std::pair<uintptr_t, size_t>> mem;
-			if (exp::where().walls != 0)
-				mem.push_back({ exp::where().walls, stubs::walls::size });
-			if (exp::where().proxy != 0)
-				mem.push_back({ exp::where().proxy, stubs::proxy::size + 16 + 0x20000 });
-			std::sort(mem.begin(), mem.end());
-			for (const auto &m : mem)
-				s.chunks.push_back({ uint32_t(m.first), bytes_at(m.first, m.second) });
-		}
-		const char *names[6] = { "ashita", "occlusion", "walls", "sse", "batch", "dedupe" };
+		// (the toggles still the addon's: tests/hifps_exp_lua.py's NAMES)
+		const char *names[2] = { "ashita", "occlusion" };
 		for (const char *n : names)
 		{
 			const exp::toggle_state t = exp::toggle(n);
@@ -670,14 +622,6 @@ namespace
 				host_addons.push_back(st.addons.substr(at, comma - at));
 			at = comma + 1;
 		}
-		actors_known = st.actors != "none";
-		if (actors_known)
-		{
-			char *end = nullptr;
-			actor_me = std::strtoul(st.actors.c_str(), &end, 16);
-			actor_target = std::strtoul(end + 1, &end, 16);
-			actor_status = std::strtoul(end + 1, &end, 16);
-		}
 	}
 
 	double t_now = 1000.0;
@@ -704,7 +648,7 @@ namespace
 		if (action == "start")
 		{
 			step_on = true;
-			for (const char *n : { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe", "ashita_force" })
+			for (const char *n : { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe", "ashita_force" })
 				set_option(n, "0");
 			timers = false;
 			exp::update();
@@ -740,67 +684,14 @@ namespace
 			check(false, "unknown action " + action);
 	}
 
-	uintptr_t base_of(const std::string &where)
+	uintptr_t base_of(const std::string &)
 	{
-		if (where == "walls")
-			return exp::where().walls;
-		if (where == "proxy")
-			return exp::where().proxy;
 		return 0;
-	}
-
-	// ---------------------------------------------------------------- the addon's harness
-
-	// A stub as the port laid it down, back to the blob its harness reads (the copy's base taken off each relocated
-	// word): its size, relocations, symbols, bytes
-	std::string blob(const std::string &laid, uintptr_t base, const uint32_t *relocs, size_t nrel, const uint32_t *syms, size_t nsym)
-	{
-		std::string b = laid;
-		for (size_t i = 0; i < nrel; ++i)
-		{
-			uint32_t v = 0;
-			std::memcpy(&v, b.data() + relocs[i], 4);
-			v -= uint32_t(base);
-			std::memcpy(b.data() + relocs[i], &v, 4);
-		}
-		std::string out = word_bytes(uint32_t(b.size())) + word_bytes(uint32_t(nrel)) + word_bytes(uint32_t(nsym));
-		for (size_t i = 0; i < nrel; ++i)
-			out += word_bytes(relocs[i]);
-		for (size_t i = 0; i < nsym; ++i)
-			out += word_bytes(syms[i]);
-		return out + b;
-	}
-
-	void run_harness(const std::string &folder, const char *name, const std::string &blob_bytes)
-	{
-		const std::string exe = folder + name + "_harness.exe";
-		if (GetFileAttributesA(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
-		{
-			check(false, exe + " built (build.cmd)");
-			return;
-		}
-		if (!write_file(folder + name + ".blob", blob_bytes))
-		{
-			check(false, std::string("writing ") + name + ".blob");
-			return;
-		}
-		std::vector<std::string> lines;
-		// (in its folder, where it reads its blob; by full path: cmd may not look in the current folder)
-		const int code = run("cd /d \"" + folder + "\" && \"" + exe + "\"", lines, true);
-		const bool said_ok = !lines.empty() && starts(lines.back(), "OK");
-		check(code == 0 && said_ok, std::string("the ") + name + " stub as the port laid it down, run by the addon's " + name + "_harness.c (32-bit): " +
-			(code == 0 && said_ok ? "passed" : "failed (exit " + std::to_string(code) + ")"));
 	}
 
 	// ---------------------------------------------------------------- one dump
 
-	struct dump_run
-	{
-		std::string walls_laid;
-		uintptr_t walls_base = 0;
-	};
-
-	void test_dump(const std::string &path, const std::string &root, dump_run &laid)
+	void test_dump(const std::string &path, const std::string &root)
 	{
 		const std::string file = path.substr(path.find_last_of('\\') + 1);
 		std::printf("\n%s\n", file.c_str());
@@ -814,32 +705,23 @@ namespace
 		if (size == 0)
 			return;
 		using hifi::game::find;
-		using hifi::game::rel_target;
 		using hifi::game::word;
 
 		// The sites, the game's own in this dump? (FFXiMain_041C0000.bin was dumped with addons' patches in)
 		dump_sites d;
-		const uintptr_t walls = find("8D8EF0080000E8????????3BC58986F4");
-		const uintptr_t vis = find("A1????????53568BF18A9828080000");
-		d.walls_call = walls != 0 ? walls + 6 : 0;
 		const uintptr_t dev = find("8BC8E8????????85C0A3????????0F84????????8B5C241C");
-		const uintptr_t cpu = find("A1????????8A4009C3");
 		d.renderer_global = dev != 0 ? word(dev + 10) : 0;
-		d.cpu_global = cpu != 0 ? word(cpu + 1) : 0;
-		const bool stock_walls = d.walls_call != 0 && rel_target(d.walls_call) == vis;
 		const bool stock_occl = find("8BBEF0090000E8????????250300008079054883C8FC403BC7") != 0;
-		std::snprintf(line, sizeof(line), "the dump's sites are the game's own: walls %s, occlusion %s", stock_walls ? "yes" : "NO",
-			stock_occl ? "yes" : "NO");
-		check(stock_walls && stock_occl, line);
-		check(d.renderer_global != 0 && d.cpu_global != 0, "the client's renderer and CPU feature pointers found");
-		if (!stock_walls || !stock_occl || d.renderer_global == 0 || d.cpu_global == 0)
+		std::snprintf(line, sizeof(line), "the dump's occlusion test is the game's own: %s", stock_occl ? "yes" : "NO");
+		check(stock_occl, line);
+		check(d.renderer_global != 0, "the client's renderer pointer found");
+		if (!stock_occl || d.renderer_global == 0)
 		{
 			check(false, "(the scenario needs the game's own bytes at every site: not run on this dump)");
 			dump::unmap(base);
 			return;
 		}
-		d.walls_rel = bytes_at(d.walls_call + 1, 4);
-		const std::string renderer_was = bytes_at(d.renderer_global, 4), cpu_was = bytes_at(d.cpu_global, 4);
+		const std::string renderer_was = bytes_at(d.renderer_global, 4);
 		build_fakes();
 
 		// Before the client's device exists (no renderer yet: its pointer 0, in the mapped copy; the dump's own points at
@@ -916,7 +798,7 @@ namespace
 				}
 			act(st.action, st);
 			const bool unloaded = st.action == "unload";
-			const snapshot port = take(dumped, base, size, !unloaded);
+			const snapshot port = take(dumped, base, size);
 			if (i < lua.size())
 			{
 				snapshot l = lua[i];
@@ -926,62 +808,93 @@ namespace
 				std::snprintf(line, sizeof(line), "step %2u %-24s", unsigned(i), st.action.c_str());
 				check(why.empty() && l.action == st.action, std::string(line) + (why.empty() ? " the same as the addon's" : ": " + why));
 			}
-			if (st.action == "on walls" && exp::toggle("walls").on && laid.walls_laid.empty())
-			{
-				laid.walls_base = exp::where().walls;
-				laid.walls_laid = bytes_at(laid.walls_base, stubs::walls::size);
-			}
 		}
 		const exp::sites w = exp::where();
-		check(w.walls == 0 && w.proxy == 0, "unload: everything forgotten");
-		check(laid.walls_base == dump::kAllocAt && !memory_free(laid.walls_base),
-			"  the walls stub's memory kept (its call was repointed by something else, and is still)");
-		check(memory_free(dump::kAllocAt + 0x10000), "  the proxy stub's memory freed");
-		check(bytes_at(d.walls_call + 1, 4) != d.walls_rel, "  the repointed call left as it is");
-		put_bytes(d.walls_call + 1, d.walls_rel);
-		VirtualFree(reinterpret_cast<void *>(laid.walls_base), 0, MEM_RELEASE);
+		check(w.occlusion == 0 && w.ashita.empty() && w.speedups == 0, "unload: everything forgotten");
+		check(memory_free(dump::kAllocAt), "  no memory taken (nothing of the addon's stubs laid down any more)");
 
-		// What only the port does: nothing put back over bytes that aren't ours, the memory kept then
-		hifi::game::set_alloc_at(dump::kAllocAt + 0x100000);
+		// What only the port does: nothing put back over bytes that aren't ours
 		options.clear();
 		step_on = true;
 		// (the others off: each is on by default)
-		for (const char *n : { "exp_ashita", "exp_walls", "exp_dedupe" })
+		for (const char *n : { "exp_ashita", "exp_batch", "exp_dedupe" })
 			set_option(n, "0");
 		set_option("exp_occlusion", "1");
-		set_option("exp_sse", "1");
-		set_option("exp_batch", "1");
 		exp::update();
-		check(exp::toggle("occlusion").on && exp::toggle("sse").on && exp::toggle("batch").on, "occlusion, sse and batch on again");
-		const uintptr_t occl = exp::where().occlusion, proxy = exp::where().proxy;
+		check(exp::toggle("occlusion").on, "occlusion on again");
+		const uintptr_t occl = exp::where().occlusion;
 		put_bytes(occl, std::string(12, '\x90'));
-		put_bytes(kCpu + 9, "\x02");
-		put32(kDevice, 0x7E7E7E7C);
 		set_option("exp_occlusion", "0");
-		set_option("exp_sse", "0");
-		set_option("exp_batch", "0");
 		exp::update();
-		const std::vector<std::string> st = exp::status();
-		check(!exp::toggle("occlusion").on && !exp::toggle("sse").on && !exp::toggle("batch").on && bytes_at(occl, 12) == std::string(12, '\x90') &&
-			bytes_at(kCpu + 9, 1) == "\x02" && word_at(kDevice) == 0x7E7E7E7C,
-			"turned off after something else changed their bytes: left as they are");
-		check(st.size() >= 3 && contains(joined(st, "|"), "occlusion: something else has changed the occlusion test since: left as it is") &&
-			contains(joined(st, "|"), "sse: something else has changed the CPU's SSE flag since: left as it is") &&
-			contains(joined(st, "|"), "batch/dedupe: something else has replaced the client device's vtable since: left as it is"),
-			"  and the status says so");
+		check(!exp::toggle("occlusion").on && bytes_at(occl, 12) == std::string(12, '\x90'), "turned off after something else changed its bytes: left as they are");
+		check(contains(joined(exp::status(), "|"), "occlusion: something else has changed the occlusion test since: left as it is"), "  and the status says so");
 		exp::stop();
-		check(!memory_free(proxy), "  stop(): the proxy's memory kept (the device may still use our vtable)");
-		VirtualFree(reinterpret_cast<void *>(proxy), 0, MEM_RELEASE);
 		put_bytes(occl, from_hex("250300008079054883C8FC40"));
-		put_bytes(kCpu + 9, std::string(1, '\0'));
-		put32(kDevice, uint32_t(kVtable));
 
-		// The stream log's draw tap: with the proxy off, a copy of the device's vtable in front of it; with it on, the
-		// proxy's own slots; the proxy going off takes the tap out first
-		hifi::game::set_alloc_at(dump::kAllocAt + 0x180000);
+		// batch and dedupe: told to HiFi XI's d3d8.dll (its two calls faked here), never to the game's code
+		{
+			const std::string image_before = bytes_at(base, size);
+			options.clear();
+			step_on = true;
+			for (const char *n : { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe" })
+				set_option(n, "0");
+			// (a d3d8.dll that isn't ours: refused, and why)
+			host.set_speedups = nullptr;
+			host.speedup_stats = nullptr;
+			exp::update();
+			set_option("exp_batch", "1");
+			exp::update();
+			const exp::toggle_state refused = exp::toggle("batch");
+			check(!refused.on && contains(refused.err, "HiFi XI's own d3d8.dll"), "batch with a d3d8.dll that isn't HiFi XI's: not on (" + refused.err + ")");
+			set_option("exp_batch", "0");
+			exp::update();
+			host.set_speedups = fake_set_speedups;
+			host.speedup_stats = fake_speedup_stats;
+			d3d8_flags = d3d8_told = 0;
+			std::memset(d3d8_counts, 0, sizeof(d3d8_counts));
+			set_option("exp_batch", "1");
+			exp::update();
+			const uint32_t batch_only = d3d8_flags;
+			set_option("exp_dedupe", "1");
+			exp::update();
+			check(exp::toggle("batch").on && exp::toggle("dedupe").on && batch_only == kHifiBatch && d3d8_flags == (kHifiBatch | kHifiDedupe) &&
+					exp::where().speedups == d3d8_flags,
+				"batch, then dedupe: the d3d8.dll told each (batch alone, then both)");
+			// (two seconds at 200 fps: 2000 quads in 400 draws, 3000 calls dropped, 1000 draws in all, a second)
+			t_now += 10.0;
+			tick(200);
+			for (int i = 0; i < 2; ++i)
+			{
+				d3d8_counts[0] += 3000;
+				d3d8_counts[1] += 2000;
+				d3d8_counts[2] += 400;
+				d3d8_counts[3] += 1000;
+				tick(200);
+			}
+			const std::string bstat = exp::toggle("batch").stat, dstat = exp::toggle("dedupe").stat;
+			check(bstat == "10 quads a frame in 2 draws; 5 draws a frame in all" && dstat == "15 calls a frame dropped",
+				"  their counts a frame in the status (" + bstat + "; " + dstat + ")");
+			set_option("exp_dedupe", "0");
+			exp::update();
+			const uint32_t after_dedupe_off = d3d8_flags;
+			step_on = false;
+			exp::update();
+			const uint32_t after_step_off = d3d8_flags;
+			step_on = true;
+			exp::update();
+			exp::update();
+			const uint32_t after_step_on = d3d8_flags;
+			check(after_dedupe_off == kHifiBatch && after_step_off == 0 && after_step_on == kHifiBatch,
+				"  dedupe off: batch alone; the frame step off: both off; on again: batch back (as its option says)");
+			exp::stop();
+			check(d3d8_flags == 0 && exp::where().speedups == 0, "  stop(): the d3d8.dll told none");
+			check(bytes_at(base, size) == image_before, "  nothing of the game's image written for them");
+		}
+
+		// The stream log's draw tap: a copy of the device's vtable in front of it, its four draw slots ours
 		options.clear();
 		step_on = true;
-		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" })
+		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe" })
 			set_option(n, "0");
 		exp::update();
 		{
@@ -996,62 +909,52 @@ namespace
 				slots = slots && (i >= 70 && i < 74 ? word_at(copy + 4 * i) == uint32_t(0x11110000 + 0x10 * (i - 70)) : word_at(copy + 4 * i) == word_at(kVtable + 4 * i));
 			for (uint32_t i = 0; i < 4; ++i)
 				slots = slots && uint32_t(reinterpret_cast<uintptr_t>(orig[i])) == word_at(kVtable + 4 * (70 + i));
-			check(on && slots, "draw tap, proxy off: a copy of the device's vtable in front, its four draw slots the taps, the rest as they were");
+			check(on && slots, "draw tap: a copy of the device's vtable in front, its four draw slots the taps, the rest as they were");
+			// (the 'ashita' check reads the device's own vtable through it: the plugins checked, nothing refused for the tap)
+			set_option("exp_ashita", "1");
+			set_option("ashita_force", "1");
+			exp::update();
+			check(exp::toggle("ashita").on && exp::where().ashita.size() == 4, "  'ashita' while tapped: Ashita's own draw methods found through the copy");
+			set_option("exp_ashita", "0");
+			set_option("ashita_force", "0");
+			exp::update();
 			exp::draw_untap();
 			check(word_at(kDevice) == uint32_t(kVtable), "  untapped: the device's own vtable back");
-
-			set_option("exp_batch", "1");
-			exp::update();
-			const uint32_t pvt = word_at(kDevice);
-			const uint32_t proxy_dip = word_at(pvt + 4 * 71);
-			const bool on2 = exp::draw_tap(taps, orig, why);
-			check(exp::toggle("batch").on && pvt != uint32_t(kVtable) && on2 && word_at(kDevice) == pvt && word_at(pvt + 4 * 71) == 0x11110010 &&
-					uint32_t(reinterpret_cast<uintptr_t>(orig[1])) == proxy_dip,
-				"draw tap, batch on: in the proxy's own vtable (the device's pointer unchanged), calling on to the proxy's own");
-			exp::draw_untap();
-			check(word_at(pvt + 4 * 71) == proxy_dip, "  untapped: the proxy's slots back");
-			exp::draw_tap(taps, orig, why);
-			set_option("exp_batch", "0");
-			exp::update();
-			check(word_at(kDevice) == uint32_t(kVtable) && word_at(pvt + 4 * 71) == proxy_dip, "  batch off while tapped: the tap out first, the device's own vtable back");
 			exp::draw_tap(taps, orig, why);
 			exp::stop();
 			check(word_at(kDevice) == uint32_t(kVtable), "  stop() while tapped: the device's own vtable back");
 		}
 
-		// stop() with everything on: the image the dump again, our memory freed
-		hifi::game::set_alloc_at(dump::kAllocAt + 0x200000);
+		// stop() with everything on: the image the dump again
 		options.clear();
 		step_on = true;
-		for (const char *n : { "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" })
+		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe" })
 			set_option(n, "1");
 		host_addons_known = false;
 		exp::update();
-		const uintptr_t mw = exp::where().walls, mp = exp::where().proxy;
-		check(exp::toggle("occlusion").on && exp::toggle("walls").on && exp::toggle("sse").on && exp::toggle("batch").on && exp::toggle("dedupe").on,
-			"everything on");
-		// The characters' test answered elsewhere (World FX's VisTest takes the call: set_actors_elsewhere): walls lets go
-		// at once (its call the game's test again) and update() keeps it off; occlusion's frame check made 'every frame'
-		// (xor eax, eax; xor edi, edi). Given back: walls on again, occlusion at its rate again.
+		check(exp::toggle("occlusion").on && exp::toggle("batch").on && exp::toggle("dedupe").on, "everything on");
+		// The characters' test answered elsewhere (World FX's VisTest takes the call: set_actors_elsewhere): occlusion's
+		// frame check made 'every frame' (xor eax, eax; xor edi, edi). Given back: occlusion at its rate again.
 		{
 			const uintptr_t occl_at = exp::where().occlusion;
 			const std::string every = std::string("\x31\xC0\x31\xFF", 4) + std::string(8, '\x90');
 			exp::set_actors_elsewhere(true);
-			const bool let_go = !exp::toggle("walls").on && !exp::walls_holding() && bytes_at(d.walls_call + 1, 4) == d.walls_rel;
 			exp::update();
-			const bool kept_off = !exp::toggle("walls").on && !exp::walls_holding();
-			const bool every_frame = occl_at != 0 && bytes_at(occl_at, 12) == every && contains(exp::toggle("occlusion").stat, "every frame");
-			check(let_go && kept_off, "the characters' test elsewhere: walls lets go of its call at once (the game's test again) and stays off");
-			check(every_frame, "  occlusion: every character tested every frame");
+			const bool every_frame = occl_at != 0 && bytes_at(occl_at, 12) == every && contains(exp::toggle("occlusion").stat, "every frame") &&
+				contains(exp::state_line(), "occlusion (every frame: VisTest answers the characters' test)");
+			check(every_frame, "the characters' test elsewhere: occlusion has every character tested every frame (and says so)");
 			exp::set_actors_elsewhere(false);
 			exp::update();
-			check(exp::toggle("walls").on && exp::walls_holding() && bytes_at(occl_at, 12) != every, "given back: walls on again, occlusion at its rate");
+			check(bytes_at(occl_at, 12) != every, "given back: occlusion at its rate");
 		}
+		const std::string line_on = exp::state_line();
+		// ('ashita' asked for too, refused here: a fake plugin handles draw calls; the line says why)
+		check(line_on == "on: occlusion, batch, dedupe; off: ashita (Not turned on: it would break plugin newbie (handles draw calls).)",
+			"the state line for the log and the reports: " + line_on);
 		exp::stop();
-		check(memory_free(mw) && memory_free(mp), "stop(): our memory freed");
+		check(d3d8_flags == 0, "stop(): the d3d8.dll told none");
 		put_bytes(d.renderer_global, renderer_was);
-		put_bytes(d.cpu_global, cpu_was);
-		check(dump::same_as_file(path, base, size), "  the image the dump again, byte for byte (the test's pointers to its fakes put back)");
+		check(dump::same_as_file(path, base, size), "  the image the dump again, byte for byte (the test's pointer to its fakes put back)");
 		dump::unmap(base);
 		std::printf("(%s: %d ok, %d failed)\n", file.c_str(), passes - passes_before, failures - failures_before);
 	}
@@ -1100,19 +1003,11 @@ int main()
 	CreateDirectoryA(folder.c_str(), nullptr);
 	CreateDirectoryA((folder + "install").c_str(), nullptr);
 	host.addons = list_addons;
-	host.actors = get_actors;
+	host.set_speedups = fake_set_speedups;
+	host.speedup_stats = fake_speedup_stats;
 	host.install = folder + "install\\";
 	host.ashita_base = kAsh;
 	host.ashita_size = kAshSize;
-
-	// stubs.inc is what tools/hifps_stubs.py makes of the addon's blobs now
-	{
-		std::vector<std::string> lines;
-		const std::string made = folder + "stubs.inc";
-		const int code = run("python \"" + root + "tools\\hifps_stubs.py\" C:\\Games\\PhoenixXI\\addons\\hifps \"" + made + "\"", lines, false);
-		check(code == 0 && read_file(made) == read_file(root + "src\\game\\hifps\\stubs.inc"),
-			"src\\game\\hifps\\stubs.inc is what tools\\hifps_stubs.py makes of the addon's proxy/*.blob and *_code.lua now");
-	}
 
 	// An image without the game's code: the toggles wait, nothing taken
 	{
@@ -1122,7 +1017,7 @@ int main()
 		exp::set_host(&host);
 		step_on = true;
 		options.clear();
-		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_walls", "exp_sse", "exp_batch", "exp_dedupe" })
+		for (const char *n : { "exp_ashita", "exp_occlusion", "exp_batch", "exp_dedupe" })
 			set_option(n, "1");
 		exp::update();
 		check(contains(exp::status()[0], "once the client's device exists"),
@@ -1137,7 +1032,6 @@ int main()
 		check(false, "the fakes mapped at 0x38000000");
 		return failures;
 	}
-	dump_run laid;
 	for (const char *path : dump::kDumps)
 	{
 		if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
@@ -1145,19 +1039,8 @@ int main()
 			check(false, std::string(path) + " is there");
 			continue;
 		}
-		dump_run one;
-		test_dump(path, root, one);
-		if (laid.walls_laid.empty() && !one.walls_laid.empty())
-			laid = one;
+		test_dump(path, root);
 	}
-
-	// The walls stub as the port laid it down, run by the addon's own harness
-	std::printf("\nthe addon's harness\n");
-	if (laid.walls_laid.empty())
-		check(false, "the walls stub laid down by the port (no dump ran)");
-	else
-		run_harness(folder, "walls", blob(laid.walls_laid, laid.walls_base, stubs::walls::relocs, std::size(stubs::walls::relocs), stubs::walls::symbols,
-			std::size(stubs::walls::symbols)));
 
 	std::printf(failures == 0 ? "\nall passed (%d)\n" : "\n%d failed\n", failures == 0 ? passes : failures);
 	return failures;

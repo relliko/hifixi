@@ -268,7 +268,7 @@ int main()
 	// 2. Every tab, balanced, with its own settings on it
 	struct tab_check { hifi::settings::tab t; const char *expect; };
 	const tab_check tabs[] = {
-		{ hifi::settings::tab::overview, "At a glance" }, { hifi::settings::tab::frame_rate, "[Answer glow, lamp, lens flare and door tests without waiting]" },
+		{ hifi::settings::tab::overview, "At a glance" }, { hifi::settings::tab::frame_rate, "[Answer glow, lamp, lens flare, door and character tests without waiting]" },
 		{ hifi::settings::tab::distance, "[Characters and monsters]" }, { hifi::settings::tab::lighting, "[Sun shadows]" },
 		{ hifi::settings::tab::world, "[Rings from moving]" }, { hifi::settings::tab::upscaling, "[Upscale the world with AMD FSR]" },
 		{ hifi::settings::tab::performance, "World FX" },
@@ -302,7 +302,7 @@ int main()
 	draw();
 	check(value("Grass") == 0.0f && value("Water") == 0.0f && value("SunShadows") == 0.0f && value("GrassDistance") == 140.0f,
 		"Off: everything off, what it leaves (the grass's distance) left");
-	check(value("VisTest") == 1.0f && !hifi::game::option_on("hifps", "exp_walls", false) && !hifi::game::option_on("hifps", "exp_dedupe", false) &&
+	check(value("VisTest") == 1.0f && !hifi::game::option_on("hifps", "exp_occlusion", false) && !hifi::game::option_on("hifps", "exp_dedupe", false) &&
 		hifi::game::option_on("hifps", "enabled", false), "Off: above 60 fps and the no-wait tests still on, the speed-ups still off (no preset turns them on)");
 	hifi::game::set_option_on("hifps", "exp_batch", true);
 	fake::click = "Balanced";
@@ -347,7 +347,7 @@ int main()
 	// 7. HiFi XI's own options (what hifps and drawcull did) in the menu
 	hifi::ui::show_tab(hifi::settings::tab::frame_rate);
 	draw();
-	check(fake::has("[Run above 60 fps]") && fake::has("[Frame cap]") && fake::has("[Hide characters by walls without waiting]"),
+	check(fake::has("[Run above 60 fps]") && fake::has("[Frame cap]") && fake::has("[Batch text and interface quads]"),
 		"the frame rate tab: hifps's settings");
 	fake::click = "Run above 60 fps";
 	draw();

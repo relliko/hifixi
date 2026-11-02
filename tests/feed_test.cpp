@@ -568,32 +568,26 @@ namespace
 					test = hifi::game::rel_target(sites[i]);
 			}
 			check(found && hifi::game::rel_target(sites[4]) == test, "the five visibility test calls found (the characters' too, to the same test)");
-			static std::vector<int> told; // (the stand-in walls: what it was told; holding while g_holding)
-			static bool g_holding = true;
+			static std::vector<int> told; // (the stand-in occlusion: what it was told)
 			told.clear();
-			hifi::game::feed::set_actor_handoff([](bool on) { told.push_back(on ? 1 : 0); }, []() { return g_holding; });
+			hifi::game::feed::set_actor_handoff([](bool on) { told.push_back(on ? 1 : 0); });
 			g_settings["VisTest"] = "1";
-			now += 1.0;
-			hifi::game::feed::frame(e, p, now);
-			const bool waited = found && hifi::game::rel_target(sites[0]) == test && hifi::game::rel_target(sites[4]) == test && !told.empty() && told.back() == 1;
-			g_holding = false;
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			bool pointed = found;
 			for (int i = 0; i < 5 && found; ++i)
 				pointed = pointed && hifi::game::rel_target(sites[i]) == 0x31000000u + uint32_t(i) * 0x10;
-			check(waited, "VisTest on while walls holds the characters' call: walls told to let go, nothing pointed yet");
-			check(pointed && g_sent.vis_original == test && g_sent.vis_on == 1 && told.back() == 1,
-				"once it has: each call pointed at World FX's entry for its kind (the characters' as actors), World FX told the game's test");
+			check(pointed && g_sent.vis_original == test && g_sent.vis_on == 1 && told.size() == 1 && told.back() == 1,
+				"VisTest on: each call pointed at World FX's entry for its kind (the characters' as actors) at once, World FX told the game's "
+				"test, occlusion told the characters' test is answered elsewhere");
 			g_settings["VisTest"] = "0";
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
 			bool back = found;
 			for (int i = 0; i < 5 && found; ++i)
 				back = back && hifi::game::rel_target(sites[i]) == test;
-			check(back && g_sent.vis_on == 0 && told.back() == 0, "VisTest off: the calls back to the game's test, the characters' given back to walls");
-			hifi::game::feed::set_actor_handoff(nullptr, nullptr);
-			g_holding = true;
+			check(back && g_sent.vis_on == 0 && told.back() == 0, "VisTest off: the calls back to the game's test, occlusion told so");
+			hifi::game::feed::set_actor_handoff(nullptr);
 		}
 
 		// 8. The game's water and rain: routed as their settings say (their own tests check the routines and lists)

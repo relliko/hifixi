@@ -177,9 +177,10 @@ namespace hifi::game::feed
 		// frame. With World FX's VisTest setting on, these calls go to its entries (worldfx_vis_entry), which answer
 		// from its copy of the world's depth a few frames late, without waiting; the game's own test still runs while
 		// none come in. Characters' and monsters' too (0CC688, the actor draw; their test every frame then, as hifps's
-		// occlusion has it: set_actor_handoff), in place of hifps's walls, which guessed from the zone's collision and
-		// hid characters behind walls that weren't drawn there (in game, 2026-10-26): optional, the other four work
-		// without it. Put back when the setting goes off, and on unload.
+		// occlusion has it: set_actor_handoff): the one way HiFi XI answers it (hifps's walls, which guessed from the
+		// zone's collision and hid characters behind walls that weren't drawn there, in game 2026-10-26, is gone:
+		// docs/frame-rate.md); optional, the other four work without it. While World FX doesn't draw, the game's own
+		// test, at occlusion's rate. Put back when the setting goes off, and on unload.
 		struct vis_site_info
 		{
 			const char *name, *pattern;
@@ -218,7 +219,6 @@ namespace hifi::game::feed
 		};
 		vis_state g_vis;
 		void (*g_actors_elsewhere)(bool) = nullptr;
-		bool (*g_walls_holding)() = nullptr;
 
 		// The Mog House: the party data keeps the town's zone there, so World FX drew the town's grass, water and
 		// shadows in the room (in game, 2026-10-21). The zone-in packet (0x00A, read only) says where you are: its login
@@ -852,7 +852,7 @@ namespace hifi::game::feed
 			g_vis.sites.clear();
 			g_vis.actors = false;
 			if (g_actors_elsewhere != nullptr)
-				g_actors_elsewhere(false); // (walls may have it again)
+				g_actors_elsewhere(false); // (the game's own test again, at occlusion's rate)
 		}
 
 		bool vis_on(std::string &why)
@@ -930,16 +930,12 @@ namespace hifi::game::feed
 			const bool want = setting_on("VisTest", true) && worldfx_drawing() != 0;
 			if (want && g_vis.sites.empty() && !g_vis.tried)
 			{
-				// (the characters' call: walls told to let go, the calls taken once it has, a half second on at most)
-				if (g_actors_elsewhere != nullptr)
-					g_actors_elsewhere(true);
-				if (g_walls_holding != nullptr && g_walls_holding())
-					return;
 				g_vis.tried = true;
 				std::string why;
 				g_vis.why = vis_on(why) ? std::string() : why;
-				if (g_actors_elsewhere != nullptr && !g_vis.actors)
-					g_actors_elsewhere(false); // (not VisTest's after all: walls may have it again)
+				// (the characters' test answered here: occlusion has every character tested every frame)
+				if (g_actors_elsewhere != nullptr)
+					g_actors_elsewhere(g_vis.actors);
 			}
 			else if (!want)
 			{
@@ -965,7 +961,7 @@ namespace hifi::game::feed
 				std::snprintf(since, sizeof(since), "%u ms ago", b[6]);
 			std::snprintf(line, sizeof(line), "answered from World FX's depth copy %u times, by the game's own test %u; %u boxes tested on the GPU, %u answers back (last %s), %u objects known, %u dropped; asked by glows %u, fades %u, the flare %u, doors %u; characters: %s",
 				b[0], b[1], b[2], b[3], since, b[4], b[5], b[7], b[8], b[9], b[10],
-				g_vis.actors ? "answered here too (every frame)" : ("left to hifps (" + (g_vis.actors_why.empty() ? std::string("not taken") : g_vis.actors_why) + ")").c_str());
+				g_vis.actors ? "answered here too (every frame)" : ("the game's own (" + (g_vis.actors_why.empty() ? std::string("not taken") : g_vis.actors_why) + ")").c_str());
 			return line;
 		}
 
@@ -1095,10 +1091,9 @@ namespace hifi::game::feed
 		++g_zone.packets;
 	}
 
-	void set_actor_handoff(void (*elsewhere)(bool on), bool (*walls_holding)())
+	void set_actor_handoff(void (*elsewhere)(bool on))
 	{
 		g_actors_elsewhere = elsewhere;
-		g_walls_holding = walls_holding;
 	}
 
 	void stop()

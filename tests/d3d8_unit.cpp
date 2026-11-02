@@ -5,7 +5,8 @@
  *     of each type, material sources, fog modes, texture coordinate generation and matrices, vertex blending, clip planes,
  *     pretransformed vertices, the alpha test) compiled with D3DCompile: every one must;
  *   - the game's own zone shaders (vs.1.1 with 0..3 lamps and ps.1.1, assembled with D3DX 8 from their text in the FFXiMain
- *     dump) and a set of vs.1.1 / ps.1.1-1.4 programs through the shader model 1 translator, compiled the same way.
+ *     dump) and a set of vs.1.1 / ps.1.1-1.4 programs through the shader model 1 translator, compiled the same way;
+ *   - the quad batch's rule and its strip-to-list (quads.hpp; the batch on a device is d3d8_hooks').
  *
  *   build\d3d8\d3d8_unit.exe
  */
@@ -15,6 +16,7 @@
 #include <d3dx8.h> // (before Direct3D 12's headers: their GUID macros don't suit D3DX 8's)
 #include "../src/d3d8/format.hpp"
 #include "../src/d3d8/shaders.hpp"
+#include "../src/d3d8/quads.hpp"
 #include <cstdarg>
 #include <cstdio>
 #include <string>
@@ -344,6 +346,38 @@ namespace
 			compiles(sm1_ps_hlsl(p, tex, uint8_t(n % 2 ? 0x2 : 0), tail), "ps_5_0", what);
 		}
 	}
+	// The quad batch (device::kBatch): the strips it takes, and a quad's triangles in the list the same as the strip's
+	void test_quads()
+	{
+		using hifi::d3d8::batchable_quad;
+		check(batchable_quad(D3DPT_TRIANGLESTRIP, 2, 28, D3DSHADE_GOURAUD), "a text quad (XYZRHW, colour, one UV: 28 bytes) is batched");
+		check(batchable_quad(D3DPT_TRIANGLESTRIP, 2, 12, D3DSHADE_GOURAUD) && batchable_quad(D3DPT_TRIANGLESTRIP, 2, 64, D3DSHADE_GOURAUD),
+			"... 12 to 64 bytes a vertex");
+		check(!batchable_quad(D3DPT_TRIANGLESTRIP, 3, 28, D3DSHADE_GOURAUD) && !batchable_quad(D3DPT_TRIANGLELIST, 2, 28, D3DSHADE_GOURAUD) &&
+				!batchable_quad(D3DPT_TRIANGLEFAN, 2, 28, D3DSHADE_GOURAUD),
+			"... only two-triangle strips");
+		check(!batchable_quad(D3DPT_TRIANGLESTRIP, 2, 8, D3DSHADE_GOURAUD) && !batchable_quad(D3DPT_TRIANGLESTRIP, 2, 68, D3DSHADE_GOURAUD) &&
+				!batchable_quad(D3DPT_TRIANGLESTRIP, 2, 30, D3DSHADE_GOURAUD),
+			"... not past 12 to 64 bytes, nor a stride of odd bytes");
+		check(!batchable_quad(D3DPT_TRIANGLESTRIP, 2, 28, D3DSHADE_FLAT), "... not flat shaded");
+		// Two quads of 16-byte vertices numbered 0-3 and 10-13: lists 0 1 2, 2 1 3 then 10 11 12, 12 11 13
+		struct v16 { float id, a, b, c; };
+		const v16 q1[4] = { { 0 }, { 1 }, { 2 }, { 3 } }, q2[4] = { { 10 }, { 11 }, { 12 }, { 13 } };
+		std::vector<uint8_t> list;
+		hifi::d3d8::append_quad(list, q1, sizeof(v16));
+		hifi::d3d8::append_quad(list, q2, sizeof(v16));
+		const float want[12] = { 0, 1, 2, 2, 1, 3, 10, 11, 12, 12, 11, 13 };
+		bool order = list.size() == 12 * sizeof(v16);
+		for (int i = 0; order && i < 12; ++i)
+			order = reinterpret_cast<const v16 *>(list.data())[i].id == want[i];
+		check(order, "two quads as a list: 0 1 2, 2 1 3, then the next (the strip's triangles, windings and order)");
+		// Each list triangle has the winding its strip triangle draws with: (v0 v1 v2) as is, the strip's second (v1 v2 v3,
+		// flipped) as v2 v1 v3
+		struct p { float x, y; };
+		auto cross = [](p a, p b, p c) { return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x); };
+		const p s[4] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+		check(cross(s[0], s[1], s[2]) * cross(s[2], s[1], s[3]) > 0, "... both triangles wound the same way, as a strip's are drawn");
+	}
 }
 
 int main(int argc, char **argv)
@@ -363,6 +397,7 @@ int main(int argc, char **argv)
 	test_formats();
 	test_fixed_function();
 	test_sm1();
+	test_quads();
 	const compile_stats cs = shader_stats();
 	std::printf("%d checks, %d failed; %u shaders compiled in %.0f ms\n", checks, failures, cs.compiled, cs.ms);
 	return failures == 0 ? 0 : 1;

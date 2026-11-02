@@ -3,6 +3,7 @@
 
 #include "device.hpp"
 #include "present.hpp"
+#include "quads.hpp"
 #include "../host/frameapi.hpp"
 #include <algorithm>
 
@@ -110,6 +111,55 @@ namespace hifi::d3d8
 	static device *g_mark_device = nullptr;
 	static hifi_frame_handler g_mark_handler = nullptr;
 	static void *g_mark_context = nullptr;
+	uint32_t g_speedups = 0;
+
+	bool device::unchanged(bool equal)
+	{
+		if (recording != nullptr)
+			return false;
+		if (equal && (g_speedups & kDedupe) != 0)
+		{
+			stats.dropped++;
+			return true;
+		}
+		if (!equal)
+			flush_quads();
+		return false;
+	}
+
+	bool device::take_quad(D3DPRIMITIVETYPE type, UINT count, const void *vertices, UINT stride)
+	{
+		if ((g_speedups & kBatch) == 0 || recording != nullptr || !batchable_quad(type, count, stride, cur.rs[D3DRS_SHADEMODE]))
+			return false;
+		// (nor one that reads a render target: the resolve and the screen passes stay the single draws they are, the world's
+		// end marked at the resolve itself, and FSR finds it as the quad it is)
+		for (IDirect3DBaseTexture8 *t : cur.textures)
+			if (const base_texture *bt = texture_of(t); bt != nullptr && bt->img->kind == image_kind::target)
+				return false;
+		const size_t bytes = size_t(stride) * 6;
+		if (quads.count != 0 && (quads.stride != stride || quads.vertices.size() + bytes > kQuadBytes))
+			flush_quads();
+		if (quads.count == 0)
+		{
+			quads.stride = stride;
+			quads.vertices.clear();
+		}
+		append_quad(quads.vertices, vertices, stride);
+		quads.count++;
+		stats.quads++;
+		return true;
+	}
+
+	void device::flush_quads()
+	{
+		if (quads.count == 0)
+			return;
+		const UINT n = quads.count;
+		quads.count = 0; // (first: the draw may come back here)
+		stats.batches++;
+		timer tm(perf_log, &perf.draw_ms);
+		draw(D3DPT_TRIANGLELIST, n * 2, false, 0, 0, 0, 0, quads.vertices.data(), quads.stride, nullptr, D3DFMT_UNKNOWN);
+	}
 
 	device::device(direct3d *p, UINT a, HWND f, DWORD b) : parent(p), adapter(a), focus(f), behaviour(b)
 	{
@@ -388,6 +438,7 @@ namespace hifi::d3d8
 	{
 		if (pp == nullptr)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		g.submit(true);
 		uint32_t default_pool = 0;
 		for (image *i : images)
@@ -416,6 +467,7 @@ namespace hifi::d3d8
 
 	HRESULT device::Present(CONST RECT *src, CONST RECT *dst, HWND w, CONST RGNDATA *)
 	{
+		flush_quads();
 		{
 			timer t(perf_log, &perf.present_ms);
 			LARGE_INTEGER presented_at;
@@ -599,6 +651,7 @@ namespace hifi::d3d8
 	{
 		if (src == nullptr || dst == nullptr)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		surface *s = static_cast<surface *>(src), *d = static_cast<surface *>(dst);
 		if (s->img->format != d->img->format)
 			return D3DERR_INVALIDCALL;
@@ -774,6 +827,7 @@ namespace hifi::d3d8
 		base_texture *s = texture_of(src), *d = texture_of(dst);
 		if (s == nullptr || d == nullptr || s->img->format != d->img->format || s->img->faces != d->img->faces)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		image *si = s->img, *di = d->img;
 		// (levels matched from the top: the source may have more)
 		const UINT skip = si->levels > di->levels ? si->levels - di->levels : 0;
@@ -795,6 +849,7 @@ namespace hifi::d3d8
 		surface *d = static_cast<surface *>(dst);
 		if (d->img->format != D3DFMT_A8R8G8B8)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		if (params.Windowed)
 		{
 			// Windowed, the front buffer is the screen: the adapter's monitor as it shows now (our window where it is, and
@@ -860,6 +915,7 @@ namespace hifi::d3d8
 			return D3DERR_INVALIDCALL;
 		if (z != nullptr && z->img->kind != image_kind::depth)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		if (r != nullptr && r != rt)
 		{
 			hold_surface(r);
@@ -942,18 +998,21 @@ namespace hifi::d3d8
 
 	HRESULT device::BeginScene()
 	{
+		flush_quads();
 		in_scene = true;
 		return D3D_OK;
 	}
 
 	HRESULT device::EndScene()
 	{
+		flush_quads();
 		in_scene = false;
 		return D3D_OK;
 	}
 
 	HRESULT device::Clear(DWORD n, CONST D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil)
 	{
+		flush_quads();
 		// (a slot marker: one 1x1 rect, stencil only; HiFi XI draws inside its ClearDepthStencilView)
 		const bool marker = n == 1 && rects != nullptr && flags == D3DCLEAR_STENCIL && rects[0].x2 - rects[0].x1 == 1 && rects[0].y2 - rects[0].y1 == 1;
 		timer t(perf_log, marker ? &perf.marker_ms : &perf.clear_ms);
@@ -977,29 +1036,27 @@ namespace hifi::d3d8
 			return D3DERR_INVALIDCALL;
 		device_state &s = target();
 		const DWORD v = DWORD(t);
+		D3DMATRIX *slot = nullptr;
+		uint8_t *mask = nullptr;
 		if (v == D3DTS_VIEW)
 		{
-			s.view = *m;
-			if (recording)
-				recording->mask.view = 1;
+			slot = &s.view;
+			mask = recording ? &recording->mask.view : nullptr;
 		}
 		else if (v == D3DTS_PROJECTION)
 		{
-			s.proj = *m;
-			if (recording)
-				recording->mask.proj = 1;
+			slot = &s.proj;
+			mask = recording ? &recording->mask.proj : nullptr;
 		}
 		else if (v >= D3DTS_TEXTURE0 && v <= D3DTS_TEXTURE7)
 		{
-			s.texm[v - D3DTS_TEXTURE0] = *m;
-			if (recording)
-				recording->mask.texm[v - D3DTS_TEXTURE0] = 1;
+			slot = &s.texm[v - D3DTS_TEXTURE0];
+			mask = recording ? &recording->mask.texm[v - D3DTS_TEXTURE0] : nullptr;
 		}
 		else if (v >= 256 && v < 260)
 		{
-			s.world[v - 256] = *m;
-			if (recording)
-				recording->mask.world[v - 256] = 1;
+			slot = &s.world[v - 256];
+			mask = recording ? &recording->mask.world[v - 256] : nullptr;
 		}
 		else if (v >= 260 && v < 512)
 		{
@@ -1008,6 +1065,11 @@ namespace hifi::d3d8
 		}
 		else
 			return D3DERR_INVALIDCALL;
+		if (unchanged(std::memcmp(slot, m, sizeof(D3DMATRIX)) == 0))
+			return D3D_OK;
+		*slot = *m;
+		if (mask != nullptr)
+			*mask = 1;
 		dirty |= d_ffvs;
 		return D3D_OK;
 	}
@@ -1053,6 +1115,8 @@ namespace hifi::d3d8
 		// (one reaching past the render target is refused, the viewport kept: Direct3D 8's rule, and dgVoodoo's)
 		if (rt != nullptr && (UINT64(v->X) + v->Width > rt->width() || UINT64(v->Y) + v->Height > rt->height()))
 			return D3DERR_INVALIDCALL;
+		if (unchanged(std::memcmp(&cur.viewport, v, sizeof(*v)) == 0))
+			return D3D_OK;
 		target().viewport = *v;
 		if (recording)
 			recording->mask.viewport = 1;
@@ -1072,6 +1136,8 @@ namespace hifi::d3d8
 	{
 		if (m == nullptr)
 			return D3DERR_INVALIDCALL;
+		if (unchanged(std::memcmp(&cur.material, m, sizeof(*m)) == 0))
+			return D3D_OK;
 		target().material = *m;
 		if (recording)
 			recording->mask.material = 1;
@@ -1092,6 +1158,8 @@ namespace hifi::d3d8
 		if (l == nullptr || i >= kMaxLights)
 			return D3DERR_INVALIDCALL;
 		light_slot &s = target().lights[i];
+		if (unchanged(s.set && std::memcmp(&s.light, l, sizeof(*l)) == 0))
+			return D3D_OK;
 		s.light = *l;
 		s.set = true;
 		if (recording)
@@ -1113,6 +1181,8 @@ namespace hifi::d3d8
 		if (i >= kMaxLights)
 			return D3DERR_INVALIDCALL;
 		light_slot &s = target().lights[i];
+		if (unchanged(s.set && s.enabled == (on != FALSE)))
+			return D3D_OK;
 		if (!s.set)
 		{
 			// (Direct3D 8: a light enabled before it's set is the default white light down +z)
@@ -1141,6 +1211,8 @@ namespace hifi::d3d8
 	{
 		if (p == nullptr || i >= 6)
 			return D3DERR_INVALIDCALL;
+		if (unchanged(std::memcmp(cur.clip[i], p, 16) == 0))
+			return D3D_OK;
 		std::memcpy(target().clip[i], p, 16);
 		if (recording)
 			recording->mask.clip[i] = 1;
@@ -1165,6 +1237,8 @@ namespace hifi::d3d8
 			recording->mask.rs[s] = 1;
 		else if (t.rs[s] == v)
 			return D3D_OK;
+		else
+			flush_quads();
 		t.rs[s] = v;
 		dirty |= dirty_of_rs(s);
 		return D3D_OK;
@@ -1194,6 +1268,8 @@ namespace hifi::d3d8
 		if (stage >= kMaxStages)
 			return D3DERR_INVALIDCALL;
 		device_state &s = target();
+		if (unchanged(s.textures[stage] == t))
+			return D3D_OK;
 		if (recording)
 			recording->mask.textures[stage] = 1;
 		set_texture_ref(s.textures[stage], t);
@@ -1220,6 +1296,8 @@ namespace hifi::d3d8
 			recording->mask.tss[stage][t] = 1;
 		else if (s.tss[stage][t] == v)
 			return D3D_OK;
+		else
+			flush_quads();
 		s.tss[stage][t] = v;
 		switch (t)
 		{
@@ -1258,6 +1336,8 @@ namespace hifi::d3d8
 	{
 		if (e == nullptr || n >= 256)
 			return D3DERR_INVALIDCALL;
+		if (std::memcmp(palettes[n], e, sizeof(palettes[n])) != 0)
+			flush_quads();
 		std::memcpy(palettes[n], e, sizeof(palettes[n]));
 		return D3D_OK;
 	}
@@ -1272,6 +1352,8 @@ namespace hifi::d3d8
 	{
 		if (n >= 256)
 			return D3DERR_INVALIDCALL;
+		if (unchanged(cur.palette == n))
+			return D3D_OK;
 		target().palette = n;
 		if (recording)
 			recording->mask.palette = 1;
@@ -1299,11 +1381,13 @@ namespace hifi::d3d8
 
 	HRESULT device::DrawPrimitive(D3DPRIMITIVETYPE t, UINT start, UINT count)
 	{
+		flush_quads();
 		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, false, start, 0, 0, 0, nullptr, 0, nullptr, D3DFMT_UNKNOWN);
 	}
 	HRESULT device::DrawIndexedPrimitive(D3DPRIMITIVETYPE t, UINT min_index, UINT vertices, UINT start, UINT count)
 	{
+		flush_quads();
 		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, true, start, INT(cur.base_vertex), min_index, vertices, nullptr, 0, nullptr, D3DFMT_UNKNOWN);
 	}
@@ -1311,6 +1395,9 @@ namespace hifi::d3d8
 	{
 		if (v == nullptr || stride == 0)
 			return D3DERR_INVALIDCALL;
+		if (take_quad(t, count, v, stride))
+			return D3D_OK;
+		flush_quads();
 		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, false, 0, 0, 0, 0, v, stride, nullptr, D3DFMT_UNKNOWN);
 	}
@@ -1318,6 +1405,7 @@ namespace hifi::d3d8
 	{
 		if (v == nullptr || i == nullptr || stride == 0)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		timer tm(perf_log, &perf.draw_ms);
 		return draw(t, count, true, 0, 0, min_index, vertices, v, stride, i, f);
 	}
@@ -1328,11 +1416,13 @@ namespace hifi::d3d8
 	}
 	HRESULT device::DrawRectPatch(UINT, CONST float *, CONST D3DRECTPATCH_INFO *)
 	{
+		flush_quads();
 		log_once(1, "patches aren't supported");
 		return D3D_OK;
 	}
 	HRESULT device::DrawTriPatch(UINT, CONST float *, CONST D3DTRIPATCH_INFO *)
 	{
+		flush_quads();
 		log_once(1, "patches aren't supported");
 		return D3D_OK;
 	}
@@ -1345,6 +1435,8 @@ namespace hifi::d3d8
 		if (n >= kMaxStreams)
 			return D3DERR_INVALIDCALL;
 		device_state &s = target();
+		if (unchanged(s.streams[n] == v && s.strides[n] == stride))
+			return D3D_OK;
 		if (recording)
 			recording->mask.streams[n] = 1;
 		if (s.streams[n] != v)
@@ -1371,6 +1463,8 @@ namespace hifi::d3d8
 	HRESULT device::SetIndices(IDirect3DIndexBuffer8 *i, UINT base)
 	{
 		device_state &s = target();
+		if (unchanged(s.indices == i && s.base_vertex == base))
+			return D3D_OK;
 		if (recording)
 			recording->mask.indices = 1;
 		if (s.indices != i)
@@ -1605,6 +1699,10 @@ namespace hifi::d3d8
 	HRESULT device::SetVertexShader(DWORD h)
 	{
 		device_state &s = target();
+		// (the same shader again is a change when its declaration has constants: they're loaded again)
+		const vertex_shader *again = s.vs == h ? vshader(h) : nullptr;
+		if (unchanged(s.vs == h && (again == nullptr || again->constants.empty())))
+			return D3D_OK;
 		if (recording)
 			recording->mask.vs = 1;
 		s.vs = h;
@@ -1638,6 +1736,8 @@ namespace hifi::d3d8
 		if (data == nullptr || r + n > kVsConstRegs)
 			return D3DERR_INVALIDCALL;
 		device_state &s = target();
+		if (unchanged(std::memcmp(s.vsc[r], data, size_t(n) * 16) == 0))
+			return D3D_OK;
 		std::memcpy(s.vsc[r], data, size_t(n) * 16);
 		if (recording)
 			for (DWORD k = 0; k < n; ++k)
@@ -1706,6 +1806,8 @@ namespace hifi::d3d8
 	HRESULT device::SetPixelShader(DWORD h)
 	{
 		device_state &s = target();
+		if (unchanged(s.ps == h))
+			return D3D_OK;
 		if (recording)
 			recording->mask.ps = 1;
 		s.ps = h;
@@ -1731,6 +1833,8 @@ namespace hifi::d3d8
 		if (data == nullptr || r + n > 8)
 			return D3DERR_INVALIDCALL;
 		device_state &s = target();
+		if (unchanged(std::memcmp(s.psc[r], data, size_t(n) * 16) == 0))
+			return D3D_OK;
 		std::memcpy(s.psc[r], data, size_t(n) * 16);
 		if (recording)
 			for (DWORD k = 0; k < n; ++k)
@@ -1997,6 +2101,7 @@ namespace hifi::d3d8
 	{
 		if (token == 0 || token > blocks.size() || blocks[token - 1] == nullptr || recording != nullptr)
 			return D3DERR_INVALIDCALL;
+		flush_quads();
 		apply(*blocks[token - 1]);
 		return D3D_OK;
 	}
@@ -2077,6 +2182,7 @@ namespace hifi::d3d8
 	{
 		if (d == nullptr || g_mark_handler == nullptr || d->g.list() == nullptr)
 			return 0;
+		d->flush_quads(); // (the quads waiting are the game's before the mark)
 		if (kind == kZoneBegin && d->rt != nullptr && d->rt->img != nullptr && d->rt->img->gpu_format != g_world_format &&
 			(d->chain == nullptr || d->rt->img != d->chain->back_image) && d->rt->img->retarget(g_world_format))
 			d->bound.epoch = 0; // (its view's descriptor now holds the new texture: bound again)
@@ -2133,6 +2239,28 @@ namespace hifi::d3d8
 extern "C" int __cdecl HifiFrameMark(uint32_t kind, uint32_t seq)
 {
 	return hifi::d3d8::mark_now(hifi::d3d8::g_mark_device, kind, seq);
+}
+
+extern "C" uint32_t __cdecl HifiFrameSetSpeedups(uint32_t flags)
+{
+	const uint32_t was = hifi::d3d8::g_speedups;
+	if (flags == kHifiSpeedupsAsk)
+		return was;
+	flags &= hifi::d3d8::device::kDedupe | hifi::d3d8::device::kBatch;
+	// (batching turned off: what waits is drawn now, on the game's thread as every call here)
+	if ((was & hifi::d3d8::device::kBatch) != 0 && (flags & hifi::d3d8::device::kBatch) == 0 && hifi::d3d8::g_mark_device != nullptr)
+		hifi::d3d8::g_mark_device->flush_quads();
+	hifi::d3d8::g_speedups = flags;
+	return was;
+}
+
+extern "C" void __cdecl HifiFrameSpeedupStats(uint32_t out[4])
+{
+	const hifi::d3d8::device *d = hifi::d3d8::g_mark_device;
+	out[0] = d != nullptr ? uint32_t(d->stats.dropped) : 0;
+	out[1] = d != nullptr ? uint32_t(d->stats.quads) : 0;
+	out[2] = d != nullptr ? uint32_t(d->stats.batches) : 0;
+	out[3] = d != nullptr ? uint32_t(d->stats.draws) : 0;
 }
 
 extern "C" int __cdecl HifiFrameSetWorldFormat(DXGI_FORMAT view)
