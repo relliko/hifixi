@@ -754,7 +754,12 @@ namespace grass
 		bool forget_colours(std::string &error);
 		uint32_t zone() const { return _zone; }
 		uint32_t blade_count() const { return _blade_count; }
-		// Called once a frame: buffers replaced this many frames ago are released
+		// Buffers and pipelines replaced: let go once the GPU is past every list that may use them. In the game, at every
+		// present after its fence's signal: signalled (that signal's value), completed (what the GPU has passed; UINT64_MAX
+		// the device removed). One replaced is kept till the fence passes signalled + 2 as it was then (the lists recorded
+		// so far go to the GPU after the next signal: see host/retire.hpp).
+		void release_done(uint64_t signalled, uint64_t completed);
+		// (the tests: their GPU waited for) buffers replaced this many release_old calls ago released
 		void release_old(uint32_t frames_to_keep = 30);
 
 		// The game's visibility tests (vistest.hpp): the boxes taken this frame, tested against the depth copy in the
@@ -1077,8 +1082,11 @@ namespace grass
 		{
 			ID3D12DeviceChild *buffer; // (a buffer, or a pipeline)
 			uint32_t frames;
+			uint64_t at; // (let go once the fence has passed it)
 		};
 		std::vector<old_buffer> _old;
+		uint64_t _signalled = 0; // (release_done's last)
+		void keep_old(ID3D12DeviceChild *buffer) { _old.push_back({ buffer, 0, _signalled + 2 }); }
 	};
 
 	// The clouds' noise as the GPU reads it (grass.hlsl cloud_tex): the broad one, 64 texels a side (a Perlin-Worley mix:

@@ -10,6 +10,7 @@
 #include <windows.h>
 #include "fxtextures.hpp"
 #include "../chars/tex.hpp"
+#include "../host/retire.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -34,7 +35,6 @@ namespace hifi::fx::textures
 			st_failed = 4,
 			st_forgotten = 5,
 		};
-		constexpr ULONGLONG kRetireMs = 2000;
 
 		struct entry
 		{
@@ -72,7 +72,6 @@ namespace hifi::fx::textures
 			UINT step = 0;
 			ID3D12Resource *white = nullptr;
 			bool white_copied = false;
-			std::vector<std::pair<ID3D12Resource *, ULONGLONG>> retired; // (let go at that tick count)
 			uint64_t gpu_bytes = 0;
 			std::atomic<uint32_t> waiting { 0 };
 		};
@@ -194,7 +193,7 @@ namespace hifi::fx::textures
 			b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 			b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			list->ResourceBarrier(1, &b);
-			g.retired.push_back({ up, GetTickCount64() + kRetireMs });
+			retire::later(up); // (once the GPU has run the copy)
 			D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
 			sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -301,9 +300,6 @@ namespace hifi::fx::textures
 		}
 		drop(g.heap);
 		drop(g.white);
-		for (auto &r : g.retired)
-			r.first->Release();
-		g.retired.clear();
 		g.heap = heap;
 		g.device = device;
 		g.step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -325,9 +321,6 @@ namespace hifi::fx::textures
 		}
 		drop(g.heap);
 		drop(g.white);
-		for (auto &r : g.retired)
-			r.first->Release();
-		g.retired.clear();
 		g.device = nullptr;
 		g.gpu_bytes = 0;
 	}
@@ -337,15 +330,6 @@ namespace hifi::fx::textures
 		std::lock_guard<std::mutex> lock(g.gpu_mutex);
 		if (g.device == nullptr || g.heap == nullptr)
 			return 0;
-		const ULONGLONG now = GetTickCount64();
-		for (auto it = g.retired.begin(); it != g.retired.end();)
-			if (now >= it->second)
-			{
-				it->first->Release();
-				it = g.retired.erase(it);
-			}
-			else
-				++it;
 		if (!g.white_copied)
 		{
 			const uint8_t white[4] = { 255, 255, 255, 255 };
@@ -363,8 +347,7 @@ namespace hifi::fx::textures
 				if (e.tex != nullptr)
 				{
 					g.gpu_bytes -= std::min<uint64_t>(g.gpu_bytes, uint64_t(e.w) * e.h * 4);
-					g.retired.push_back({ e.tex, now + kRetireMs });
-					e.tex = nullptr;
+					retire::let_go(e.tex); // (lists recorded with it may still be running)
 				}
 				e.rgba.clear();
 				e.rgba.shrink_to_fit();

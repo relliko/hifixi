@@ -108,6 +108,11 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND
   /Fe"build\streamlog_test.exe" /link /NOLOGO || exit /b 1
 echo Built build\streamlog_test.exe
 
+rem GPU objects let go behind the GPU (src\host\retire.hpp), on WARP: build\retire_test.exe
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\retire_test.cpp /Fo"build\test\\" /Fe"build\retire_test.exe" /link /NOLOGO d3d12.lib dxgi.lib || exit /b 1
+echo Built build\retire_test.exe
+
 rem The render engine with the plugin's flags (C++20, /EHa): build\engine_check.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\engine_check.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\engine_check.exe" ^

@@ -4,7 +4,7 @@
 // from (a ship's, a piece of furniture's, a plant's) read on a thread of its own (zonemesh::load_file, one at a time) the
 // first time one of its models is drawn, then put on the GPU on a copy queue of HiFi XI's own (gpu_zone, as the zone's).
 // Until then the game draws that actor itself. A DAT no model actor has drawn from for kUnusedPresents is let go
-// (kRetirePresents later: the GPU may still read it).
+// (once the GPU is past every list that may draw it: host/retire.hpp).
 //
 // Everything here is called on the game's thread (Ashita's present, the actor walk).
 

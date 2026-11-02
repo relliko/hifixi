@@ -7,6 +7,7 @@
 #include <windows.h>
 #include "actordata.hpp"
 #include "zone_gpu.hpp"
+#include "../host/retire.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21,7 +22,6 @@ namespace hifi::zone::actordata
 	namespace
 	{
 		namespace zm = bake::zonemesh;
-		constexpr uint64_t kRetirePresents = 240;
 		constexpr uint64_t kUnusedPresents = 3600; // (half a minute to a minute: a Mog House left and come back to keeps its furniture)
 		constexpr size_t kMaxFiles = 96;           // (DATs held at once; asked for past that: the game draws those)
 		constexpr size_t kMaxQueued = 64;
@@ -32,12 +32,6 @@ namespace hifi::zone::actordata
 			uint64_t used_at = 0; // (the present it was last asked for)
 			std::string why;      // (why it couldn't be read: then never asked again this session)
 			double read_ms = 0.0;
-		};
-
-		struct retired
-		{
-			std::unique_ptr<gpu_zone> z;
-			uint64_t at = 0;
 		};
 
 		struct state
@@ -56,7 +50,6 @@ namespace hifi::zone::actordata
 			bake::result result;
 			bool read_ok = false;
 			double read_ms = 0.0;
-			std::vector<retired> old;
 			uint64_t asked = 0, uploaded = 0, failed = 0, let_go = 0;
 		};
 		state g;
@@ -75,7 +68,6 @@ namespace hifi::zone::actordata
 			g.data = zm::zone();
 			g.files.clear();
 			g.queue.clear();
-			g.old.clear();
 		}
 
 		void forget_device()
@@ -91,11 +83,6 @@ namespace hifi::zone::actordata
 	void frame(ID3D12Device *device, bool wanted)
 	{
 		g.presents++;
-		for (size_t i = 0; i < g.old.size();)
-			if (g.presents - g.old[i].at > kRetirePresents)
-				g.old.erase(g.old.begin() + ptrdiff_t(i));
-			else
-				++i;
 		if (device != g.device)
 			forget_device();
 		g.wanted = wanted && device != nullptr;
@@ -108,7 +95,7 @@ namespace hifi::zone::actordata
 				g.loaded = false;
 				for (auto &f : g.files)
 					if (f.second.z != nullptr)
-						g.old.push_back({ std::move(f.second.z), g.presents });
+						retire::later(std::move(f.second.z));
 				g.files.clear();
 				g.queue.clear();
 			}
@@ -130,7 +117,7 @@ namespace hifi::zone::actordata
 		for (auto i = g.files.begin(); i != g.files.end();)
 			if (i->second.z != nullptr && g.presents - i->second.used_at > kUnusedPresents)
 			{
-				g.old.push_back({ std::move(i->second.z), g.presents });
+				retire::later(std::move(i->second.z));
 				g.let_go++;
 				i = g.files.erase(i);
 			}

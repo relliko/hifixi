@@ -85,6 +85,7 @@
 #include "../framegen/framegen.hpp"
 #include "../host/hooks.hpp"
 #include "../host/passes.hpp"
+#include "../host/retire.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../render/gpu_crash.hpp"
 #include "../ui/menu.hpp"
@@ -1112,6 +1113,7 @@ public:
 		hifi::game::hifps::exp::set_ashita(nullptr);
 		g_core = nullptr;
 		hifi::backend::stop();
+		hifi::retire::release_all(); // (nothing of ours is recorded after this: what the GPU has done with let go)
 	}
 
 	bool HandleCommand(int32_t mode, const char *command, bool injected) override

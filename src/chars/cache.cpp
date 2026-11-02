@@ -15,6 +15,7 @@
 #include "cache.hpp"
 #include "charframe.hpp"
 #include "tex.hpp"
+#include "../host/retire.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <cstdio>
@@ -128,11 +129,11 @@ namespace hifi::chars::cache
 			d.swap(g.dead);
 			return d;
 		}
+		// (lists recorded this frame or before may still draw them: let go behind the GPU, not at once)
 		void bury(std::vector<IUnknown *> &&d)
 		{
 			for (IUnknown *p : d)
-				if (p != nullptr)
-					p->Release();
+				retire::later(p);
 		}
 		template <typename T>
 		void later(T *&p)

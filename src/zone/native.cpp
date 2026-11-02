@@ -2,13 +2,14 @@
  * The native zone renderer's per-zone data in the game (native.hpp). One loader for each of the renderer's two map
  * slots (the zone, and a second map such as a building's interior), each one load at a time: a thread reads the map's
  * DATs (zonemesh::load: 3-35 ms offline), then the game's thread uploads them at its next present (gpu_zone::upload on
- * our copy queue) and polls the copy's fence at the presents after. A map left is kept for kRetirePresents more
- * presents before its resources are let go.
+ * our copy queue) and polls the copy's fence at the presents after. A map left is let go once the GPU is past every
+ * list that may draw it (host/retire.hpp).
  */
 
 #include <windows.h>
 #include "native.hpp"
 #include "zone_gpu.hpp"
+#include "../host/retire.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -20,14 +21,6 @@ namespace hifi::zone::native
 	namespace
 	{
 		namespace zm = bake::zonemesh;
-		constexpr uint32_t kRetirePresents = 240;
-
-		struct retired
-		{
-			std::unique_ptr<gpu_zone> z;
-			uint64_t at = 0;
-		};
-
 		// One map slot's data
 		struct slot
 		{
@@ -52,9 +45,7 @@ namespace hifi::zone::native
 		{
 			ID3D12Device *device = nullptr;
 			ID3D12CommandQueue *copy = nullptr;
-			uint64_t presents = 0;
 			slot slots[2];
-			std::vector<retired> old;
 		};
 		state g;
 
@@ -66,8 +57,7 @@ namespace hifi::zone::native
 
 		void retire(slot &s)
 		{
-			if (s.current != nullptr)
-				g.old.push_back({ std::move(s.current), g.presents });
+			retire::later(std::move(s.current));
 			s.map = 0;
 		}
 
@@ -81,7 +71,6 @@ namespace hifi::zone::native
 				s.current.reset();
 				s.map = 0;
 			}
-			g.old.clear();
 			if (g.copy != nullptr)
 				g.copy->Release();
 			g.copy = nullptr;
@@ -167,12 +156,6 @@ namespace hifi::zone::native
 
 	void frame(ID3D12Device *device, uint32_t zone, uint32_t second, bool wanted)
 	{
-		g.presents++;
-		for (size_t i = 0; i < g.old.size();)
-			if (g.presents - g.old[i].at > kRetirePresents)
-				g.old.erase(g.old.begin() + ptrdiff_t(i));
-			else
-				++i;
 		if (device != g.device)
 			forget_device();
 		if (!wanted || device == nullptr)
@@ -233,8 +216,6 @@ namespace hifi::zone::native
 			if (!s.why.empty())
 				lines.push_back(std::string("native zone data: ") + what + " " + std::to_string(s.failed_map) + " not loaded: " + s.why);
 		}
-		if (!g.old.empty())
-			lines.push_back("native zone data: " + std::to_string(g.old.size()) + " earlier map(s) let go shortly");
 		return lines;
 	}
 

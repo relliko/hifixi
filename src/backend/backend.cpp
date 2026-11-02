@@ -16,6 +16,7 @@
 #include "../host/passes.hpp"
 #include "../host/frameapi.hpp"
 #include "../host/shadercache.hpp"
+#include "../host/retire.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../render/gpu_crash.hpp"
 #include <share.h>
@@ -1040,6 +1041,7 @@ namespace hifi::backend
 			return;
 		host::quiet q;
 		worldfx::on_present(queue);
+		retire::on_present(queue); // (the zone's, effects' and characters' GPU objects let go behind the GPU)
 	}
 
 	const std::wstring &folder() { return g_folder; }

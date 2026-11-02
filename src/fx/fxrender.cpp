@@ -23,6 +23,7 @@
 #include "fxtextures.hpp"
 #include "../zone/zone_gpu.hpp"
 #include "../host/shadercache.hpp"
+#include "../host/retire.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
@@ -488,12 +489,9 @@ float4 ps_grab(g2p i) : SV_Target
 		sv.Texture2D.MipLevels = 1;
 		if (_dist == nullptr || _dist_format != t.rtv_format)
 		{
+			// (lists recorded with them may still be running: let go behind the GPU; the format changes with the float world)
 			for (IUnknown **u : { reinterpret_cast<IUnknown **>(&_dist), reinterpret_cast<IUnknown **>(&_grab_pso) })
-			{
-				if (*u != nullptr)
-					(*u)->Release();
-				*u = nullptr;
-			}
+				retire::let_go(*u);
 			if (_dist_rtv == nullptr)
 			{
 				const D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };

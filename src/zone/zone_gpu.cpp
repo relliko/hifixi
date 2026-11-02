@@ -91,6 +91,19 @@ namespace hifi::zone
 
 	void gpu_zone::release()
 	{
+		// (the copy still running on our copy queue: the game's fence says nothing about that queue, so waited for here,
+		// at most 5 s; still running then, or its end never signalled, what it reads and writes is left, not freed under it)
+		if (_copying == 2)
+			wait(5000);
+		if (_copying != 0)
+		{
+			_textures.clear();
+			_vb = _ib = _upload = nullptr;
+			_list = nullptr;
+			_allocator = nullptr;
+			_fence = nullptr;
+			_copying = 0;
+		}
 		for (ID3D12Resource *&t : _textures)
 			drop(t);
 		_textures.clear();
@@ -196,8 +209,10 @@ namespace hifi::zone
 			return failed("the upload's command list couldn't be closed");
 		ID3D12CommandList *lists[] = { _list };
 		queue->ExecuteCommandLists(1, lists);
+		_copying = 1;
 		if (FAILED(queue->Signal(_fence, 1)))
 			return failed("the upload's fence couldn't be signalled");
+		_copying = 2;
 
 		// The descriptors
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
@@ -238,6 +253,7 @@ namespace hifi::zone
 		if (_fence == nullptr || _fence->GetCompletedValue() < 1)
 			return false;
 		_ready = true;
+		_copying = 0;
 		_upload_ms = ms_since(_started);
 		drop(_upload);
 		drop(_list);

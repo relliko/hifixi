@@ -99,6 +99,8 @@ extern "C"
 	void __cdecl worldfx_weather(const uint32_t *words, uint32_t count);
 	// The game's Vana'diel clock (Earth seconds since 2002-01-01 JST, as FFXiMain 1039E0 has it): the moon's phase
 	void __cdecl worldfx_moon(uint32_t clock);
+	// The zone (0: none; a Mog House 1000 + its room) and whether a character is in (1: logged in, not zoning), every frame
+	void __cdecl worldfx_zone(uint32_t zone, uint32_t in_game);
 	uintptr_t __cdecl worldfx_vis_entry(uint32_t kind);
 	void __cdecl worldfx_vis_setup(uintptr_t original, uint32_t on);
 	void __cdecl worldfx_vis_stats(uint32_t out[12]);

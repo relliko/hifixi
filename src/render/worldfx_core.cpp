@@ -11,8 +11,8 @@
  * depth-tested against the blades.
  *
  * Camera: the game's own (gGame +0x94 view, +0x154 projection, found in FFXiMain.dll by facelift's
- * 'game.sys' pattern). Zone: the worldfx Ashita addon puts it in the process environment
- * (FFXI_WORLDFX_ZONE); blades for zone N are read from worldfx-grass\N.bin in the host's folder.
+ * 'game.sys' pattern). Zone: HiFi XI's game side tells it every frame (worldfx_zone, src/game/feed.cpp); blades for
+ * zone N are read from worldfx-grass\N.bin in the host's folder.
  *
  * Lamps: the zone's from worldfx-lamps\N.bin (tools/bake_lamps.py); which are lit now, from the game's light
  * table, which the Ashita addon reads and sends (worldfx_lamps). Their glow goes in with the shading pass.
@@ -45,7 +45,11 @@
 
 namespace
 {
-	constexpr const char *kZoneVariable = "FFXI_WORLDFX_ZONE";
+	// The zone and whether a character is in, as the game side last told them (worldfx_zone: 0 none known; in 1 logged
+	// in, not zoning). check_zone reads the zone's files at the present after a change; until it has, nothing is drawn
+	// (zone_stale: the GPU hung drawing the last zone's grass in the next, 2026-11-01/02)
+	std::atomic<uint32_t> g_told_zone{ 0 };
+	std::atomic<uint32_t> g_told_in{ 0 };
 	// The zone's files to be read again (worldfx::reload_zone: HiFi XI just made them)
 	std::atomic<bool> g_reload_zone{ false };
 	// The game's world found since its device was attached: World FX draws there (worldfx_drawing: HiFi XI's game side
@@ -56,14 +60,13 @@ namespace
 	// At most kMaxPasses drawings between two presents: a full-screen pass at twice the screen's size many
 	// times in one frame is enough to make the GPU time out
 	constexpr uint32_t kMaxPasses = 2;
-	// Nothing is drawn unless the worldfx Ashita addon says a character is in the game (FFXI_WORLDFX_INGAME
-	// = 1: logged in, not zoning), from the first frame it does. The shading pass (ambient occlusion, relief,
+	// Nothing is drawn unless the game side says a character is in the game (worldfx_zone's in = 1: logged in, not
+	// zoning), from the first frame it does. The shading pass (ambient occlusion, relief,
 	// sun shadows) pauses kShadePauseMs whenever the GPU timer says it took more than kShadeMaxMs
 	// (TestShadeMaxMs in ReShade.ini: another limit, for the end-to-end test on WARP, a CPU many times slower
 	// than the GPU). (Until 2026-10-17 everything also waited 60 frames in the field, and the shading pass
 	// 3 s more, against GPU hangs at zone-in; those were the add-on leaving its own state bound after a
 	// shading-only pass and the NVIDIA driver's forced anisotropic filtering, and happened with both waits.)
-	constexpr const char *kInGameVariable = "FFXI_WORLDFX_INGAME";
 	constexpr ULONGLONG kShadePauseMs = 5000;
 	constexpr float kShadeMaxMs = 30.0f;
 	constexpr uint32_t kZoneCheckFrames = 30;
@@ -165,7 +168,7 @@ namespace
 		static constexpr uint32_t kDrawings = 8;
 		drawing drawings[kDrawings];
 		uint32_t drawing_count = 0;
-		bool in_game = false;             // the Ashita addon says so (FFXI_WORLDFX_INGAME)
+		bool in_game = false;             // the game side says so (worldfx_zone)
 		ULONGLONG in_game_since = 0;      // (GetTickCount64)
 		ULONGLONG shading_paused_until = 0;
 		const char *shading_held = nullptr; // why the shading pass isn't running now (nullptr: it is)
@@ -697,12 +700,16 @@ namespace
 		return n;
 	}
 
+	// (g.mutex held) The game side has told a zone check_zone hasn't read the files of yet: what's loaded is another's
+	bool zone_stale()
+	{
+		return !g.zone_tried || g_told_zone.load(std::memory_order_acquire) != g.zone;
+	}
+
 	void check_zone()
 	{
-		char text[16] = "";
-		const DWORD n = GetEnvironmentVariableA(kZoneVariable, text, sizeof(text));
-		const bool known = n > 0 && n < sizeof(text);
-		const uint32_t zone = known ? std::strtoul(text, nullptr, 10) : 0;
+		const uint32_t zone = g_told_zone.load(std::memory_order_acquire);
+		const bool known = zone != 0;
 		// (the zone's files just made: read again as if it had just been entered)
 		if (g_reload_zone.exchange(false))
 			g.zone_tried = false;
@@ -1997,6 +2004,11 @@ namespace
 			g.skip = "not in the game (login, character select, zoning; or the worldfx Ashita addon isn't loaded)";
 			return;
 		}
+		if (zone_stale())
+		{
+			g.skip = "a new zone, its files not read yet (the last zone's never drawn in it)";
+			return;
+		}
 		if (g.passes >= kMaxPasses)
 		{
 			g.skip = "the world ended more than twice this frame (the rest skipped)";
@@ -2137,11 +2149,9 @@ namespace
 	void end_frame()
 	{
 		uint32_t passes_this_frame = 0;
-		// In the game? (the Ashita addon's word: logged in, not zoning)
+		// In the game? (the game side's word: logged in, not zoning)
 		{
-			char text[8] = "";
-			const DWORD n = GetEnvironmentVariableA(kInGameVariable, text, sizeof(text));
-			const bool now_in = n == 1 && text[0] == '1';
+			const bool now_in = g_told_in.load(std::memory_order_acquire) != 0;
 			if (now_in && !g.in_game)
 			{
 				g.in_game_since = GetTickCount64();
@@ -2686,7 +2696,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
 		ID3D12Resource *const ds = resource_of(dsv);
-		if (!g.in_game || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
+		if (!g.in_game || zone_stale() || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
 			return;
 		// (the world the markers named, its views still its own, D24S8 as the blades' depth)
 		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || g.world_rtv == 0 || resource_of(g.world_rtv) != g.world_rt ||
@@ -2790,7 +2800,11 @@ namespace worldfx
 					frequency_known = true;
 				}
 			}
-			g.renderer->release_old();
+			// (replaced buffers let go behind the frame-pacing fence, signalled just now in pace_present; without one, by count)
+			if (g.pace_fence != nullptr && g.pace_device == g.dev)
+				g.renderer->release_done(g.presents, g.pace_fence->GetCompletedValue());
+			else
+				g.renderer->release_old();
 			if (g.debug_layer)
 				gpu_crash::write_debug_messages(g.dev, addon_folder() + L"worldfx-d3d12-debug.txt");
 			// (the zone at every present, after end_frame read "in game": the frame after a character comes in never draws
@@ -2951,6 +2965,15 @@ static void take_actors(const float *xyzr, const uint32_t *flags, uint32_t count
 extern "C" __declspec(dllexport) void __cdecl worldfx_grass_actors(const float *xyzr, uint32_t count)
 {
 	take_actors(xyzr, nullptr, count);
+}
+
+// From HiFi XI's game side (src/game/feed.cpp), every frame on the game's thread: the zone (0: none known; a Mog House
+// 1000 + its room) and whether a character is in (1: logged in, not zoning). The zone's files are read at the next
+// present; nothing is drawn till then.
+extern "C" __declspec(dllexport) void __cdecl worldfx_zone(uint32_t zone, uint32_t in_game)
+{
+	g_told_zone.store(zone, std::memory_order_release);
+	g_told_in.store(in_game != 0 ? 1u : 0u, std::memory_order_release);
 }
 
 // For HiFi XI's game side: whether World FX draws into the game's world (it has found it since the game's device was

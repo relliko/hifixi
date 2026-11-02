@@ -52,6 +52,7 @@ namespace
 		std::vector<uint32_t> weather;
 		uint32_t weather_calls = 0;
 		uint32_t moon = 0, moon_calls = 0;
+		uint32_t zone = 0, in = 0, zone_calls = 0; // (worldfx_zone)
 		uint32_t glow_calls = 0;
 		uintptr_t vis_original = 0;
 		uint32_t vis_on = 0;
@@ -87,6 +88,12 @@ extern "C"
 	{
 		g_sent.moon = clock;
 		g_sent.moon_calls++;
+	}
+	void __cdecl worldfx_zone(uint32_t zone, uint32_t in_game)
+	{
+		g_sent.zone = zone;
+		g_sent.in = in_game;
+		g_sent.zone_calls++;
 	}
 	// (each kind's entry: a stand-in address)
 	uintptr_t __cdecl worldfx_vis_entry(uint32_t kind) { return 0x31000000u + kind * 0x10; }
@@ -150,13 +157,6 @@ namespace
 			if ((v >> k) & 1u)
 				p[at / 8] = uint8_t(p[at / 8] | (1u << (at % 8)));
 		}
-	}
-
-	std::string env(const char *name)
-	{
-		char text[64] = "";
-		const DWORD n = GetEnvironmentVariableA(name, text, sizeof(text));
-		return n > 0 && n < sizeof(text) ? std::string(text) : std::string("(none)");
 	}
 
 	uint32_t bits_of(float f)
@@ -311,7 +311,7 @@ namespace
 		p.server_id = 0x1000005;
 
 		// 2. The zone and in game, through the environment
-		check(env("FFXI_WORLDFX_ZONE") == "100" && env("FFXI_WORLDFX_INGAME") == "1", "the zone (100) and in game told to World FX");
+		check(g_sent.zone == 100 && g_sent.in == 1, "the zone (100) and in game told to World FX");
 		{
 			std::vector<uint8_t> zone_in(0x100, 0);
 			zone_in[0x80] = 1;
@@ -320,32 +320,32 @@ namespace
 			hifi::game::feed::packet_in(0x00A, zone_in.data(), uint32_t(zone_in.size()), e);
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
-			check(env("FFXI_WORLDFX_ZONE") == "1261" && hifi::game::feed::zone() == 1261, "in a Mog House: 1000 + its room's model (1261)");
+			check(g_sent.zone == 1261 && hifi::game::feed::zone() == 1261, "in a Mog House: 1000 + its room's model (1261)");
 			zone_in[0x80] = 0;
 			hifi::game::feed::packet_in(0x00A, zone_in.data(), uint32_t(zone_in.size()), e);
 			p.zone = 0;
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
-			check(env("FFXI_WORLDFX_ZONE") == "1261", "zoning (zone 0): the last zone stays");
+			check(g_sent.zone == 1261, "zoning (zone 0): the last zone stays");
 			p.zone = 101;
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
-			check(env("FFXI_WORLDFX_ZONE") == "101", "out again: the party's zone (101)");
+			check(g_sent.zone == 101, "out again: the party's zone (101)");
 
 			// Zoning, the party's zone still the last one after (Windurst, 2026-11-02 03:17): "in" waits for the zone-in packet
 			p.in_game = false;
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
-			check(env("FFXI_WORLDFX_INGAME") == "0", "zoning: out");
+			check(g_sent.in == 0, "zoning: out");
 			p.in_game = true;
 			now += 0.5;
 			hifi::game::feed::frame(e, p, now);
-			check(env("FFXI_WORLDFX_INGAME") == "0" && env("FFXI_WORLDFX_ZONE") == "101", "  in again, the party's zone the last one: not told in yet");
+			check(g_sent.in == 0 && g_sent.zone == 101, "  in again, the party's zone the last one: not told in yet");
 			zone_in[0x30] = 238;
 			hifi::game::feed::packet_in(0x00A, zone_in.data(), uint32_t(zone_in.size()), e);
 			now += 0.02;
 			hifi::game::feed::frame(e, p, now);
-			check(env("FFXI_WORLDFX_ZONE") == "238" && env("FFXI_WORLDFX_INGAME") == "1", "  the zone-in packet's zone (238), then in, the same frame");
+			check(g_sent.zone == 238 && g_sent.in == 1, "  the zone-in packet's zone (238), then in, the same frame");
 			p.zone = 238;
 			p.in_game = false;
 			now += 1.0;
@@ -353,10 +353,10 @@ namespace
 			p.in_game = true;
 			now += 1.0;
 			hifi::game::feed::frame(e, p, now);
-			const bool held = env("FFXI_WORLDFX_INGAME") == "0";
+			const bool held = g_sent.in == 0;
 			now += 3.0;
 			hifi::game::feed::frame(e, p, now);
-			check(held && env("FFXI_WORLDFX_INGAME") == "1", "  no zone-in packet: in after 3 s all the same");
+			check(held && g_sent.in == 1, "  no zone-in packet: in after 3 s all the same");
 		}
 
 		// 3. A weapon skill's action packet: user 6, skill 20 (an area skill, radius 10), targets 5 (3 yalms off) and 9 (57)
@@ -708,7 +708,7 @@ namespace
 			check(s.size() >= 8 && s[0].find("zone 238") != std::string::npos, "the status lines (the zone first)");
 		}
 		hifi::game::feed::stop();
-		check(env("FFXI_WORLDFX_ZONE") == "(none)" && env("FFXI_WORLDFX_INGAME") == "(none)", "stopped: the zone and in game taken out of the environment");
+		check(g_sent.zone == 0 && g_sent.in == 0, "stopped: World FX told no zone, not in");
 		// (the test's own writes, the light table and the weather's globals, were put back above)
 		const bool own = std::memcmp(clean.data(), reinterpret_cast<const void *>(base), size) == 0;
 		for (const addon_site &a : addon)
