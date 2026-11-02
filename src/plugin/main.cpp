@@ -99,6 +99,54 @@
 namespace
 {
 	constexpr double kVersion = 0.65;
+	// A present's steps on the game's thread, timed; the lot in the log when they took over kSlowPresentMs (at most
+	// kSlowPresentLines a session: a zone change takes a second or two every time)
+	struct slow_present
+	{
+		static constexpr double kSlowPresentMs = 200.0;
+		static constexpr int kSlowPresentLines = 40;
+		LARGE_INTEGER start {}, last {};
+		const char *names[12] = {};
+		double ms[12] = {};
+		int count = 0;
+		slow_present()
+		{
+			QueryPerformanceCounter(&start);
+			last = start;
+		}
+		static double per_ms()
+		{
+			static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return double(q.QuadPart) / 1000.0; }();
+			return f;
+		}
+		void step(const char *name)
+		{
+			LARGE_INTEGER t;
+			QueryPerformanceCounter(&t);
+			if (count < 12)
+			{
+				names[count] = name;
+				ms[count++] = double(t.QuadPart - last.QuadPart) / per_ms();
+			}
+			last = t;
+		}
+		void log_if_slow() const
+		{
+			static int logged = 0;
+			const double total = double(last.QuadPart - start.QuadPart) / per_ms();
+			if (total < kSlowPresentMs || logged >= kSlowPresentLines)
+				return;
+			logged++;
+			char text[600];
+			int n = std::snprintf(text, sizeof(text), "HiFi XI: a slow present on the game's thread: %.0f ms (", total);
+			for (int i = 0; i < count && n > 0 && n < int(sizeof(text)); ++i)
+				n += std::snprintf(text + n, sizeof(text) - size_t(n), "%s%s %.0f", i == 0 ? "" : ", ", names[i], ms[i]);
+			if (n > 0 && n < int(sizeof(text)) - 2)
+				std::snprintf(text + n, sizeof(text) - size_t(n), ")");
+			hifi::backend::log(1, text);
+		}
+	};
+
 	constexpr size_t kStatusChatLines = 12; // (/hifi status <word>: at most this many lines in the chat)
 	constexpr size_t kChatLine = 110;       // (one chat line's most characters: say() breaks longer text)
 
@@ -1247,6 +1295,9 @@ public:
 		// The frame rate first (the cap waits here, before the frame is shown), then the game-side parts: hifps's,
 		// and drawcull's work, each following its options every half second
 		hifi::game::hifps::present(now);
+		// (each step's time from here, logged when the present took long: where a hitch on the game's thread went. A
+		// blizzard forced on 2026-11-02 stalled it 1.3 s outside HiFi XI's passes, and nothing said where)
+		slow_present slow;
 		hifi::game::hifps::exp::present(now);
 		hifi::game::drawcull::frame(now);
 		// (the next frame's offset, before the camera tick builds its projection: only while FSR 2 draws to take it back out)
@@ -1271,6 +1322,7 @@ public:
 				"Report: bootloader\\worldfx-gpu-crash.txt", true);
 		}
 		hifi::framegen::present(); // (frame generation on or off as FSR 2 runs and the setting says)
+		slow.step("frame rate, culling, frame generation");
 		if (now >= m_next_update)
 		{
 			m_next_update = now + 0.5;
@@ -1291,6 +1343,7 @@ public:
 				if (m.update != nullptr)
 					m.update(now);
 			follow_overlay();
+			slow.step("settings followed");
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first
 		// time it's entered)
@@ -1298,11 +1351,14 @@ public:
 		{
 			const hifi::game::feed::party p = party_now();
 			hifi::game::feed::frame(g_entities, p, now);
+			slow.step("the game's data for World FX");
 			// (the native zone renderer's data for the zone and its second map)
 			hifi::zone::native::frame(worldfx::attached(), p.in_game ? hifi::game::feed::zone() : 0, p.in_game ? hifi::game::zonedraw::second_map() : 0, true);
 			native_gate();
+			slow.step("the native zone's data");
 			// (the model actors' DATs, as they're seen)
 			hifi::zone::actordata::frame(worldfx::attached(), p.in_game && hifi::game::modelactor::in());
+			slow.step("the model actors' data");
 			// (the own-frame passes, src/host/passes.hpp: the device as it's known, then each present)
 			if (ID3D12Device *const device = worldfx::attached(); device != m_pass_device)
 			{
@@ -1320,8 +1376,11 @@ public:
 				m_zone = zone;
 				hifi::bake::runner::zone_entered(zone);
 			}
+			slow.step("the own-frame passes");
 		}
 		hifi::backend::present();
+		slow.step("World FX");
+		slow.log_if_slow();
 		if (const std::string line = hifi::backend::streamlog::present(); !line.empty())
 			say(line);
 		if (g_gui != nullptr && hifi::game::option_on("hifps", "counter", true) && hifi::game::hifps::fps() > 0.0)

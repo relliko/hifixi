@@ -1079,6 +1079,10 @@ namespace
 	// For this long after entering a zone (ms) its ground goes straight to its weather's wetness and snow: the last zone's
 	// doesn't come along (the game's weather may still be the last zone's for the first frames)
 	constexpr ULONGLONG kZoneWeatherMs = 5000;
+	// The weather late for less than this (ms: a long frame, a hitch) leaves the wet ground and settled snow as they are;
+	// gone for longer (logged out, the addon unloaded) they go. A 1.3 s hitch in a forced blizzard made the weather stale
+	// for a frame: the snow was zeroed, then laid whole at once as if logging in (2026-11-02)
+	constexpr ULONGLONG kWeatherLostMs = 10000;
 
 	bool weather_fresh()
 	{
@@ -1433,15 +1437,18 @@ namespace
 		// (rain that starts while you watch wets the ground over kWettingSeconds; already raining when the weather
 		// becomes known (logging in), it's wet at once; in a zone just entered, as its weather has it at once)
 		const bool zone_new = now - g.zone_entered_at < kZoneWeatherMs;
-		if (!fresh)
+		const bool lost = !fresh && (!g.weather.known || now - g.weather_at >= kWeatherLostMs);
+		if (lost)
 			g.wetness = 0.0f;
+		else if (!fresh)
+			{} // (late for a moment: as it was)
 		else if (zone_new)
 			g.wetness = rain;
 		else if (rain >= g.wetness)
 			g.wetness = g.wet_weather_known ? std::min(rain, g.wetness + dt / kWettingSeconds) : rain;
 		else
 			g.wetness = std::max(rain, g.wetness - dt / kDryingSeconds);
-		g.wet_weather_known = fresh;
+		g.wet_weather_known = fresh || (g.wet_weather_known && !lost);
 		g.look.wet = g.zone_sunlit ? g.wet_ground * g.wetness : 0.0f; // (only under open sky, as the sun's shadows)
 		// The add-on's rain: as hard as the weather's (blended across a change, as the game blends its lights), slanted
 		// by its wind, which blows the way the game's own clouds drifted in that zone and weather (grass::wind_bearing; the
@@ -1473,15 +1480,17 @@ namespace
 			const float target = fresh && g.snow_on ? std::min(grass::weather_snowfall(w) * 1.4f, 1.0f) : 0.0f;
 			const float sdt = g.snow_at != 0 ? std::min(float(now - g.snow_at) / 1000.0f, 1.0f) : 0.0f;
 			g.snow_at = now;
-			if (!fresh || !g.snow_on)
+			if (lost || !g.snow_on)
 				g.snow_cover = 0.0f;
+			else if (!fresh)
+				{} // (late for a moment: as it was)
 			else if (zone_new)
 				g.snow_cover = target;
 			else if (target >= g.snow_cover)
 				g.snow_cover = g.snow_weather_known ? std::min(target, g.snow_cover + sdt / kSnowSettleSeconds) : target;
 			else
 				g.snow_cover = std::max(target, g.snow_cover - sdt / kSnowMeltSeconds);
-			g.snow_weather_known = fresh;
+			g.snow_weather_known = fresh || (g.snow_weather_known && !lost);
 			g.look.snow_cover = g.renderer != nullptr && g.renderer->rain_loaded() ? g.snow_cover_amount * g.snow_cover : 0.0f;
 			g.look.snow_depth = g.snow_depth;
 			g.look.snow_trails = g.snow_trails;
@@ -2733,10 +2742,32 @@ namespace worldfx
 
 	void on_present(ID3D12CommandQueue *queue)
 	{
+		// (its steps timed, in the log when over 150 ms: the wait for its lock (another thread's work), the frame's end,
+		// the zone's files, the rest. A blizzard forced on 2026-11-02 stalled the game's thread 1.3 s, nobody knew where)
+		const ULONGLONG t0 = GetTickCount64();
 		std::lock_guard<std::mutex> lock(g.mutex);
+		const ULONGLONG t_lock = GetTickCount64();
+		ULONGLONG t_end = t_lock, t_zone = t_lock;
+		struct timed
+		{
+			const ULONGLONG &t0, &t_lock, &t_end, &t_zone;
+			~timed()
+			{
+				const ULONGLONG t = GetTickCount64();
+				static int logged = 0;
+				if (t - t0 < 150 || logged >= 40)
+					return;
+				logged++;
+				char text[200];
+				std::snprintf(text, sizeof(text), "FFXI World FX: a slow present: %llu ms (waiting for its lock %llu, the frame's end %llu, the zone's "
+					"files %llu, the rest %llu)", t - t0, t_lock - t0, t_end - t_lock, t_zone - t_end, t - t_zone);
+				log_message(1, text);
+			}
+		} timing { t0, t_lock, t_end, t_zone };
 		if (g.dev == nullptr || queue == nullptr)
 			return;
 		end_frame();
+		t_end = t_zone = GetTickCount64();
 		pace_present(queue);
 		// The visibility tests' counts from the frames the GPU has finished (their slots' presents + 2)
 		if (g.vis_on && g.renderer != nullptr && g.pace_fence != nullptr)
@@ -2765,6 +2796,7 @@ namespace worldfx
 			// (the zone at every present, after end_frame read "in game": the frame after a character comes in never draws
 			// the last zone's grass, water or sea; the GPU hung on that in Windurst, 2026-11-02)
 			check_zone();
+			t_zone = GetTickCount64();
 			if (g.frames++ % kZoneCheckFrames == 0)
 				check_shaders();
 			constexpr uint64_t kMemoryCheckMs = 5000;
