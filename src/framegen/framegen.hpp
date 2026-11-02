@@ -45,9 +45,6 @@ namespace hifi::framegen
 	// ours, when wanted. False with why when they couldn't be; true (nothing done) when not wanted.
 	// log: HiFi XI's log (level 0 info, 1 warning, 2 error), told of each swap chain made through ours.
 	bool install(void *create_factory1, std::string &why, void (*log)(int level, const char *text) = nullptr);
-	// Called first thing on AMD's swap chain's own threads (interpolation, presenter) once they start (fg_threads.h): HiFi
-	// XI keeps its hooks quiet there. Before install().
-	void set_thread_start(void (*start)());
 	// The setting at the start (before install(): AMD's swap chain put in only then), and as it is now (generation
 	// only while on: off at once, on again at once when the swap chain is AMD's)
 	void set_wanted(bool on);

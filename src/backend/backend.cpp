@@ -1,7 +1,6 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include "backend.hpp"
-#include "streamlog.hpp"
 #include "../game/slotmark.hpp"
 #include "../chars/marks.hpp" // (native characters)
 #include "../chars/charinject.hpp" // (native characters)
@@ -12,10 +11,10 @@
 #include "../upscale/upscale.hpp"
 #include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
-#include "../host/events.hpp"
 #include "../host/passes.hpp"
 #include "../host/frameapi.hpp"
 #include "../host/shadercache.hpp"
+#include "../host/retire.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../render/gpu_crash.hpp"
 #include <share.h>
@@ -29,14 +28,9 @@
 #include <mutex>
 #include <unordered_map>
 
-// The core gets the hooks' calls as the World FX add-on got ReShade's events (worldfx_core.hpp says where each goes:
-// before or after the call), for the lists of the game's device once it's attached (at the first present after its
-// queue was seen). Everything the core records itself on the d3d8.dll's lists, and every view it makes, goes through the
-// same hooks: the core is called with the thread quiet (host::quiet), so they let those through untouched.
-//
-// Which resource a view is of: the d3d8.dll's render target and depth views as they're made (CreateRenderTargetView,
-// CreateDepthStencilView) and copied (CopyDescriptors): a map from the descriptor to the resource and the view's
-// format. ReShade knew it from wrapping the device from the start; so does this, started early.
+// HiFi XI's passes go in at our d3d8.dll's marks (src/host/frameapi.hpp: the direct channel), on the game's thread:
+// d3d8.dll hands over its list, what's bound, the world and the states they're all in, and binds all of its own again
+// after. Its device and queue come from it too (HifiFrameDevice). Nothing of Direct3D 12's is hooked or followed.
 //
 // Settings: HiFi XI's own file, config\hifixi\settings.ini beside the plugins folder ([worldfx]: World FX's, by the
 // names the add-on had). The first time there's none, it's made from the add-on's settings (bootloader\ReShade.ini
@@ -50,11 +44,15 @@ namespace hifi::backend
 		std::wstring g_settings; // HiFi XI's settings file
 		constexpr const wchar_t *kSection = L"worldfx";
 		std::atomic<bool> g_started { false };
+		std::atomic<bool> g_running { false }; // (started and not stopped: /hifi off stops the passes, on puts them back)
 		bool g_early = false;
 		std::atomic<ID3D12Device *> g_device { nullptr };     // the game's (its queue's)
 		std::atomic<ID3D12CommandQueue *> g_queue { nullptr }; // its direct queue (the last lists were submitted on)
+		// (our d3d8.dll's HifiFrameDevice: where the device and the game's queue come from; nullptr: an older one, they're
+		// found through the hooked ExecuteCommandLists) and its channel's version (1: the marks without the world's fields)
+		hifi_frame_device_fn g_frame_device = nullptr;
+		uint32_t g_frame_version = 1;
 		std::atomic<bool> g_attached { false };
-		UINT g_rtv_increment = 0;
 		std::atomic<void (*)(int, const char *)> g_log_sink { nullptr };
 		std::atomic<uint64_t> g_presents { 0 };
 
@@ -85,57 +83,6 @@ namespace hifi::backend
 			}
 			if (auto *const sink = g_log_sink.load())
 				sink(level, text);
-		}
-
-		// Views: the resource and format behind each render target and depth descriptor made or copied since the start
-		struct view_entry
-		{
-			ID3D12Resource *resource;
-			DXGI_FORMAT format;
-		};
-		std::mutex views_mutex;
-		std::unordered_map<uint64_t, view_entry> views;
-		std::atomic<uint64_t> views_made { 0 }, views_copied { 0 }, views_unknown { 0 };
-
-		// Each list's data for the core (made with the list or at its first reset since the start; never freed: a list
-		// at the same address later is made or reset before it records)
-		std::mutex lists_mutex;
-		std::unordered_map<void *, std::unique_ptr<worldfx::list_data>> lists;
-		thread_local void *tl_list = nullptr;
-		thread_local worldfx::list_data *tl_data = nullptr;
-
-		worldfx::list_data *data_of(void *list, bool make)
-		{
-			if (list == tl_list && tl_data != nullptr)
-				return tl_data;
-			std::lock_guard<std::mutex> lock(lists_mutex);
-			auto it = lists.find(list);
-			if (it == lists.end())
-			{
-				if (!make)
-					return nullptr;
-				it = lists.emplace(list, std::make_unique<worldfx::list_data>()).first;
-			}
-			tl_list = list;
-			tl_data = it->second.get();
-			return tl_data;
-		}
-		// The thread our d3d8.dll records the game's frames on (the game's), from its first frame mark. Lists recorded on
-		// any other thread (HiFi XI's own loaders' uploads, AMD's frame generation threads, DXGI's list in their Present)
-		// are none of the core's business: their events go no further, so no lock of the passes is taken there. One was:
-		// the characters' loader's upload reset a list inside the Direct3D debug layer's lock while the game's thread,
-		// holding World FX's lock in its pass, waited on that one (a deadlock, 2026-11-02)
-		std::atomic<DWORD> g_render_thread { 0 };
-		bool elsewhere()
-		{
-			const DWORD t = g_render_thread.load(std::memory_order_relaxed);
-			return t != 0 && t != GetCurrentThreadId();
-		}
-
-		// A list's data when the core should hear of it (attached, the list known, on the game's thread)
-		worldfx::list_data *live(void *list)
-		{
-			return g_attached.load(std::memory_order_acquire) && !elsewhere() ? data_of(list, false) : nullptr;
 		}
 
 		// The core's port
@@ -219,30 +166,6 @@ namespace hifi::backend
 			ini_set(key, w);
 		}
 		void port_set_int(const char *key, int value) { ini_set(key, std::to_wstring(value).c_str()); }
-		ID3D12Resource *port_resource_of_view(uint64_t view)
-		{
-			std::lock_guard<std::mutex> lock(views_mutex);
-			const auto it = views.find(view);
-			if (it == views.end())
-			{
-				views_unknown.fetch_add(1, std::memory_order_relaxed);
-				return nullptr;
-			}
-			return it->second.resource;
-		}
-		DXGI_FORMAT port_format_of_view(uint64_t view)
-		{
-			std::lock_guard<std::mutex> lock(views_mutex);
-			const auto it = views.find(view);
-			return it != views.end() ? it->second.format : DXGI_FORMAT_UNKNOWN;
-		}
-		// (the stream log's: not counted as looked up)
-		void *streamlog_view(uint64_t view)
-		{
-			std::lock_guard<std::mutex> lock(views_mutex);
-			const auto it = views.find(view);
-			return it != views.end() ? it->second.resource : nullptr;
-		}
 
 		// HiFi XI's settings file: HIFIXI_SETTINGS when set (the tests), else config\hifixi\settings.ini beside the
 		// plugins folder this DLL is in (the game's)
@@ -502,143 +425,11 @@ namespace hifi::backend
 			p.set_bool = port_set_bool;
 			p.set_float = port_set_float;
 			p.set_int = port_set_int;
-			p.resource_of_view = port_resource_of_view;
-			p.format_of_view = port_format_of_view;
 			p.folder = g_folder;
 			worldfx::set_port(p);
 			worldfx::load_settings();
-			streamlog::set_views(streamlog_view);
-			streamlog::set_folder(g_folder);
 		}
 
-		// The hooks' events
-		void ev_created(ID3D12GraphicsCommandList *list)
-		{
-			*data_of(list, true) = worldfx::list_data();
-		}
-		void ev_reset(ID3D12GraphicsCommandList *list)
-		{
-			if (elsewhere())
-				return;
-			upscale::on_reset(list);
-			worldfx::list_data *const d = data_of(list, true);
-			if (!g_attached.load(std::memory_order_acquire))
-			{
-				*d = worldfx::list_data();
-				return;
-			}
-			host::quiet q;
-			worldfx::on_reset(*d);
-		}
-		void ev_close(ID3D12GraphicsCommandList *list)
-		{
-			if (worldfx::list_data *const d = live(list))
-			{
-				host::quiet q;
-				upscale::before_other(list, d->state); // (the screen upscaled before the list closes, when it's waiting)
-			}
-		}
-		void ev_targets(ID3D12GraphicsCommandList *list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL single_range, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv)
-		{
-			worldfx::list_data *const d = live(list);
-			if (d == nullptr)
-				return;
-			const uint32_t n = rtvs != nullptr ? std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) : 0;
-			uint64_t v[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-			for (uint32_t i = 0; i < n; ++i)
-				v[i] = single_range ? uint64_t(rtvs[0].ptr) + uint64_t(i) * g_rtv_increment : uint64_t(rtvs[i].ptr);
-			host::quiet q;
-			worldfx::on_targets(list, *d, n, v, dsv != nullptr ? uint64_t(dsv->ptr) : 0);
-		}
-		void ev_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pso)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_pipeline(*d, pso);
-		}
-		void ev_topology(ID3D12GraphicsCommandList *list, D3D12_PRIMITIVE_TOPOLOGY topology)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_topology(*d, topology);
-		}
-		void ev_viewports(ID3D12GraphicsCommandList *list, UINT count, const D3D12_VIEWPORT *viewports)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_viewports(*d, 0, viewports != nullptr ? count : 0, viewports);
-		}
-		void ev_scissors(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RECT *rects)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_scissors(*d, 0, rects != nullptr ? count : 0, rects);
-		}
-		void ev_root_signature(ID3D12GraphicsCommandList *list, ID3D12RootSignature *root)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_tables(*d, root, 0, 0, nullptr);
-		}
-		void ev_root_table(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE table)
-		{
-			if (worldfx::list_data *const d = live(list))
-			{
-				const uint64_t t = table.ptr;
-				worldfx::on_root_tables(*d, d->state.root, param, 1, &t);
-			}
-		}
-		void ev_root_constants(ID3D12GraphicsCommandList *list, UINT param, UINT count, const void *values, UINT first)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_constants(*d, d->state.root, param, first, count, values);
-		}
-		void ev_root_cbv(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_VIRTUAL_ADDRESS address)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_descriptor(*d, d->state.root, param, grass::root_arg::cbv, address);
-		}
-		void ev_root_srv(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_VIRTUAL_ADDRESS address)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_descriptor(*d, d->state.root, param, grass::root_arg::srv, address);
-		}
-		void ev_root_uav(ID3D12GraphicsCommandList *list, UINT param, D3D12_GPU_VIRTUAL_ADDRESS address)
-		{
-			if (worldfx::list_data *const d = live(list))
-				worldfx::on_root_descriptor(*d, d->state.root, param, grass::root_arg::uav, address);
-		}
-		void ev_barrier(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RESOURCE_BARRIER *barriers)
-		{
-			worldfx::list_data *const d = live(list);
-			if (d == nullptr)
-				return;
-			// (the native zone renderer follows the world depth's planes, each of them)
-			zone::inject::on_barrier(count, barriers);
-			chars::inject::on_barrier(count, barriers); // (native characters: the same)
-			// (transitions only, as ReShade reports them: the resource and where it went. Of a subresource other than the
-			// first only when it's all of them: the core follows the world's depth plane, and a move of the stencil plane
-			// (subresource 1) on its own would otherwise read as the depth's state)
-			host::quiet q;
-			for (UINT done = 0; done < count;)
-			{
-				ID3D12Resource *res[32];
-				D3D12_RESOURCE_STATES after[32];
-				uint32_t n = 0;
-				for (; done < count && n < 32; ++done)
-					if (barriers[done].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
-						(barriers[done].Transition.Subresource == 0 || barriers[done].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))
-					{
-						res[n] = barriers[done].Transition.pResource;
-						after[n] = barriers[done].Transition.StateAfter;
-						n++;
-					}
-				if (n != 0)
-					worldfx::on_barrier(list, *d, n, res, after);
-			}
-			// (the world's end on this list: the upscale's resolve is the next draw out of it)
-			if (d->world_ended != nullptr)
-			{
-				upscale::on_world_end(list, d->world_ended, d->world_rt_state);
-				d->world_ended = nullptr;
-			}
-			upscale::after_barrier(list, count, barriers, d->state);
-		}
 		// The game side's slot markers (src/game/slotmark.hpp) as our d3d8.dll hands them on: how many of each kind, how
 		// many came out of order (each zone begin, then its end with the same seq, then the next seq's begin), the last
 		std::atomic<uint64_t> marks_seen[slotmark::kinds] = {};
@@ -648,10 +439,34 @@ namespace hifi::backend
 		ID3D12Resource *zone_rt = nullptr;
 		DXGI_FORMAT zone_rt_format = DXGI_FORMAT_UNKNOWN;
 
-		// fm: our d3d8.dll's word at the mark (src/host/frameapi.hpp): what's bound and the states, exactly
-		void on_mark(ID3D12GraphicsCommandList *list, worldfx::list_data &d, const slotmark::mark &m, const hifi_frame_mark &fm)
+		// The world as World FX takes it at a mark: our d3d8.dll's word (channel 3 on), the views and formats when it's bound
+		worldfx::world_mark world_of(const hifi_frame_mark &fm)
 		{
-			const uint64_t dsv = uint64_t(fm.dsv.ptr);
+			worldfx::world_mark w;
+			w.list = fm.list;
+			w.rt = fm.world_rt;
+			w.ds = fm.world_ds;
+			w.rt_state = fm.world_rt_state;
+			w.ds_planes[0] = fm.world_ds_planes[0];
+			w.ds_planes[1] = fm.world_ds_plane_count > 1 ? fm.world_ds_planes[1] : fm.world_ds_planes[0];
+			if (fm.rt != nullptr && fm.rt == fm.world_rt && fm.ds != nullptr && fm.ds == fm.world_ds)
+			{
+				w.rtv = uint64_t(fm.rtv.ptr);
+				w.dsv = uint64_t(fm.dsv.ptr);
+				w.rt_format = fm.rt_format;
+				w.ds_format = fm.ds_format;
+				w.width = fm.width;
+				w.height = fm.height;
+			}
+			w.fog_known = fm.world_clear_known != 0;
+			for (int i = 0; i < 3; ++i)
+				w.fog[i] = fm.world_clear[i];
+			return w;
+		}
+
+		// fm: our d3d8.dll's word at the mark (src/host/frameapi.hpp): what's bound and the states, exactly
+		void on_mark(ID3D12GraphicsCommandList *list, const slotmark::mark &m, const hifi_frame_mark &fm)
+		{
 			ID3D12Resource *const depth = fm.ds;
 			// (the depth's planes, after the trackers have taken the depth in)
 			const auto exact_planes = [&]() {
@@ -661,8 +476,10 @@ namespace hifi::backend
 				zone::inject::set_depth_planes(depth, planes);
 				chars::inject::set_depth_planes(depth, planes);
 			};
-			// (the world's target's state: our d3d8.dll's when it's the one bound, else as the barriers left it)
-			const auto world_rt_state = [&]() { return fm.rt != nullptr && fm.rt == zone_rt ? fm.rt_state : d.world_rt_state; };
+			// (the world's target's state: our d3d8.dll's, bound or not)
+			const auto world_rt_state = [&]() {
+				return fm.world_rt != nullptr && fm.world_rt == zone_rt ? fm.world_rt_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
+			};
 			marks_seen[m.kind].fetch_add(1, std::memory_order_relaxed);
 			// (the own-frame passes: their module draws at its marker, src/host/passes.hpp)
 			if (m.kind >= slotmark::first_pass)
@@ -674,10 +491,6 @@ namespace hifi::backend
 					chars::inject::on_marker(depth);
 					exact_planes();
 				}
-				// (and the upscaled world, when it waits for the next call after the resolve, goes in before what they
-				// draw: a marker isn't a clear to it)
-				else
-					upscale::before_other(list, d.state);
 				if (depth == nullptr)
 					return;
 				passes::world w;
@@ -712,7 +525,7 @@ namespace hifi::backend
 			{
 				zone_rt = fm.rt;
 				zone_rt_format = fm.rt_format;
-				worldfx::on_world_marker(fm.rt, depth, uint64_t(fm.rtv.ptr), dsv);
+				worldfx::on_world_marker(world_of(fm));
 			}
 			if (m.kind == slotmark::zone_end && depth != nullptr)
 			{
@@ -724,9 +537,7 @@ namespace hifi::backend
 				w.rt_state = world_rt_state();
 				zone::inject::on_zone_end(list, w, m.seq);
 				// (then World FX's blades, written into the world's depth before the characters and effects)
-				D3D12_RESOURCE_STATES planes[2];
-				if (zone::inject::depth_planes(depth, planes))
-					worldfx::on_zone_end(list, d, dsv, planes);
+				worldfx::on_zone_end(world_of(fm));
 			}
 			// (native characters: the opaque models at their end marker, a see-through one at its own)
 			if ((m.kind == slotmark::chars_end || m.kind == slotmark::see_through) && depth != nullptr)
@@ -756,130 +567,6 @@ namespace hifi::backend
 			}
 		}
 
-		void ev_clear_depth(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS, UINT, const D3D12_RECT *)
-		{
-			worldfx::list_data *const d = live(list);
-			if (d == nullptr || port_resource_of_view(dsv.ptr) == nullptr)
-				return;
-			// (the upscaled world, when it waits for the next call after the resolve, goes in before the clear)
-			host::quiet q;
-			upscale::before_other(list, d->state);
-		}
-		void ev_clear_target(ID3D12GraphicsCommandList *list, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT count, const D3D12_RECT *rects)
-		{
-			if (worldfx::list_data *const d = live(list))
-			{
-				host::quiet q;
-				upscale::before_other(list, d->state);
-				worldfx::on_clear_target(*d, rtv.ptr, color, rects != nullptr ? count : 0, rects);
-			}
-		}
-		void ev_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps)
-		{
-			if (live(list) != nullptr)
-			{
-				upscale::on_heaps(list, count, heaps);
-			}
-		}
-		void ev_draw(ID3D12GraphicsCommandList *list, uint64_t vertices)
-		{
-			if (worldfx::list_data *const d = live(list))
-			{
-				host::quiet q;
-				upscale::before_draw(list, vertices, d->rt0, uint64_t(d->state.rtvs[0].ptr), port_format_of_view, d->state);
-			}
-		}
-		void ev_execute(ID3D12CommandQueue *queue, UINT, ID3D12CommandList *const *)
-		{
-			if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
-				return;
-			g_queue.store(queue, std::memory_order_release);
-			if (g_device.load(std::memory_order_acquire) == nullptr)
-			{
-				ID3D12Device *device = nullptr;
-				if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) && device != nullptr)
-				{
-					device->Release(); // (the d3d8.dll holds it for as long as it draws)
-					g_device.store(device, std::memory_order_release);
-				}
-			}
-		}
-		void ev_view(ID3D12Device *, D3D12_DESCRIPTOR_HEAP_TYPE, D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource, DXGI_FORMAT format, uint32_t)
-		{
-			std::lock_guard<std::mutex> lock(views_mutex);
-			views[uint64_t(at.ptr)] = { resource, format };
-			views_made.fetch_add(1, std::memory_order_relaxed);
-		}
-		void ev_copy(ID3D12Device *device, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT dst_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_starts, const UINT *dst_sizes,
-			UINT src_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE *src_starts, const UINT *src_sizes)
-		{
-			if (dst_starts == nullptr || src_starts == nullptr)
-				return;
-			const uint64_t step = device->GetDescriptorHandleIncrementSize(type);
-			// (the source ranges, one after another, go into the destination ranges one after another; a range without a
-			// size is one descriptor)
-			std::lock_guard<std::mutex> lock(views_mutex);
-			UINT di = 0, si = 0, dk = 0, sk = 0;
-			while (di < dst_ranges && si < src_ranges)
-			{
-				const UINT dn = dst_sizes != nullptr ? dst_sizes[di] : 1, sn = src_sizes != nullptr ? src_sizes[si] : 1;
-				if (dk >= dn)
-				{
-					di++;
-					dk = 0;
-					continue;
-				}
-				if (sk >= sn)
-				{
-					si++;
-					sk = 0;
-					continue;
-				}
-				const uint64_t dst = uint64_t(dst_starts[di].ptr) + dk * step, src = uint64_t(src_starts[si].ptr) + sk * step;
-				const auto it = views.find(src);
-				if (it != views.end())
-				{
-					const view_entry e = it->second;
-					views[dst] = e;
-				}
-				else
-					views.erase(dst);
-				views_copied.fetch_add(1, std::memory_order_relaxed);
-				dk++;
-				sk++;
-			}
-		}
-
-		const host::events &events_table()
-		{
-			static const host::events e = [] {
-				host::events x;
-				x.created = ev_created;
-				x.reset = ev_reset;
-				x.close = ev_close;
-				x.targets = ev_targets;
-				x.pipeline = ev_pipeline;
-				x.topology = ev_topology;
-				x.viewports = ev_viewports;
-				x.scissors = ev_scissors;
-				x.root_signature = ev_root_signature;
-				x.root_table = ev_root_table;
-				x.root_constants = ev_root_constants;
-				x.root_cbv = ev_root_cbv;
-				x.root_srv = ev_root_srv;
-				x.root_uav = ev_root_uav;
-				x.barrier = ev_barrier;
-				x.clear_depth = ev_clear_depth;
-				x.clear_target = ev_clear_target;
-				x.draw = ev_draw;
-				x.heaps = ev_heaps;
-				x.execute = ev_execute;
-				x.view = ev_view;
-				x.copy = ev_copy;
-				return x;
-			}();
-			return e;
-		}
 	}
 
 	namespace
@@ -888,43 +575,78 @@ namespace hifi::backend
 		// marks one of its passes
 		// (our d3d8.dll's HifiFrameSetWorldFormat; nullptr: an older one, the world stays 8-bit)
 		hifi_frame_set_world_format_fn g_set_world_format = nullptr;
+		// The world's depth planes, exactly as our d3d8.dll has them at this mark (version 2: at every mark, the world's
+		// end and the back buffer's too), for the renderers that draw on it: nothing follows barriers for them
+		void world_planes(const hifi_frame_mark &fm)
+		{
+			if (g_frame_version < 2 || fm.world_ds == nullptr)
+				return;
+			const D3D12_RESOURCE_STATES planes[2] = { fm.world_ds_planes[0], fm.world_ds_plane_count > 1 ? fm.world_ds_planes[1] : fm.world_ds_planes[0] };
+			zone::inject::set_depth_planes(fm.world_ds, planes);
+			chars::inject::set_depth_planes(fm.world_ds, planes);
+		}
 
 		void __cdecl on_frame_mark(void *, uint32_t kind, uint32_t seq, const hifi_frame_mark *fm)
 		{
-			g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
 			// (the device removed: none of HiFi XI's passes recorded again; the game's own lists go on as d3d8.dll has them)
 			if (gpu_crash::lost())
 				return;
 			// (the world's format as the setting has it: d3d8.dll changes it at the next zone's begin mark)
 			if (g_set_world_format != nullptr)
 				g_set_world_format(worldfx::float_world() ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
+			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || !g_attached.load(std::memory_order_acquire))
+				return;
+			world_planes(*fm); // (at every mark, one with no depth bound too)
+			// (the resolve drawn: FSR goes in over it, the resolve's target bound)
+			if (kind == slotmark::resolve)
+			{
+				upscale::resolve_mark r;
+				r.list = fm->list;
+				r.world = fm->world_rt;
+				r.world_state = fm->world_rt_state;
+				r.target = fm->rt;
+				r.rtv = uint64_t(fm->rtv.ptr);
+				r.target_format = fm->rt_format;
+				r.target_state = fm->rt_state;
+				r.vertices = fm->draw_vertices;
+				upscale::on_resolve(r);
+				return;
+			}
 			// (the world's end comes with the resolve's targets bound, often no depth; every other mark is on a depth)
-			if (fm == nullptr || fm->list == nullptr || kind >= slotmark::kinds || (fm->dsv.ptr == 0 && kind != slotmark::world_end))
+			if (fm->dsv.ptr == 0 && kind != slotmark::world_end)
 				return;
-			worldfx::list_data *const d = live(fm->list);
-			if (d == nullptr)
-				return;
-			host::quiet q;
 			// (the world's end: World FX draws into it there, before the resolve reads it)
 			if (kind == slotmark::world_end)
 			{
-				worldfx::on_world_end(fm->list, *d);
+				worldfx::on_world_end(world_of(*fm));
 				return;
 			}
 			slotmark::mark m;
 			m.kind = kind;
 			m.seq = seq & 15;
-			on_mark(fm->list, *d, m, *fm);
+			on_mark(fm->list, m, *fm);
 		}
 
-		// Our d3d8.dll told where to call (nullptr: let go, at stop); false when it isn't the one loaded
+		// Our d3d8.dll told where to call (nullptr: let go, at stop); false when it isn't the one loaded, or is an older
+		// HiFi XI's (channel 1: its marks don't carry the world's states, and nothing follows barriers for them any more,
+		// so its passes would read stale states: they stay off, as with another d3d8.dll)
+		const char *g_channel_refused = nullptr;
 		bool direct_channel(bool on)
 		{
 			HMODULE d3d8 = GetModuleHandleW(L"d3d8.dll");
 			const auto set = d3d8 != nullptr ? reinterpret_cast<hifi_frame_set_handler_fn>(GetProcAddress(d3d8, kHifiFrameSetHandler)) : nullptr;
 			if (set == nullptr)
 				return false;
+			const auto version = reinterpret_cast<hifi_frame_version_fn>(GetProcAddress(d3d8, kHifiFrameVersion));
+			g_frame_version = version != nullptr ? version() : 1;
+			if (on && g_frame_version < kHifiFrameChannel)
+			{
+				g_channel_refused = "the d3d8.dll in bootloader is an older HiFi XI's (its marks don't carry the world's states): its passes (native zone and "
+					"characters, World FX, FSR) stay off; put this release's d3d8.dll (and d3d8-shader-cache) in bootloader";
+				return false;
+			}
 			g_set_world_format = on ? reinterpret_cast<hifi_frame_set_world_format_fn>(GetProcAddress(d3d8, kHifiFrameSetWorldFormat)) : nullptr;
+			g_frame_device = on ? reinterpret_cast<hifi_frame_device_fn>(GetProcAddress(d3d8, kHifiFrameDevice)) : nullptr;
 			set(on ? &on_frame_mark : nullptr, nullptr);
 			return true;
 		}
@@ -937,32 +659,18 @@ namespace hifi::backend
 		setup_port();
 		write_log(0, "HiFi XI: starting before the game's Direct3D 12 device (the starter, bootloader\\dxgi.dll)");
 		worldfx::before_device(true);
-		// The throwaway objects the hooks are found by: on WARP, so the game's adapter isn't touched before the d3d8.dll
-		IDXGIFactory4 *factory = nullptr;
-		IDXGIAdapter *warp = nullptr;
-		using create_factory_fn = HRESULT(WINAPI *)(REFIID, void **);
-		if (create_factory1 != nullptr && SUCCEEDED(reinterpret_cast<create_factory_fn>(create_factory1)(IID_PPV_ARGS(&factory))) && factory != nullptr)
-			factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
 		std::string why;
-		const bool ok = host::install(why, warp);
-		if (warp != nullptr)
-			warp->Release();
-		if (factory != nullptr)
-			factory->Release();
-		if (!ok)
-		{
-			write_log(2, ("HiFi XI: Direct3D 12 hooks not in: " + why).c_str());
-			return false;
-		}
-		host::set_events(&events_table());
 		g_early = true;
 		g_started = true;
-		write_log(0, "HiFi XI: Direct3D 12 hooks in, before the game's device: its lists and views followed from their making");
 		const bool direct = direct_channel(true);
 		g_own_d3d8 = direct;
-		write_log(direct ? 0 : 2, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
-			"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: its passes (native zone and characters, World FX, FSR) can't be placed and stay off; "
-			"HiFi XI needs its own d3d8.dll in bootloader");
+		g_running = direct; // (refused, or not ours: the passes stay off)
+		if (g_channel_refused != nullptr)
+			write_log(2, (std::string("HiFi XI: ") + g_channel_refused).c_str());
+		else
+			write_log(direct ? 0 : 2, direct ? "HiFi XI: HiFi XI's d3d8.dll calls it at the game's passes (the direct channel)" :
+				"HiFi XI: the d3d8.dll loaded isn't HiFi XI's own: its passes (native zone and characters, World FX, FSR) can't be placed and stay off; "
+				"HiFi XI needs its own d3d8.dll in bootloader");
 		// (frame generation: the d3d8.dll's swap chain made as AMD's, when the setting's on as the game starts, and FSR too:
 		// generation runs only on FSR's frames, so without it AMD's swap chain would only stand in the way of each present)
 		{
@@ -974,8 +682,6 @@ namespace hifi::backend
 		}
 		if (framegen::wanted())
 		{
-			// (AMD's own threads quiet: DXGI's list in their Present mustn't wait on World FX's lock)
-			framegen::set_thread_start(host::quiet_thread);
 			if (framegen::install(create_factory1, why, [](int level, const char *text) { write_log(level, text); }))
 				write_log(0, "HiFi XI: frame generation's swap chain in (upscale.framegen on): the game window's swap chain will be AMD's");
 			else
@@ -990,56 +696,74 @@ namespace hifi::backend
 			return true;
 		setup_port();
 		worldfx::set_crash_reports_status("off (Direct3D 12's device was made before HiFi XI loaded: HiFi XI's starter, bootloader\\dxgi.dll, makes them possible)");
-		if (!host::install(why))
+		g_early = false;
+		if (!direct_channel(true))
 		{
-			write_log(2, ("HiFi XI: Direct3D 12 hooks not in: " + why).c_str());
+			// (not started: tried again at the next start)
+			why = g_channel_refused != nullptr ? g_channel_refused : "the d3d8.dll loaded isn't HiFi XI's own";
+			write_log(2, ("HiFi XI: " + why).c_str());
 			return false;
 		}
-		host::set_events(&events_table());
-		g_early = false;
+		g_own_d3d8 = true;
 		g_started = true;
-		direct_channel(true);
-		write_log(1, "HiFi XI: Direct3D 12 hooks in after the game's device was made (no starter, bootloader\\dxgi.dll): the views it made before aren't known, so its world isn't found");
+		g_running = true;
+		write_log(1, "HiFi XI: started after the game's device was made (no starter, bootloader\\dxgi.dll): no GPU crash reports, no frame generation");
 		return true;
 	}
 
 	bool started() { return g_started.load(); }
+	bool running() { return g_started.load() && g_running.load(); }
 	bool early() { return g_early; }
 
 	void stop()
 	{
 		direct_channel(false);
-		host::uninstall();
+		g_running = false;
 	}
 
 	bool resume(std::string &why)
 	{
-		return host::install(why);
+		if (!direct_channel(true))
+		{
+			why = g_channel_refused != nullptr ? g_channel_refused : "the d3d8.dll loaded isn't HiFi XI's own";
+			return false;
+		}
+		g_own_d3d8 = true;
+		g_running = true;
+		return true;
 	}
 
 	void present()
 	{
-		if (!g_started.load() || !host::installed())
+		if (!g_started.load() || !g_running.load())
 			return;
 		g_presents.fetch_add(1, std::memory_order_relaxed);
+		// (the device and the game's queue: our d3d8.dll says them, nothing to learn from its submits)
+		if (g_frame_device != nullptr)
+		{
+			ID3D12Device *device = nullptr;
+			ID3D12CommandQueue *queue = nullptr;
+			if (g_frame_device(&device, &queue) != 0)
+			{
+				if (g_device.load(std::memory_order_acquire) == nullptr)
+					g_device.store(device, std::memory_order_release);
+				g_queue.store(queue, std::memory_order_release);
+			}
+		}
 		if (!g_attached.load(std::memory_order_acquire))
 		{
 			ID3D12Device *const device = g_device.load(std::memory_order_acquire);
 			if (device == nullptr)
 				return;
-			g_rtv_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-			{
-				host::quiet q;
-				worldfx::attach(device);
-			}
+			worldfx::attach(device);
 			g_attached.store(true, std::memory_order_release);
 			write_log(0, "HiFi XI: World FX attached to the game's device");
 		}
 		ID3D12CommandQueue *const queue = g_queue.load(std::memory_order_acquire);
 		if (queue == nullptr || gpu_crash::lost()) // (the device removed: World FX's own uploads and lists not sent)
 			return;
-		host::quiet q;
 		worldfx::on_present(queue);
+		retire::on_present(queue); // (the zone's, effects' and characters' GPU objects let go behind the GPU)
 	}
 
 	const std::wstring &folder() { return g_folder; }
@@ -1158,21 +882,6 @@ namespace hifi::backend
 		for (const std::string &l : worldfx::frame_counts())
 			out.push_back(l);
 		out.push_back(shadercache::status());
-		size_t known = 0;
-		{
-			std::lock_guard<std::mutex> lock(views_mutex);
-			known = views.size();
-		}
-		std::snprintf(line, sizeof(line), "views: %zu known, %llu made and %llu copied since the start, %llu looked up not known", known,
-			static_cast<unsigned long long>(views_made.load()), static_cast<unsigned long long>(views_copied.load()), static_cast<unsigned long long>(views_unknown.load()));
-		out.push_back(line);
-		size_t list_count = 0;
-		{
-			std::lock_guard<std::mutex> lock(lists_mutex);
-			list_count = lists.size();
-		}
-		std::snprintf(line, sizeof(line), "lists followed: %zu", list_count);
-		out.push_back(line);
 		std::snprintf(line, sizeof(line), "slot markers seen in Direct3D 12: zone begin %llu, zone end %llu; out of order %llu",
 			static_cast<unsigned long long>(marks_seen[slotmark::zone_begin].load()), static_cast<unsigned long long>(marks_seen[slotmark::zone_end].load()),
 			static_cast<unsigned long long>(marks_out_of_order.load()));

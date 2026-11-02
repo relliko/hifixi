@@ -82,6 +82,25 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 		return code;
 	}
 
+	ID3D12Resource *g_marked = nullptr; // (the depth the marker named: the only one followed, as the renderer's)
+	// The depth's planes as the test moves them (a new depth: both as the first barrier found them), handed to the
+	// renderer as our d3d8.dll hands them at each mark
+	void follow_planes(ID3D12Resource *r, UINT sub, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+	{
+		static ID3D12Resource *of = nullptr;
+		static D3D12_RESOURCE_STATES planes[2] = {};
+		if (r != of)
+		{
+			of = r;
+			planes[0] = planes[1] = from;
+		}
+		if (sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+			planes[0] = planes[1] = to;
+		else if (sub < 2)
+			planes[sub] = to;
+		hifi::zone::inject::set_depth_planes(r, planes);
+	}
+
 	void barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *r, UINT sub, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
 	{
 		D3D12_RESOURCE_BARRIER b = {};
@@ -90,7 +109,9 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 		b.Transition.StateBefore = from;
 		b.Transition.StateAfter = to;
 		list->ResourceBarrier(1, &b);
-		hifi::zone::inject::on_barrier(1, &b); // (as the hooks hand them over)
+		// (the marked depth's planes handed over as our d3d8.dll hands them at each mark)
+		if (r == g_marked)
+			follow_planes(r, sub, from, to);
 	}
 
 	struct mat4
@@ -409,6 +430,7 @@ int main(int argc, char **argv)
 		barrier(list, tex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 	}
 	inj::on_marker(Az); // (the zone's begin marker named the depth)
+	g_marked = Az;
 	const float sky[4] = { 0.55f, 0.65f, 0.78f, 1.0f };
 	list->ClearRenderTargetView(rtv, sky, 0, nullptr);
 	list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);

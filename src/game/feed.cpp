@@ -10,9 +10,8 @@
 #include <unordered_map>
 
 // The worldfx Ashita addon's worldfx.lua, ported part by part (its comments carried over where they still hold).
-// World FX itself is in this DLL: what the addon looked up with GetProcAddress is called directly; the zone and
-// whether a character is in still go through this process's environment (FFXI_WORLDFX_ZONE, FFXI_WORLDFX_INGAME),
-// where World FX reads them.
+// World FX itself is in this DLL: what the addon looked up with GetProcAddress is called directly, the zone and whether
+// a character is in too (worldfx_zone, every frame).
 
 namespace hifi::game::feed
 {
@@ -239,7 +238,8 @@ namespace hifi::game::feed
 			uint32_t packets_out = 0; // (... when the character was last out: a newer one says where they're in)
 			bool waiting = false;   // (out since the last zone-in packet: World FX not told "in" until it comes)
 			double in_since = -1.0; // (when the game said in, while waiting)
-			uint32_t last = 0;      // (told to World FX; 0 none yet)
+			uint32_t last = 0;      // (the last zone found; 0 none yet)
+			uint32_t told = 0;      // (the zone told to World FX: last, 0 once stopped)
 			int in_game = -1;       // (told: 1, 0; -1 not yet)
 			double next_check = 0.0;
 		};
@@ -266,20 +266,21 @@ namespace hifi::game::feed
 			return v;
 		}
 
+		void tell_world_fx()
+		{
+			worldfx_zone(g_zone.told, g_zone.in_game == 1 ? 1u : 0u);
+		}
+
 		void publish_zone(uint32_t zone)
 		{
-			char text[16];
-			std::snprintf(text, sizeof(text), "%u", zone);
-			SetEnvironmentVariableA("FFXI_WORLDFX_ZONE", zone != 0 ? text : nullptr);
+			g_zone.told = zone;
+			tell_world_fx();
 		}
 
 		void publish_in_game(bool in)
 		{
-			const int now = in ? 1 : 0;
-			if (now == g_zone.in_game)
-				return;
-			g_zone.in_game = now;
-			SetEnvironmentVariableA("FFXI_WORLDFX_INGAME", in ? "1" : "0");
+			g_zone.in_game = in ? 1 : 0;
+			tell_world_fx();
 		}
 
 		// Actors
@@ -1098,9 +1099,8 @@ namespace hifi::game::feed
 
 	void stop()
 	{
-		publish_zone(0);
-		SetEnvironmentVariableA("FFXI_WORLDFX_INGAME", nullptr);
 		g_zone.in_game = -1;
+		publish_zone(0);
 		std::string why;
 		if (g_flare.off)
 			set_flare(false, why);

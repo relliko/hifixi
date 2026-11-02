@@ -7,7 +7,6 @@
 #include "../game/feed.hpp"
 #include "../game/hifps/exp.hpp"
 #include "../game/hifps/step.hpp"
-#include "../host/hooks.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../upscale/upscale.hpp"
 #include <algorithm>
@@ -37,15 +36,13 @@ namespace hifi::ui
 		const float kGood[4] = { 0.55f, 0.85f, 0.45f, 1.0f };
 		const float kWarn[4] = { 0.95f, 0.75f, 0.30f, 1.0f };
 
-		// The frame rate, from the frames the menu is drawn on (one a present while it's open), and the hooks' calls a
-		// frame over the same second
+		// The frame rate, from the frames the menu is drawn on (one a present while it's open), and frame generation's
+		// frames over the same second
 		struct meter
 		{
 			std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
 			uint32_t frames = 0;
 			float fps = 0.0f, ms = 0.0f;
-			host::stats last = {};
-			double lists = 0.0, calls = 0.0, draws = 0.0;
 			uint64_t made = 0;      // (frame generation's frames made between, so far)
 			float made_rate = 0.0f; // (and a second, over the same second)
 			bool known = false;
@@ -59,26 +56,12 @@ namespace hifi::ui
 			const double secs = std::chrono::duration<double>(now - g_meter.since).count();
 			if (secs < 1.0)
 				return;
-			const host::stats s = host::get_stats();
 			const double frames = double(g_meter.frames);
 			g_meter.fps = float(frames / secs);
 			g_meter.ms = float(secs * 1000.0 / frames);
 			const uint64_t made = framegen::made_between();
 			g_meter.made_rate = g_meter.known ? float(double(made - std::min(made, g_meter.made)) / secs) : 0.0f;
 			g_meter.made = made;
-			if (g_meter.known)
-			{
-				uint64_t calls = 0, draws = 0;
-				for (uint32_t i = 0; i < host::slot_count; ++i)
-					if (host::is_list_slot(i))
-						calls += s.calls[i] - std::min(s.calls[i], g_meter.last.calls[i]);
-				draws = (s.calls[host::list_draw] - std::min(s.calls[host::list_draw], g_meter.last.calls[host::list_draw])) +
-					(s.calls[host::list_draw_indexed] - std::min(s.calls[host::list_draw_indexed], g_meter.last.calls[host::list_draw_indexed]));
-				g_meter.calls = double(calls) / frames;
-				g_meter.draws = double(draws) / frames;
-				g_meter.lists = double(s.lists_executed - std::min(s.lists_executed, g_meter.last.lists_executed)) / frames;
-			}
-			g_meter.last = s;
 			g_meter.known = true;
 			g_meter.frames = 0;
 			g_meter.since = now;
@@ -399,11 +382,13 @@ namespace hifi::ui
 		{
 			heading(g, "HiFi XI");
 			if (!backend::started())
-				g.text_colored(kWarn, "Not started: its Direct3D 12 hooks aren't in (see /hifi status).");
+				g.text_colored(kWarn, "Not started: HiFi XI's own d3d8.dll isn't calling it (see /hifi status).");
+			else if (!backend::running())
+				g.text_colored(kWarn, "Its passes are off (/hifi on; or its d3d8.dll was refused: see /hifi status).");
 			else if (backend::early())
 				g.text_colored(kGood, "Started before the game's Direct3D 12 device (its starter, bootloader\\dxgi.dll).");
 			else
-				g.text_colored(kWarn, "Started late, without its starter (bootloader\\dxgi.dll): the world's views weren't seen, so nothing is drawn.");
+				g.text_colored(kWarn, "Started late, without its starter (bootloader\\dxgi.dll): no GPU crash reports and no frame generation this session.");
 			if (worldfx::attached() != nullptr)
 				g.text_colored(kGood, "Drawing into the game's Direct3D 12 output (HiFi XI's d3d8.dll).");
 			else
@@ -520,14 +505,6 @@ namespace hifi::ui
 				textf(g, "%.0f fps (%.1f ms a frame)", g_meter.fps, g_meter.ms);
 			else
 				g.text_disabled("Measuring...");
-			if (g_meter.known && host::installed())
-			{
-				textf(g, "The game's Direct3D 12: %.1f command lists, %.0f draws and %.0f calls a frame through HiFi XI's hooks",
-					g_meter.lists, g_meter.draws, g_meter.calls);
-				const host::stats s = host::get_stats();
-				if (s.world.width != 0)
-					textf(g, "The world drawn at %llu x %u", static_cast<unsigned long long>(s.world.width), s.world.height);
-			}
 			heading(g, "World FX");
 			static const worldfx::ui u = [] {
 				worldfx::ui x;

@@ -2079,9 +2079,14 @@ namespace grass
 					}
 			};
 			const size_t cores = std::thread::hardware_concurrency();
+			// (the helpers at the caller's priority: a background job's below normal, so the game's frames come first)
+			const int priority = GetThreadPriority(GetCurrentThread());
 			std::vector<std::thread> threads;
 			for (size_t t = 1; t < std::min(kShaderEntryCount, cores > 3 ? cores - 2 : size_t(1)); ++t)
-				threads.emplace_back(work);
+				threads.emplace_back([&work, priority] {
+					SetThreadPriority(GetCurrentThread(), priority);
+					work();
+				});
 			work();
 			for (std::thread &t : threads)
 				t.join();
@@ -2098,13 +2103,22 @@ namespace grass
 		return true;
 	}
 
+	bool cached_shaders(const std::string &source, const std::wstring &cache_folder, shader_code &out)
+	{
+		const uint64_t key = shader_key(source);
+		if (cache_folder.empty() || key == 0 || !read_shader_cache(shader_cache_file(cache_folder, key), key, out))
+			return false;
+		touch(shader_cache_file(cache_folder, key));
+		return true;
+	}
+
 	const std::string &built_in_shader_source()
 	{
 		static const std::string source(kShader);
 		return source;
 	}
 
-	bool renderer::init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache)
+	bool renderer::init(ID3D12Device *device, std::string &error, const std::wstring &shader_cache, bool shaders_now)
 	{
 		if (_root != nullptr)
 			return true;
@@ -2113,9 +2127,17 @@ namespace grass
 		{
 			const auto start = std::chrono::steady_clock::now();
 			shader_code code;
-			if (!compile_shaders(built_in_shader_source(), shader_cache, code, _shaders_from_cache, error))
-				return false;
-			set_shader_code(std::move(code));
+			if (shaders_now)
+			{
+				if (!compile_shaders(built_in_shader_source(), shader_cache, code, _shaders_from_cache, error))
+					return false;
+				set_shader_code(std::move(code));
+			}
+			else if (cached_shaders(built_in_shader_source(), shader_cache, code))
+			{
+				_shaders_from_cache = true;
+				set_shader_code(std::move(code));
+			}
 			_shader_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 		}
 
@@ -2490,7 +2512,7 @@ namespace grass
 		if (_motion != nullptr && _motion_w == w && _motion_h == h)
 			return true;
 		if (_motion != nullptr)
-			_old.push_back({ _motion, 0 }); // (lists recorded with it may still be running)
+			keep_old(_motion); // (lists recorded with it may still be running)
 		_motion = nullptr;
 		if (_motion_rtv_heap == nullptr)
 		{
@@ -2550,72 +2572,73 @@ namespace grass
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
 			into[i]->swap(code.blobs[i]);
 		_shader_key = code.key;
+		_has_shaders = true;
 		if (_sun_pso != nullptr)
-			_old.push_back({ _sun_pso, 0 });
+			keep_old(_sun_pso);
 		_sun_pso = nullptr;
 		if (_vis_pso != nullptr)
-			_old.push_back({ _vis_pso, 0 });
+			keep_old(_vis_pso);
 		_vis_pso = nullptr;
 		if (_cloud_pso != nullptr)
-			_old.push_back({ _cloud_pso, 0 });
+			keep_old(_cloud_pso);
 		_cloud_pso = nullptr;
 		if (_cloud_shadow_pso != nullptr)
-			_old.push_back({ _cloud_shadow_pso, 0 });
+			keep_old(_cloud_shadow_pso);
 		_cloud_shadow_pso = nullptr;
 		if (_shadow_pso != nullptr)
-			_old.push_back({ _shadow_pso, 0 });
+			keep_old(_shadow_pso);
 		_shadow_pso = nullptr;
 		if (_trail_pso != nullptr)
-			_old.push_back({ _trail_pso, 0 });
+			keep_old(_trail_pso);
 		_trail_pso = nullptr;
 		if (_vol_pso != nullptr)
-			_old.push_back({ _vol_pso, 0 });
+			keep_old(_vol_pso);
 		_vol_pso = nullptr;
 		for (pso_entry &e : _layer_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		_layer_psos.clear();
 		for (ID3D12PipelineState **pso : { &_look_first_pso, &_look_down_pso, &_look_exposure_pso, &_look_up_pso })
 		{
 			if (*pso != nullptr)
-				_old.push_back({ *pso, 0 });
+				keep_old(*pso);
 			*pso = nullptr;
 		}
 		for (pso_entry &e : _look_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		_look_psos.clear();
 		for (cascade &c : _cascades)
 			c.forget(); // (drawn again with the new shaders)
 		for (pso_entry &e : _psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _motion_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		_motion_psos.clear();
 		for (pso_entry &e : _shade_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _water_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _water_debug_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (std::vector<pso_entry> *v : { &_water_whole_psos, &_sea_psos, &_water_fading_psos })
 		{
 			for (pso_entry &e : *v)
-				_old.push_back({ e.pso, 0 });
+				keep_old(e.pso);
 			v->clear();
 		}
 		for (pso_entry &e : _firefly_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _rain_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _splash_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _snow_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _leaf_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _air_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		for (pso_entry &e : _flash_psos)
-			_old.push_back({ e.pso, 0 });
+			keep_old(e.pso);
 		_leaf_psos.clear();
 		_air_psos.clear();
 		_flash_psos.clear();
@@ -2703,7 +2726,7 @@ namespace grass
 		if (_sun_mask != nullptr && _sun_mask_size >= size)
 			return true;
 		if (_sun_mask != nullptr)
-			_old.push_back({ _sun_mask, 0 }); // (a list recorded this frame may still use it)
+			keep_old(_sun_mask); // (a list recorded this frame may still use it)
 		_sun_mask = nullptr;
 		_sun_mask_size = 0;
 		D3D12_HEAP_PROPERTIES heap = {};
@@ -3471,7 +3494,7 @@ namespace grass
 		if (_look_buf == nullptr || _look_buf_size < bytes)
 		{
 			if (_look_buf != nullptr)
-				_old.push_back({ _look_buf, 0 }); // (a list recorded this frame may still use it)
+				keep_old(_look_buf); // (a list recorded this frame may still use it)
 			_look_buf = nullptr;
 			_look_buf_size = 0;
 			D3D12_HEAP_PROPERTIES heap = {};
@@ -3624,7 +3647,7 @@ namespace grass
 	void renderer::unload_rain()
 	{
 		if (_rain_window != nullptr)
-			_old.push_back({ _rain_window, 0 }); // (as the water)
+			keep_old(_rain_window); // (as the water)
 		_rain_window = nullptr;
 		_rain = rain_file();
 		_trail_epoch++; // (the next zone's trails start untrodden: grass.hlsl trail_tag)
@@ -3707,7 +3730,7 @@ namespace grass
 		buffer->Unmap(0, nullptr);
 		buffer->SetName(L"worldfx: rain map around the camera");
 		if (_rain_window != nullptr)
-			_old.push_back({ _rain_window, 0 });
+			keep_old(_rain_window);
 		_rain_window = buffer;
 		_rain_window_i = wi;
 		_rain_window_j = wj;
@@ -3854,7 +3877,7 @@ namespace grass
 	void renderer::unload_water()
 	{
 		if (_water != nullptr)
-			_old.push_back({ _water, 0 }); // a list recorded this frame may still use it
+			keep_old(_water); // a list recorded this frame may still use it
 		_water = nullptr;
 		_water_zone = 0;
 		_water_corners = 0;
@@ -3916,7 +3939,7 @@ namespace grass
 	void renderer::unload_sea()
 	{
 		if (_sea != nullptr)
-			_old.push_back({ _sea, 0 }); // (as the water)
+			keep_old(_sea); // (as the water)
 		_sea = nullptr;
 		_sea_corners = 0;
 	}
@@ -3970,7 +3993,7 @@ namespace grass
 	void renderer::unload_wet()
 	{
 		if (_wet != nullptr)
-			_old.push_back({ _wet, 0 }); // (as the water)
+			keep_old(_wet); // (as the water)
 		_wet = nullptr;
 		_wet_width = _wet_height = _wet_words_a_row = 0;
 	}
@@ -4081,7 +4104,7 @@ namespace grass
 	{
 		for (ID3D12Resource *r : { _shadow_geo, _shadow_staging, _shadow_masks })
 			if (r != nullptr)
-				_old.push_back({ r, 0 }); // a list recorded this frame may still use them
+				keep_old(r); // a list recorded this frame may still use them
 		_shadow_geo = _shadow_staging = _shadow_masks = nullptr;
 		_shadow_zone = 0;
 		_shadow_triangles = 0;
@@ -4366,7 +4389,7 @@ namespace grass
 			transition(list, _shadow_geo, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
 			list->CopyBufferRegion(_shadow_geo, 0, _shadow_staging, 0, UINT64(_shadow_triangles) * 48);
 			transition(list, _shadow_geo, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-			_old.push_back({ _shadow_staging, 0 });
+			keep_old(_shadow_staging);
 			_shadow_staging = nullptr;
 		}
 		section(list, L"worldfx: sun shadow map");
@@ -5095,7 +5118,7 @@ namespace grass
 	bool renderer::forget_colours(std::string &error)
 	{
 		if (_memory != nullptr)
-			_old.push_back({ _memory, 0 });
+			keep_old(_memory);
 		_memory = nullptr;
 		if (_blade_count == 0)
 			return true;
@@ -5128,14 +5151,30 @@ namespace grass
 	void renderer::unload()
 	{
 		if (_buffer != nullptr)
-			_old.push_back({ _buffer, 0 }); // a list recorded this frame may still use it
+			keep_old(_buffer); // a list recorded this frame may still use it
 		if (_memory != nullptr)
-			_old.push_back({ _memory, 0 });
+			keep_old(_memory);
 		_memory = nullptr;
 		_buffer = nullptr;
 		_zone = 0;
 		_blade_count = 0;
 		_cells.clear();
+	}
+
+	void renderer::release_done(uint64_t signalled, uint64_t completed)
+	{
+		_signalled = signalled;
+		for (size_t i = 0; i < _old.size();)
+		{
+			if (_old[i].at <= completed)
+			{
+				release(_old[i].buffer);
+				_old[i] = _old.back();
+				_old.pop_back();
+			}
+			else
+				++i;
+		}
 	}
 
 	void renderer::release_old(uint32_t frames_to_keep)
@@ -5158,7 +5197,7 @@ namespace grass
 		if (c.buffer != nullptr && c.size >= size)
 			return true;
 		if (c.buffer != nullptr)
-			_old.push_back({ c.buffer, 0 });
+			keep_old(c.buffer);
 		c.buffer = nullptr;
 		c.size = 0;
 		D3D12_HEAP_PROPERTIES heap = {};
@@ -5253,7 +5292,7 @@ namespace grass
 			const D3D12_RESOURCE_DESC have = _blade_depth->GetDesc();
 			if (have.Width == rt_desc.Width && have.Height == rt_desc.Height && same_samples(have.SampleDesc, rt_desc.SampleDesc))
 				return true;
-			_old.push_back({ _blade_depth, 0 }); // (a list recorded this frame may still use it)
+			keep_old(_blade_depth); // (a list recorded this frame may still use it)
 			_blade_depth = nullptr;
 		}
 		HRESULT hr = S_OK;
@@ -6078,7 +6117,7 @@ namespace grass
 				{
 					list->CopyBufferRegion(_cloud_noise, 0, _cloud_noise_staging, 0, UINT64(cloud_noise().size()) * 4);
 					transition(list, _cloud_noise, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-					_old.push_back({ _cloud_noise_staging, 0 });
+					keep_old(_cloud_noise_staging);
 					_cloud_noise_staging = nullptr;
 				}
 				section(list, L"worldfx: clouds");

@@ -1,21 +1,25 @@
 /*
- * The world upscaled to the screen (src/upscale) on a list recorded as dgVoodoo records its own, on WARP with the debug
- * layer. dgVoodoo's stand-in: the world A (320x180, typeless, a light and a dark half split along a slanted edge, a red
- * band along the bottom), the screen's back buffer (640x360), its own root signature, shader-visible heap, table and
- * pipeline bound once; at A's end the resolve (one 6-vertex quad stretching A over the screen), then the "UI" (the same
- * quad into a 64x64 corner, with nothing bound again, as dgVoodoo binds lazily).
+ * The world upscaled to the screen (src/upscale) on a list recorded as our d3d8.dll records the game's, on WARP with the
+ * debug layer. The game's stand-in: the world A (320x180, typeless, a light and a dark half split along a slanted edge, a
+ * red band along the bottom), the screen's back buffer (640x360), its own root signature, shader-visible heap, table and
+ * pipeline bound once; at A's end the resolve (one 6-vertex quad stretching A over the screen) and right after it our
+ * d3d8.dll's resolve mark (upscale::on_resolve, the back buffer bound), after which it binds all of its own again; then
+ * the "UI" (the same quad into a 64x64 corner).
  *   - the first frame: the module asks for its screen-size texture and the back buffer's pipeline, the game's stretch
  *     stays (the picture as with FSR off); once prepared, FSR's picture: close to the stretch overall, its edge no wider,
  *     not the same picture;
- *   - the UI drawn on top as dgVoodoo meant it, the same with FSR as without (its pipeline, root signature, heap and
- *     table put back);
- *   - ours goes in at the next draw, at the list's close, and after a barrier that moves the back buffer on (PRESENT);
- *   - none with FSR off, for a draw of more than 6 vertices, or with the world as big as the screen;
+ *   - the UI drawn on top as the game meant it, the same with FSR as without;
+ *   - the status: placed at the resolve mark once for each frame it saw there;
+ *   - the game's tint (a cutscene fade) on FSR's picture, the UI left as drawn;
+ *   - none with FSR off, for a resolve of more than 6 vertices, or with the world as big as the screen;
  *   - FSR 2 (temporal): the world's depth (typeless D24S8) followed as the native zone follows it, each frame's camera
  *     published as the zone pass's and taken at its end marker; the first frame asks for FSR 2's context, prepare makes it
  *     (FSR 2's shaders compiled with d3dcompiler_47 and reflected), then each frame FSR 2's picture: at twice the world's
- *     size close to the stretch, its colours kept, the UI on top as meant; with the world as big as the screen (FSR 2's
- *     anti-aliasing alone) close to the world itself; temporal_running while it draws; a jittered run stays finite;
+ *     size close to the stretch, its colours kept, the UI on top as meant, the tint on it; with the world as big as the
+ *     screen (FSR 2's anti-aliasing alone) close to the world itself; temporal_running while it draws; a jittered run
+ *     stays finite; FSR 3.1's upscaler in its place the same;
+ *   - FSR's masks: the reactive one where the game's effects are, the transparency one where World FX's see-through
+ *     things are; the characters' own motion where a character is seen;
  *   - FSR 2's motion pass, with World FX's blades' motion: taken where a blade is still what's seen (its view depth the
  *     world's), the camera's where something nearer was drawn over it and where there's no blade;
  *   - the debug layer says nothing.
@@ -55,7 +59,7 @@ namespace
 
 	constexpr UINT IW = 320, IH = 180, OW = 640, OH = 360, UI = 64;
 
-	// dgVoodoo's stand-in: a textured quad (6 vertices from SV_VertexID) through a root table
+	// The game's stand-in: a textured quad (6 vertices from SV_VertexID) through a root table
 	const char *kGame = R"(
 Texture2D t : register(t0);
 SamplerState s : register(s0);
@@ -103,8 +107,6 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 		q->ClearStoredMessages();
 		return errors;
 	}
-
-	DXGI_FORMAT screen_format(uint64_t) { return DXGI_FORMAT_R8G8B8A8_UNORM; }
 
 	// The world's picture: light right of a slanted edge, dark left of it, a red band along the bottom
 	uint32_t world_texel(UINT x, UINT y)
@@ -187,7 +189,7 @@ int main(int argc, char **argv)
 	device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence));
 	ID3D12GraphicsCommandList *const list = g.list;
 
-	// dgVoodoo's world (typeless, a UNORM view), one as big as the screen, and the back buffer
+	// The game's world (typeless, a UNORM view), one as big as the screen, and the back buffer
 	D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, upload = { D3D12_HEAP_TYPE_UPLOAD }, rb = { D3D12_HEAP_TYPE_READBACK };
 	D3D12_RESOURCE_DESC td = {};
 	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -238,7 +240,7 @@ int main(int argc, char **argv)
 		buf->Release();
 	}
 
-	// dgVoodoo's own: a root signature (a table of one view, a static sampler), a shader-visible heap with the worlds'
+	// The game's own: a root signature (a table of one view, a static sampler), a shader-visible heap with the worlds'
 	// views, its pipeline, an RTV heap
 	ID3D12RootSignature *game_root = nullptr;
 	ID3D12PipelineState *game_pso = nullptr;
@@ -297,73 +299,53 @@ int main(int argc, char **argv)
 	ID3D12Resource *readback = nullptr;
 	device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
 
-	enum class after_resolve { draw, close, present_barrier };
-	// One frame as dgVoodoo records it: the world's end, the resolve (vertices), then the UI. Returns the back buffer.
-	auto frame = [&](ID3D12Resource *world, UINT world_slot, uint64_t resolve_vertices, after_resolve how) {
-		up::on_reset(list);
+	// One frame as our d3d8.dll records the game's: the world's end, the resolve (vertices) and its mark, then the UI.
+	// Returns the back buffer.
+	auto frame = [&](ID3D12Resource *world, UINT world_slot, uint32_t resolve_vertices) {
 		ID3D12DescriptorHeap *heaps[1] = { game_heap };
 		list->SetDescriptorHeaps(1, heaps);
-		up::on_heaps(list, 1, heaps);
 		const float clear[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
 		list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-		grass::list_state st;
-		st.rtvs[0] = rtv;
-		st.rtv_count = 1;
-		st.pipeline = game_pso;
-		st.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		st.viewports[0] = { 0.0f, 0.0f, float(OW), float(OH), 0.0f, 1.0f };
-		st.viewport_count = 1;
-		st.scissors[0] = { 0, 0, LONG(OW), LONG(OH) };
-		st.scissor_count = 1;
-		st.set_root(game_root);
+		const D3D12_VIEWPORT full = { 0.0f, 0.0f, float(OW), float(OH), 0.0f, 1.0f };
+		const D3D12_RECT full_rect = { 0, 0, LONG(OW), LONG(OH) };
 		const D3D12_GPU_DESCRIPTOR_HANDLE table = { game_heap->GetGPUDescriptorHandleForHeapStart().ptr + UINT64(world_slot) * step };
-		st.arg(0).kind = grass::root_arg::table;
-		st.arg(0).value = table.ptr;
 		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 		list->SetPipelineState(game_pso);
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		list->RSSetViewports(1, st.viewports);
-		list->RSSetScissorRects(1, st.scissors);
+		list->RSSetViewports(1, &full);
+		list->RSSetScissorRects(1, &full_rect);
 		list->SetGraphicsRootSignature(game_root);
 		list->SetGraphicsRootDescriptorTable(0, table);
 		// (the world's end: it turns readable)
-		D3D12_RESOURCE_BARRIER b = {};
-		barrier(list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &b);
-		up::on_world_end(list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-		up::after_barrier(list, 1, &b, st);
+		barrier(list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		// The resolve
-		up::before_draw(list, resolve_vertices, B, rtv.ptr, screen_format, st);
 		list->DrawInstanced(6, 1, 0, 0);
-		D3D12_RESOURCE_STATES b_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		if (how == after_resolve::close)
-		{
-			up::before_other(list, st);
-			g.run();
-			// (the UI on the next list: dgVoodoo binds it all again there)
-			list->SetDescriptorHeaps(1, heaps);
-			list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-			list->SetPipelineState(game_pso);
-			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			list->SetGraphicsRootSignature(game_root);
-			list->SetGraphicsRootDescriptorTable(0, table);
-		}
-		else if (how == after_resolve::present_barrier)
-		{
-			barrier(list, B, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT, &b);
-			up::after_barrier(list, 1, &b, st);
-			barrier(list, B, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, &b);
-			up::after_barrier(list, 1, &b, st);
-		}
-		// The UI: the same quad into the corner, nothing bound again but the viewport
+		// (our d3d8.dll's resolve mark right after the resolve's draw, the back buffer bound; then it binds all of its own
+		// again, as after every mark)
+		up::resolve_mark r;
+		r.list = list;
+		r.world = world;
+		r.world_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		r.target = B;
+		r.rtv = rtv.ptr;
+		r.target_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		r.target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		r.vertices = resolve_vertices;
+		up::on_resolve(r);
+		list->SetDescriptorHeaps(1, heaps);
+		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		list->SetPipelineState(game_pso);
+		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		list->SetGraphicsRootSignature(game_root);
+		list->SetGraphicsRootDescriptorTable(0, table);
+		// The UI: the same quad into the corner
 		const D3D12_VIEWPORT corner = { 0.0f, 0.0f, float(UI), float(UI), 0.0f, 1.0f };
 		const D3D12_RECT corner_rect = { 0, 0, LONG(UI), LONG(UI) };
-		if (how != after_resolve::close)
-			up::before_draw(list, 6, B, rtv.ptr, screen_format, st);
 		list->RSSetViewports(1, &corner);
 		list->RSSetScissorRects(1, &corner_rect);
 		list->DrawInstanced(6, 1, 0, 0);
 		barrier(list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		barrier(list, B, b_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		barrier(list, B, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		D3D12_TEXTURE_COPY_LOCATION dst = { readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, src = { B, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
 		dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, OW, OH, 1, OW * 4 };
 		list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -409,21 +391,28 @@ int main(int argc, char **argv)
 		}
 		return w;
 	};
+	auto placed = [&]() {
+		std::string line;
+		for (const std::string &l : up::status())
+			if (l.rfind("upscale: placed at our d3d8.dll's resolve mark, ", 0) == 0)
+				line = l;
+		return line;
+	};
 	std::string why, first;
 
 	// The game's stretch: FSR off
 	up::set_options(false, false, 0.8f);
-	const std::vector<uint8_t> stretch = frame(A, 0, 6, after_resolve::draw);
+	const std::vector<uint8_t> stretch = frame(A, 0, 6);
 	check(up::prepare(device, why), "the passes made (shaders through AMD's headers, root signature, EASU's pipeline)" + (why.empty() ? "" : ": " + why));
 	check(drawn() == 0, "FSR off: nothing drawn");
 
 	// FSR on: the first frame asks, prepare makes, then it's drawn
 	up::set_options(true, false, 0.8f);
-	const std::vector<uint8_t> asked = frame(A, 0, 6, after_resolve::draw);
+	const std::vector<uint8_t> asked = frame(A, 0, 6);
 	check(drawn() == 0 && same(asked, stretch, false) == 0, "the first frame: the game's stretch while the screen-size texture is asked for");
-	check(up::prepare(device, why), "... made off dgVoodoo's thread");
-	const std::vector<uint8_t> fsr = frame(A, 0, 6, after_resolve::draw);
-	check(drawn() == 1, "then FSR drawn after the resolve, at the UI's draw");
+	check(up::prepare(device, why), "... made off the game's thread");
+	const std::vector<uint8_t> fsr = frame(A, 0, 6);
+	check(drawn() == 1, "then FSR drawn at the resolve's mark");
 	{
 		double diff = 0.0;
 		for (UINT y = UI; y < OH; ++y)
@@ -437,7 +426,18 @@ int main(int argc, char **argv)
 		check(same(fsr, stretch, false) > 1000 && diff < 6.0, "FSR's picture: not the stretch's, close to it overall");
 		check(wf <= ws && wf >= 1, "its edge no wider than the stretch's");
 		check(std::abs(int(red[0]) - 200) <= 3 && std::abs(int(red[1]) - 30) <= 3 && std::abs(int(red[2]) - 30) <= 3, "colours kept (the red band)");
-		check(same(fsr, stretch, true) == 0, "the UI drawn on top as dgVoodoo meant it (its state put back)");
+	}
+	// Placed at our d3d8.dll's resolve mark: once for the frame that asked, once for the one drawn; the same picture again
+	// next frame; a resolve of more than 6 vertices: the game's stretch, not placed
+	{
+		const std::string placement = placed();
+		check(placement == "upscale: placed at our d3d8.dll's resolve mark, 2 times", "the status: placed at the resolve's mark for both (" + placement + ")");
+		const std::vector<uint8_t> again = frame(A, 0, 6);
+		check(drawn() == 2 && same(again, fsr, false) == 0 && same(again, fsr, true) == 0, "the next frame: the same picture, the UI on top as meant");
+		const std::vector<uint8_t> many = frame(A, 0, 7);
+		check(drawn() == 2 && same(many, stretch, false) == 0 && placed() == "upscale: placed at our d3d8.dll's resolve mark, 3 times",
+			"a resolve of 7 vertices: the game's stretch, not placed (" + placed() + ")");
+		check(same(fsr, stretch, true) == 0, "the UI drawn on top as the game meant it (d3d8.dll's state bound again after the mark)");
 		if (argc > 1)
 			if (FILE *f = nullptr; fopen_s(&f, argv[1], "wb") == 0 && f != nullptr)
 			{
@@ -460,20 +460,14 @@ int main(int argc, char **argv)
 			}
 	}
 
-	// At the list's close, and after a barrier that moves the back buffer on
-	const std::vector<uint8_t> at_close = frame(A, 0, 6, after_resolve::close);
-	check(drawn() == 2 && same(at_close, fsr, false) == 0 && same(at_close, stretch, true) == 0, "at the list's close: the same picture, the UI as meant");
-	const std::vector<uint8_t> at_barrier = frame(A, 0, 6, after_resolve::present_barrier);
-	check(drawn() == 3 && same(at_barrier, fsr, false) == 0, "after a barrier moving the back buffer to PRESENT: the same picture");
-
 	// The game's tint (its resolve's: a cutscene fade) on FSR's picture too, the UI left as drawn
 	{
 		up::set_tint(0x404000);
-		const std::vector<uint8_t> half = frame(A, 0, 6, after_resolve::draw);
+		const std::vector<uint8_t> half = frame(A, 0, 6);
 		up::set_tint(0x000000);
-		const std::vector<uint8_t> black = frame(A, 0, 6, after_resolve::draw);
+		const std::vector<uint8_t> black = frame(A, 0, 6);
 		up::set_tint(0x808080);
-		const std::vector<uint8_t> back = frame(A, 0, 6, after_resolve::draw);
+		const std::vector<uint8_t> back = frame(A, 0, 6);
 		const uint8_t *was = &fsr[(size_t(340) * OW + 400) * 4], *now = &half[(size_t(340) * OW + 400) * 4];
 		std::printf("  the red band with the tint 404000: %u %u %u (without: %u %u %u)\n", now[0], now[1], now[2], was[0], was[1], was[2]);
 		check(std::abs(int(now[0]) - int(was[0]) / 2) <= 1 && std::abs(int(now[1]) - int(was[1]) / 2) <= 1 && now[2] == 0 && same(half, fsr, true) == 0,
@@ -484,19 +478,20 @@ int main(int argc, char **argv)
 				lit += luma(black, x, y) > 0.0f ? 1 : 0;
 		check(lit == 0 && same(black, fsr, true) == 0, "the tint 000000: the world black, the UI as drawn");
 		check(same(back, fsr, false) == 0, "the tint 808080 again: the picture as before");
-		check(drawn() == 6, "drawn each of those frames");
+		check(drawn() == 5, "drawn each of those frames");
 	}
 
 	// Not the resolve: more than 6 vertices; the world as big as the screen; FSR off again
-	const std::vector<uint8_t> many = frame(A, 0, 300, after_resolve::draw);
-	check(drawn() == 6 && same(many, stretch, false) == 0, "a first draw out of the world of 300 vertices: not taken for the resolve");
-	frame(big, 1, 6, after_resolve::draw);
-	check(drawn() == 6, "the world as big as the screen: the game's stretch");
+	const std::vector<uint8_t> many = frame(A, 0, 300);
+	check(drawn() == 5 && same(many, stretch, false) == 0, "a resolve of 300 vertices: the game's stretch");
+	frame(big, 1, 6);
+	check(drawn() == 5, "the world as big as the screen: the game's stretch");
 	up::set_options(false, false, 0.8f);
-	frame(A, 0, 6, after_resolve::draw);
-	check(drawn() == 6, "FSR off again: nothing");
+	const std::vector<uint8_t> off = frame(A, 0, 6);
+	check(drawn() == 5 && same(off, stretch, false) == 0 && placed() == "upscale: placed at our d3d8.dll's resolve mark, 6 times",
+		"FSR off again: nothing, the game's stretch (" + placed() + ")");
 
-	// FSR 2: A's depth and the big one's (as dgVoodoo's: typeless D24S8), each frame's camera as the zone pass's
+	// FSR 2: A's depth and the big one's (as our d3d8.dll's: typeless D24S8), each frame's camera as the zone pass's
 	{
 		namespace zi = hifi::zone::inject;
 		auto make_depth = [&](UINT w, UINT h) {
@@ -526,7 +521,7 @@ int main(int argc, char **argv)
 			dh->Release();
 			return z;
 		};
-		// (the native zone's tracking: the marker names the depth, dgVoodoo's barriers its planes' states)
+		// (the native zone's tracking: the marker names the depth, our d3d8.dll's barriers its planes' states)
 		auto follow_depth = [&](ID3D12Resource *z) {
 			zi::on_marker(z);
 			D3D12_RESOURCE_BARRIER b[2] = {};
@@ -538,7 +533,8 @@ int main(int argc, char **argv)
 				b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ;
 			}
 			list->ResourceBarrier(2, b);
-			zi::on_barrier(2, b);
+			const D3D12_RESOURCE_STATES planes[2] = { b[0].Transition.StateAfter, b[1].Transition.StateAfter };
+			zi::set_depth_planes(z, planes); // (as our d3d8.dll hands them at the mark)
 			g.run();
 		};
 		ID3D12Resource *Az = make_depth(IW, IH), *bigz = make_depth(OW, OH);
@@ -583,15 +579,15 @@ int main(int argc, char **argv)
 		follow_depth(Az);
 		up::set_options(true, true, 0.8f, false);
 		publish(0.0f, 0.0f, IW, IH);
-		frame(A, 0, 6, after_resolve::draw);
+		frame(A, 0, 6);
 		const auto t0 = std::chrono::steady_clock::now();
-		check(up::prepare(device, why), "FSR 2's context made off dgVoodoo's thread" + (why.empty() ? "" : ": " + why));
+		check(up::prepare(device, why), "FSR 2's context made off the game's thread" + (why.empty() ? "" : ": " + why));
 		const double make_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 		std::vector<uint8_t> fsr2;
 		for (int k = 0; k < 8; ++k)
 		{
 			publish(0.0f, 0.0f, IW, IH);
-			fsr2 = frame(A, 0, 6, after_resolve::draw);
+			fsr2 = frame(A, 0, 6);
 		}
 		for (const std::string &line : up::status())
 			std::printf("  %s\n", line.c_str());
@@ -606,7 +602,7 @@ int main(int argc, char **argv)
 			std::printf("  FSR 2 at twice the size against the stretch: %.2f levels apart on average; the red band %u %u %u\n", diff, red[0], red[1], red[2]);
 			check(diff < 8.0 && same(fsr2, stretch, false) > 1000, "FSR 2's picture: its own, close to the stretch overall");
 			check(std::abs(int(red[0]) - 200) <= 8 && std::abs(int(red[1]) - 30) <= 8 && std::abs(int(red[2]) - 30) <= 8, "colours kept (the red band)");
-			check(same(fsr2, stretch, true) == 0, "the UI drawn on top as dgVoodoo meant it (its state put back after FSR 2)");
+			check(same(fsr2, stretch, true) == 0, "the UI drawn on top as the game meant it (after FSR 2)");
 			check(up::temporal_running() && up::jitter_phases() >= 8, "running (the jitter goes with it), " + std::to_string(up::jitter_phases()) + " jitter phases");
 		}
 		// Jittered frames: still a picture (nothing lost or blown out)
@@ -617,7 +613,7 @@ int main(int argc, char **argv)
 			{
 				const float jx = (k % 2 ? 0.25f : -0.25f), jy = (k % 4 < 2 ? 0.25f : -0.25f);
 				publish(jx, jy, IW, IH);
-				px = frame(A, 0, 6, after_resolve::draw);
+				px = frame(A, 0, 6);
 			}
 			double mean = 0.0;
 			for (UINT y = UI; y < OH; ++y)
@@ -636,7 +632,7 @@ int main(int argc, char **argv)
 		{
 			publish(0.0f, 0.0f, IW, IH);
 			up::set_tint(0x404000);
-			const std::vector<uint8_t> half = frame(A, 0, 6, after_resolve::draw);
+			const std::vector<uint8_t> half = frame(A, 0, 6);
 			up::set_tint(0x808080);
 			const uint8_t *now = &half[(size_t(340) * OW + 400) * 4];
 			std::printf("  FSR 2's red band with the tint 404000: %u %u %u\n", now[0], now[1], now[2]);
@@ -646,13 +642,13 @@ int main(int argc, char **argv)
 		// The world as big as the screen: FSR 2's anti-aliasing alone (a new context for that size)
 		follow_depth(bigz);
 		publish(0.0f, 0.0f, OW, OH);
-		frame(big, 1, 6, after_resolve::draw);
+		frame(big, 1, 6);
 		check(up::prepare(device, why), "a context for the world as big as the screen" + (why.empty() ? "" : ": " + why));
 		std::vector<uint8_t> native;
 		for (int k = 0; k < 6; ++k)
 		{
 			publish(0.0f, 0.0f, OW, OH);
-			native = frame(big, 1, 6, after_resolve::draw);
+			native = frame(big, 1, 6);
 		}
 		{
 			double diff = 0.0;
@@ -679,16 +675,16 @@ int main(int argc, char **argv)
 			follow_depth(Az);
 			up::set_options(true, true, 0.8f, true);
 			publish(0.0f, 0.0f, IW, IH);
-			frame(A, 0, 6, after_resolve::draw);
+			frame(A, 0, 6);
 			const auto t3 = std::chrono::steady_clock::now();
-			check(up::prepare(device, why), "FSR 3.1's upscaler made off dgVoodoo's thread" + (why.empty() ? "" : ": " + why));
+			check(up::prepare(device, why), "FSR 3.1's upscaler made off the game's thread" + (why.empty() ? "" : ": " + why));
 			const double make3 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t3).count();
 			const unsigned long long before = fsr2_drawn();
 			std::vector<uint8_t> fsr3;
 			for (int k = 0; k < 8; ++k)
 			{
 				publish(0.0f, 0.0f, IW, IH);
-				fsr3 = frame(A, 0, 6, after_resolve::draw);
+				fsr3 = frame(A, 0, 6);
 			}
 			bool named = false;
 			for (const std::string &line : up::status())
@@ -706,7 +702,7 @@ int main(int argc, char **argv)
 			std::printf("  FSR 3.1 at twice the size against the stretch: %.2f levels apart on average; the red band %u %u %u\n", diff, red[0], red[1], red[2]);
 			check(diff < 8.0 && same(fsr3, stretch, false) > 1000, "FSR 3.1's picture: its own, close to the stretch overall");
 			check(std::abs(int(red[0]) - 200) <= 8 && std::abs(int(red[1]) - 30) <= 8 && std::abs(int(red[2]) - 30) <= 8, "  colours kept (the red band)");
-			check(same(fsr3, stretch, true) == 0, "  the UI drawn on top as dgVoodoo meant it");
+			check(same(fsr3, stretch, true) == 0, "  the UI drawn on top as the game meant it");
 		}
 		up::set_options(false, false, 0.8f);
 

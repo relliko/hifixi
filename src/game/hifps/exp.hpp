@@ -35,7 +35,7 @@ namespace hifi::game::hifps::exp
 	void set_actors_elsewhere(bool on);
 	// Everything put back (only over our own bytes), the memory freed when nothing points into it, all forgotten
 	void stop();
-	// The stream log's tap on the game's draws (src/backend/streamlog): the client device's DrawPrimitive,
+	// A tap on the game's draws (the stream log's, till it went with the Direct3D 12 hooks; unused now): the client device's DrawPrimitive,
 	// DrawIndexedPrimitive, DrawPrimitiveUP and DrawIndexedPrimitiveUP (slots 70-73) pointed at taps[0..3], each
 	// calling on to originals[i] (filled here), in a copy of the device's vtable put in front of it. On the game's
 	// thread only (a present); false and why when it can't. draw_untap puts the device's own vtable back.

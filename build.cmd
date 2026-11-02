@@ -1,7 +1,7 @@
 @echo off
 rem Builds build\hifixi.dll (32-bit, like the game), the render engine (build_engine.cmd: build\engine\worldfx_engine.lib)
-rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests but hook_test; "build.cmd e2e":
-rem everything and the end-to-end test's folder).
+rem and the offline tests with Visual Studio's compiler ("build.cmd quick": no tests). Every
+rem suite is run by python -I tests\run_suites.py.
 rem The Ashita v4 plugin SDK is in deps\ashita (a sparse clone of AshitaXI/Ashita-v4beta, plugins\sdk only); the Windows
 rem SDK headers and libraries are the NuGet copy reshade-worldfx uses (no Windows SDK installed on this PC).
 rem Each cl line with more than one source file has /MP: its files compiled side by side, one per core (here and in
@@ -76,9 +76,9 @@ set "PASSES_ACTORS="
 set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D%"
 
-rem The plugin: the Ashita side, the backend (World FX's core on the hooks) and the hooks, with the engine
+rem The plugin: the Ashita side, the backend (World FX's core at our d3d8.dll's marks), with the engine
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
-  /LD src\plugin\main.cpp src\plugin\hangwatch.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  /LD src\plugin\main.cpp src\plugin\hangwatch.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp ^
   %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib ^
   /Fo"build\obj\\" /Fe"build\hifixi.dll" /link /NOLOGO /MAP:build\hifixi.map /DEF:src\plugin\exports.def user32.lib dxgi.lib || exit /b 1
 del /q build\hifixi.exp build\hifixi.lib 2>nul
@@ -92,21 +92,14 @@ del /q build\starter\dxgi.exp build\starter\dxgi.lib 2>nul
 echo Built build\starter\dxgi.dll
 call "%~dp0build_d3d8.cmd" %1 || exit /b 1
 
-rem The hooks' offline test (WARP): build\hook_test.exe [--debug]
-cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\hook_test.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\test\\" /Fe"build\hook_test.exe" ^
-  /link /NOLOGO || exit /b 1
-echo Built build\hook_test.exe
-
-rem "build.cmd quick": the plugin, the starter and hook_test only (a small fix). The other tests stay as the last full
+rem "build.cmd quick": the plugin, the starter and our d3d8.dll only (a small fix). The other tests stay as the last full
 rem build left them: run the full build when what they test changed, and before a public release.
 if /i "%~1"=="quick" exit /b 0
 
-rem The stream log (/hifi streamlog) on the hooks, on WARP: build\streamlog_test.exe
-cl /nologo /MP /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\streamlog_test.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\test\\" ^
-  /Fe"build\streamlog_test.exe" /link /NOLOGO || exit /b 1
-echo Built build\streamlog_test.exe
+rem GPU objects let go behind the GPU (src\host\retire.hpp), on WARP: build\retire_test.exe
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\retire_test.cpp /Fo"build\test\\" /Fe"build\retire_test.exe" /link /NOLOGO d3d12.lib dxgi.lib || exit /b 1
+echo Built build\retire_test.exe
 
 rem The render engine with the plugin's flags (C++20, /EHa): build\engine_check.exe
 cl /nologo /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
@@ -125,6 +118,17 @@ rem The renderer's offline test (WARP, debug layer; from this folder): build\gra
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\grass_test.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\grass_test.exe" /link /NOLOGO || exit /b 1
 echo Built build\grass_test.exe
+
+rem World FX's core pinned before its rewrite (WARP, debug layer and GPU-based validation; fed as the backend feeds it,
+rem the game's camera from a stand-in FFXiMain.dll, tests\fake_ffximain.cpp, x86 only): build\worldfx_core_test.exe.
+rem WFX_CORE_API: the re-architecture's step 4 so far (1 the stream events, 2 the marks, 3 no lock while recording,
+rem 4 the shaders compiled on their own thread at attach)
+if not exist build\test\fake mkdir build\test\fake
+cl /nologo /O2 /MT /W4 /DWIN32_LEAN_AND_MEAN /LD tests\fake_ffximain.cpp /Fo"build\test\\" /Fe"build\test\fake\FFXiMain.dll" /link /NOLOGO || exit /b 1
+del /q build\test\fake\FFXiMain.exp build\test\fake\FFXiMain.lib 2>nul
+cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /DWFX_CORE_API=4 /I src\render /I src\host ^
+  tests\worldfx_core_test.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\worldfx_core_test.exe" /link /NOLOGO d3d12.lib dxgi.lib || exit /b 1
+echo Built build\worldfx_core_test.exe
 
 rem The shading pass timed on the real GPU (see its header): build\shade_bench.exe <width> <height> [shader file] ...
 cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
@@ -208,7 +212,7 @@ echo Built build\dgv\ui2d_dgv.exe
 
 rem The menu drawn with a fake GUI, its settings in a folder of its own: build\menu_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
-  tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp src\backend\streamlog.cpp src\host\hooks.cpp src\host\slots.cpp ^
+  tests\menu_test.cpp src\ui\menu.cpp src\settings\schema.cpp src\backend\backend.cpp ^
   %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" /Fe"build\menu_test.exe" /link /NOLOGO user32.lib dxgi.lib || exit /b 1
 echo Built build\menu_test.exe
 
@@ -334,17 +338,3 @@ for %%t in ("..\reshade-worldfx\tests\gamewater_cave.c" "tests\gamerain_cave.c")
     /Fo"build\test\%%~nt.obj" || exit /b 1
   echo Built build\test\%%~nt.exe
 )
-
-rem "build.cmd e2e": World FX's end-to-end test on HiFi XI (tests\e2e.cpp) in build\e2e-native: the starter as its
-rem dxgi.dll, hifixi.dll beside it, the stand-in FFXiMain.dll and zone 100's blades. Run build\e2e-native\e2e.exe from
-rem there (WFX_E2E_HOUR=22 or 3 for night).
-if /i not "%~1"=="e2e" exit /b 0
-if not exist build\e2e-native\worldfx-grass mkdir build\e2e-native\worldfx-grass
-cl /nologo /O2 /MT /W4 /DWIN32_LEAN_AND_MEAN /LD tests\fake_ffximain.cpp /Fo"build\test\\" /Fe"build\e2e-native\FFXiMain.dll" /link /NOLOGO || exit /b 1
-cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
-  tests\e2e.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\e2e-native\e2e.exe" /link /NOLOGO user32.lib || exit /b 1
-del /q build\e2e-native\FFXiMain.exp build\e2e-native\FFXiMain.lib 2>nul
-copy /y build\hifixi.dll build\e2e-native\ >nul || exit /b 1
-copy /y build\starter\dxgi.dll build\e2e-native\ >nul || exit /b 1
-copy /y build\testdata\grass\100.bin build\e2e-native\worldfx-grass\ >nul || exit /b 1
-echo Built build\e2e-native

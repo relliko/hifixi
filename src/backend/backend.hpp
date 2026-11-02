@@ -1,6 +1,6 @@
 #pragma once
 
-// HiFi XI's backend: World FX's core (src/render/worldfx_core) fed from HiFi XI's own Direct3D 12 hooks
+// HiFi XI's backend: World FX's core (src/render/worldfx_core) fed at HiFi XI's own d3d8.dll's marks
 // (src/host), in place of the World FX ReShade add-on. Its settings are HiFi XI's own (config\hifixi\settings.ini,
 // [worldfx]: made once from the add-on's in ReShade.ini, which isn't read or written after), its files the add-on's
 // (worldfx-grass\ and the rest in the game's bootloader folder, which is the process's own), its log hifixi.log there.
@@ -24,7 +24,9 @@ namespace hifi::backend
 	bool late_start(std::string &why);
 	bool started();
 	bool early();
-	// The hooks out (the plugin unloaded) and back in
+	// Started and not stopped: HiFi XI's passes go in at the marks
+	bool running();
+	// The passes off (our d3d8.dll told to call nothing: /hifi off, the plugin unloaded) and on again
 	void stop();
 	bool resume(std::string &why);
 
@@ -49,7 +51,7 @@ namespace hifi::backend
 	// not set. set_option with value nullptr takes it out (its default again).
 	bool option(const char *section, const char *key, std::string &value);
 	void set_option(const char *section, const char *key, const char *value);
-	// For the menu's test: the settings alone (the core's port, this file), no hooks; folder: where hifixi.log goes
+	// For the menu's test: the settings alone (the core's port, this file), no passes; folder: where hifixi.log goes
 	bool start_settings_only(const wchar_t *settings_file, const wchar_t *folder);
 	// A line into hifixi.log (and the plugin's sink, when set: level 0 info, 1 warning, 2 error)
 	void log(int level, const char *text);

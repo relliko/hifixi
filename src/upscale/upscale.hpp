@@ -2,17 +2,14 @@
 // HiFi XI's own stretch of the world over the screen (research/ffxi-re/notes-fsr.md, milestone 1). The game draws the
 // world into its target A at the background resolution, then stretches A over the screen's back buffer with one
 // bilinear quad (the resolve, 00C0B0), then draws the UI at the screen's size. When A is smaller than the screen and
-// FSR is on, HiFi XI draws A over the screen again right after that quad, before anything else on the list (the UI's
-// first draw, a clear, a barrier or the list's close): AMD FSR 1's EASU up to the screen's size into a texture of its
-// own, then RCAS sharpening into the back buffer. The UI is drawn on top as before, never upscaled.
+// FSR is on, HiFi XI draws A over the screen again right after that quad, at our d3d8.dll's resolve mark: FSR 3.1 (or
+// FSR 2) with the world's depth and motion, else AMD FSR 1's EASU up to the screen's size into a texture of its own,
+// then RCAS sharpening into the back buffer. The UI is drawn on top as before, never upscaled.
 //
-// The resolve is told on the list where A turned readable (its end: World FX's passes went in there): the first draw
-// after it of at most 6 vertices into a target bigger than A. Nothing is drawn on a list whose descriptor heaps aren't
-// known (they're put back after, with dgVoodoo's targets, pipeline, root signature and arguments). Device objects are
-// made off dgVoodoo's thread (prepare, from the plugin's frame): a new screen size or format is asked for there and
-// used from the next frame; until then the game's stretch stays.
+// The resolve: the draw of at most 6 vertices that read A into a target bigger than it, as d3d8.dll marks it. Device
+// objects are made off the recording (prepare, from the plugin's frame): a new screen size or format is asked for there
+// and used from the next frame; until then the game's stretch stays.
 #include <d3d12.h>
-#include "../render/grass_render.hpp" // (grass::list_state)
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -53,17 +50,19 @@ namespace hifi::upscale
 	void release();
 	std::vector<std::string> status();
 
-	// dgVoodoo's lists (its thread)
-	void on_reset(ID3D12GraphicsCommandList *list);
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps); // after
-	// The world turned readable on this list (its end), in that state
-	void on_world_end(ID3D12GraphicsCommandList *list, ID3D12Resource *world, D3D12_RESOURCE_STATES state);
-	// Before a draw of `vertices` into rt (through rtv: format_of gives a view's format), with the list's state as dgVoodoo
-	// left it. Costs an atomic load while no list waits on a resolve.
-	void before_draw(ID3D12GraphicsCommandList *list, uint64_t vertices, ID3D12Resource *rt, uint64_t rtv, DXGI_FORMAT (*format_of)(uint64_t),
-		const grass::list_state &state);
-	// Before a clear or the list's close
-	void before_other(ID3D12GraphicsCommandList *list, const grass::list_state &state);
-	// After barriers (the states they left)
-	void after_barrier(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RESOURCE_BARRIER *barriers, const grass::list_state &state);
+	// Our d3d8.dll's resolve mark (src/host/frameapi.hpp, channel 4): right after the draw that read the world into the
+	// target bound now, on the game's thread. FSR goes in here, with nothing to put back: d3d8.dll binds all of its own
+	// again after a mark.
+	struct resolve_mark
+	{
+		ID3D12GraphicsCommandList *list = nullptr;
+		ID3D12Resource *world = nullptr;  // (its target, read by the resolve)
+		D3D12_RESOURCE_STATES world_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		ID3D12Resource *target = nullptr; // (what the resolve drew into, bound now)
+		uint64_t rtv = 0;
+		DXGI_FORMAT target_format = DXGI_FORMAT_UNKNOWN;
+		D3D12_RESOURCE_STATES target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		uint32_t vertices = 0;
+	};
+	void on_resolve(const resolve_mark &r);
 }

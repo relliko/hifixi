@@ -73,14 +73,12 @@ namespace hifi::upscale
 			HRESULT __stdcall Close(LPCVOID) override { return S_OK; }
 		};
 
+		// The resolve as our d3d8.dll's mark hands it: the world it read and the target it drew into (FSR goes in there,
+		// with nothing of the list's to put back: d3d8.dll binds all of its own again after a mark)
 		struct per_list
 		{
-			ID3D12DescriptorHeap *heaps[2] = {};
-			UINT heap_count = 0;
 			ID3D12Resource *world = nullptr;
 			D3D12_RESOURCE_STATES world_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			bool ended = false;   // the world's end seen here, the first draw out of it not yet
-			bool pending = false; // the game's resolve drawn: ours goes in at the next call
 			ID3D12Resource *target = nullptr;
 			uint64_t target_rtv = 0;
 			DXGI_FORMAT target_format = DXGI_FORMAT_UNKNOWN;
@@ -103,11 +101,10 @@ namespace hifi::upscale
 		struct state_t
 		{
 			std::mutex mutex;
-			// (lists waiting on a resolve or ours: none, and a draw costs nothing here)
-			std::atomic<uint32_t> armed{ 0 };
 			std::atomic<bool> fsr{ true }, temporal{ true };
 			std::atomic<float> sharpen{ 0.4f };
 			std::atomic<uint32_t> tint{ 0x808080 }; // (the game's resolve's: set_tint)
+			uint64_t marked = 0; // (resolve marks FSR went in at)
 			uint64_t faded = 0;                      // (frames drawn with a tint other than 0x808080)
 			made_t made;
 			// (the compiled shaders, kept for pipelines of formats asked for later)
@@ -134,7 +131,6 @@ namespace hifi::upscale
 			// What dgVoodoo's thread asked for: the screen's size, its back buffer's formats
 			UINT want_w = 0, want_h = 0;
 			std::vector<DXGI_FORMAT> want_formats;
-			std::unordered_map<ID3D12GraphicsCommandList *, per_list> lists;
 			// For the status
 			uint64_t drawn = 0, skipped = 0, game_stretch = 0;
 			const char *why = nullptr;
@@ -152,23 +148,6 @@ namespace hifi::upscale
 			for (int c = 0; c < 3; ++c)
 				k[5 + c] = float((t >> (16 - 8 * c)) & 0xFF) / 128.0f;
 			return t != 0x808080u;
-		}
-
-		// A list's two flags, with the count of lists waiting kept (mutex held)
-		void arm(per_list &l, bool ended, bool pending)
-		{
-			const bool was = l.ended || l.pending, now = ended || pending;
-			l.ended = ended;
-			l.pending = pending;
-			if (was != now)
-				g.armed.fetch_add(now ? 1u : ~0u, std::memory_order_relaxed);
-		}
-
-		// Every list forgotten (mutex held)
-		void forget_lists()
-		{
-			g.lists.clear();
-			g.armed.store(0, std::memory_order_relaxed);
 		}
 
 		bool bigger(ID3D12Resource *a, ID3D12Resource *b)
@@ -358,17 +337,16 @@ namespace hifi::upscale
 			}
 		}
 
-		// FSR 2 over l.target (temporal.hpp), its picture drawn onto it, dgVoodoo's heaps and state back; false (nothing
+		// FSR 2 over l.target (temporal.hpp), its picture drawn onto it, at the resolve's mark; false (nothing
 		// drawn) when it can't be (mutex held)
-		bool record_temporal(ID3D12GraphicsCommandList *list, per_list &l, const grass::list_state &state, const D3D12_RESOURCE_DESC &in, UINT out_w, UINT out_h)
+		bool record_temporal(ID3D12GraphicsCommandList *list, per_list &l, const D3D12_RESOURCE_DESC &in, UINT out_w, UINT out_h)
 		{
 			made_t &m = g.made;
 			auto copy = std::find_if(m.copy.begin(), m.copy.end(), [&](const auto &p) { return p.first == l.target_format; });
 			zone::inject::frame_camera c;
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES planes[2] = {};
-			const char *why = m.root == nullptr ? "the passes aren't made" : l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
-				g.fsr2 == nullptr || !g.fsr2->fits(UINT(in.Width), in.Height, out_w, out_h, g.fsr2->v3()) ? "waiting for FSR 2's context" :
+			const char *why = m.root == nullptr ? "the passes aren't made" : g.fsr2 == nullptr || !g.fsr2->fits(UINT(in.Width), in.Height, out_w, out_h, g.fsr2->v3()) ? "waiting for FSR 2's context" :
 				copy == m.copy.end() ? "waiting for the screen's pipeline" :
 				!zone::inject::last_camera(c) || GetTickCount64() - c.at > 250 ? "no camera from the native zone's frame" :
 				!zone::inject::world_depth(depth, planes) ? "the world's depth isn't known" : nullptr;
@@ -455,9 +433,7 @@ namespace hifi::upscale
 				if (!tinted)
 					framegen::prepare(list, f, unused);
 			}
-			// (FSR 2 set its own heaps, root signatures and pipelines, drawn or not)
-			list->SetDescriptorHeaps(l.heap_count, l.heaps);
-			state.restore(list);
+			// (FSR 2 set its own heaps, root signatures and pipelines, drawn or not: nothing put back, d3d8.dll binds its own)
 			if (!drawn)
 			{
 				g.fsr2_why = fail;
@@ -474,8 +450,8 @@ namespace hifi::upscale
 			return true;
 		}
 
-		// The two passes over l.target, then dgVoodoo's heaps and state back (mutex held)
-		void record(ID3D12GraphicsCommandList *list, per_list &l, const grass::list_state &state)
+		// The two passes over l.target, at the resolve's mark (mutex held)
+		void record(ID3D12GraphicsCommandList *list, per_list &l)
 		{
 			made_t &m = g.made;
 			const D3D12_RESOURCE_DESC in = l.world->GetDesc(), out = l.target->GetDesc();
@@ -495,13 +471,12 @@ namespace hifi::upscale
 			{
 				g.want_rw = UINT(in.Width);
 				g.want_rh = in.Height;
-				if (record_temporal(list, l, state, in, out_w, out_h))
+				if (record_temporal(list, l, in, out_w, out_h))
 					return;
 			}
 			if (!smaller)
 				return;
-			const char *why = m.root == nullptr ? "the passes aren't made" : l.heap_count == 0 ? "the list's descriptor heaps aren't known" :
-				l.target_format == DXGI_FORMAT_UNKNOWN ? "the screen's format isn't known" :
+			const char *why = m.root == nullptr ? "the passes aren't made" : l.target_format == DXGI_FORMAT_UNKNOWN ? "the screen's format isn't known" :
 				m.mid == nullptr || m.mid_w != out_w || m.mid_h != out_h || rcas == m.rcas.end() ? "waiting for the screen-size texture" : nullptr;
 			if (why != nullptr)
 			{
@@ -558,9 +533,7 @@ namespace hifi::upscale
 			transition(list, l.target, D3D12_RESOURCE_STATE_RENDER_TARGET, l.target_state);
 			if (world_moved)
 				transition(list, l.world, readable_state, world_was);
-			// (its heaps before its root tables: a table must be in the heaps bound when it's set)
-			list->SetDescriptorHeaps(l.heap_count, l.heaps);
-			state.restore(list);
+			// (nothing of the list's put back: d3d8.dll binds all of its own again after the mark)
 			g.drawn++;
 			g.why = nullptr;
 			g.in_w = UINT(in.Width);
@@ -689,7 +662,6 @@ namespace hifi::upscale
 			{
 				gone = g.made;
 				g.made = fresh_made;
-				forget_lists();
 				if (gone.mid != nullptr)
 				{
 					g.old.push_back({ gone.mid, g.uses });
@@ -760,7 +732,6 @@ namespace hifi::upscale
 			gone = g.made;
 			g.made = made_t();
 			old.swap(g.old);
-			forget_lists();
 			g.failed.clear();
 			fsr2 = std::move(g.fsr2);
 			fsr2_old.swap(g.fsr2_old);
@@ -785,6 +756,8 @@ namespace hifi::upscale
 			std::snprintf(line, sizeof(line), "upscale: FSR 1, %llu frames drawn (the last %ux%u to %ux%u), %llu skipped%s%s%s; %llu with the background at least the screen's size (the game's stretch)",
 				static_cast<unsigned long long>(g.drawn), g.in_w, g.in_h, g.out_w, g.out_h, static_cast<unsigned long long>(g.skipped),
 				g.why != nullptr ? " (the last: " : "", g.why != nullptr ? g.why : "", g.why != nullptr ? ")" : "", static_cast<unsigned long long>(g.game_stretch));
+		lines.push_back(line);
+		std::snprintf(line, sizeof(line), "upscale: placed at our d3d8.dll's resolve mark, %llu times", static_cast<unsigned long long>(g.marked));
 		lines.push_back(line);
 		if (g.temporal.load())
 		{
@@ -812,113 +785,30 @@ namespace hifi::upscale
 		return lines;
 	}
 
-	void on_reset(ID3D12GraphicsCommandList *list)
+	void on_resolve(const resolve_mark &r)
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		per_list &l = g.lists[list];
-		arm(l, false, false);
-		l = per_list();
-	}
-
-	void on_heaps(ID3D12GraphicsCommandList *list, UINT count, ID3D12DescriptorHeap *const *heaps)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		per_list &l = g.lists[list];
-		l.heap_count = std::min<UINT>(count, 2);
-		for (UINT i = 0; i < l.heap_count; ++i)
-			l.heaps[i] = heaps[i];
-	}
-
-	void on_world_end(ID3D12GraphicsCommandList *list, ID3D12Resource *world, D3D12_RESOURCE_STATES state)
-	{
-		if (gpu_crash::lost()) // (nothing armed: nothing of FSR's recorded on a removed device)
+		if (gpu_crash::lost() || r.list == nullptr || r.world == nullptr || r.target == nullptr)
 			return;
 		std::lock_guard<std::mutex> lock(g.mutex);
-		per_list &l = g.lists[list];
-		l.world = world;
-		l.world_state = state;
-		arm(l, true, false);
-	}
-
-	void before_draw(ID3D12GraphicsCommandList *list, uint64_t vertices, ID3D12Resource *rt, uint64_t rtv, DXGI_FORMAT (*format_of)(uint64_t),
-		const grass::list_state &state)
-	{
-		if (g.armed.load(std::memory_order_relaxed) == 0)
+		const bool fsr = g.fsr.load(std::memory_order_relaxed);
+		const bool fits = g.temporal.load(std::memory_order_relaxed) ? covers(r.target, r.world) : bigger(r.target, r.world);
+		// (the resolve: a quad of at most 6 vertices into a target bigger than the world; else the game's stretch stays)
+		if (!fsr || r.vertices > kResolveVertices || r.rtv == 0 || r.target == r.world)
 			return;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		const auto it = g.lists.find(list);
-		if (it == g.lists.end())
-			return;
-		per_list &l = it->second;
-		if (l.pending)
-		{
-			arm(l, false, false);
-			record(list, l, state);
-			return;
-		}
-		if (!l.ended || rt == nullptr || rt == l.world || l.world == nullptr)
-			return;
-		// (the first draw out of the world: the resolve, when it's a quad into something bigger)
-		arm(l, false, false);
-		if (!g.fsr.load(std::memory_order_relaxed) || vertices > kResolveVertices || rtv == 0)
-			return;
-		if (!(g.temporal.load(std::memory_order_relaxed) ? covers(rt, l.world) : bigger(rt, l.world)))
+		if (!fits)
 		{
 			g.game_stretch++;
 			return;
 		}
-		arm(l, false, true);
-		l.target = rt;
-		l.target_rtv = rtv;
-		l.target_format = format_of != nullptr ? format_of(rtv) : DXGI_FORMAT_UNKNOWN;
-		if (l.target_format == DXGI_FORMAT_UNKNOWN)
-			l.target_format = rt->GetDesc().Format;
-		l.target_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		per_list l;
+		l.world = r.world;
+		l.world_state = r.world_state;
+		l.target = r.target;
+		l.target_rtv = r.rtv;
+		l.target_format = r.target_format != DXGI_FORMAT_UNKNOWN ? r.target_format : r.target->GetDesc().Format;
+		l.target_state = r.target_state;
+		record(r.list, l);
+		g.marked++;
 	}
 
-	void before_other(ID3D12GraphicsCommandList *list, const grass::list_state &state)
-	{
-		if (g.armed.load(std::memory_order_relaxed) == 0)
-			return;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		const auto it = g.lists.find(list);
-		if (it == g.lists.end() || !it->second.pending)
-			return;
-		arm(it->second, false, false);
-		record(list, it->second, state);
-	}
-
-	void after_barrier(ID3D12GraphicsCommandList *list, UINT count, const D3D12_RESOURCE_BARRIER *barriers, const grass::list_state &state)
-	{
-		if (g.armed.load(std::memory_order_relaxed) == 0)
-			return;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		const auto it = g.lists.find(list);
-		if (it == g.lists.end())
-			return;
-		per_list &l = it->second;
-		bool touched = false;
-		for (UINT i = 0; i < count; ++i)
-		{
-			const D3D12_RESOURCE_BARRIER &b = barriers[i];
-			if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
-				continue;
-			if (b.Transition.pResource == l.world && l.world != nullptr)
-			{
-				l.world_state = b.Transition.StateAfter;
-				touched = true;
-			}
-			else if (b.Transition.pResource == l.target && l.target != nullptr)
-			{
-				l.target_state = b.Transition.StateAfter;
-				touched = true;
-			}
-		}
-		// (moved by dgVoodoo after the resolve: drawn now, from where they are)
-		if (l.pending && touched)
-		{
-			arm(l, false, false);
-			record(list, l, state);
-		}
-	}
 }

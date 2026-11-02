@@ -276,6 +276,8 @@ namespace hifi::d3d8
 			colour(c, color);
 			g.flush_barriers();
 			l->ClearRenderTargetView(rt->rtv(), c, UINT(list.size()), list.empty() ? nullptr : list.data());
+			if (list.empty())
+				note_clear(this, rt->img, c); // (the whole world cleared: the zone's fog, for HiFi XI's marks)
 		}
 		if (flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))
 		{
@@ -304,10 +306,25 @@ namespace hifi::d3d8
 			return D3DERR_INVALIDCALL;
 		if (g.draws_in_list >= kSplitDraws)
 			g.submit(false);
-		// (the world's end: this draw reads its target, before anything is bound for it)
+		// (the world's end: this draw reads its target, before anything is bound for it; once it's drawn, the resolve's
+		// mark, whatever way this returns)
+		struct resolve_after
+		{
+			device *d = nullptr;
+			UINT vertices = 0;
+			~resolve_after()
+			{
+				if (d != nullptr)
+					resolve_drawn(d, vertices);
+			}
+		} resolve;
 		for (IDirect3DBaseTexture8 *t : cur.textures)
 			if (const base_texture *bt = texture_of(t))
-				mark_world_read(this, bt->img, rt->img);
+				if (mark_world_read(this, bt->img, rt->img))
+				{
+					resolve.d = this;
+					resolve.vertices = vcount;
+				}
 		const device_state &s = cur;
 
 		// ---- Shaders ----

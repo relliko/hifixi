@@ -112,6 +112,20 @@ namespace hifi::d3d8
 	static hifi_frame_handler g_mark_handler = nullptr;
 	static void *g_mark_context = nullptr;
 	uint32_t g_speedups = 0;
+	// (the world's target and depth as bound at the last zone's begin mark: every mark tells HiFi XI their states;
+	// forgotten when the game lets them go, device::forget)
+	static image *g_world_rt_img = nullptr, *g_world_ds_img = nullptr;
+	// (the colour the world's target was last cleared to, the whole of it: World FX's fog)
+	static float g_world_clear[4] = {};
+	static bool g_world_clear_known = false;
+
+	void note_clear(device *d, const image *img, const float colour[4])
+	{
+		if (img == nullptr || img != g_world_rt_img || d != g_mark_device)
+			return;
+		std::memcpy(g_world_clear, colour, sizeof(g_world_clear));
+		g_world_clear_known = true;
+	}
 
 	bool device::unchanged(bool equal)
 	{
@@ -336,6 +350,13 @@ namespace hifi::d3d8
 		if (!async_results.empty() && async_index.count(img) != 0)
 			async_results.clear();
 		async_index.erase(img);
+		if (img == g_world_rt_img)
+		{
+			g_world_rt_img = nullptr;
+			g_world_clear_known = false;
+		}
+		if (img == g_world_ds_img)
+			g_world_ds_img = nullptr;
 		const auto it = std::find(images.begin(), images.end(), img);
 		if (it != images.end())
 			images.erase(it);
@@ -2156,26 +2177,42 @@ namespace hifi::d3d8
 {
 	// The world: the target bound at the zone's begin mark; its end (kWorldEnd) sent once, at the first draw or copy that
 	// reads it after that (mark_world_read)
-	constexpr uint32_t kZoneBegin = 0, kWorldEnd = 13;
+	constexpr uint32_t kZoneBegin = 0, kWorldEnd = 13, kResolve = 14;
 	// The world's GPU format HiFi XI wants (HifiFrameSetWorldFormat; kTargetView until it says): the target bound at the
 	// zone's begin mark is made again in it there when it differs (never the back buffer: it's copied into the swap chain's)
 	static DXGI_FORMAT g_world_format = kTargetView;
 	static ID3D12Resource *g_world = nullptr;
 	static uint32_t g_world_seq = 0, g_world_width = 0;
 	static bool g_world_ended = true;
+	static uint32_t g_resolve_vertices = 0; // (the resolve's draw, while its mark is made)
+	static bool g_resolve_wanted = false;   // (the world's end marked, the draw that resolves it not seen yet)
 
 	static int mark_now(device *d, uint32_t kind, uint32_t seq);
 
-	void mark_world_read(device *d, const image *read, const image *into)
+	bool mark_world_read(device *d, const image *read, const image *into)
 	{
-		if (g_world_ended || g_world == nullptr || read == nullptr || read->gpu.res != g_world || d != g_mark_device)
-			return;
+		if (g_world == nullptr || read == nullptr || read->gpu.res != g_world || d != g_mark_device)
+			return false;
 		// (only into something at least the world's width: the resolve, a screenshot; a distortion's grab of it into the
 		// 256 x 256 target mid-frame isn't its end)
 		if (into == nullptr || into->gpu.res == g_world || into->width < g_world_width)
-			return;
-		g_world_ended = true;
-		mark_now(d, kWorldEnd, g_world_seq);
+			return false;
+		if (!g_world_ended)
+		{
+			g_world_ended = true;
+			g_resolve_wanted = true;
+			mark_now(d, kWorldEnd, g_world_seq);
+		}
+		// (the resolve: the first draw of it after its end, a copy or not before it; true for a draw to make its mark)
+		return g_resolve_wanted;
+	}
+
+	void resolve_drawn(device *d, uint32_t vertices)
+	{
+		g_resolve_wanted = false;
+		g_resolve_vertices = vertices;
+		mark_now(d, kResolve, g_world_seq);
+		g_resolve_vertices = 0;
 	}
 
 	static int mark_now(device *d, uint32_t kind, uint32_t seq)
@@ -2209,6 +2246,33 @@ namespace hifi::d3d8
 			m.ds_planes[0] = d->ds->img->gpu.plane[0];
 			m.ds_planes[1] = d->ds->img->gpu.plane[1];
 		}
+		// (the world: the zone's begin names it; its states now, bound or not)
+		if (kind == kZoneBegin)
+		{
+			image *const rt_img = d->rt != nullptr ? d->rt->img : nullptr;
+			if (rt_img != g_world_rt_img)
+				g_world_clear_known = false; // (another world: its clears not seen yet)
+			g_world_rt_img = rt_img;
+			g_world_ds_img = d->ds != nullptr ? d->ds->img : nullptr;
+		}
+		if (g_world_rt_img != nullptr)
+		{
+			m.world_rt = g_world_rt_img->gpu.res;
+			m.world_rt_state = g_world_rt_img->gpu.state;
+			if (g_world_clear_known)
+			{
+				std::memcpy(m.world_clear, g_world_clear, sizeof(m.world_clear));
+				m.world_clear_known = 1;
+			}
+		}
+		if (g_world_ds_img != nullptr)
+		{
+			m.world_ds = g_world_ds_img->gpu.res;
+			m.world_ds_plane_count = g_world_ds_img->gpu.planes;
+			m.world_ds_planes[0] = g_world_ds_img->gpu.plane[0];
+			m.world_ds_planes[1] = g_world_ds_img->gpu.plane[1];
+		}
+		m.draw_vertices = g_resolve_vertices;
 		LARGE_INTEGER called_at;
 		QueryPerformanceCounter(&called_at);
 		g_mark_handler(g_mark_context, kind, seq, &m);
@@ -2231,6 +2295,7 @@ namespace hifi::d3d8
 			g_world_seq = seq;
 			g_world_width = m.width;
 			g_world_ended = m.rt == nullptr;
+			g_resolve_wanted = false;
 		}
 		return 1;
 	}
@@ -2239,6 +2304,21 @@ namespace hifi::d3d8
 extern "C" int __cdecl HifiFrameMark(uint32_t kind, uint32_t seq)
 {
 	return hifi::d3d8::mark_now(hifi::d3d8::g_mark_device, kind, seq);
+}
+
+extern "C" uint32_t __cdecl HifiFrameVersion()
+{
+	return kHifiFrameChannel;
+}
+
+extern "C" int __cdecl HifiFrameDevice(ID3D12Device **device, ID3D12CommandQueue **queue)
+{
+	const hifi::d3d8::device *d = hifi::d3d8::g_mark_device;
+	if (device == nullptr || queue == nullptr || d == nullptr || d->g.device == nullptr || d->g.queue == nullptr)
+		return 0;
+	*device = d->g.device;
+	*queue = d->g.queue;
+	return 1;
 }
 
 extern "C" uint32_t __cdecl HifiFrameSetSpeedups(uint32_t flags)

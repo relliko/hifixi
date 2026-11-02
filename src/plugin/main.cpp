@@ -3,8 +3,9 @@
  * output of its own d3d8.dll (src/d3d8), without ReShade.
  *
  * - World FX (src/render/worldfx_core: grass, shading, shadows, water, weather, sky, lamps, glows) draws into the
- *   game's own frame on HiFi XI's Direct3D 12 hooks (src/host, src/backend). HiFi XI's starter (bootloader\dxgi.dll)
- *   starts it before the d3d8.dll makes its device; without it, it starts here, late, and can't find the world.
+ *   game's own frame at our d3d8.dll's marks (src/host/frameapi.hpp, src/backend). HiFi XI's starter
+ *   (bootloader\dxgi.dll) starts it before the d3d8.dll makes its device (GPU crash reports, frame generation); without
+ *   it, it starts here, late, without those.
  * - The game side (src/game): what World FX needs from the game each frame (feed: the zone, characters near, weapon
  *   skills, lamps, glows, the weather), and the game's own effects it replaces left out while World FX draws;
  *   hifps's frame step, limiter and speed-ups (hifps/); drawcull's view distance (drawcull).
@@ -12,15 +13,12 @@
  * - Settings in config\hifixi\settings.ini, the menu (src/ui/menu) drawn through Ashita's ImGui.
  *
  *   /hifi          the menu (presets, settings by tab, status), or closes it
- *   /hifi status   what each part is doing (the hooks' counts per frame since they went in, or /hifi reset), written to
+ *   /hifi status   what each part is doing (the frames since the start, or /hifi reset), written to
  *                  Ashita's logs\hifixi-status.txt; /hifi status <word> puts the lines with a word in the chat
  *   /hifi glows    the glows lighting the scene now
  *   /hifi gpu      World FX's GPU time by section, the costliest first
  *   /hifi gamedraw [zone|chars] [on|off]   the game's own zone or character drawing switched off (a debug toggle for
  *                  the native renderer to come: off at every start), or what's off
- *   /hifi streamlog [frames] [label]   the next world frame (up to 8) as the d3d8.dll records it in Direct3D 12, call by
- *                  call, and the game's own Direct3D 8 draws of it, into bootloader\hifixi-stream-<time>-<label>.txt
- *                  (src/backend/streamlog; the label is what /hifi gamedraw has off when none is given)
  *   /hifi zoneslot [on|off]   the zone pass's slot markers (src/game/zoneslot: on by default, [zone] slot in the
  *                  settings): where the game draws its zone, marked in its own Direct3D 8 stream for the Direct3D 12
  *                  side (World FX finds the world by them, the game's zone drawing on or off), or what they're doing
@@ -49,12 +47,11 @@
  *                  cross-faded; off: back to the real one; flash: lightning now. Debug, not saved (off at every start);
  *                  only World FX's own drawing: the zone's light and fog still follow the real weather
  *   /hifi reset    starts the counts again
- *   /hifi off|on   takes the hooks out, or puts them back
+ *   /hifi off|on   HiFi XI's passes off (the game draws as without it), or on again
  */
 
 #include "../../deps/ashita/plugins/sdk/Ashita.h"
 #include "../backend/backend.hpp"
-#include "../backend/streamlog.hpp"
 #include "../bake/runner.hpp"
 #include "../game/drawcull.hpp"
 #include "../game/feed.hpp"
@@ -83,8 +80,8 @@
 #include "../upscale/upscale.hpp"
 #include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
-#include "../host/hooks.hpp"
 #include "../host/passes.hpp"
+#include "../host/retire.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../render/gpu_crash.hpp"
 #include "../ui/menu.hpp"
@@ -446,22 +443,24 @@ class hifixi final : public IPlugin
 	void start()
 	{
 		std::string why;
-		if (hifi::backend::started())
+		// (loaded again after an unload: the DLL is pinned, so the backend is started, its passes off since the unload)
+		if (hifi::backend::started() && !hifi::backend::running() && !hifi::backend::resume(why))
+			say("HiFi XI's passes can't go in: " + why, true);
+		else if (hifi::backend::started())
 			say(hifi::backend::early() ? "Started before the game's Direct3D 12 device (the starter): World FX runs without ReShade. /hifi for the menu."
 				: "Running (started late).");
 		else if (hifi::backend::late_start(why))
-			say("Direct3D 12 hooks in, late: no starter (bootloader\\dxgi.dll), so the views the d3d8.dll made before aren't known and World FX can't find the world.", true);
+			say("Started late: no starter (bootloader\\dxgi.dll), so no GPU crash reports and no frame generation this session.", true);
 		else
-			say("Direct3D 12 hooks not in: " + why, true);
+			say("HiFi XI's passes can't go in: " + why, true);
 		if (hifi::backend::safe_start())
 			say("The GPU stopped last session (report: bootloader\\worldfx-gpu-crash.txt). Safe start: light in the air, ambient occlusion, "
 				"water reflections, rain, snow, cloud quality and lamp shadows are off until the next start; /hifi turns them on again now.", true);
-		hifi::host::reset_stats();
 		m_presents = 0;
 		m_since = now_seconds();
 	}
 
-	// Everything /hifi status knows, a line each; the frame-rate line also kept in m_rate_line (blank with the hooks out)
+	// Everything /hifi status knows, a line each; the frame-rate line also kept in m_rate_line (blank with the passes off)
 	std::vector<std::string> status_lines()
 	{
 		std::vector<std::string> out;
@@ -503,40 +502,16 @@ class hifixi final : public IPlugin
 		say(hifi::game::jitter::status());
 		for (const std::string &line : hifi::framegen::status())
 			say(line);
-		if (!hifi::host::installed())
+		if (!hifi::backend::running())
 		{
-			say("The hooks aren't in (/hifi on).");
+			say("HiFi XI's passes are off (/hifi on).");
 			return out;
 		}
-		const hifi::host::stats s = hifi::host::get_stats();
 		const double secs = now_seconds() - m_since;
-		const double frames = m_presents != 0 ? double(m_presents) : 1.0;
-		char line[320];
-		std::snprintf(line, sizeof(line), "%.1f s, %llu frames (%.1f fps); lists submitted %llu (%.1f a frame), not hooked %llu; list vtables hooked %llu, refused %llu; lists known %llu; calls on lists in an unknown state %llu; queues %u",
-			secs, static_cast<unsigned long long>(m_presents), secs > 0 ? m_presents / secs : 0.0, static_cast<unsigned long long>(s.lists_executed),
-			s.lists_executed / frames, static_cast<unsigned long long>(s.lists_foreign), static_cast<unsigned long long>(s.vtables_hooked),
-			static_cast<unsigned long long>(s.vtables_refused), static_cast<unsigned long long>(s.lists_seen),
-			static_cast<unsigned long long>(s.lists_unknown_state), s.queues_seen);
+		char line[160];
+		std::snprintf(line, sizeof(line), "%.1f s, %llu frames (%.1f fps)", secs, static_cast<unsigned long long>(m_presents), secs > 0 ? m_presents / secs : 0.0);
 		say(line);
 		m_rate_line = line;
-		std::snprintf(line, sizeof(line), "world: %llux%u %s, its end seen %llu times (%.2f a frame); depth: %llux%u %s",
-			static_cast<unsigned long long>(s.world.width), s.world.height, format_name(s.world.format), static_cast<unsigned long long>(s.world.ends),
-			s.world.ends / frames, static_cast<unsigned long long>(s.depth.width), s.depth.height, format_name(s.depth.format));
-		say(line);
-		std::string calls = "calls a frame:";
-		for (uint32_t i = 0; i < hifi::host::slot_count; ++i)
-		{
-			char item[80];
-			std::snprintf(item, sizeof(item), " %s %.1f;", hifi::host::slot_name(i), s.calls[i] / frames);
-			calls += item;
-			if (calls.size() > 180)
-			{
-				say(calls);
-				calls = " ";
-			}
-		}
-		if (calls.size() > 1)
-			say(calls);
 		return out;
 	}
 
@@ -575,7 +550,7 @@ class hifixi final : public IPlugin
 				std::fprintf(f, "%s\n", line.c_str());
 			written = std::fclose(f) == 0;
 		}
-		say(std::string(head) + (m_rate_line.empty() ? std::string(": the hooks aren't in (/hifi on).") : ": " + m_rate_line));
+		say(std::string(head) + (m_rate_line.empty() ? std::string(": HiFi XI's passes are off (/hifi on).") : ": " + m_rate_line));
 		if (written)
 			say("The whole status (" + std::to_string(lines.size()) + " lines) is in " + path + ". /hifi status <word> shows the lines with a word "
 				"(fx, names, ui, failed...).");
@@ -666,7 +641,7 @@ class hifixi final : public IPlugin
 				hifi::backend::log(1, ("HiFi XI: the zone pass's slot not marked: " + why).c_str());
 			}
 		}
-		hifi::game::zoneslot::set_wanted(hifi::game::zoneslot::in() && hifi::backend::started() && hifi::host::installed() && worldfx::attached() != nullptr);
+		hifi::game::zoneslot::set_wanted(hifi::game::zoneslot::in() && hifi::backend::running() && worldfx::attached() != nullptr);
 	}
 
 	// (native characters) The character passes' slot markers in (the character data needs their frames), sent only while
@@ -684,7 +659,7 @@ class hifixi final : public IPlugin
 				hifi::backend::log(1, ("HiFi XI: the character passes' slots not marked: " + why).c_str());
 			}
 		}
-		hifi::game::charslot::set_wanted(hifi::game::charslot::in() && hifi::backend::started() && hifi::host::installed() && worldfx::attached() != nullptr);
+		hifi::game::charslot::set_wanted(hifi::game::charslot::in() && hifi::backend::running() && worldfx::attached() != nullptr);
 	}
 
 	// (native characters) The model draw's stub in (after the character slots), taking over /hifi gamedraw chars's
@@ -717,7 +692,7 @@ class hifixi final : public IPlugin
 				hifi::backend::log(1, ("HiFi XI: the character models not recorded: " + why).c_str());
 		}
 		if (cm::in())
-			hifi::chars::cache::frame_tick(hifi::backend::started() && hifi::host::installed() ? worldfx::attached() : nullptr, now);
+			hifi::chars::cache::frame_tick(hifi::backend::running() ? worldfx::attached() : nullptr, now);
 	}
 
 	// (native characters) The en-spell elements' names for /hifi enspell, in charframe.hpp's kEn* order
@@ -974,52 +949,6 @@ class hifixi final : public IPlugin
 		hifi::game::zonedraw::set_state(want, hifi::zone::native::ready_zone(0), hifi::zone::native::ready_zone(1), flowing && hifi::zone::inject::ready());
 	}
 
-	// /hifi streamlog [frames] [label]: the next world frame(s) as dgVoodoo records them, and the game's draws of them,
-	// into a file beside hifixi.log (written a frame or two later, when it says so)
-	void streamlog(std::string rest)
-	{
-		using hifi::game::gamedraw::is_off;
-		using hifi::game::gamedraw::part;
-		if (!hifi::backend::started() || !hifi::host::installed())
-		{
-			say("The Direct3D 12 hooks aren't in: there's nothing to log.", true);
-			return;
-		}
-		uint32_t frames = 1;
-		std::string label;
-		while (!rest.empty())
-		{
-			while (!rest.empty() && rest.front() == ' ')
-				rest.erase(rest.begin());
-			const size_t space = rest.find(' ');
-			const std::string word = rest.substr(0, space);
-			rest = space == std::string::npos ? std::string() : rest.substr(space + 1);
-			if (word.empty())
-				continue;
-			if (word.find_first_not_of("0123456789") == std::string::npos && word.size() <= 2)
-				frames = uint32_t(std::stoul(word));
-			else
-				label += (label.empty() ? "" : "-") + word;
-		}
-		if (frames < 1 || frames > 8)
-		{
-			say("/hifi streamlog [frames 1-8] [label]: the next world frame(s) as the d3d8.dll records them, into bootloader\\hifixi-stream-<time>-<label>.txt");
-			return;
-		}
-		if (label.empty())
-			label = std::string("zone-") + (is_off(part::zone) ? "off" : "on") + "-chars-" + (is_off(part::chars) ? "off" : "on");
-		char version[32];
-		std::snprintf(version, sizeof(version), "HiFi XI %.2f", kVersion);
-		const std::string context = std::string(version) + "; " + hifi::game::gamedraw::status() + "; World FX " +
-			(worldfx_drawing() != 0 ? "draws into the game's world" : "doesn't draw (no world found yet)") + "\n";
-		if (!hifi::backend::streamlog::request(frames, label, context))
-		{
-			say("A stream log is being made already.", true);
-			return;
-		}
-		say("Stream log: the next " + std::to_string(frames) + " world frame(s) go into bootloader\\hifixi-stream-<time>-" + label + ".txt");
-	}
-
 public:
 	const char *GetName() const override { return "hifixi"; }
 	const char *GetAuthor() const override { return "Relli"; }
@@ -1041,15 +970,14 @@ public:
 		g_core = core;
 		g_gui = core->GetGuiManager();
 		g_ashita_log = logger;
-		// Pinned: dgVoodoo's threads call into this DLL's hooks, so it stays loaded even after Ashita unloads the plugin
+		// Pinned: our d3d8.dll calls into this DLL at its marks and AMD's threads into its frame generation, so it stays
+		// loaded even after Ashita unloads the plugin
 		HMODULE self = nullptr;
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&now_seconds), &self);
 		hifi::backend::set_log_sink(ashita_log);
 		hifi::game::hifps::exp::set_ashita(core);
 		// (the characters' visibility test: answered by World FX's VisTest, occlusion tests every frame then)
 		hifi::game::feed::set_actor_handoff(hifi::game::hifps::exp::set_actors_elsewhere);
-		// (the stream log's view of the game's draws: a tap on the client device, a copy of its vtable in front)
-		hifi::backend::streamlog::set_d3d8_tap(hifi::game::hifps::exp::draw_tap, hifi::game::hifps::exp::draw_untap);
 		// (the zone pass's begin and end to the native zone draw)
 		hifi::game::zoneslot::set_listener(hifi::game::zonedraw::on_slot);
 		hifi::game::charslot::set_listener(char_slot); // (native characters, and the model actors in the same walk)
@@ -1064,7 +992,6 @@ public:
 	void Release() override
 	{
 		// (the game's own drawing back first, while the log still takes the reason it can't be)
-		hifi::backend::streamlog::set_d3d8_tap(nullptr, nullptr);
 		std::string why;
 		// (the own-frame passes first: the game draws each of them again)
 		for (const hifi::passes::module &m : hifi::passes::modules())
@@ -1112,6 +1039,7 @@ public:
 		hifi::game::hifps::exp::set_ashita(nullptr);
 		g_core = nullptr;
 		hifi::backend::stop();
+		hifi::retire::release_all(); // (nothing of ours is recorded after this: what the GPU has done with let go)
 	}
 
 	bool HandleCommand(int32_t mode, const char *command, bool injected) override
@@ -1125,7 +1053,6 @@ public:
 			arg.erase(arg.begin());
 		if (arg == "reset")
 		{
-			hifi::host::reset_stats();
 			m_presents = 0;
 			m_since = now_seconds();
 			say("Counts started again.");
@@ -1150,8 +1077,6 @@ public:
 		}
 		else if (arg == "gamedraw" || arg.rfind("gamedraw ", 0) == 0)
 			gamedraw(arg.substr(8));
-		else if (arg == "streamlog" || arg.rfind("streamlog ", 0) == 0)
-			streamlog(arg.substr(9));
 		else if (arg == "nativezone" || arg.rfind("nativezone ", 0) == 0)
 		{
 			const std::string how = arg.size() > 11 ? arg.substr(11) : std::string();
@@ -1252,7 +1177,7 @@ public:
 		else if (arg == "off")
 		{
 			hifi::backend::stop();
-			say("Direct3D 12 hooks out.");
+			say("HiFi XI's passes off: the game draws as without it (/hifi on puts them back).");
 		}
 		else if (arg == "on")
 		{
@@ -1260,12 +1185,12 @@ public:
 			if (!hifi::backend::started())
 				start();
 			else if (hifi::backend::resume(why))
-				say("Direct3D 12 hooks back in.");
+				say("HiFi XI's passes on again.");
 			else
-				say("Direct3D 12 hooks not in: " + why, true);
+				say("HiFi XI's passes can't go in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi streamlog [frames] [label]: the next world frame call by call, into a file (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its hooks out or in.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi reset: its counts again; /hifi off|on: its passes off or on again.");
 		return true;
 	}
 
@@ -1276,7 +1201,7 @@ public:
 		UNREFERENCED_PARAMETER(size_chunk);
 		UNREFERENCED_PARAMETER(data_chunk);
 		UNREFERENCED_PARAMETER(injected);
-		if (!blocked && hifi::backend::started() && hifi::host::installed())
+		if (!blocked && hifi::backend::running())
 			hifi::game::feed::packet_in(id, data, size, g_entities);
 		return false;
 	}
@@ -1347,7 +1272,7 @@ public:
 		}
 		// (the game's parts while World FX runs here: the worldfx Ashita addon's work; the zone's files made the first
 		// time it's entered)
-		if (hifi::backend::started() && hifi::host::installed())
+		if (hifi::backend::running())
 		{
 			const hifi::game::feed::party p = party_now();
 			hifi::game::feed::frame(g_entities, p, now);
@@ -1381,8 +1306,6 @@ public:
 		hifi::backend::present();
 		slow.step("World FX");
 		slow.log_if_slow();
-		if (const std::string line = hifi::backend::streamlog::present(); !line.empty())
-			say(line);
 		if (g_gui != nullptr && hifi::game::option_on("hifps", "counter", true) && hifi::game::hifps::fps() > 0.0)
 		{
 			// (the frame rate, top left)

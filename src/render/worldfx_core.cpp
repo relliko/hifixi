@@ -11,8 +11,8 @@
  * depth-tested against the blades.
  *
  * Camera: the game's own (gGame +0x94 view, +0x154 projection, found in FFXiMain.dll by facelift's
- * 'game.sys' pattern). Zone: the worldfx Ashita addon puts it in the process environment
- * (FFXI_WORLDFX_ZONE); blades for zone N are read from worldfx-grass\N.bin in the host's folder.
+ * 'game.sys' pattern). Zone: HiFi XI's game side tells it every frame (worldfx_zone, src/game/feed.cpp); blades for
+ * zone N are read from worldfx-grass\N.bin in the host's folder.
  *
  * Lamps: the zone's from worldfx-lamps\N.bin (tools/bake_lamps.py); which are lit now, from the game's light
  * table, which the Ashita addon reads and sends (worldfx_lamps). Their glow goes in with the shading pass.
@@ -45,7 +45,20 @@
 
 namespace
 {
-	constexpr const char *kZoneVariable = "FFXI_WORLDFX_ZONE";
+	// The zone and whether a character is in, as the game side last told them (worldfx_zone: 0 none known; in 1 logged
+	// in, not zoning). check_zone reads the zone's files at the present after a change; until it has, nothing is drawn
+	// (zone_stale: the GPU hung drawing the last zone's grass in the next, 2026-11-01/02)
+	std::atomic<uint32_t> g_told_zone{ 0 };
+	std::atomic<uint32_t> g_told_in{ 0 };
+	// (the FloatWorld setting, for our d3d8.dll at every mark without the core's lock)
+	std::atomic<bool> g_float_world{ false };
+	// The renderer records without the core's lock (g.mutex): it's held from the frame's look till the recording starts,
+	// and again after it. While it records, the game's thread holds render_mutex instead, and owns the renderer: what
+	// reads the renderer from elsewhere takes render_mutex too (a status or a stat only tries it, and goes without the
+	// renderer's part when it's busy), always after g.mutex; the recording lets render_mutex go before it takes g.mutex
+	// again, so the two are never held the other way round. (The 11-02 deadlocks: World FX's lock held across D3D12
+	// calls that took the debug layer's lock, waited on by a list Reset from another thread.)
+	std::mutex g_render_mutex;
 	// The zone's files to be read again (worldfx::reload_zone: HiFi XI just made them)
 	std::atomic<bool> g_reload_zone{ false };
 	// The game's world found since its device was attached: World FX draws there (worldfx_drawing: HiFi XI's game side
@@ -56,21 +69,17 @@ namespace
 	// At most kMaxPasses drawings between two presents: a full-screen pass at twice the screen's size many
 	// times in one frame is enough to make the GPU time out
 	constexpr uint32_t kMaxPasses = 2;
-	// Nothing is drawn unless the worldfx Ashita addon says a character is in the game (FFXI_WORLDFX_INGAME
-	// = 1: logged in, not zoning), from the first frame it does. The shading pass (ambient occlusion, relief,
+	// Nothing is drawn unless the game side says a character is in the game (worldfx_zone's in = 1: logged in, not
+	// zoning), from the first frame it does. The shading pass (ambient occlusion, relief,
 	// sun shadows) pauses kShadePauseMs whenever the GPU timer says it took more than kShadeMaxMs
 	// (TestShadeMaxMs in ReShade.ini: another limit, for the end-to-end test on WARP, a CPU many times slower
 	// than the GPU). (Until 2026-10-17 everything also waited 60 frames in the field, and the shading pass
 	// 3 s more, against GPU hangs at zone-in; those were the add-on leaving its own state bound after a
 	// shading-only pass and the NVIDIA driver's forced anisotropic filtering, and happened with both waits.)
-	constexpr const char *kInGameVariable = "FFXI_WORLDFX_INGAME";
 	constexpr ULONGLONG kShadePauseMs = 5000;
 	constexpr float kShadeMaxMs = 30.0f;
 	constexpr uint32_t kZoneCheckFrames = 30;
 	constexpr uint32_t kHistory = 120;
-
-	// What's bound on one command list (worldfx_core.hpp)
-	using worldfx::list_data;
 
 	// worldfx.hlsl compiled on a thread of its own (shader_thread): compiling all the shaders takes over 11 s, and done
 	// on the game's frame it froze the game until Windows closed it (in game, 2026-10-21). The frame picks the result
@@ -84,6 +93,7 @@ namespace
 		bool ok = false, from_cache = false;
 		std::string error;
 		double seconds = 0.0;
+		bool built_in = false; // (the built-in shaders at attach, not in the cache: none in use till they're in)
 		std::atomic<bool> done { false };
 	};
 
@@ -128,11 +138,12 @@ namespace
 
 		// Zone and blades
 		uint32_t frames = 0;
-		// The world's views as last bound (for its end, where the resolve's targets are bound)
+		// The world's views, their formats and its size, as the zone's begin mark had them bound (for its end, where the
+		// resolve's targets are bound); whether World FX has drawn at its end since
 		uint64_t world_rtv = 0, world_dsv = 0;
-		// The states the last barrier (on any list) put the world's target and depth in
-		D3D12_RESOURCE_STATES last_rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		D3D12_RESOURCE_STATES last_ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+		DXGI_FORMAT world_rt_format = DXGI_FORMAT_UNKNOWN, world_ds_format = DXGI_FORMAT_UNKNOWN;
+		uint32_t world_width = 0, world_height = 0;
+		bool world_end_done = false;
 		bool zone_known = false;
 		uint32_t zone = 0;
 		bool zone_tried = false;
@@ -146,7 +157,6 @@ namespace
 		uint32_t passes = 0;          // world ends drawn at since the last present
 		uint32_t passes_wanted = 0;   // and wanted
 		uint32_t most_wanted = 0;     // the most wanted between two presents so far (logged when it grows past kMaxPasses)
-		bool logged_stale_views = false;
 		bool crash_reports_tried = false;
 		std::string crash_reports = "off (Direct3D 12's device was made before the add-on loaded)";
 		bool debug_layer = false;         // D3D12DebugLayer=1: its messages go to worldfx-d3d12-debug.txt
@@ -165,7 +175,7 @@ namespace
 		static constexpr uint32_t kDrawings = 8;
 		drawing drawings[kDrawings];
 		uint32_t drawing_count = 0;
-		bool in_game = false;             // the Ashita addon says so (FFXI_WORLDFX_INGAME)
+		bool in_game = false;             // the game side says so (worldfx_zone)
 		ULONGLONG in_game_since = 0;      // (GetTickCount64)
 		ULONGLONG shading_paused_until = 0;
 		const char *shading_held = nullptr; // why the shading pass isn't running now (nullptr: it is)
@@ -485,25 +495,6 @@ namespace
 			host.set_int(key, value);
 	}
 
-	// The resource a view is of now (nullptr: none, or not known)
-	ID3D12Resource *resource_of(uint64_t view)
-	{
-		return view != 0 && host.resource_of_view != nullptr ? host.resource_of_view(view) : nullptr;
-	}
-
-	const char *arg_name(grass::root_arg::kind_t kind)
-	{
-		switch (kind)
-		{
-		case grass::root_arg::table: return "table";
-		case grass::root_arg::root_constants: return "constants";
-		case grass::root_arg::cbv: return "CBV";
-		case grass::root_arg::srv: return "SRV";
-		case grass::root_arg::uav: return "UAV";
-		default: return "unset";
-		}
-	}
-
 	// Game memory
 
 	bool safe_copy(void *dst, uintptr_t src, size_t size)
@@ -697,12 +688,16 @@ namespace
 		return n;
 	}
 
+	// (g.mutex held) The game side has told a zone check_zone hasn't read the files of yet: what's loaded is another's
+	bool zone_stale()
+	{
+		return !g.zone_tried || g_told_zone.load(std::memory_order_acquire) != g.zone;
+	}
+
 	void check_zone()
 	{
-		char text[16] = "";
-		const DWORD n = GetEnvironmentVariableA(kZoneVariable, text, sizeof(text));
-		const bool known = n > 0 && n < sizeof(text);
-		const uint32_t zone = known ? std::strtoul(text, nullptr, 10) : 0;
+		const uint32_t zone = g_told_zone.load(std::memory_order_acquire);
+		const bool known = zone != 0;
 		// (the zone's files just made: read again as if it had just been entered)
 		if (g_reload_zone.exchange(false))
 			g.zone_tried = false;
@@ -918,6 +913,34 @@ namespace
 		FreeLibraryAndExitThread(module, 0);
 	}
 
+	// (mutex held) A job compiling source on a thread of its own, below normal (the game's frames first): false when no
+	// thread could be made
+	bool start_shader_job(std::string source, bool built_in)
+	{
+		auto job = std::make_shared<shader_job>();
+		job->source = std::move(source);
+		job->cache = shader_cache_folder();
+		job->built_in = built_in;
+		HANDLE thread = nullptr;
+		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&shader_thread), &job->module))
+		{
+			auto *const held = new std::shared_ptr<shader_job>(job);
+			thread = CreateThread(nullptr, 0, shader_thread, held, CREATE_SUSPENDED, nullptr);
+			if (thread == nullptr)
+			{
+				delete held;
+				FreeLibrary(job->module);
+			}
+		}
+		if (thread == nullptr)
+			return false;
+		SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+		ResumeThread(thread);
+		CloseHandle(thread);
+		g.shader_compiling = std::move(job);
+		return true;
+	}
+
 	// Shaders from worldfx.hlsl next to the add-on, compiled again whenever the file changes (its time or size): edits
 	// show while the game runs. The shaders in use stay while it compiles, on a thread of its own (one at a time: a
 	// change meanwhile is seen once it's done); then it's swapped in on a frame. The same source as the shaders in use
@@ -931,6 +954,26 @@ namespace
 			if (!job.done.load(std::memory_order_acquire))
 				return;
 			const std::string when = clock_now();
+			if (job.built_in)
+			{
+				// (the built-in shaders, compiled at attach: World FX draws from now on)
+				if (job.ok && g.renderer != nullptr)
+				{
+					g.renderer->set_shader_code(std::move(job.code));
+					char how[96];
+					std::snprintf(how, sizeof(how), "compiled in the background in %.1f s (kept in the shader cache)", job.seconds);
+					g.shader_status = std::string("built in, ") + how;
+					log_message(0, (std::string("FFXI World FX: the built-in shaders, ") + how).c_str());
+				}
+				else if (!job.ok)
+				{
+					g.error = "the built-in shaders don't compile: " + job.error.substr(0, 300);
+					g.shader_status = g.error;
+					log_message(2, ("FFXI World FX: grass renderer: the built-in shaders: " + job.error).c_str());
+				}
+				g.shader_compiling.reset();
+				return;
+			}
 			if (job.ok)
 			{
 				char how[64];
@@ -951,6 +994,8 @@ namespace
 			g.shader_compiling.reset();
 			return;
 		}
+		if (g.renderer == nullptr || !g.renderer->has_shaders())
+			return; // (the built-in ones first)
 		const std::wstring path = addon_folder() + L"worldfx.hlsl";
 		WIN32_FILE_ATTRIBUTE_DATA a = {};
 		if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a))
@@ -982,66 +1027,25 @@ namespace
 			log_message(0, "FFXI World FX: worldfx.hlsl is the same as the shaders in use");
 			return;
 		}
-		auto job = std::make_shared<shader_job>();
-		job->source = std::move(source);
-		job->cache = shader_cache_folder();
-		HANDLE thread = nullptr;
-		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&shader_thread), &job->module))
-		{
-			auto *const held = new std::shared_ptr<shader_job>(job);
-			thread = CreateThread(nullptr, 0, shader_thread, held, 0, nullptr);
-			if (thread == nullptr)
-			{
-				delete held;
-				FreeLibrary(job->module);
-			}
-		}
-		if (thread == nullptr)
+		if (!start_shader_job(std::move(source), false))
 		{
 			g.shader_status = "worldfx.hlsl couldn't be compiled (" + when + ": no thread for it); the last good shaders stay";
 			log_message(2, "FFXI World FX: worldfx.hlsl: no thread to compile it on");
 			return;
 		}
-		SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
-		CloseHandle(thread);
-		g.shader_compiling = std::move(job);
 		g.shader_status = "worldfx.hlsl changed at " + when + ": compiling in the background (the shaders in use stay until it's done)";
 		log_message(0, "FFXI World FX: worldfx.hlsl changed: compiling it in the background");
 	}
 
-	DXGI_FORMAT view_format(uint64_t view, ID3D12Resource *res)
-	{
-		DXGI_FORMAT fmt = view != 0 && host.format_of_view != nullptr ? host.format_of_view(view) : DXGI_FORMAT_UNKNOWN;
-		if (fmt == DXGI_FORMAT_UNKNOWN && res != nullptr)
-			fmt = res->GetDesc().Format;
-		return fmt;
-	}
-
-	// The first draw goes to the log with dgVoodoo's root signature, so a crash can be traced
-	void log_first(const list_data &d, const grass::target &t)
+	// The first draw goes to the log with the world as our d3d8.dll handed it, so a crash can be traced
+	void log_first(const grass::target &t)
 	{
 		g.logged_first = true;
-		std::string text = "FFXI World FX: first grass draw. Root parameters of the game's root signature:";
-		const size_t known = host.root_param_count != nullptr ? host.root_param_count(d.state.root) : 0;
-		const size_t count = known != 0 ? known : d.state.args.size();
-		for (size_t i = 0; i < count; ++i)
-		{
-			const char *const param = known != 0 && host.root_param != nullptr ? host.root_param(d.state.root, i) : nullptr;
-			char item[64];
-			std::snprintf(item, sizeof(item), " [%zu] %s (%s)", i, param != nullptr ? param : "?",
-				i < d.state.args.size() ? arg_name(d.state.args[i].kind) : "unset");
-			text += item;
-		}
-		char tail[320];
-		const D3D12_VIEWPORT &vp = d.state.viewports[0];
-		const D3D12_RESOURCE_DESC rd = t.rt->GetDesc(), dd = t.ds->GetDesc();
-		std::snprintf(tail, sizeof(tail), ". World formats %u/%u (resources %u/%u, %llux%u / %llux%u), states 0x%X/0x%X, %u viewport(s) (first %.0f,%.0f %.0fx%.0f depth %.3f..%.3f), topology %u.",
-			static_cast<unsigned>(t.rtv_format), static_cast<unsigned>(t.dsv_format), static_cast<unsigned>(rd.Format), static_cast<unsigned>(dd.Format),
-			static_cast<unsigned long long>(rd.Width), rd.Height, static_cast<unsigned long long>(dd.Width), dd.Height,
-			static_cast<unsigned>(t.rt_state), static_cast<unsigned>(t.ds_state),
-			d.state.viewport_count, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth, static_cast<unsigned>(d.state.topology));
-		text += tail;
-		log_message(0, text.c_str());
+		char text[240];
+		std::snprintf(text, sizeof(text), "FFXI World FX: first grass draw. The world: %ux%u, views' formats %u/%u, states 0x%X/0x%X (depth plane 0).",
+			g.world_width, g.world_height, static_cast<unsigned>(t.rtv_format), static_cast<unsigned>(t.dsv_format), static_cast<unsigned>(t.rt_state),
+			static_cast<unsigned>(t.ds_state));
+		log_message(0, text);
 	}
 
 	// Lit lights from the game's light table are this fresh at most (ms): older, the worldfx Ashita addon is gone,
@@ -1987,14 +1991,64 @@ namespace
 		log_people(cam, people);
 	}
 
-	void inject(ID3D12GraphicsCommandList *list, list_data &d, uint64_t rtv, uint64_t dsv)
+	// What the look points into, copied for the recording (the game side may send new ones while it records)
+	struct recording_arrays
+	{
+		float actors[grass::kMaxActors * 4] = {};
+		float cuts[grass::kMaxCuts * 8] = {};
+		float ripples[grass::kMaxRipples * 8] = {};
+		float lamps[grass::kMaxLamps * 8] = {};
+	};
+	recording_arrays g_recording; // (the game's thread only)
+
+	// (g.mutex held by lock) The renderer's drawing on the list, without the core's lock while it records (render_mutex
+	// held instead); the lock held again after it
+	grass::draw_stats record(std::unique_lock<std::mutex> &lock, ID3D12GraphicsCommandList *list, const grass::target &t, const grass::camera &cam,
+		grass::look l, std::string &error)
+	{
+		const auto own = [](const float *&from, float *to, size_t floats) {
+			if (from != nullptr)
+			{
+				std::memcpy(to, from, floats * sizeof(float));
+				from = to;
+			}
+		};
+		own(l.actors, g_recording.actors, grass::kMaxActors * 4);
+		own(l.cuts, g_recording.cuts, grass::kMaxCuts * 8);
+		own(l.ripples, g_recording.ripples, grass::kMaxRipples * 8);
+		own(l.lamps, g_recording.lamps, grass::kMaxLamps * 8);
+		grass::renderer *const r = g.renderer.get();
+		std::unique_lock<std::mutex> render(g_render_mutex);
+		lock.unlock();
+		const grass::draw_stats s = r->draw(list, t, cam, l, error);
+		render.unlock();
+		lock.lock();
+		return s;
+	}
+
+	void inject(std::unique_lock<std::mutex> &lock, ID3D12GraphicsCommandList *list, const worldfx::world_mark &m, uint64_t rtv)
 	{
 		g.tried = true;
 		g.passes_wanted++;
-		g_has_drawn = true; // (the world found: World FX draws into it here, whatever is on this frame)
+		// (the world found: World FX draws into it here, whatever is on this frame; said to the game side only once the
+		// renderer has its shaders, else it would leave out its own water and weather with nothing drawn for them)
+		if (g.renderer != nullptr && g.renderer->ready())
+			g_has_drawn = true;
 		if (!g.in_game)
 		{
 			g.skip = "not in the game (login, character select, zoning; or the worldfx Ashita addon isn't loaded)";
+			return;
+		}
+		// (before the zone guard: the zone's files are read only once the renderer is ready, so it would take the blame)
+		if (g.renderer == nullptr || !g.renderer->ready())
+		{
+			g.skip = g.shader_compiling != nullptr && g.shader_compiling->built_in ? "the renderer isn't ready (its shaders compiling in the background)" :
+				"the renderer isn't ready";
+			return;
+		}
+		if (zone_stale())
+		{
+			g.skip = "a new zone, its files not read yet (the last zone's never drawn in it)";
 			return;
 		}
 		if (g.passes >= kMaxPasses)
@@ -2008,11 +2062,6 @@ namespace
 		if (!g.enabled && !shading_on() && !water_on && g.look.fireflies <= 0.0f && !rain_on && !g.vis_on && !look_on())
 		{
 			g.skip = "off";
-			return;
-		}
-		if (g.renderer == nullptr || !g.renderer->ready())
-		{
-			g.skip = "the renderer isn't ready";
 			return;
 		}
 		if (!g.renderer->loaded() && !shading_on() && !water_on && !rain_on && !g.vis_on && !look_on())
@@ -2033,12 +2082,12 @@ namespace
 		t.rt = g.world_rt;
 		t.ds = g.world_ds;
 		t.rtv = { static_cast<SIZE_T>(rtv) };
-		t.rtv_format = view_format(rtv, g.world_rt);
-		t.dsv_format = view_format(dsv, g.world_ds);
-		t.rt_state = d.world_rt_state;
-		t.ds_state = d.world_ds_state;
+		t.rtv_format = g.world_rt_format;
+		t.dsv_format = g.world_ds_format;
+		t.rt_state = m.rt_state;
+		t.ds_state = m.ds_planes[0]; // (the renderer copies and moves plane 0 alone)
 		if (!g.logged_first)
-			log_first(d, t);
+			log_first(t);
 
 		std::string error;
 		// (the frame's look: worked out at the zone's end when the blades went in there, else here)
@@ -2082,7 +2131,7 @@ namespace
 			if (n != 0 && !g.renderer->set_vis_boxes(g.vis_objects, g.vis_boxes, n, g.presents, vis_error))
 				g.vis_skipped += n;
 		}
-		g.last = g.renderer->draw(list, t, cam, l, error);
+		g.last = record(lock, list, t, cam, l, error);
 		if (g.last.sun_map_cascades != 0)
 			g.sun_map_redraws++;
 		{
@@ -2137,11 +2186,9 @@ namespace
 	void end_frame()
 	{
 		uint32_t passes_this_frame = 0;
-		// In the game? (the Ashita addon's word: logged in, not zoning)
+		// In the game? (the game side's word: logged in, not zoning)
 		{
-			char text[8] = "";
-			const DWORD n = GetEnvironmentVariableA(kInGameVariable, text, sizeof(text));
-			const bool now_in = n == 1 && text[0] == '1';
+			const bool now_in = g_told_in.load(std::memory_order_acquire) != 0;
 			if (now_in && !g.in_game)
 			{
 				g.in_game_since = GetTickCount64();
@@ -2251,7 +2298,8 @@ static std::string crash_context()
 	out += "  weather of its own: " + weather_fx_text() + "\n";
 	std::snprintf(line, sizeof(line), "  shading pass: %s\n", g.shading_held != nullptr ? g.shading_held : g.shading_logged ? "running" : "not run yet");
 	out += line;
-	if (g.renderer != nullptr)
+	std::unique_lock<std::mutex> render(g_render_mutex, std::try_to_lock); // (busy recording: the times left out)
+	if (g.renderer != nullptr && render.owns_lock())
 	{
 		std::snprintf(line, sizeof(line), "  GPU time a frame (smoothed): copies and shading %.2f ms, grass %.2f ms\n", g.renderer->shading_ms(), g.renderer->grass_ms());
 		out += line;
@@ -2332,18 +2380,6 @@ static void pace_present(ID3D12CommandQueue *q)
 	q->Signal(g.pace_fence, ++g.presents);
 }
 
-// Whether a clear's rectangles (none: all of it) cover the whole of res
-static bool covers_all(ID3D12Resource *res, uint32_t rect_count, const D3D12_RECT *rects)
-{
-	if (rect_count == 0)
-		return true;
-	const D3D12_RESOURCE_DESC rd = res->GetDesc();
-	for (uint32_t i = 0; i < rect_count; ++i)
-		if (rects[i].left <= 0 && rects[i].top <= 0 && rects[i].right >= int32_t(rd.Width) && rects[i].bottom >= int32_t(rd.Height))
-			return true;
-	return false;
-}
-
 namespace worldfx
 {
 	void set_port(const port &p)
@@ -2393,6 +2429,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.casters = fn;
 		g.casters_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_casters(fn, context);
 	}
@@ -2424,6 +2461,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		texture = nullptr;
 		frames = 0;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		return g.renderer != nullptr && g.renderer->blade_motion(texture, frames);
 	}
 
@@ -2433,6 +2471,7 @@ namespace worldfx
 		g.zone_bounds = bounds;
 		g.zone_draw = draw;
 		g.zone_casters_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_zone_casters(bounds, draw, context);
 	}
@@ -2442,6 +2481,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.floor = fn;
 		g.floor_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_floor_source(fn, context);
 	}
@@ -2451,6 +2491,7 @@ namespace worldfx
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.light = fn;
 		g.light_context = context;
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
 			g.renderer->set_light_source(fn, context);
 	}
@@ -2458,6 +2499,7 @@ namespace worldfx
 	void attach(ID3D12Device *device)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
+		std::lock_guard<std::mutex> render(g_render_mutex); // (the renderer replaced)
 		if (device == nullptr || g.dev == device)
 			return;
 		g.dev = device;
@@ -2471,20 +2513,30 @@ namespace worldfx
 		g.shader_status = "built in";
 		g.error.clear();
 		std::string error;
-		if (!g.renderer->init(device, error, shader_cache_folder()))
+		// (the shaders from the cache now; not there, compiled on a thread of their own: the game's thread waited
+		// seconds for them, frozen, at the first start after each release)
+		g.shader_compiling.reset();
+		if (!g.renderer->init(device, error, shader_cache_folder(), false))
 		{
 			g.error = error;
 			log_message(2, ("FFXI World FX: grass renderer: " + error).c_str());
 		}
-		else
+		else if (g.renderer->has_shaders())
 		{
 			char how[96];
-			if (g.renderer->shaders_from_cache())
-				std::snprintf(how, sizeof(how), "from the shader cache (%.2f s)", g.renderer->shader_seconds());
-			else
-				std::snprintf(how, sizeof(how), "compiled in %.1f s (kept in the shader cache)", g.renderer->shader_seconds());
+			std::snprintf(how, sizeof(how), "from the shader cache (%.2f s)", g.renderer->shader_seconds());
 			g.shader_status = std::string("built in, ") + how;
 			log_message(0, (std::string("FFXI World FX: the built-in shaders, ") + how).c_str());
+		}
+		else if (start_shader_job(grass::built_in_shader_source(), true))
+		{
+			g.shader_status = "built in: compiling in the background (World FX draws once they're in)";
+			log_message(0, "FFXI World FX: the built-in shaders aren't in the shader cache: compiling them in the background");
+		}
+		else
+		{
+			g.error = "the built-in shaders couldn't be compiled (no thread for it)";
+			log_message(2, ("FFXI World FX: grass renderer: " + g.error).c_str());
 		}
 		g.zone_tried = false;
 		g.world_rt = nullptr;
@@ -2499,6 +2551,7 @@ namespace worldfx
 	void detach(ID3D12Device *device)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
+		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (device != g.dev)
 			return;
 		gpu_crash::unwatch();
@@ -2521,176 +2574,77 @@ namespace worldfx
 		g.dev = nullptr;
 	}
 
-	void on_reset(list_data &d)
-	{
-		d = list_data();
-		// A list starts with the world in the states the last barrier on any list left it in: dgVoodoo may
-		// change them on one list and draw on the next (the depth, before the resolve)
-		std::lock_guard<std::mutex> lock(g.mutex);
-		d.world_rt_state = g.last_rt_state;
-		d.world_ds_state = g.last_ds_state;
-	}
-
-	void on_targets(ID3D12GraphicsCommandList *, list_data &d, uint32_t count, const uint64_t *rtvs, uint64_t dsv)
-	{
-		// The new binding (already made: this comes after the call)
-		count = std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
-		d.state.rtv_count = count;
-		for (uint32_t i = 0; i < count; ++i)
-			d.state.rtvs[i] = { static_cast<SIZE_T>(rtvs[i]) };
-		d.state.dsv = { static_cast<SIZE_T>(dsv) };
-		d.rt0 = count != 0 && rtvs[0] != 0 ? resource_of(rtvs[0]) : nullptr;
-		d.ds = dsv != 0 ? resource_of(dsv) : nullptr;
-		if (d.rt0 != nullptr && d.rt0 == g.world_rt && d.ds == g.world_ds)
-		{
-			std::lock_guard<std::mutex> lock(g.mutex);
-			g.world_rtv = rtvs[0];
-			g.world_dsv = dsv;
-		}
-	}
-
-	void on_pipeline(list_data &d, ID3D12PipelineState *pso)
-	{
-		d.state.pipeline = pso;
-	}
-
-	void on_topology(list_data &d, D3D12_PRIMITIVE_TOPOLOGY topology)
-	{
-		d.state.topology = topology;
-	}
-
-	void on_viewports(list_data &d, uint32_t first, uint32_t count, const D3D12_VIEWPORT *viewports)
-	{
-		const uint32_t total = std::min<uint32_t>(first + count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
-		for (uint32_t i = first; i < total; ++i)
-			std::memcpy(&d.state.viewports[i], &viewports[i - first], sizeof(D3D12_VIEWPORT));
-		d.state.viewport_count = count != 0 ? total : 0;
-	}
-
-	void on_scissors(list_data &d, uint32_t first, uint32_t count, const D3D12_RECT *rects)
-	{
-		const uint32_t total = std::min<uint32_t>(first + count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
-		for (uint32_t i = first; i < total; ++i)
-			std::memcpy(&d.state.scissors[i], &rects[i - first], sizeof(D3D12_RECT));
-		d.state.scissor_count = count != 0 ? total : 0;
-	}
-
-	void on_root_tables(list_data &d, ID3D12RootSignature *root, uint32_t first, uint32_t count, const uint64_t *tables)
-	{
-		// No tables: the root signature was set (or the list reset)
-		d.state.set_root(root);
-		for (uint32_t i = 0; i < count; ++i)
-		{
-			grass::root_arg &a = d.state.arg(first + i);
-			a = grass::root_arg();
-			a.kind = grass::root_arg::table;
-			a.value = tables[i];
-		}
-	}
-
-	void on_root_constants(list_data &d, ID3D12RootSignature *root, uint32_t param, uint32_t first, uint32_t count, const void *values)
-	{
-		d.state.set_root(root);
-		d.state.set_constants(param, first, count, static_cast<const uint32_t *>(values));
-	}
-
-	void on_root_descriptor(list_data &d, ID3D12RootSignature *root, uint32_t param, grass::root_arg::kind_t kind, uint64_t address)
-	{
-		d.state.set_root(root);
-		grass::root_arg &a = d.state.arg(param);
-		a = grass::root_arg();
-		if (kind == grass::root_arg::cbv || kind == grass::root_arg::srv || kind == grass::root_arg::uav)
-		{
-			a.kind = kind;
-			a.value = address;
-		}
-	}
-
-	void on_barrier(ID3D12GraphicsCommandList *, list_data &d, uint32_t count, ID3D12Resource *const *resources, const D3D12_RESOURCE_STATES *after)
-	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		for (uint32_t i = 0; i < count; ++i)
-		{
-			if (resources[i] == nullptr)
-				continue;
-			if (resources[i] == g.world_rt)
-				g.last_rt_state = d.world_rt_state = after[i];
-			else if (resources[i] == g.world_ds)
-				g.last_ds_state = d.world_ds_state = after[i];
-		}
-	}
-
 	bool float_world()
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		return g.float_world;
+		return g_float_world.load(std::memory_order_relaxed);
 	}
 
-	void on_world_end(ID3D12GraphicsCommandList *list, list_data &d)
+	// (g.mutex held) The zone's fog: the colour the world's target was last cleared to, the whole of it (the water's sky
+	// along the horizon), as our d3d8.dll says it at the marks
+	void take_fog(const world_mark &m)
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (d.grass_done || g.world_rtv == 0 || g.world_dsv == 0)
+		if (!m.fog_known)
 			return;
-		d.grass_done = true;
-		d.world_ended = g.world_rt;
-		if (resource_of(g.world_rtv) == g.world_rt && resource_of(g.world_dsv) == g.world_ds)
-			inject(list, d, g.world_rtv, g.world_dsv);
+		for (int i = 0; i < 3; ++i)
+			g.look.fog[i] = std::clamp(m.fog[i], 0.0f, 1.0f);
+		g.look.fog_known = true;
+	}
+
+	void on_world_end(const world_mark &m)
+	{
+		std::unique_lock<std::mutex> lock(g.mutex);
+		// (once after each zone's begin: our d3d8.dll marks the world's end once after it)
+		if (g.world_end_done || g.world_rtv == 0 || g.world_dsv == 0)
+			return;
+		g.world_end_done = true;
+		take_fog(m);
+		if (m.rt != nullptr && m.rt == g.world_rt && m.ds == g.world_ds)
+			inject(lock, m.list, m, g.world_rtv);
 		else
-			g.skip = "the world's views hold something else now (skipped)";
+			g.skip = "the world's target and depth aren't the zone's begin's now (skipped)";
 	}
 
-	// The world's colour (the sky/fog clear) is cleared once, at the frame's start, to the zone's fog
-	void on_clear_target(list_data &, uint64_t rtv, const float color[4], uint32_t rect_count, const D3D12_RECT *rects)
+	void on_world_marker(const world_mark &m)
 	{
-		ID3D12Resource *const res = resource_of(rtv);
-		std::lock_guard<std::mutex> lock(g.mutex);
-		if (res == nullptr || res != g.world_rt)
-			return;
-		if (!covers_all(res, rect_count, rects))
-			return;
-		// (the colour it's cleared to is the zone's fog: the water's sky along the horizon)
-		if (color != nullptr)
-		{
-			for (int i = 0; i < 3; ++i)
-				g.look.fog[i] = std::clamp(color[i], 0.0f, 1.0f);
-			g.look.fog_known = true;
-		}
-	}
-
-	void on_world_marker(ID3D12Resource *rt, ID3D12Resource *ds, uint64_t rtv, uint64_t dsv)
-	{
-		if (rt == nullptr || ds == nullptr || rtv == 0 || dsv == 0)
+		if (m.rt == nullptr || m.ds == nullptr || m.rtv == 0 || m.dsv == 0)
 			return;
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
 		g.look_at_marker = false;
+		g.world_end_done = false;
 		g.markers++;
 		g.marker_present = g.presents;
-		g.world_rtv = rtv;
-		g.world_dsv = dsv;
-		if (rt == g.world_rt && ds == g.world_ds)
+		g.world_rtv = m.rtv;
+		g.world_dsv = m.dsv;
+		g.world_rt_format = m.rt_format;
+		g.world_ds_format = m.ds_format;
+		g.world_width = m.width;
+		g.world_height = m.height;
+		take_fog(m);
+		if (m.rt == g.world_rt && m.ds == g.world_ds)
 			return;
-		g.world_rt = rt;
-		g.world_ds = ds;
-		const D3D12_RESOURCE_DESC w = rt->GetDesc();
+		g.world_rt = m.rt;
+		g.world_ds = m.ds;
 		char text[160];
-		const bool floats = world_floats(rt);
-		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %llux%u%s%s", static_cast<unsigned long long>(w.Width), w.Height,
+		const bool floats = world_floats(m.rt);
+		std::snprintf(text, sizeof(text), "FFXI World FX: the world is where the game's zone marker is: %ux%u%s%s", m.width, m.height,
 			floats ? ", as floats (light past white)" : "", g.marker_logged ? " (again: it had moved)" : "");
 		log_message(g.marker_logged ? 1 : 0, text);
 		g.marker_logged = true;
 	}
 
-	void on_zone_end(ID3D12GraphicsCommandList *list, list_data &d, uint64_t dsv, const D3D12_RESOURCE_STATES planes[2])
+	void on_zone_end(const world_mark &m)
 	{
-		std::lock_guard<std::mutex> lock(g.mutex);
+		std::unique_lock<std::mutex> lock(g.mutex);
 		g.blades_at_marker = false;
-		ID3D12Resource *const ds = resource_of(dsv);
-		if (!g.in_game || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
+		ID3D12GraphicsCommandList *const list = m.list;
+		ID3D12Resource *const ds = m.ds;
+		const D3D12_RESOURCE_STATES *const planes = m.ds_planes;
+		if (!g.in_game || zone_stale() || !g.enabled || g.renderer == nullptr || !g.renderer->ready() || !g.renderer->loaded())
 			return;
-		// (the world the markers named, its views still its own, D24S8 as the blades' depth)
-		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || g.world_rtv == 0 || resource_of(g.world_rtv) != g.world_rt ||
-			view_format(dsv, ds) != DXGI_FORMAT_D24_UNORM_S8_UINT)
+		// (the world the zone's begin named, bound now, D24S8 as the blades' depth)
+		if (ds == nullptr || ds != g.world_ds || g.world_rt == nullptr || m.rt != g.world_rt || g.world_rtv == 0 || m.dsv == 0 ||
+			m.ds_format != DXGI_FORMAT_D24_UNORM_S8_UINT)
 			return;
 		grass::camera cam;
 		if (read_camera(cam) != nullptr)
@@ -2703,9 +2657,9 @@ namespace worldfx
 		t.rt = g.world_rt;
 		t.ds = ds;
 		t.rtv = { static_cast<SIZE_T>(g.world_rtv) };
-		t.rtv_format = view_format(g.world_rtv, g.world_rt);
-		t.dsv_format = view_format(dsv, ds);
-		t.rt_state = d.world_rt_state;
+		t.rtv_format = g.world_rt_format;
+		t.dsv_format = m.ds_format;
+		t.rt_state = m.rt_state;
 		t.ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 		t.blades_into_world_depth = true;
 		// Both planes DEPTH_WRITE while the blades write the depth (and test it), then back as dgVoodoo had them
@@ -2724,7 +2678,7 @@ namespace worldfx
 		if (n != 0)
 			list->ResourceBarrier(n, b);
 		std::string error;
-		g.marker_blades = g.renderer->draw(list, t, cam, l, error);
+		g.marker_blades = record(lock, list, t, cam, l, error);
 		for (UINT k = 0; k < n; ++k)
 			std::swap(b[k].Transition.StateBefore, b[k].Transition.StateAfter);
 		if (n != 0)
@@ -2778,6 +2732,9 @@ namespace worldfx
 			for (int i = 0; i < 4 && done != UINT64_MAX && (n = g.renderer->read_vis(done, g.vis_objects, g.vis_points)) != 0; ++i)
 				vistest::answer(g.vis_objects, g.vis_points, n, now);
 		}
+		// (a shader job polled at every present: the built-in shaders compiled at attach make the renderer ready)
+		if (g.shader_compiling != nullptr)
+			check_shaders();
 		if (g.renderer != nullptr && g.renderer->ready())
 		{
 			static bool frequency_known = false;
@@ -2790,7 +2747,11 @@ namespace worldfx
 					frequency_known = true;
 				}
 			}
-			g.renderer->release_old();
+			// (replaced buffers let go behind the frame-pacing fence, signalled just now in pace_present; without one, by count)
+			if (g.pace_fence != nullptr && g.pace_device == g.dev)
+				g.renderer->release_done(g.presents, g.pace_fence->GetCompletedValue());
+			else
+				g.renderer->release_old();
 			if (g.debug_layer)
 				gpu_crash::write_debug_messages(g.dev, addon_folder() + L"worldfx-d3d12-debug.txt");
 			// (the zone at every present, after end_frame read "in game": the frame after a character comes in never draws
@@ -2951,6 +2912,15 @@ static void take_actors(const float *xyzr, const uint32_t *flags, uint32_t count
 extern "C" __declspec(dllexport) void __cdecl worldfx_grass_actors(const float *xyzr, uint32_t count)
 {
 	take_actors(xyzr, nullptr, count);
+}
+
+// From HiFi XI's game side (src/game/feed.cpp), every frame on the game's thread: the zone (0: none known; a Mog House
+// 1000 + its room) and whether a character is in (1: logged in, not zoning). The zone's files are read at the next
+// present; nothing is drawn till then.
+extern "C" __declspec(dllexport) void __cdecl worldfx_zone(uint32_t zone, uint32_t in_game)
+{
+	g_told_zone.store(zone, std::memory_order_release);
+	g_told_in.store(in_game != 0 ? 1u : 0u, std::memory_order_release);
 }
 
 // For HiFi XI's game side: whether World FX draws into the game's world (it has found it since the game's device was
@@ -3256,6 +3226,7 @@ extern "C" __declspec(dllexport) uint32_t __cdecl worldfx_set_setting(const char
 extern "C" __declspec(dllexport) void __cdecl worldfx_sea_stats(uint32_t out[4])
 {
 	std::lock_guard<std::mutex> lock(g.mutex);
+	std::lock_guard<std::mutex> render(g_render_mutex);
 	out[0] = g.renderer != nullptr ? g.renderer->sea_corners() : 0u;
 	out[1] = g.last.sea_corners;
 	out[2] = g.last.water_corners;
@@ -3576,7 +3547,8 @@ static void status_lines(const worldfx::ui &u)
 		text_wrapped(u, "Shaders: %s", g.shader_status.c_str());
 		if (!g.memory_status.empty())
 			text_colored(u, warn, "Over the video memory: %s (stutters; a lower background resolution would fit).", g.memory_status.c_str());
-		if (g.renderer != nullptr)
+		std::unique_lock<std::mutex> render(g_render_mutex, std::try_to_lock); // (busy recording: left out this once)
+		if (g.renderer != nullptr && render.owns_lock())
 		{
 			text(u, "GPU time a frame: copies and shading %.2f ms, grass %.2f ms", g.renderer->shading_ms(), g.renderer->grass_ms());
 			for (const std::string &l : gpu_time_lines(*g.renderer))
@@ -3939,6 +3911,7 @@ void worldfx::load_settings()
 	std::lock_guard<std::mutex> lock(g.mutex);
 	for (setting_slot &s : slots())
 		read_setting(s);
+	g_float_world.store(g.float_world, std::memory_order_relaxed);
 }
 
 size_t worldfx::setting_count()
@@ -3989,6 +3962,7 @@ bool worldfx::set_setting(const char *key, const float value[3])
 			s->number[k] = value[k];
 	keep_in_range(*s);
 	save_setting(*s);
+	g_float_world.store(g.float_world, std::memory_order_relaxed);
 	return true;
 }
 
@@ -4053,12 +4027,16 @@ std::vector<std::string> worldfx::gpu_times()
 	std::lock_guard<std::mutex> lock(g.mutex);
 	if (g.renderer == nullptr)
 		return { "GPU time by section: World FX isn't drawing" };
+	std::unique_lock<std::mutex> render(g_render_mutex, std::try_to_lock);
+	if (!render.owns_lock())
+		return { "GPU time by section: World FX is recording now (ask again)" };
 	return gpu_time_lines(*g.renderer);
 }
 
 void worldfx::forget_colours()
 {
 	std::lock_guard<std::mutex> lock(g.mutex);
+	std::lock_guard<std::mutex> render(g_render_mutex);
 	if (g.renderer != nullptr)
 	{
 		std::string ignored;

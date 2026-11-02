@@ -38,9 +38,6 @@ namespace hifi::chars::inject
 	bool motion(ID3D12Resource *&texture, uint64_t &frames);
 	std::vector<std::string> status();
 
-
-	void on_barrier(UINT count, const D3D12_RESOURCE_BARRIER *barriers);
-
 	struct world
 	{
 		ID3D12Resource *rt = nullptr, *ds = nullptr;

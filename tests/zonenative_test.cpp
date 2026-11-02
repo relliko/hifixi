@@ -9,6 +9,7 @@
 #include <dxgi1_4.h>
 #include "../src/zone/native.hpp"
 #include "../src/zone/zone_gpu.hpp"
+#include "../src/host/retire.hpp"
 #include "game_dump.hpp"
 #include <cstdio>
 #include <string>
@@ -84,10 +85,24 @@ int main()
 
 	hifi::zone::gpu_zone *y = present_until_ready(device, 230, presents);
 	check(y != nullptr && y != z && y->data().models.size() == 252, "zone 230 in its place after " + std::to_string(presents) + " presents" + lines());
-	check(lines().find("earlier map") != std::string::npos, "  zone 100 kept a while (the GPU may still read it)");
-	for (int i = 0; i < 300; ++i)
-		native::frame(device, 230, 0, true);
-	check(lines().find("earlier map") == std::string::npos, "  and let go 240 presents on");
+	check(hifi::retire::status().held == 1, "  zone 100 kept (the GPU may still read it: host/retire.hpp)");
+	{
+		// (the game's queue: the fence signalled at each present, as backend::present does)
+		ID3D12CommandQueue *queue = nullptr;
+		D3D12_COMMAND_QUEUE_DESC qd = {};
+		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+		for (int i = 0; i < 300 && hifi::retire::status().held != 0; ++i)
+		{
+			native::frame(device, 230, 0, true);
+			hifi::retire::on_present(queue);
+			Sleep(2);
+		}
+		// (handed over before the fence's first signal: counted from it, so let go once it has passed 2)
+		check(hifi::retire::status().held == 0 && hifi::retire::status().signalled >= 2,
+			"  and let go once the fence passed it (" + std::to_string(hifi::retire::status().signalled) + " presents)");
+		queue->Release();
+	}
 
 	native::frame(device, 5000, 0, true); // (no such map)
 	for (int i = 0; i < 2000 && lines().find("not loaded") == std::string::npos; ++i)

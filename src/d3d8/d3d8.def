@@ -9,3 +9,5 @@ EXPORTS
 	HifiFrameSetWorldFormat
 	HifiFrameSetSpeedups
 	HifiFrameSpeedupStats
+	HifiFrameVersion
+	HifiFrameDevice

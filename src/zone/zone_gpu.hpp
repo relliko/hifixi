@@ -70,6 +70,9 @@ namespace hifi::zone
 		int64_t _started = 0;
 		double _upload_ms = 0.0;
 		bool _ready = false;
+		// The copy on the copy queue: 0 none running, 1 sent without its fence signalled (its end never known), 2 sent
+		// with it (release waits for it)
+		uint32_t _copying = 0;
 		uint32_t _vertex_count = 0, _index_count = 0;
 	};
 }

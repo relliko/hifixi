@@ -29,7 +29,9 @@ namespace hifi::slotmark
 		grid_end = 12,   // just after the Mog House layout grid (177B40)
 		world_end = 13,  // our d3d8.dll: the first draw or copy that reads the world's target after its zone began (the
 		                 // resolve), before it binds anything (src/host/frameapi.hpp)
-		spare_14 = 14, spare_15 = 15,
+		resolve = 14,    // our d3d8.dll: right after the draw that ended the world (the resolve: the world read into the
+		                 // target bound now), the draw's vertices with it (src/host/frameapi.hpp)
+		spare_15 = 15,
 		kinds = 16,
 	};
 	// The kinds sent on the back buffer's own depth (the screen's 2D: src/game/uidraw), not the world's: the world's depth
@@ -41,7 +43,7 @@ namespace hifi::slotmark
 	inline const char *kind_name(uint32_t k)
 	{
 		static const char *const names[kinds] = { "zone begin", "zone end", "characters begin", "characters end", "see-through character",
-			"effects run", "sky end", "names end", "screen", "interface begin", "interface end", "frame end", "grid end", "world end", "spare 14", "spare 15" };
+			"effects run", "sky end", "names end", "screen", "interface begin", "interface end", "frame end", "grid end", "world end", "resolve", "spare 15" };
 		return k < kinds ? names[k] : "?";
 	}
 

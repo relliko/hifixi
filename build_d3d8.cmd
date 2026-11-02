@@ -50,8 +50,9 @@ rem tests\d3d8_warm.cmd) compiled into build\d3d8\d3d8-shader-cache, without a G
 if not exist build\d3d8\d3d8-shader-cache mkdir build\d3d8\d3d8-shader-cache
 copy /y data\d3d8\keys.bin build\d3d8\d3d8-shader-cache\ >nul || exit /b 1
 build\d3d8\d3d8_unit.exe --warm build\d3d8\d3d8-shader-cache || exit /b 1
-rem HiFi XI's own hooks (src\host) over the DLL's Direct3D 12 stream, an FFXI-shaped frame on WARP: build\d3d8\d3d8_hooks.exe
+rem The DLL as HiFi XI meets it (src\host\frameapi.hpp: its marks, the world's states, its device), an FFXI-shaped frame on
+rem WARP: build\d3d8\d3d8_host.exe
 cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I "%D3D8INC%" ^
-  tests\d3d8_hooks.cpp src\host\hooks.cpp src\host\slots.cpp /Fo"build\d3d8\test\\" /Fe"build\d3d8\d3d8_hooks.exe" /link /NOLOGO d3d12.lib dxgi.lib user32.lib || exit /b 1
-echo Built build\d3d8\d3d8_hooks.exe
+  tests\d3d8_host.cpp /Fo"build\d3d8\test\\" /Fe"build\d3d8\d3d8_host.exe" /link /NOLOGO d3d12.lib dxgi.lib user32.lib || exit /b 1
+echo Built build\d3d8\d3d8_host.exe
 exit /b 0
