@@ -228,6 +228,9 @@ float4 shade(v2p i, out float share)
 	float3 lit, spec = 0;
 	const bool bump = (piece & kBump) != 0;
 	const env_t e = env_of(objects[object_index]);
+#ifdef GBUF
+	float3 gbuf_n = normalize(i.normal);
+#endif
 	if (options.x > 0)
 	{
 		// Per pixel: the sun and the lamps at each pixel; a normal map in the frame its UVs give (its green is the
@@ -246,6 +249,9 @@ float4 shade(v2p i, out float share)
 			const float s = rsqrt(max(max(dot(U, U), dot(V, V)), 1e-20));
 			n = normalize(m.g * U * s + m.r * V * s + m.b * n);
 		}
+#ifdef GBUF
+		gbuf_n = n;
+#endif
 		n *= scale;
 		const float3 s_rgb = bump ? e.sun_bump.rgb : e.sun.rgb, a_rgb = bump ? e.ambient_bump.rgb : e.ambient.rgb;
 		// (the lamps the game names for the object, as per vertex: every lamp in reach, near_lamp_light, lit a Mog House far
@@ -274,6 +280,15 @@ float4 shade(v2p i, out float share)
 	// piece writes at least 2 instead, so the band where a ground layer's vertex alpha fades out doesn't come out 1 (Valkurm's
 	// sand outlined in lines, 2026-10-27); a blended one keeps its own (it's also its colour's share), and blended over 2 or
 	// more its result stays over 1.99)
+#ifdef GBUF
+	// (zone_view's buffers for offline mock-ups, never in the plugin: 1 the texture, 2 the normal, 3 the view depth and
+	// 4 the piece's first index, each 24 bits, 5 the vertex colour; blended pieces left out)
+	if ((piece & kBlended) != 0)
+		return 0;
+	const float g24 = GBUF == 3 ? floor(saturate(i.depth / 4000) * 16777215) : GBUF == 4 ? float(first_index) : 0;
+	const float3 packed = float3(floor(g24 / 65536), floor(fmod(g24, 65536) / 256), fmod(g24, 256)) / 255;
+	return float4(GBUF == 1 ? t.rgb : GBUF == 2 ? gbuf_n * 0.5 + 0.5 : GBUF == 5 ? i.vcol.rgb : packed, 1);
+#endif
 	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb + spec, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
 }
 float4 ps(v2p i) : SV_Target
@@ -616,7 +631,11 @@ light_out ps_light(v2p i)
 			why = "d3dcompiler_47.dll isn't there";
 			return false;
 		}
-		const std::string source = std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
+		std::string source = std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
+#ifdef ZONE_GBUF
+		if (const char *mode = std::getenv("ZONE_GBUF"); mode != nullptr && *mode != '0')
+			source = std::string("#define GBUF ") + mode + "\n" + source;
+#endif
 		for (int k = 0; k < 3; ++k)
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;

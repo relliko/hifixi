@@ -207,6 +207,19 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	const zm::zone &d = gz.data();
+#ifdef ZONE_GBUF
+	// (with the buffers: each piece's first index, texture and model, for the mock-up's materials)
+	if (FILE *pf = nullptr; fopen_s(&pf, (std::string(out) + ".pieces.txt").c_str(), "w") == 0 && pf != nullptr)
+	{
+		for (const zm::model &m : d.models)
+			for (uint32_t k = m.first_piece; k < m.first_piece + m.pieces; ++k)
+			{
+				const zm::piece &p = d.pieces[k];
+				std::fprintf(pf, "%u\t%.16s\t%.16s\t%u\n", p.first_index, p.texture < d.textures.size() ? d.textures[p.texture].name : "-", m.name, p.bits);
+			}
+		std::fclose(pf);
+	}
+#endif
 	hifi::zone::zone_renderer renderer;
 	auto t0 = std::chrono::steady_clock::now();
 	if (!renderer.init(device, why))
@@ -227,7 +240,7 @@ int main(int argc, char **argv)
 	td.SampleDesc.Count = 1;
 	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-	const float sky[4] = { 0.55f, 0.65f, 0.78f, 1.0f };
+	float sky[4] = { 0.55f, 0.65f, 0.78f, 1.0f };
 	D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_R8G8B8A8_UNORM, { sky[0], sky[1], sky[2], sky[3] } };
 	ID3D12Resource *target = nullptr, *depth = nullptr, *readback = nullptr;
 	device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&target));
@@ -317,8 +330,17 @@ int main(int argc, char **argv)
 	float sun_dir[3] = { 0.35f, night ? -0.25f : -0.85f, 0.4f };
 	norm3(sun_dir);
 	std::memcpy(f.sun_dir, sun_dir, sizeof(sun_dir));
-	const float sun[3] = { 1.26f, 1.25f, 1.1f }, dusk[3] = { 0.35f, 0.38f, 0.55f };
-	const float ambient[3] = { 0.49f, 0.47f, 0.49f }, dark[3] = { 0.18f, 0.2f, 0.3f };
+	float sun[3] = { 1.26f, 1.25f, 1.1f }, dusk[3] = { 0.35f, 0.38f, 0.55f };
+	float ambient[3] = { 0.49f, 0.47f, 0.49f }, dark[3] = { 0.18f, 0.2f, 0.3f };
+#ifdef ZONE_GBUF
+	// (the mock-ups' light: ZONE_VIEW_LIGHT="sun x y z  sun r g b  ambient r g b  sky r g b")
+	if (const char *l = std::getenv("ZONE_VIEW_LIGHT"); l != nullptr)
+	{
+		std::sscanf(l, "%f %f %f %f %f %f %f %f %f %f %f %f", &sun_dir[0], &sun_dir[1], &sun_dir[2], &sun[0], &sun[1], &sun[2], &ambient[0], &ambient[1], &ambient[2], &sky[0], &sky[1], &sky[2]);
+		norm3(sun_dir);
+		std::memcpy(f.sun_dir, sun_dir, sizeof(sun_dir));
+	}
+#endif
 	std::memcpy(f.sun, night ? dusk : sun, 12);
 	std::memcpy(f.sun_bump, night ? dusk : sun, 12);
 	std::memcpy(f.ambient, night ? dark : ambient, 12);
