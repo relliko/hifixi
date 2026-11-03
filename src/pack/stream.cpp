@@ -54,6 +54,8 @@ namespace hifi::pack::stream
 		std::atomic<bool> g_cancel_open { false };
 		// (tests only: test::before_pick)
 		std::atomic<void (*)()> g_before_pick { nullptr };
+		// (tests only: test::after_load)
+		std::atomic<void (*)()> g_after_load { nullptr };
 
 		uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 		unsigned long long megabytes(uint64_t bytes) { return static_cast<unsigned long long>((bytes + 524288) / 1048576); }
@@ -77,7 +79,8 @@ namespace hifi::pack::stream
 
 		// A texture: being made and copied (one job of the worker's holds it), or ready and shared by the tickets that
 		// hold it. Taken out of the map (in_map false) by an epoch change while its job still runs: the job then lets go
-		// of it alone
+		// of it alone. A ready one taken out by an open, close or reload is held (g.held) for the tickets that held it,
+		// gone now, until the last of them is dropped (zones.md decision 1)
 		struct resident
 		{
 			rkey k;
@@ -88,6 +91,7 @@ namespace hifi::pack::stream
 				ready,
 			} phase = making;
 			bool in_map = true;
+			bool held = false; // (out of the map, kept for gone tickets: g.held)
 			ID3D12Resource *res = nullptr;
 			DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 			uint32_t w = 0, h = 0, levels = 0, first = 0;
@@ -156,6 +160,7 @@ namespace hifi::pack::stream
 			std::shared_ptr<const index> snap;
 			std::shared_ptr<reader> rd;
 			int post = 0; // (1 open a folder, 2 open an index, 3 close: the worker does it)
+			uint64_t posted = 0, post_done = 0; // (the opens and closes asked; the last of them the worker has done)
 			std::wstring post_folder;
 			std::shared_ptr<const index> post_index;
 			std::string open_status;
@@ -168,6 +173,9 @@ namespace hifi::pack::stream
 			std::unordered_map<owner, owner_rec> owners;
 			owner next_owner = 1;
 			std::unordered_map<rkey, resident *, rkey_hash> map;
+			// (ready textures an open, close or reload took out of the map while gone tickets still hold them: each let go
+			// at its last drop, or all at once by stop, a device change or loss)
+			std::unordered_set<resident *> held;
 			limits lim;
 			uint64_t made_since = 0; // (allocation bytes made since the last set_limits: the usage lags)
 			uint64_t refused_bytes = 0; // (the allocation the 95% stop last refused: set_limits keeps kVideoMemory while it won't fit)
@@ -245,11 +253,14 @@ namespace hifi::pack::stream
 				it->second.done.insert(s);
 		}
 
-		void finish(uint32_t s, state st, miss why = miss::none)
+		// (the mutex held) keep: a ready ticket turned gone by an open, close or reload keeps its texture (d.r) till it's
+		// dropped
+		void finish(uint32_t s, state st, miss why = miss::none, bool keep = false)
 		{
 			slot_data &d = g.slots[s];
 			d.why = why;
-			d.r = nullptr;
+			if (!keep)
+				d.r = nullptr;
 			set_state(s, st);
 			if (st == state::missed)
 				g.n.refused[size_t(why)]++;
@@ -314,15 +325,24 @@ namespace hifi::pack::stream
 			return rkey { d.w.k.hash, d.w.k.bytes, d.w.k.w, d.w.k.h, d.w.kind, d.w.first, d.w.count };
 		}
 
-		// (the mutex held) A ready texture's last reference gone: out of the map, to the retire list
+		// (the mutex held) A ready texture's last reference gone: out of the map (or the held list), to the retire list
 		void let_go_locked(resident *r)
 		{
 			if (r->in_map)
 				g.map.erase(r->k);
 			g.to_retire.push_back(r->res);
 			g.n.retired++;
-			g.n.resident--;
-			g.n.resident_bytes -= r->bytes;
+			if (r->held)
+			{
+				g.held.erase(r);
+				g.n.held--;
+				g.n.held_bytes -= r->bytes;
+			}
+			else
+			{
+				g.n.resident--;
+				g.n.resident_bytes -= r->bytes;
+			}
 			delete r;
 		}
 
@@ -354,6 +374,11 @@ namespace hifi::pack::stream
 						g.n.shared_bytes -= d.r->bytes; // (one owner fewer sharing it)
 				}
 				break;
+			case state::gone:
+				// (a ticket an open, close or reload turned gone while it was ready: its texture held till now)
+				if (d.r != nullptr && --d.r->refs == 0)
+					let_go_locked(d.r);
+				break;
 			default:
 				break;
 			}
@@ -362,31 +387,55 @@ namespace hifi::pack::stream
 
 		// (the mutex held) A new epoch: the pack opened, closed or reloaded, a new device, the device lost, stop. Every
 		// ticket alive reads gone (lost: the ones queued or on their way read missed); one that already missed stays
-		// missed, with its reason (it holds nothing); ready textures go to the retire list; those on their way are left
-		// to their jobs (out of the map, nobody waiting); nothing stays queued
-		void end_epoch_locked(bool lost)
+		// missed, with its reason (it holds nothing); those on their way are left to their jobs (out of the map, nobody
+		// waiting); nothing stays queued. Ready textures, as `keep` says (zones.md decision 1):
+		//   - keep (an open, close or reload: done on the worker at a time of its own, while owners may still record views
+		//     of them): out of the map (a new request streams the key again) but held, each by the tickets that held it,
+		//     gone now and keeping it, until the last of them is dropped; then to the retire list as any drop. So a view's
+		//     texture lives exactly while its ticket is held, whatever the timing;
+		//   - let go (stop, a new device, the device lost): to the retire list at once, with every one held before, and
+		//     the gone tickets' hold on them forgotten (stop ends everything, release_all follows; retire frees a device's
+		//     objects at once when it sees the next device; on a lost device nothing runs)
+		void end_epoch_locked(bool lost, bool keep)
 		{
 			g.epoch++;
 			for (uint32_t s = 1; s < g.slots.size(); ++s)
 			{
 				slot_data &d = g.slots[s];
-				if (!d.live || d.st == state::gone || d.st == state::missed)
+				if (!d.live || d.st == state::missed)
 					continue;
+				if (d.st == state::gone)
+				{
+					if (!keep)
+						d.r = nullptr; // (its texture let go below)
+					continue;
+				}
 				const bool on_way = d.st == state::queued || d.st == state::reading || d.st == state::copying;
-				finish(s, lost && on_way ? state::missed : state::gone, lost && on_way ? miss::lost : miss::none);
+				finish(s, lost && on_way ? state::missed : state::gone, lost && on_way ? miss::lost : miss::none, keep && d.st == state::ready);
 			}
 			for (auto &[k, r] : g.map)
 			{
+				r->in_map = false;
 				if (r->phase == resident::ready)
 				{
-					r->in_map = false;
-					let_go_locked(r);
+					if (keep)
+					{
+						r->held = true;
+						g.held.insert(r);
+						g.n.held++;
+						g.n.held_bytes += r->bytes;
+					}
+					else
+						let_go_locked(r);
 				}
 				else
-				{
-					r->in_map = false;
 					r->waiters.clear();
-				}
+			}
+			if (!keep)
+			{
+				const std::vector<resident *> held(g.held.begin(), g.held.end());
+				for (resident *r : held)
+					let_go_locked(r);
 			}
 			g.map.clear();
 			g.queue.clear();
@@ -641,7 +690,7 @@ namespace hifi::pack::stream
 			if ((g.pause & kLost) != 0)
 				return;
 			g.pause |= kLost;
-			end_epoch_locked(true);
+			end_epoch_locked(true, false);
 		}
 
 		// ---- Ring space
@@ -1188,7 +1237,7 @@ namespace hifi::pack::stream
 
 		// ---- Opening, device change, stop
 
-		void do_open(int post, const std::wstring &folder, std::shared_ptr<const index> given)
+		void do_open(int post, uint64_t number, const std::wstring &folder, std::shared_ptr<const index> given)
 		{
 			crumb(sc::kOpening);
 			std::string why;
@@ -1202,6 +1251,8 @@ namespace hifi::pack::stream
 			}
 			else if (post == 2)
 				idx = std::move(given);
+			if (void (*fn)() = g_after_load.load())
+				fn();
 			std::shared_ptr<reader> rd = idx ? std::make_shared<reader>(idx) : nullptr;
 			std::shared_ptr<reader> old;
 			std::vector<IUnknown *> rel;
@@ -1211,7 +1262,9 @@ namespace hifi::pack::stream
 				g.snap = idx;
 				g.rd = rd;
 				g.open_status = post == 1 && !idx ? "pack can't be used: " + why : "";
-				end_epoch_locked(false);
+				end_epoch_locked(false, true);
+				// (with its epoch: an open or close asked while this one loaded is done next, and raises it again)
+				g.post_done = number;
 				rel = take_retire_locked();
 			}
 			// (the worker is the reading thread: no read of the old reader's runs now. Its files closed, the folder can be
@@ -1254,7 +1307,7 @@ namespace hifi::pack::stream
 			std::shared_ptr<reader> rd;
 			{
 				std::lock_guard<std::mutex> lock(g.mutex);
-				end_epoch_locked(false);
+				end_epoch_locked(false, false);
 				// (every ticket now reads gone; slots given back)
 				for (uint32_t s = 1; s < g.slots.size(); ++s)
 					free_slot(s, state::gone);
@@ -1288,6 +1341,7 @@ namespace hifi::pack::stream
 			{
 				// What's asked of it
 				int post = 0;
+				uint64_t number = 0;
 				std::wstring folder;
 				std::shared_ptr<const index> given;
 				bool change = false, lost = false;
@@ -1297,15 +1351,22 @@ namespace hifi::pack::stream
 					std::lock_guard<std::mutex> lock(g.mutex);
 					if (g.quit)
 						break;
-					post = g.post;
-					g.post = 0;
-					folder.swap(g.post_folder);
-					given = std::move(g.post_index);
 					change = g.device_change;
 					g.device_change = false;
 					lost = (g.pause & kLost) != 0;
 					device = g.device;
 					ring_size = g.ring_size;
+					// (an open or close is taken only when it's what this pass does: one posted with a device change or a
+					// loss waits for the next pass. Taken with them, it was dropped: the module's set_device then open,
+					// both pending at the loop's top on the 4070 Ti, left the pack unopened for good, M4)
+					if (!change && !(lost && !w.lost))
+					{
+						post = g.post;
+						number = g.posted; // (the last asked: a later one overwrote any before it)
+						g.post = 0;
+						folder.swap(g.post_folder);
+						given = std::move(g.post_index);
+					}
 				}
 				if (change)
 				{
@@ -1319,7 +1380,7 @@ namespace hifi::pack::stream
 				}
 				if (post != 0)
 				{
-					do_open(post, folder, std::move(given));
+					do_open(post, number, folder, std::move(given));
 					continue;
 				}
 				if (!w.lost && !w.failed && w.queue == nullptr && device != nullptr)
@@ -1433,7 +1494,7 @@ namespace hifi::pack::stream
 			{
 				// (the epoch first: every old ticket reads gone before anything of the new device's is made; the old
 				// device kept till the worker has let go of what it made on it)
-				end_epoch_locked(false);
+				end_epoch_locked(false, false);
 				if (g.device != nullptr)
 					g.old_devices.push_back(g.device);
 				g.device = device;
@@ -1523,12 +1584,14 @@ namespace hifi::pack::stream
 		return g.started;
 	}
 
-	void open(const std::wstring &folder)
+	uint64_t open(const std::wstring &folder)
 	{
 		std::shared_ptr<reader> rd;
+		uint64_t number = 0;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			g.post = 1;
+			number = ++g.posted;
 			g.post_folder = folder;
 			g.post_index = nullptr;
 			rd = g.rd;
@@ -1536,14 +1599,17 @@ namespace hifi::pack::stream
 		if (rd)
 			rd->cancel(); // (the old snapshot's read in flight ends now)
 		wake();
+		return number;
 	}
 
-	void open(std::shared_ptr<const index> pack)
+	uint64_t open(std::shared_ptr<const index> pack)
 	{
 		std::shared_ptr<reader> rd;
+		uint64_t number = 0;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			g.post = 2;
+			number = ++g.posted;
 			g.post_folder.clear();
 			g.post_index = std::move(pack);
 			rd = g.rd;
@@ -1551,14 +1617,17 @@ namespace hifi::pack::stream
 		if (rd)
 			rd->cancel();
 		wake();
+		return number;
 	}
 
-	void close()
+	uint64_t close()
 	{
 		std::shared_ptr<reader> rd;
+		uint64_t number = 0;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			g.post = 3;
+			number = ++g.posted;
 			g.post_folder.clear();
 			g.post_index = nullptr;
 			rd = g.rd;
@@ -1566,6 +1635,7 @@ namespace hifi::pack::stream
 		if (rd)
 			rd->cancel();
 		wake();
+		return number;
 	}
 
 	std::shared_ptr<const index> current()
@@ -1578,6 +1648,12 @@ namespace hifi::pack::stream
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		return g.epoch;
+	}
+
+	uint64_t posts_done()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		return g.post_done;
 	}
 
 	std::string open_status()
@@ -1653,8 +1729,16 @@ namespace hifi::pack::stream
 				return missed(miss::not_in_pack);
 			if (check(*r) != nullptr || w.first >= r->levels)
 				return missed(miss::rule);
-			// (count 0, or past the chain: all the rest)
+			// (count 0, or past the chain: all the rest; count 0 with a size to stop at: down to the first level whose sides
+			// are at most it, the game's own size for a zone's texture: zones.md "The zone's levels")
 			d.w.count = uint8_t(w.count == 0 || w.count > r->levels - w.first ? r->levels - w.first : w.count);
+			if (w.count == 0 && w.down_to_w != 0 && w.down_to_h != 0)
+			{
+				uint32_t n = 1;
+				while (n < d.w.count && ((uint32_t(r->w) >> (w.first + n - 1)) > w.down_to_w || (uint32_t(r->h) >> (w.first + n - 1)) > w.down_to_h))
+					++n;
+				d.w.count = uint8_t(n);
+			}
 			if (w.first > 0 && !sides_by_4(*r, w.first))
 				return missed(miss::first_level);
 			d.span = reader::levels_span(*r, d.w.first, d.w.count);
@@ -1900,6 +1984,12 @@ namespace hifi::pack::stream
 			static_cast<unsigned long long>(c.in_flight), static_cast<unsigned long long>(c.resident), megabytes(c.resident_bytes),
 			static_cast<unsigned long long>(c.resident_peak), megabytes(c.shared_bytes));
 		out.push_back(line);
+		if (c.held != 0)
+		{
+			std::snprintf(line, sizeof(line), "  %llu textures (%llu MB) kept for owners that haven't let go of them since the pack was opened, closed or reloaded",
+				static_cast<unsigned long long>(c.held), megabytes(c.held_bytes));
+			out.push_back(line);
+		}
 		std::snprintf(line, sizeof(line), "  read %llu MB in %.0f ms; made %llu textures (%llu without their top level), %llu let go behind the copies, %llu to the retire list, %llu objects left",
 			megabytes(c.bytes_read), c.read_ms, static_cast<unsigned long long>(c.made), static_cast<unsigned long long>(c.skipped_top),
 			static_cast<unsigned long long>(c.released), static_cast<unsigned long long>(c.retired), static_cast<unsigned long long>(c.leaked));
@@ -1948,6 +2038,11 @@ namespace hifi::pack::stream
 		void before_pick(void (*fn)())
 		{
 			g_before_pick = fn;
+		}
+
+		void after_load(void (*fn)())
+		{
+			g_after_load = fn;
 		}
 
 		size_t done_waiting(owner o)

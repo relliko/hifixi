@@ -44,6 +44,9 @@ namespace hifi::zone
 	struct draw_options
 	{
 		bool per_pixel = false; // sun and lamps per pixel on every piece
+		// The colour maps' extra mip bias (SampleBias, on top of the sampler's -0.5): the texture pack's under FSR
+		// (docs/texture-pack/zones.md "The FSR bias"); 0: Sample, today's instruction
+		float texture_bias = 0.0f;
 	};
 
 	// What a list of objects is drawn with besides them: the camera, the lighting environments (0 the zone's own), the
@@ -96,6 +99,7 @@ namespace hifi::zone
 		{
 			uint32_t object = 0, model = 0, piece = 0, first_index = 0, triangles = 0, flags = 0, object_flags = 0;
 			uint32_t texture = 0, normal_map = 0, lamps = 0, zone = 0;
+			bool pack = false; // (the texture bound was the texture pack's: gpu_zone::texture_srv)
 			char name[16] = {};
 			float at[3] = {};
 		};

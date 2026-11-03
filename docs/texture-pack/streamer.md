@@ -459,25 +459,28 @@ Elsewhere: `pack_test` gains the reader's cancel race (a cancel set just before 
   per `gpu_zone`, characters into a second pair.
 - An epoch change (pack off, reload, device) is asked for on the game's thread (`close`, `open`, `set_device`), and
   every owner drops its pack views before it next records (zones clear their flags; characters
-  `forget_all_textures`). As built, an open, close or reload is done on the worker, whenever it gets there: that is
-  when every resident texture goes to `retire::later`, even with gone tickets still held (a gone ticket holds no
-  reference). Retire's +2 rule then covers the lists recorded up to the next `retire::on_present`
-  (backend.cpp:766), not the frame after. So:
+  `forget_all_textures`). As built in M3, an open, close or reload is done on the worker, whenever it gets there: that
+  was when every resident texture went to `retire::later`, even with gone tickets still held (a gone ticket held no
+  reference). Retire's +2 rule then covered the lists recorded up to the next `retire::on_present`
+  (backend.cpp:766), not the frame after. So (M3's rules; since M4 part B a gone ticket keeps its texture, "As built"
+  below, and they are no longer load-bearing, though the module still keeps the first):
   - the module clears the owners' pack views in the same update that calls `close` or `open` (pack off, reload),
     before anything more is recorded;
   - an owner reads its tickets (`take_done`, `poll`) after the last present's `retire::on_present` and before it
     records, and records no view of a ticket that isn't ready (a look from the module's present taken before
     backend::present's `retire::on_present` can miss an epoch change landing in between);
   - (an alternative for M4 to weigh: a gone ticket keeps its reference until the owner drops it, so the texture lives
-    exactly as long as `view::resource` says, whatever the timing.)
+    exactly as long as `view::resource` says, whatever the timing. Taken: docs/texture-pack/zones.md decision 1.)
 - `gpu_zone::upload` today makes its resources on the game's thread (zone_gpu.cpp:128-271, from native.cpp:111): M4
   adds no pack work there; pack textures come only from the worker.
 - The module: `stream::start` at the first enable with a device; `set_limits` and the pause bits in `update()`;
   `on_present` and `device_lost` in `present()`; `stop` in its `stop()`; `take_log`'s lines into hifixi.log from
   `update()` (plan §3: a miss at the worker is a log line; the streamer logs nothing itself).
+  (Built in M4 part A, src/pack/pack_module.cpp: docs/texture-pack/zones.md "As built, part A".)
 - Destruction points needn't wait for `in_flight(owner)` to read 0 (plan §4 "Zones" 8 and M4 step 5 still say they
   do): `drop_owner` and the owner may go at once (above). `in_flight` is for the status and the tests. Until then (M3) `PASSES_PACK` (build.cmd:78)
-  stays as it is: the plugin doesn't link stream.cpp.
+  stays as it is: the plugin doesn't link stream.cpp. (M4 links it: `PASSES_PACK` gains the streamer, the reader and
+  `src/zone/zonepack.cpp`.)
 
 ## What goes onto the d3d12 pages (with the code)
 
@@ -529,6 +532,23 @@ something it didn't know:
   recorded); a gone ticket holds no reference, and dropping it only frees its slot. Textures on their way are left to
   their jobs, which release them behind the copy fence. So "Ready means" above holds only until the epoch changes:
   an open, close or reload is done on the worker at a time of its own, and owners keep the rule in "Notes for M4".
+  (M3. Changed in M4 part B: the next bullet.)
+- **Gone tickets keep their texture** (M4 part B, docs/texture-pack/zones.md decision 1; the critic's open point). An
+  open, close or reload (`do_open`) ends the epoch in keep mode (`end_epoch_locked(lost, keep)`): each ready ticket
+  turns gone but keeps `d.r` (`finish`'s keep), its texture leaves the residency map (a new request streams the key
+  again, into a new texture) for a `held` list with its references, and the last drop of its tickets
+  (`drop_locked`'s gone case) hands it to `retire::later` as any drop. So `view::resource` is valid exactly while the
+  ticket is held, whatever the timing; `get` and `write_view` still answer only for a ready ticket. Stop, a device
+  change and a loss end it in let-go mode: every ready texture, and every held one, to the retire list at once, the
+  gone tickets' hold forgotten (their drop frees nothing twice). `counts` gains `held` and `held_bytes`, the status a
+  line while any are held ("kept for owners that haven't let go"), the module's menu a note on the video memory line.
+  A forgotten drop now costs video memory (shown), never a use-after-free. packstream_test "gone tickets keep their
+  texture" (a reload: gone, held, refs alive after 4 presents, dropped: retired, alive one present, freed behind the
+  fence; a close: both held; a device change lets go of the held one at once) fails 3 checks against the old do_open.
+- **`want::down_to_w/down_to_h`** (M4 part B): with `count` 0 and both set, `request` counts the levels from `first`
+  down to the first whose sides are at most them, from the record under the lock (zones ask down to the game's own
+  size: a 2x record 2 levels, 4x 3, the game's own size 1; packstream_test "down_to"). The owner never looks entries
+  up.
 - **kAddressSpace** is evaluated by the worker at each pick from the last `set_limits` (only the limits drive it).
 - **kVideoMemory, what `pressure()` reads, is a level** (M3 review): `set_limits` sets it when its numbers alone are
   over 95% of the budget, and keeps it while the texture the worker last refused still wouldn't fit under them; else
@@ -577,6 +597,16 @@ something it didn't know:
   - A miss at the worker (a CRC mismatch, a data file that can't be opened) wasn't tested in packstream_test (only
     the reader's in pack_test): now it is, with the texture made for it released at once and the ring's space given
     back (a good texture between them comes).
+- **An open or close waits for its own pass** (found in M4 part A): the worker's loop top took a pending open with a
+  pending device change (or loss) and returned after the change, dropping the open; the module's `set_device` then
+  `open` in one update never opened the pack (packmodule_test on the 4070 Ti). Now the post is taken only on a pass
+  that isn't a device change or loss (stream.cpp:1359-1369); packstream_test makes both on the worker at once.
+- **Whose open is done** (found in M4's review): an open still in `pack::load` isn't cancelled by a newer open or
+  close (only `stop` cancels it), so it raises the epoch too, before the newer one does. A caller that took the
+  first epoch raised as its own open's went on in an epoch the next open ended. `open` and `close` now return their
+  number and `posts_done()` the last the worker has done (set with the epoch, under the lock, in `do_open`); the
+  module waits for its own. `test::after_load` holds an open on the worker after its pack.idx is loaded
+  (packmodule_test).
 - **Tests not as planned:** device loss runs in child processes (D3D12 hands out one device per adapter and process:
   `RemoveDevice` on "a second WARP device" would remove the test's own); `hook_test` is gone (no hooks since step 5b);
   the plugin load/unload with 1,000 queued is `stop()` with 1,000 queued plus `retire::release_all` here, and `stop()`

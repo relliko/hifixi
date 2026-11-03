@@ -7,6 +7,7 @@
 #include "../game/feed.hpp"
 #include "../game/hifps/exp.hpp"
 #include "../game/hifps/step.hpp"
+#include "../pack/pack_module.hpp"
 #include "../render/worldfx_core.hpp"
 #include "../upscale/upscale.hpp"
 #include <algorithm>
@@ -321,7 +322,8 @@ namespace hifi::ui
 			const char *section = nullptr;
 			for (size_t i = 0; i < n; ++i)
 			{
-				if (all[i].where != t)
+				// (one not shown now, its section's heading with it when it's the only one: the texture pack's, without a pack)
+				if (all[i].where != t || (all[i].shown != nullptr && !all[i].shown()))
 					continue;
 				if (section == nullptr || std::strcmp(section, all[i].section) != 0)
 				{
@@ -363,6 +365,8 @@ namespace hifi::ui
 			for (size_t i = 0; i < n; ++i)
 			{
 				const settings::entry &e = all[i];
+				if (e.shown != nullptr && !e.shown())
+					continue;
 				if (!contains(e.label, g_search) && !contains(e.help, g_search) && !contains(e.section, g_search) && !contains(e.key, g_search))
 					continue;
 				const std::string here = std::string(settings::tab_name(e.where)) + " / " + e.section;
@@ -527,6 +531,11 @@ namespace hifi::ui
 		void draw_game(const gui &g)
 		{
 			draw_tab_settings(g, settings::tab::game);
+			// (the texture pack's lines under its setting, the tab's last: what it found, this area, memory, how to remove
+			// it. Strings the module made in its update: nothing here reads a file, asks DXGI or the streamer)
+			if (pack::folder_exists())
+				for (const std::string &line : pack::menu_lines())
+					g.text_wrapped(line.c_str());
 			// The en-spell effect on your weapons ([chars] enspell, as /hifi enspell sets it; the plugin follows it every
 			// half second): the en-spell on you, off, or one held to look at it
 			heading(g, "En-spell effects");
@@ -573,6 +582,8 @@ namespace hifi::ui
 			textf(g, "Settings: %s", narrow(backend::settings_file()).c_str());
 			textf(g, "Log: %shifixi.log", narrow(backend::folder()).c_str());
 			textf(g, "Zone files: %s (worldfx-grass and the rest)", narrow(backend::folder()).c_str());
+			if (const std::string pack_folder = pack::folder_text(); !pack_folder.empty())
+				textf(g, "Texture pack: %s%s", pack_folder.c_str(), pack::folder_exists() ? "" : " (none there)");
 		}
 
 		// The preset row: a dropdown of the built-in presets and your own, a name and Save (every setting as it is now,

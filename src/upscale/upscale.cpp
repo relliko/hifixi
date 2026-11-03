@@ -136,8 +136,19 @@ namespace hifi::upscale
 			const char *why = nullptr;
 			std::string failed;
 			UINT in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+			// (the same widths and when, for world_scale: read with no lock by the game's thread)
+			std::atomic<UINT> drawn_in_w{ 0 }, drawn_out_w{ 0 };
+			std::atomic<ULONGLONG> drawn_at{ 0 };
 		};
 		state_t g;
+
+		// (the mutex held) What FSR drew, any path: world_scale's
+		void note_drawn(UINT in_w, UINT out_w)
+		{
+			g.drawn_in_w.store(in_w, std::memory_order_relaxed);
+			g.drawn_out_w.store(out_w, std::memory_order_relaxed);
+			g.drawn_at.store(GetTickCount64(), std::memory_order_release);
+		}
 
 		// The game's tint into the last pass's constants 5-7 (it draws onto the back buffer): what its resolve multiplies the
 		// world by (MODULATE2X, 0x80 the picture as it is: x 1 here, the game's 256/255 left out). True when it changes
@@ -447,6 +458,7 @@ namespace hifi::upscale
 			g.in_h = in.Height;
 			g.out_w = out_w;
 			g.out_h = out_h;
+			note_drawn(g.in_w, g.out_w);
 			return true;
 		}
 
@@ -540,6 +552,7 @@ namespace hifi::upscale
 			g.in_h = in.Height;
 			g.out_w = out_w;
 			g.out_h = out_h;
+			note_drawn(g.in_w, g.out_w);
 		}
 	}
 
@@ -570,6 +583,16 @@ namespace hifi::upscale
 	{
 		const ULONGLONG at = g.fsr2_at.load(std::memory_order_relaxed);
 		return at != 0 && GetTickCount64() - at < 250;
+	}
+
+	bool world_scale(float &ratio)
+	{
+		const ULONGLONG at = g.drawn_at.load(std::memory_order_acquire);
+		const UINT in = g.drawn_in_w.load(std::memory_order_relaxed), out = g.drawn_out_w.load(std::memory_order_relaxed);
+		if (at == 0 || GetTickCount64() - at >= 250 || in == 0 || in >= out)
+			return false;
+		ratio = float(in) / float(out);
+		return true;
 	}
 
 	uint32_t jitter_phases()

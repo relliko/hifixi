@@ -226,6 +226,11 @@ namespace hifi::pack
 		std::wstring folder;              // with its slash
 		// "" or a line for the status: the game's files differ from the ones the pack was made from
 		std::string status;
+		// (parse fills them, for the menu's "Found" line: the module reads three numbers, never the entries) Entries by
+		// source_kind (kSourceUnknown, kSourceZone, kSourceModel; a kind this build doesn't know counted as unknown), and
+		// the colour records' bytes
+		uint32_t by_source[3] = {};
+		uint64_t colour_bytes = 0;
 
 		// The entry with this key (hash, bytes, w and h all equal); nullptr: a miss
 		const entry *find(const key &k) const;

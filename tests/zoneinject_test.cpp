@@ -18,6 +18,8 @@
  *   - a lamp in the frame that no object names (the game's per-object lamps): it lights nothing, per pixel or per vertex
  *     (the game's own way: every lamp in reach, draw.cpp near_lamp_light, lit a Mog House far too bright, so it's off);
  *     named by every object, per vertex it lights them;
+ *   - the texture pack's FSR bias set as main.cpp sets it (inject::set_texture_bias): the same picture over the game's
+ *     one-level textures; over a copy whose textures have a red second level, less red at -1 than at 0;
  *   - the sun's shadows from a made-up zone: the moving layer (a swaying card's shadow moves with its sway, an open door's
  *     is where the pass drew it), the near cascade leaving those to it while the far one keeps them at rest, and the
  *     second map's (an interior's) placements cast with the zone's.
@@ -236,9 +238,37 @@ int main(int argc, char **argv)
 	device->CreateCommandQueue(&qd, IID_PPV_ARGS(&direct));
 	qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
 	device->CreateCommandQueue(&qd, IID_PPV_ARGS(&copy));
-	hifi::zone::gpu_zone gz;
+	hifi::zone::gpu_zone gz, gz_red;
 	std::string why;
+	// (a copy whose colour maps have a second level, solid red, as the texture pack's have more than one: the FSR bias
+	// below draws less of it at -1, through inject::set_texture_bias as main.cpp sets it)
+	zm::zone z_red = z;
+	uint32_t red_levels = 0;
+	for (zm::texture &t : z_red.textures)
+		if (t.w % 8 == 0 && t.h % 8 == 0 && t.w >= 8 && t.h >= 8)
+		{
+			const uint32_t w = t.w / 2, h = t.h / 2;
+			std::vector<uint8_t> level;
+			if (t.format == zm::kBC2)
+			{
+				// (alpha 15 throughout, both colours 565 red, every index 0)
+				const uint8_t block[16] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0 };
+				for (uint32_t b = 0; b < (w / 4) * (h / 4); ++b)
+					level.insert(level.end(), block, block + 16);
+			}
+			else
+			{
+				const uint8_t px[4] = { 0, 0, 255, 255 }; // (B G R A)
+				for (uint32_t p = 0; p < w * h; ++p)
+					level.insert(level.end(), px, px + 4);
+			}
+			t.mips = { level };
+			t.levels = 2;
+			red_levels++;
+		}
 	check(gz.upload(device, copy, std::move(z), why) && gz.wait(10000), "on the GPU (its copy queue)" + why);
+	check(gz_red.upload(device, copy, std::move(z_red), why) && gz_red.wait(10000) && red_levels > 0, "  and a copy with a red second level in " +
+		std::to_string(red_levels) + " of its textures" + why);
 	check(inj::prepare(device, why), "the renderer made" + (why.empty() ? "" : ": " + why));
 	inj::set_options(GetEnvironmentVariableA("ZONE_PERPIXEL", nullptr, 0) != 0); // (the per-pixel option: ZONE_PERPIXEL=1)
 
@@ -372,10 +402,11 @@ int main(int argc, char **argv)
 	const zm::zone &d = gz.data();
 	const float eye[3] = { -27.1f, -4.5f, 35.1f };
 	const mat4 vp = camera(eye, 1.5708f, 0.12f);
+	hifi::zone::gpu_zone *fill_zone = &gz; // (the red-levelled copy for the FSR bias's passes: the same placements)
 	auto fill = [&](uint32_t seq, bool native, const hifi::zone::frame_lamp *lamp = nullptr, bool named = false) {
 		hifi::zone::frame &f = hifi::zone::frame_slot(seq);
 		f.native = native;
-		f.zone = &gz;
+		f.zone = fill_zone;
 		f.map = 230;
 		std::memcpy(f.view_proj, vp.m, 64);
 		std::memcpy(f.camera, eye, 12);
@@ -992,15 +1023,22 @@ int main(int argc, char **argv)
 		list->SetDescriptorHeaps(1, &srvh); // (dgVoodoo's heaps on its new list, as the stand-in's root table needs them)
 		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-		ID3D12Resource *outs[4] = {};
+		// (and a fifth, drawn first: the first again with the texture pack's FSR bias set, inject::set_texture_bias: the
+		// zone's game textures have one level, so the same picture, through the shader's SampleBias; before it a sixth and
+		// seventh, the first over the red-levelled copy at 0 and at -1: less red at -1, so the bias set here reaches the
+		// pass; the lamp's pass last, for the breadcrumbs below)
+		ID3D12Resource *outs[7] = {};
 		bd.Width = UINT64(W) * 4 * H;
 		for (ID3D12Resource *&o : outs)
 			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&o));
-		const uint32_t seqs[4] = { 7, 8, 9, 10 };
-		for (int k = 0; k < 4; ++k)
+		const uint32_t seqs[7] = { 7, 8, 9, 10, 11, 12, 13 };
+		for (const int k : { 5, 6, 4, 0, 1, 2, 3 })
 		{
-			fill(seqs[k], true, k == 0 ? nullptr : &lamp, k == 3);
-			inj::set_options(k < 2);
+			fill_zone = k >= 5 ? &gz_red : &gz;
+			fill(seqs[k], true, k == 0 || k >= 4 ? nullptr : &lamp, k == 3);
+			fill_zone = &gz;
+			inj::set_options(k < 2 || k >= 4);
+			inj::set_texture_bias(k == 4 || k == 6 ? -1.0f : 0.0f);
 			list->ClearRenderTargetView(rtv, sky, 0, nullptr);
 			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			inj::on_zone_end(list, w, seqs[k]);
@@ -1015,6 +1053,7 @@ int main(int argc, char **argv)
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		}
 		inj::set_options(false);
+		inj::set_texture_bias(0.0f);
 		// (the target and its depth back as the first pass left them, for the parts after this one)
 		barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1037,15 +1076,32 @@ int main(int argc, char **argv)
 		}
 		const uint32_t lamp_messages = debug_messages(info, first);
 		check(lamp_messages == 0, "the debug layer: nothing (" + std::to_string(lamp_messages) + (lamp_messages != 0 ? ": " + first : std::string()) + ")");
-		double lumas[4] = {};
-		for (int k = 0; k < 4; ++k)
+		double lumas[5] = {};
+		std::vector<uint8_t> pictures[2], reds[2];
+		// (how red a picture is: each pixel's red past the mean of its green and blue, summed)
+		auto redness = [](const std::vector<uint8_t> &img) {
+			double sum = 0.0;
+			for (size_t i = 0; i + 3 < img.size(); i += 4)
+				sum += std::max(0.0, double(img[i]) - 0.5 * (double(img[i + 1]) + double(img[i + 2])));
+			return sum;
+		};
+		for (int k = 0; k < 7; ++k)
 		{
 			uint8_t *img = nullptr;
 			outs[k]->Map(0, nullptr, reinterpret_cast<void **>(&img));
-			lumas[k] = luma_at(img);
+			if (k < 5)
+				lumas[k] = luma_at(img);
+			if (k == 0 || k == 4)
+				pictures[k == 4].assign(img, img + size_t(W) * H * 4);
+			if (k >= 5)
+				reds[k == 6].assign(img, img + size_t(W) * H * 4);
 			outs[k]->Unmap(0, nullptr);
 			outs[k]->Release();
 		}
+		check(!pictures[0].empty() && pictures[0] == pictures[1], "the texture pack's FSR bias (-1, inject::set_texture_bias) on the zone's one-level game textures: the same picture");
+		std::snprintf(line, sizeof(line), "  over the red-levelled copy: less of the red level 1 at -1 (%.0f -> %.0f), so the bias set reaches the pass",
+			redness(reds[0]), redness(reds[1]));
+		check(!reds[0].empty() && reds[0] != reds[1] && redness(reds[1]) < redness(reds[0]), line);
 		std::snprintf(line, sizeof(line), "a lamp no object names, at (%.1f %.1f %.1f): the street under it per pixel %.1f -> %.1f; per vertex %.1f (first pass %.1f)",
 			lamp.pos[0], lamp.pos[1], lamp.pos[2], lumas[0], lumas[1], lumas[2], first_luma);
 		check(d < 1.0 && std::fabs(lumas[1] - lumas[0]) < 0.5, line);

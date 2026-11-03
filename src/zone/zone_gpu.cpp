@@ -2,6 +2,10 @@
  * One map's zone data on the GPU (zone_gpu.hpp). Everything goes through one upload buffer: the vertices, the
  * indices, then each texture's rows at its copyable footprint (512-byte aligned); one command list copies them all
  * into default-heap resources made in COMMON, and a fence says when it's done.
+ *
+ * The texture pack's region (zone_gpu.hpp; docs/texture-pack/zones.md) is data only here: its slots, their words and
+ * what the glue (src/zone/zonepack) keeps. No call of the streamer's is made from this file (eight builds link it); the
+ * glue's drop hook lets go of the zone's pack textures.
  */
 
 #include <windows.h>
@@ -86,6 +90,17 @@ namespace hifi::zone
 		{
 			return image_of(t.data.data(), t.w, t.h, t.format);
 		}
+
+		// (the texture pack's: every gpu_zone's; the game's thread today, atomics in case a mark moves thread)
+		std::atomic<bool> g_compare { false };
+		std::atomic<void (*)(gpu_zone &)> g_pack_drop { nullptr };
+		std::atomic<void (*)(const gpu_zone &, uint32_t, char)> g_test_log { nullptr };
+
+		void test_log(const gpu_zone &z, uint32_t texture, char what)
+		{
+			if (void (*fn)(const gpu_zone &, uint32_t, char) = g_test_log.load(std::memory_order_relaxed))
+				fn(z, texture, what);
+		}
 	}
 
 	gpu_zone::~gpu_zone()
@@ -95,6 +110,8 @@ namespace hifi::zone
 
 	void gpu_zone::release()
 	{
+		// (the texture pack's textures first: the glue drops the owner; no wait, the zone may go right after)
+		pack_let_go();
 		// (the copy still running on our copy queue: the game's fence says nothing about that queue, so waited for here,
 		// at most 5 s; still running then, or its end never signalled, what it reads and writes is left, not freed under it)
 		if (_copying == 2)
@@ -122,6 +139,9 @@ namespace hifi::zone
 		_ready = false;
 		_bytes = 0;
 		_upload_ms = 0.0;
+		_pack_base = 0;
+		_pack_words.reset();
+		_pack = pack_data {};
 		_z = zm::zone();
 	}
 
@@ -235,10 +255,14 @@ namespace hifi::zone
 			return failed("the upload's fence couldn't be signalled");
 		_copying = 2;
 
-		// The descriptors
+		// The descriptors: the images', then (a zone read in the texture pack's mode with keys) a pack region of one slot a
+		// texture, each starting as the game texture's own view (zones.md: never read before its word says drawn, but a
+		// slot bound by mistake still reads a valid texture)
+		const bool pack_region = _z.pack && !_z.overlaid && !_z.textures.empty();
+		const size_t pack_slots = pack_region ? _z.textures.size() : 0;
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		hd.NumDescriptors = UINT(images.size());
+		hd.NumDescriptors = UINT(images.size() + pack_slots);
 		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap))))
 			return failed("the zone's descriptor heap couldn't be made");
@@ -253,6 +277,23 @@ namespace hifi::zone
 			v.Texture2D.MipLevels = UINT(levels[i].size());
 			device->CreateShaderResourceView(_textures[i], &v, h);
 			h.ptr += _srv_step;
+		}
+		if (pack_region)
+		{
+			_pack_base = UINT(images.size());
+			_pack_words = std::make_unique<std::atomic<uint8_t>[]>(pack_slots);
+			for (size_t i = 0; i < pack_slots; ++i)
+			{
+				_pack_words[i].store(kPackNone, std::memory_order_relaxed);
+				D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+				v.Format = images[i].format;
+				v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				v.Texture2D.MipLevels = UINT(levels[i].size());
+				device->CreateShaderResourceView(_textures[i], &v, h);
+				h.ptr += _srv_step;
+			}
+			_pack.tickets.assign(pack_slots, hifi::pack::stream::ticket {});
 		}
 
 		// What drawing doesn't need dropped (the sizes stay)
@@ -323,7 +364,21 @@ namespace hifi::zone
 		return v;
 	}
 
-	D3D12_GPU_DESCRIPTOR_HANDLE gpu_zone::texture_srv(uint32_t texture) const
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_zone::texture_srv(uint32_t texture, bool *pack) const
+	{
+		// (acquire: the view was written before drawn was stored)
+		const bool from_pack = _pack_words != nullptr && texture < _z.textures.size() && _pack_words[texture].load(std::memory_order_acquire) == kPackDrawn &&
+			!g_compare.load(std::memory_order_relaxed);
+		if (pack != nullptr)
+			*pack = from_pack;
+		if (!from_pack)
+			return game_srv(texture);
+		D3D12_GPU_DESCRIPTOR_HANDLE h = _heap->GetGPUDescriptorHandleForHeapStart();
+		h.ptr += uint64_t(_pack_base + texture) * _srv_step;
+		return h;
+	}
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_zone::game_srv(uint32_t texture) const
 	{
 		D3D12_GPU_DESCRIPTOR_HANDLE h = _heap->GetGPUDescriptorHandleForHeapStart();
 		const size_t white = _z.textures.size() + _z.normal_maps.size();
@@ -337,5 +392,91 @@ namespace hifi::zone
 		const size_t flat = _z.textures.size() + _z.normal_maps.size() + 1;
 		h.ptr += uint64_t(normal_map < _z.normal_maps.size() ? _z.textures.size() + normal_map : flat) * _srv_step;
 		return h;
+	}
+
+	uint8_t gpu_zone::pack_word(uint32_t texture) const
+	{
+		return _pack_words != nullptr && texture < _z.textures.size() ? _pack_words[texture].load(std::memory_order_acquire) : uint8_t(kPackNone);
+	}
+
+	void gpu_zone::set_pack_word(uint32_t texture, uint8_t word)
+	{
+		if (_pack_words == nullptr || texture >= _z.textures.size() || _pack_words[texture].load(std::memory_order_relaxed) == word)
+			return;
+		_pack_words[texture].store(word, std::memory_order_release);
+		test_log(*this, texture, word == kPackAsked ? 'a' : word == kPackDrawn ? 'd' : word == kPackSpent ? 's' : 'n');
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE gpu_zone::pack_cpu(uint32_t texture) const
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE h = {};
+		if (_heap == nullptr || _pack_words == nullptr || texture >= _z.textures.size())
+			return h;
+		h = _heap->GetCPUDescriptorHandleForHeapStart();
+		h.ptr += SIZE_T(_pack_base + texture) * _srv_step;
+		return h;
+	}
+
+	void gpu_zone::pack_written(uint32_t texture) const
+	{
+		test_log(*this, texture, 'w');
+	}
+
+	void gpu_zone::pack_let_go()
+	{
+		if (_pack.owner == 0)
+			return;
+		if (void (*fn)(gpu_zone &) = g_pack_drop.load(std::memory_order_acquire))
+			fn(*this);
+		// (the hook dropped the owner and spent every word; this visit is over either way)
+		_pack.owner = 0;
+		_pack.done = true;
+	}
+
+	gpu_zone::pack_counts gpu_zone::pack_summary() const
+	{
+		pack_counts c;
+		c.textures = uint32_t(_z.textures.size());
+		if (_pack_words == nullptr)
+			return c;
+		for (uint32_t i = 0; i < c.textures; ++i)
+		{
+			c.keyed += _z.textures[i].key.bytes != 0;
+			switch (_pack_words[i].load(std::memory_order_acquire))
+			{
+			case kPackAsked:
+				c.asked++;
+				break;
+			case kPackDrawn:
+				c.drawn++;
+				break;
+			case kPackSpent:
+				c.spent++;
+				break;
+			default:
+				break;
+			}
+		}
+		return c;
+	}
+
+	void gpu_zone::set_compare(bool on)
+	{
+		g_compare.store(on, std::memory_order_relaxed);
+	}
+
+	bool gpu_zone::comparing()
+	{
+		return g_compare.load(std::memory_order_relaxed);
+	}
+
+	void gpu_zone::set_pack_drop(void (*fn)(gpu_zone &))
+	{
+		g_pack_drop.store(fn, std::memory_order_release);
+	}
+
+	void gpu_zone::set_test_log(void (*fn)(const gpu_zone &, uint32_t, char))
+	{
+		g_test_log.store(fn, std::memory_order_relaxed);
 	}
 }

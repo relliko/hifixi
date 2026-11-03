@@ -5,7 +5,8 @@
  *   - the copy layout (footprint) against GetCopyableFootprints on WARP: BC2, BC7 and BC4, widths that aren't
  *     multiples of 64 or of 256 bytes a row, every level count of each; and the rules refusing what a pack mustn't hold;
  *   - round trip: entries of many sizes written, loaded, found and read back whole and level by level, rows where the
- *     layout puts them and the padding zeros; hit and miss (another hash, size, width or height misses);
+ *     layout puts them and the padding zeros; hit and miss (another hash, size, width or height misses); the index's
+ *     summary (entries by source kind, the colour bytes) as a count over its entries says;
  *   - roll-over: with a small test limit the records go into several data files, none past the limit, also when the
  *     next file holds an interrupted run's bytes; an index naming a record past 1 GiB refused;
  *   - dedupe: a key added again with the same bytes or other ones isn't written (counted), unless told to replace it; a
@@ -495,6 +496,7 @@ int main()
 		for (const auto &s : sizes)
 		{
 			made m = make(s[0], s[1], seed++);
+			m.e.source_kind = uint8_t(made_a.size() % 4); // (unknown, zone, model, and one this build doesn't know)
 			all_ok = w.add(m.e, { m.map }, why) == pk::add_result::ok && all_ok;
 			made_a.push_back(std::move(m));
 		}
@@ -505,6 +507,22 @@ int main()
 
 		auto x = pk::load(a, nullptr, why);
 		check(x && x->entries.size() == 13 && x->head.file_count == 1 && x->status.empty(), "loaded: 13 entries in 1 data file " + why);
+		if (x)
+		{
+			// (the index's summary, for the menu's Found line: entries by source kind, a kind not known counted as unknown,
+			// and the colour records' bytes, as a count over the entries says)
+			uint32_t kinds[3] = {};
+			uint64_t colour = 0;
+			for (const pk::entry &e : x->entries)
+			{
+				kinds[e.source_kind <= pk::kSourceModel ? e.source_kind : pk::kSourceUnknown]++;
+				if (const pk::record *rec = e.map(pk::kColour))
+					colour += rec->bytes;
+			}
+			check(x->by_source[0] == kinds[0] && x->by_source[1] == kinds[1] && x->by_source[2] == kinds[2] && x->colour_bytes == colour && kinds[1] != 0 &&
+				kinds[2] != 0 && kinds[0] > kinds[1], "the index's summary: " + std::to_string(x->by_source[1]) + " zone, " + std::to_string(x->by_source[2]) +
+				" model, " + std::to_string(x->by_source[0]) + " unknown or a kind not known; " + std::to_string(x->colour_bytes) + " colour bytes, as counted");
+		}
 		if (x)
 		{
 			pk::reader r(x);

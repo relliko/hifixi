@@ -74,8 +74,13 @@ set "PASSES_FX=src\fx\fxframe.cpp src\fx\fxtextures.cpp src\fx\fxrender.cpp src\
 set "PASSES_WORLD=src\world\world_frames.cpp src\world\world_dome.cpp src\world\world_render.cpp src\world\world_font.cpp src\world\world_module.cpp src\game\worldmark.cpp src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp"
 set "PASSES_ACTORS="
 set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
-rem (the texture pack: docs\texture-pack-plan.md; for now its memory watch and reports only)
-set "PASSES_PACK=src\pack\memwatch.cpp src\pack\pack_module.cpp"
+rem (the texture pack: docs\texture-pack-plan.md; its module (src\pack\pack_module: the pack opened as [textures] pack
+rem says), the streamer and the pack's reader, the memory watch and the reports, and the zones' and model actors' glue
+rem (src\zone\zonepack: docs\texture-pack\zones.md))
+set "PASSES_PACK=src\pack\memwatch.cpp src\pack\pack_module.cpp src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp src\zone\zonepack.cpp"
+rem (what a test that streams zone textures links besides the zone's own files: the streamer, the reader, the glue and
+rem both loaders it asks)
+set "PACK_ZONES=src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\zone\zonepack.cpp"
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D% %PASSES_PACK%"
 
 rem The plugin: the Ashita side, the backend (World FX's core at our d3d8.dll's marks), with the engine
@@ -265,11 +270,13 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   /Fo"build\test\\" /Fe"build\enspell_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\enspell_view.exe
 rem The native zone renderer's zone data against tests\zonemesh_oracle.py: build\zonemesh_test.exe; and its offline
-rem picture of a zone through the GPU upload (needs the game closed, or --warp): build\zone_view.exe; the plugin's
-rem per-zone loading on WARP: build\zonenative_test.exe
+rem picture of a zone through the GPU upload (needs the game closed, or --warp; ZONE_VIEW_PACK, a pack's folder: with the
+rem texture pack's textures streamed from it): build\zone_view.exe; the plugin's
+rem per-zone loading on WARP, and the texture pack's zones (src\zone\zonepack; no address-space randomisation: the
+rem FFXiMain dump goes at its own base): build\zonenative_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zonemesh_test.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\zonemesh_test.exe" ^
-  /link /NOLOGO user32.lib || exit /b 1
+  tests\zonemesh_test.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\pack.cpp src\pack\hash.cpp src\pack\validate.cpp ^
+  /Fo"build\test\\" /Fe"build\zonemesh_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zonemesh_test.exe
 rem The texture pack's key (src\pack\pack.hpp) on the game's own DATs: build\packkey_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
@@ -288,19 +295,28 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\memwatch_test.exe
 rem The texture pack's streamer (src\pack\stream: worker, copy queue, ring, shared textures; docs\texture-pack\streamer.md)
-rem on WARP, and on the GPU with ZONE_GPU=1 (run_suites: packstream_gpu); the plugin doesn't link stream.cpp yet (M4):
+rem on WARP, and on the GPU with ZONE_GPU=1 (run_suites: packstream_gpu); the plugin links it through PASSES_PACK (M4):
 rem build\packstream_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\packstream_test.cpp src\pack\stream.cpp src\pack\pack.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\pack\hash.cpp src\pack\validate.cpp ^
   src\pack\memwatch.cpp /Fo"build\test\\" /Fe"build\packstream_test.exe" /link /NOLOGO /LARGEADDRESSAWARE user32.lib d3d12.lib dxgi.lib d3dcompiler.lib || exit /b 1
 echo Built build\packstream_test.exe
+rem The texture pack's module (src\pack\pack_module: on, off, compare, reload, a device change, a safe start, the
+rem plugin's unload with 1,000 queued and copies in flight, loaded again; the quiet window) through passes::modules() on
+rem WARP, a made-up pack under build\test\packmodule: build\packmodule_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
+  tests\packmodule_test.cpp src\backend\backend.cpp src\pack\pack_write.cpp src\pack\bc2.cpp ^
+  %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" ^
+  /Fe"build\packmodule_test.exe" /link /NOLOGO /LARGEADDRESSAWARE user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\packmodule_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\memwatch.cpp /Fo"build\test\\" ^
-  /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\memwatch.cpp ^
+  src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp /Fo"build\test\\" /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zone_view.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zonenative_test.cpp src\zone\native.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
-  /Fo"build\test\\" /Fe"build\zonenative_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  tests\zonenative_test.cpp src\zone\native.cpp src\zone\actordata.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
+  src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
+  %PACK_ZONES% /Fo"build\test\\" /Fe"build\zonenative_test.exe" /link /NOLOGO /LARGEADDRESSAWARE /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zonenative_test.exe
 rem The zone's objects handed to the native renderer (17CBA8's stub run on both dumps, zone 100 on WARP): build\zonedraw_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
@@ -309,14 +325,15 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
 echo Built build\zonedraw_test.exe
 rem The model actors handed to the zone renderer (0C4CC8's call on both dumps, a model DAT on WARP): build\modelactor_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\modelactor_test.cpp src\game\modelactor.cpp src\zone\actordata.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
-  src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\modelactor_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  tests\modelactor_test.cpp src\game\modelactor.cpp src\zone\actordata.cpp src\zone\native.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
+  src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp %PACK_ZONES% /Fo"build\test\\" /Fe"build\modelactor_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\modelactor_test.exe
 rem The native renderer drawing at the zone's end marker on a list recorded as dgVoodoo records (WARP, debug layer):
 rem build\zoneinject_test.exe [out.bmp]
 rem (no address-space randomisation: the FFXiMain dump goes at its own base, which a system mapping took at times)
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp ^
+  src\zone\native.cpp src\zone\actordata.cpp %PACK_ZONES% ^
   src\game\game.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\zoneinject_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zoneinject_test.exe
 rem The world upscaled to the screen on a list recorded as dgVoodoo records its own (src\upscale): build\upscale_test.exe

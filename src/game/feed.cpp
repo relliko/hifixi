@@ -1128,6 +1128,11 @@ namespace hifi::game::feed
 		return g_zone.last;
 	}
 
+	bool in()
+	{
+		return g_zone.in_game == 1;
+	}
+
 	std::vector<std::string> status()
 	{
 		std::vector<std::string> out;

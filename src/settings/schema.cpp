@@ -1,5 +1,7 @@
 #include "schema.hpp"
 #include "../chars/charoptions.hpp" // (native characters)
+#include "../pack/pack_module.hpp"  // (the texture pack: whether a pack folder is on this PC)
+#include "../pack/packoptions.hpp"
 #include "../zone/zoneoptions.hpp"
 #include <cmath>
 #include <cstring>
@@ -227,6 +229,13 @@ namespace hifi::settings
 				"bright pattern shines like metal. Needs per-pixel lighting. (/hifi nativechars detail)", nullptr, "chars.perpixel", false,
 				{ _, _, _, _ },
 				flag, 0.0f, 1.0f, chars::options::kDetailByDefault ? 1.0f : 0.0f },
+			// (the texture pack: src/pack/packoptions.hpp; shown only while a pack folder is on this PC, the module's cached
+			// answer. The Game tab's last section: the menu draws the pack's lines right after it)
+			{ "textures.pack", tab::game, "Texture pack", "Use the texture pack",
+				"Sharper scenery, ships and furniture, from a texture pack made on this PC from your own game files and kept on "
+				"the graphics card. Anything the pack doesn't have is drawn as the game's own. Takes effect at the next area you "
+				"enter. (/hifi textures)", nullptr, nullptr, false, { 0.0f, _, _, _ },
+				flag, 0.0f, 1.0f, pack::options::kPackByDefault ? 1.0f : 0.0f, &pack::folder_exists },
 			// (the upscale: src/upscale)
 			{ "upscale.fsr", tab::upscaling, "AMD FSR", "Upscale the world with AMD FSR",
 				"When the game's background resolution is below the screen's, the world is stretched to the screen with AMD "
@@ -312,6 +321,7 @@ namespace hifi::settings
 			{ "Display", "How the picture fits your screen." },
 			{ "Left out", "The game's own versions of what HiFi XI draws better itself." },
 			{ "Drawn by HiFi XI", "How HiFi XI lights the scenery and characters it draws in the game's place." },
+			{ "Texture pack", "Higher-resolution textures kept on the graphics card, made on your own PC from your game's files." },
 			{ "AMD FSR", "The world brought to your screen's size with AMD FidelityFX Super Resolution: sharper and smoother than the game's stretch." },
 			{ "Frame generation", "A frame made between each two the game draws, for motion twice as smooth." },
 			{ "Grass colour", "Where the grass gets its colour from." },

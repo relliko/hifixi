@@ -505,7 +505,7 @@ float4 ps_ground(v2g i) : SV_Target
 		if (ground != nullptr)
 			list->SetGraphicsRoot32BitConstants(0, 12, ground, 24);
 		// (a table must always be set: the white stand-in where nothing's tested)
-		D3D12_GPU_DESCRIPTOR_HANDLE bound = z.texture_srv(zm::kNone);
+		D3D12_GPU_DESCRIPTOR_HANDLE bound = z.game_srv(zm::kNone);
 		list->SetGraphicsRootDescriptorTable(5, bound);
 		uint32_t triangles = 0;
 		for (const group &gr : groups)
@@ -520,7 +520,7 @@ float4 ps_ground(v2g i) : SV_Target
 					continue;
 				if (gr.tested != 0 || ground != nullptr) // (the ground map reads every piece's texture)
 				{
-					const D3D12_GPU_DESCRIPTOR_HANDLE h = z.texture_srv(pc.texture);
+					const D3D12_GPU_DESCRIPTOR_HANDLE h = z.game_srv(pc.texture);
 					if (h.ptr != bound.ptr)
 					{
 						list->SetGraphicsRootDescriptorTable(5, h);

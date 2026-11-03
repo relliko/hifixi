@@ -16,11 +16,15 @@
 //     own thread, into a slot it alone decides is free.
 //   - One mutex, a leaf: never held across ReadFile, a D3D12 or DXGI call, a fence wait, pack::load or a call into
 //     retire; no callbacks. An owner may call in with its own lock held (owner lock, then the streamer's).
-//   - Textures that were ready go through retire::later (the game queue's fence, the +2 rule); what only the copy
-//     queue ever saw (never ready, the ring, queue, lists, fence) is released by the worker once its own fence passed,
-//     or leaked on purpose when that doesn't happen within the wait.
+//   - Textures that were ready go through retire::later (the game queue's fence, the +2 rule) at the last drop of the
+//     tickets holding them, gone ones too: an open, close or reload turns a ready ticket gone but leaves it its texture
+//     (held) till it's dropped (docs/texture-pack/zones.md decision 1); stop, a new device or a loss let go at once.
+//     What only the copy queue ever saw (never ready, the ring, queue, lists, fence) is released by the worker once its
+//     own fence passed, or leaked on purpose when that doesn't happen within the wait.
 //
-// M3: nothing in the plugin starts it (build.cmd's PASSES_PACK doesn't link stream.cpp); packstream_test drives it.
+// Started by the texture pack's module (src/pack/pack_module.cpp) at the first enable with a device, kept for the
+// session (paused with kOff while the pack is off); the zones and model actors ask through src/zone/zonepack;
+// packstream_test drives it alone.
 
 #include "pack.hpp"
 #include <d3d12.h>
@@ -80,13 +84,16 @@ namespace hifi::pack::stream
 		uint8_t first = 0, count = 0; // levels: the top `first` never wanted; count 0: all the rest
 		int32_t priority = 0;         // (higher first; then the order asked)
 		uint32_t epoch = 0;           // (the snapshot's the key was found in; 0: the current one)
+		// (count 0 and these set: the levels from `first` down to the first whose sides are at most these, the game's own
+		// size (zones: the key's w x h), worked out from the record under the streamer's lock; 0: all the rest)
+		uint32_t down_to_w = 0, down_to_h = 0;
 	};
 	struct view
 	{
-		// (valid while the ticket is held and ready, and until the retire fence after its drop or the epoch change that
-		// made it gone: an open, close or reload hands every resident texture to retire::later on the worker, whenever it
-		// gets there. So an owner records no view of a ticket that isn't ready, as it reads it after the last present's
-		// retire::on_present, and stops recording its views when it calls open or close itself: streamer.md "Notes for M4")
+		// (valid while the ticket is held, and until the retire fence after its drop: an open, close or reload turns a
+		// ready ticket gone but leaves it its texture till it's dropped (zones.md decision 1). Stop, a new device and the
+		// device lost let go at once: owners are cleared before stop, a device's objects are freed when retire sees the
+		// next, and nothing runs on a lost one. get() and write_view() answer only for a ready ticket)
 		ID3D12Resource *resource = nullptr;
 		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		uint32_t w = 0, h = 0, levels = 0, first = 0; // (w x h: level `first` of the record's, the texture's level 0)
@@ -126,10 +133,14 @@ namespace hifi::pack::stream
 	void stop();
 	bool running();
 	// The pack: loaded and checked on the worker (pack::load); the index now (nullptr: none) and its epoch. Each open
-	// and close cancels the read in flight and raises the epoch once the worker has done it
-	void open(const std::wstring &folder);
-	void open(std::shared_ptr<const index> pack); // (tests: an index they built)
-	void close();
+	// and close cancels the read in flight and raises the epoch once the worker has done it. Each returns its number,
+	// and posts_done() the number of the last the worker has done: an open still loading isn't cancelled by a newer
+	// open or close, so it raises the epoch too, before the newer one does. Whoever waits for its own post waits for
+	// posts_done() to reach it, not for the epoch to move (the module's check_open)
+	uint64_t open(const std::wstring &folder);
+	uint64_t open(std::shared_ptr<const index> pack); // (tests: an index they built)
+	uint64_t close();
+	uint64_t posts_done();
 	std::shared_ptr<const index> current();
 	uint32_t epoch();
 	// The last open's failure ("" when it loaded, or none was asked)
@@ -172,6 +183,8 @@ namespace hifi::pack::stream
 		                                         // its references past the first)
 		uint64_t queued = 0, in_flight = 0;      // (tickets waiting; copies submitted and not yet seen done)
 		uint64_t resident = 0, resident_bytes = 0, resident_peak = 0;
+		uint64_t held = 0, held_bytes = 0;       // (textures an open, close or reload took out while gone tickets still
+		                                         // hold them: let go at each one's last drop)
 		uint64_t made = 0, made_bytes = 0;       // (textures made)
 		uint64_t released = 0;                   // (released by the worker: never ready, behind its own fence)
 		uint64_t retired = 0;                    // (handed to retire::later: were ready)
@@ -208,6 +221,9 @@ namespace hifi::pack::stream
 		// (tests only) Called on the worker between its loop's top and the pick of the next texture, no lock held
 		// (nullptr: none): a test calls set_device and request there, the race of a device change landing in that window
 		void before_pick(void (*fn)());
+		// (tests only) Called on the worker in each open, after pack.idx is loaded and before it's put in use, no lock
+		// held (nullptr: none): a test holds an open there while it asks for another, or changes the device
+		void after_load(void (*fn)());
 		// (tests only) How many tickets the owner's next take_done would hand over
 		size_t done_waiting(owner o);
 	}

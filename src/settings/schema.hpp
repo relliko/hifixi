@@ -40,6 +40,9 @@ namespace hifi::settings
 		// (HiFi XI's own options only: what it is, its range and its default)
 		option_kind kind = option_kind::flag;
 		float low = 0.0f, high = 1.0f, fallback = 0.0f;
+		// Whether the menu shows it (in its tab and in a search); nullptr: always. Must answer from what's cached (the menu
+		// is drawn on the game's thread): no file, DXGI or other slow call (the texture pack's: a folder found)
+		bool (*shown)() = nullptr;
 	};
 	const entry *entries(size_t &count);
 	const entry *find(const char *key);

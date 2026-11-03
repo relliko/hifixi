@@ -8,7 +8,9 @@
  * matrix, TEXTUREFACTOR as it computes it, the blend by the letter, z write by flags bit 12, the class's stages and
  * geometry from the chunks through fxgeo), one run; the textures go through fxtextures (decoded on its thread, copied
  * in on the list at the marker). An MMB effect mesh is drawn from its DAT's data on the GPU as the native zone
- * renderer has it (zonemesh::load_file, gpu_zone uploaded on the test's queue): its pieces by the model's name. The marker is handled on a list recorded as our d3d8.dll records (its own heap and
+ * renderer has it (zonemesh::load_file, gpu_zone uploaded on the test's queue): its pieces by the model's name. (Read in the texture
+ * pack's mode, every pack slot holding another texture's view and its word drawn: the effects draw the game's textures,
+ * game_srv, so a picture would show it if they read the pack's.) The marker is handled on a list recorded as our d3d8.dll records (its own heap and
  * targets bound; nothing put back after: the d3d8.dll binds its own again). The picture must match the oracle's: the mean difference
  * per channel and the share of pixels off by more than 24 (of 255) small (8-bit blending and the rasteriser's own
  * rounding differ, never the shapes, colours or order).
@@ -202,6 +204,45 @@ namespace
 	ID3D12Device *g_device = nullptr;
 	ID3D12CommandQueue *g_queue = nullptr;
 	std::map<uint32_t, std::unique_ptr<hifi::zone::gpu_zone>> g_zones;
+	// (the texture pack: every DAT read in pack mode, its pack slots holding another texture's view, every word drawn;
+	// the effects draw the game's textures (game_srv), so the pictures below would show it if they read the pack's)
+	ID3D12Resource *g_other = nullptr;
+	uint32_t g_drawn_words = 0, g_pack_picked = 0;
+
+	void pack_slots_drawn(hifi::zone::gpu_zone &z)
+	{
+		if (!z.has_pack())
+			return;
+		if (g_other == nullptr)
+		{
+			// (a 4x4 texture never written: whatever it reads, not the game's)
+			D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = 4;
+			d.Height = 4;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			d.SampleDesc.Count = 1;
+			if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_other))))
+				return;
+		}
+		D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+		v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		v.Texture2D.MipLevels = 1;
+		for (uint32_t i = 0; i < z.data().textures.size(); ++i)
+		{
+			g_device->CreateShaderResourceView(g_other, &v, z.pack_cpu(i));
+			z.set_pack_word(i, hifi::zone::gpu_zone::kPackDrawn);
+			bool pack = false;
+			z.texture_srv(i, &pack);
+			g_drawn_words++;
+			g_pack_picked += pack;
+		}
+	}
 
 	hifi::zone::gpu_zone *zone_data(uint32_t file)
 	{
@@ -212,11 +253,13 @@ namespace
 		hifi::bake::zonemesh::zone d;
 		hifi::bake::result r;
 		std::string why;
-		if (!hifi::bake::zonemesh::load_file(file, d, r) || !z->upload(g_device, g_queue, std::move(d), why) || !z->wait(60000))
+		if (!hifi::bake::zonemesh::load_file(file, d, r, true) || !z->upload(g_device, g_queue, std::move(d), why) || !z->wait(60000))
 		{
 			check(false, "DAT " + std::to_string(file) + "'s data: " + r.why + why);
 			z.reset();
 		}
+		else
+			pack_slots_drawn(*z);
 		return (g_zones[file] = std::move(z)).get();
 	}
 
@@ -1360,9 +1403,15 @@ int main(int argc, char **argv)
 		dsvh->Release();
 		game_heap->Release();
 	}
+	// (the MMB meshes above drawn from DATs whose every pack word said drawn: the pictures matched with the game's)
+	if (!g_zones.empty())
+		check(g_drawn_words > 0 && g_pack_picked == g_drawn_words, "the MMB meshes' DATs read in the texture pack's mode, every pack word drawn (" +
+			std::to_string(g_drawn_words) + " textures, texture_srv picking the pack's slot for each): the effects drew the game's textures (game_srv)");
 	fx::inject::release();
 	fx::textures::stop();
 	g_zones.clear();
+	if (g_other != nullptr)
+		g_other->Release();
 	if (mapped)
 		dump::unmap(dump_base);
 	std::printf("\n%d passed, %d failed\n", passes, failures);

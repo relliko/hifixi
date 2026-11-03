@@ -7,7 +7,8 @@
  * the "UI" (the same quad into a 64x64 corner).
  *   - the first frame: the module asks for its screen-size texture and the back buffer's pipeline, the game's stretch
  *     stays (the picture as with FSR off); once prepared, FSR's picture: close to the stretch overall, its edge no wider,
- *     not the same picture;
+ *     not the same picture; world_scale (the texture pack's FSR bias reads it) false before, the world's width over the
+ *     screen's once FSR draws, false a quarter second after it stops;
  *   - the UI drawn on top as the game meant it, the same with FSR as without;
  *   - the status: placed at the resolve mark once for each frame it saw there;
  *   - the game's tint (a cutscene fade) on FSR's picture, the UI left as drawn;
@@ -405,6 +406,8 @@ int main(int argc, char **argv)
 	const std::vector<uint8_t> stretch = frame(A, 0, 6);
 	check(up::prepare(device, why), "the passes made (shaders through AMD's headers, root signature, EASU's pipeline)" + (why.empty() ? "" : ": " + why));
 	check(drawn() == 0, "FSR off: nothing drawn");
+	float scale_before = 0.0f;
+	check(!up::world_scale(scale_before), "world_scale: false before FSR has drawn");
 
 	// FSR on: the first frame asks, prepare makes, then it's drawn
 	up::set_options(true, false, 0.8f);
@@ -413,6 +416,11 @@ int main(int argc, char **argv)
 	check(up::prepare(device, why), "... made off the game's thread");
 	const std::vector<uint8_t> fsr = frame(A, 0, 6);
 	check(drawn() == 1, "then FSR drawn at the resolve's mark");
+	{
+		float scale = 0.0f;
+		const bool known = up::world_scale(scale);
+		check(known && scale == float(IW) / float(OW), "world_scale: the world's width over the screen's while FSR draws (" + std::to_string(scale) + ")");
+	}
 	{
 		double diff = 0.0;
 		for (UINT y = UI; y < OH; ++y)
@@ -490,6 +498,11 @@ int main(int argc, char **argv)
 	const std::vector<uint8_t> off = frame(A, 0, 6);
 	check(drawn() == 5 && same(off, stretch, false) == 0 && placed() == "upscale: placed at our d3d8.dll's resolve mark, 6 times",
 		"FSR off again: nothing, the game's stretch (" + placed() + ")");
+	{
+		Sleep(260);
+		float scale = 0.0f;
+		check(!up::world_scale(scale), "world_scale: false a quarter second after FSR last drew");
+	}
 
 	// FSR 2: A's depth and the big one's (as our d3d8.dll's: typeless D24S8), each frame's camera as the zone pass's
 	{

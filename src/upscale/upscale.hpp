@@ -43,6 +43,9 @@ namespace hifi::upscale
 	// jitter sequence for A's size and the screen's
 	bool temporal_running();
 	uint32_t jitter_phases();
+	// Whether FSR (1, 2 or 3.1) drew the world bigger in the last quarter second, and the world's width over the screen's
+	// then (the texture pack's mip bias: docs/texture-pack/zones.md "The FSR bias"; AMD gives FSR 1 the same bias)
+	bool world_scale(float &ratio);
 	// For the device dgVoodoo draws with: its root signature and pipelines, and what dgVoodoo's thread has asked for
 	// since (the screen-size texture, a pipeline for the back buffer's format). Not on dgVoodoo's thread. False with why
 	// when they can't be made (FSR then stays off).

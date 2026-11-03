@@ -16,9 +16,14 @@
  *   - take_done hands a ticket over once across an epoch change (a miss keeps its reason), and keeps nothing for an
  *     owner that only polls;
  *   - set_device and a request of the new epoch between the worker's loop top and its pick (test::before_pick): the
- *     ticket comes, on the new parts;
+ *     ticket comes, on the new parts; set_device and open both waiting at the loop's top: the open done after the change
+ *     (not dropped with it);
  *   - two owners of one key share one texture (its bytes counted as the sharing's saving); it goes to the retire list
  *     when the second drops it;
+ *   - gone tickets keep their texture (docs/texture-pack/zones.md decision 1): a reload or a close turns a ready ticket
+ *     gone and holds its texture (counted held) till it's dropped, then the retire list lets it go behind the fence; a
+ *     device change lets go of the held ones at once;
+ *   - want::down_to: a record down to half its size 2 levels, a quarter 3, its own size 1;
  *   - failures at the worker: a level CRC that doesn't match and a data file that can't be opened: missed "a CRC
  *     mismatch" and "a read failed", the texture made for each released at once, a good one between them ready, one
  *     take_log line each with the reader's why, handed over once;
@@ -507,6 +512,20 @@ namespace
 		st::set_device(G.device);
 		g_race_ticket = st::request(g_race_owner, want_of(g_race_key));
 		g_race_done = true;
+	}
+
+	// ---- A device change and an open both waiting at the worker's loop top (made on the worker, test::before_pick): the
+	// change is done first, the open on the next pass (it used to be taken with the change and dropped: M4's module saw
+	// it on the 4070 Ti, set_device then open in one update, the pack never opened)
+	std::atomic<bool> g_both_armed { false }, g_both_done { false };
+	std::wstring g_both_folder;
+	void both_hook()
+	{
+		if (!g_both_armed.exchange(false))
+			return;
+		st::set_device(G.device);
+		st::open(g_both_folder);
+		g_both_done = true;
 	}
 
 	// ---- A slow pack.idx (pk::load_test_window): each piece takes 40 ms
@@ -1689,6 +1708,112 @@ int main(int argc, char **argv)
 		messages_check("two owners");
 	}
 
+	// ---- Gone tickets keep their texture (docs/texture-pack/zones.md decision 1): an open (a reload) or a close turns a
+	// ready ticket gone but leaves it its texture till it's dropped (held), then to the retire list as any drop, let go
+	// behind the fence; a new device lets go at once, the held ones too
+	{
+		std::vector<const made_entry *> plain;
+		for (const made_entry &m : made)
+			if (m.tag.empty() && m.w <= 256 && m.h <= 256 && plain.size() < 3)
+				plain.push_back(&m);
+		const st::owner o = st::add_owner("gone keeps");
+		const st::ticket t = st::request(o, want_of(plain[0]->k));
+		const bool came = wait_for(t, st::state::ready);
+		st::view v;
+		st::get(t, v);
+		ID3D12Resource *const res = v.resource;
+		if (res != nullptr)
+			res->AddRef();
+		const bool reopened = open_and_wait(made_idx); // (a reload)
+		settle();                                       // (presents: nothing of it let go)
+		const st::counts c1 = st::get_counts();
+		ULONG alive = 0;
+		if (res != nullptr)
+		{
+			res->AddRef();
+			alive = res->Release();
+		}
+		st::view gone_view;
+		const bool refused = !st::get(t, gone_view) && !st::write_view(t, D3D12_CPU_DESCRIPTOR_HANDLE { 0 });
+		char line[400];
+		std::snprintf(line, sizeof(line), "a reload: the ready ticket %s, its texture held for it (held %llu, %llu bytes; refs %lu after 4 presents); get and write_view refuse it",
+			st::text(st::poll(t)), static_cast<unsigned long long>(c1.held), static_cast<unsigned long long>(c1.held_bytes), alive);
+		check(came && reopened && st::poll(t) == st::state::gone && c1.held == 1 && c1.held_bytes == v.bytes && c1.resident == 0 && alive >= 2 && refused, line);
+		const st::counts c1b = st::get_counts();
+		st::drop(t);
+		const st::counts c2 = st::get_counts();
+		frame(); // (one present: still held by the retire list)
+		ULONG one = 0;
+		if (res != nullptr)
+		{
+			res->AddRef();
+			one = res->Release();
+		}
+		idle();
+		settle();
+		const ULONG last = res != nullptr ? res->Release() : 99;
+		std::snprintf(line, sizeof(line), "  dropped: to the retire list (held %llu, retired +%llu), after one present still there (refs %lu), let go behind the fence (refs %lu)",
+			static_cast<unsigned long long>(c2.held), static_cast<unsigned long long>(c2.retired - c1b.retired), one, last);
+		check(c2.held == 0 && c2.held_bytes == 0 && c2.retired == c1b.retired + 1 && one >= 2 && last == 0, line);
+		// (a close the same; then a new device: the held ones let go at once, their tickets' hold forgotten)
+		const st::ticket t2 = st::request(o, want_of(plain[1]->k));
+		const st::ticket t3 = st::request(o, want_of(plain[2]->k));
+		const tally got = wait_all({ t2, t3 });
+		const uint32_t e0 = st::epoch();
+		st::close();
+		for (int i = 0; i < 30000 && st::epoch() == e0; ++i)
+			Sleep(1);
+		const st::counts c3 = st::get_counts();
+		const bool closed_held = got.ready == 2 && st::poll(t2) == st::state::gone && c3.held == 2 && st::current() == nullptr;
+		st::drop(t3);
+		const st::counts c4 = st::get_counts();
+		st::set_device(G.device); // (a device change, as a new device's: the epoch at once)
+		const st::counts c5 = st::get_counts();
+		st::drop(t2); // (its hold forgotten: nothing let go twice)
+		const st::counts c6 = st::get_counts();
+		std::snprintf(line, sizeof(line), "a close: both gone and held (%llu); one dropped (held %llu); a device change lets go of the other at once (held %llu, retired +%llu), its drop then nothing (+%llu)",
+			static_cast<unsigned long long>(c3.held), static_cast<unsigned long long>(c4.held), static_cast<unsigned long long>(c5.held),
+			static_cast<unsigned long long>(c5.retired - c4.retired), static_cast<unsigned long long>(c6.retired - c5.retired));
+		check(closed_held && c4.held == 1 && c5.held == 0 && c5.held_bytes == 0 && c5.retired == c4.retired + 1 && c6.retired == c5.retired, line);
+		st::drop_owner(o);
+		check(wait_parts() && open_and_wait(nullptr, synthetic), "the made-up pack opened again on the device's new parts");
+		settle();
+		messages_check("gone tickets keep their texture");
+	}
+
+	// ---- want::down_to: the levels from the top down to the first at most a size (a zone's: the game's own), counted
+	// by the streamer from the record: a 2x record 2 levels, 4x 3, the same size 1; down_to wider than tall: both sides
+	{
+		const made_entry *m = nullptr;
+		for (const made_entry &e : made)
+			if (e.tag.empty() && e.format == pk::kBC2 && e.w >= 64 && e.h >= 64 && e.w <= 512 && e.h <= 512 && e.levels >= 5)
+			{
+				m = &e;
+				break;
+			}
+		const st::owner o = st::add_owner("down to");
+		auto ask = [&](uint32_t dw, uint32_t dh) {
+			st::want w = want_of(m->k);
+			w.down_to_w = dw;
+			w.down_to_h = dh;
+			return st::request(o, w);
+		};
+		const st::ticket t2 = m != nullptr ? ask(m->w / 2, m->h / 2) : st::ticket {};
+		const st::ticket t4 = m != nullptr ? ask(m->w / 4, m->h / 4) : st::ticket {};
+		const st::ticket t1 = m != nullptr ? ask(m->w, m->h) : st::ticket {};
+		const st::ticket tw = m != nullptr ? ask(m->w / 4, m->h) : st::ticket {};
+		wait_all({ t2, t4, t1, tw });
+		st::view v2, v4, v1, vw;
+		const bool got = st::get(t2, v2) && st::get(t4, v4) && st::get(t1, v1) && st::get(tw, vw);
+		char line[300];
+		std::snprintf(line, sizeof(line), "down_to: a %ux%u record down to half its size %u levels, a quarter %u, its own size %u, a quarter wide and its own height %u",
+			m != nullptr ? m->w : 0, m != nullptr ? m->h : 0, v2.levels, v4.levels, v1.levels, vw.levels);
+		check(m != nullptr && got && v2.levels == 2 && v4.levels == 3 && v1.levels == 1 && vw.levels == 3 && v2.w == m->w, line);
+		st::drop_owner(o);
+		settle();
+		messages_check("down_to");
+	}
+
 	// ---- Failures at the worker: a level CRC that doesn't match (changed in a copy of the index) and a data file that
 	// can't be opened (a copy whose folder has none). Missed "a CRC mismatch" and "a read failed", the texture made for
 	// each released at once (no queue ran on it), one line each from take_log with the reader's why; a good texture
@@ -2068,6 +2193,36 @@ int main(int argc, char **argv)
 		st::drop_owner(o);
 		settle();
 		messages_check("set_device");
+	}
+
+	// ---- set_device and open both waiting at the worker's loop top: the open isn't lost to the device change
+	{
+		const auto before = st::current();
+		const uint32_t e0 = st::epoch();
+		const st::owner o = st::add_owner("device change and open");
+		g_both_folder = synthetic;
+		g_both_done = false;
+		g_both_armed = true;
+		st::test::before_pick(both_hook);
+		const st::ticket waker = st::request(o, want_of(made[1502].k));
+		double t0 = now_ms();
+		while (!g_both_done && now_ms() - t0 < 10000)
+			Sleep(1);
+		st::test::before_pick(nullptr);
+		t0 = now_ms();
+		while ((st::current() == before || st::current() == nullptr) && now_ms() - t0 < 10000)
+			Sleep(1);
+		const auto after = st::current();
+		const uint32_t e1 = st::epoch();
+		char line[200];
+		std::snprintf(line, sizeof(line), "set_device and open both waiting at the worker's loop top: the change done, then the open (a new snapshot %s; epoch %u -> %u)",
+			after != nullptr && after != before ? "open" : "NOT opened", e0, e1);
+		check(g_both_done && after != nullptr && after != before && e1 >= e0 + 2, line);
+		st::drop(waker);
+		st::drop_owner(o);
+		wait_worker();
+		settle();
+		messages_check("set_device and open");
 	}
 
 	// ---- The ring: 8 MB, mixed sizes, wraps; too big; first levels

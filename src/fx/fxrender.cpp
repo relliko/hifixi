@@ -779,7 +779,7 @@ float4 ps_grab(g2p i) : SV_Target
 				list->SetDescriptorHeaps(1, &want);
 				heap_bound = want;
 				// (the environment's table from the heap now bound: the zone's untextured view under an MMB mesh)
-				list->SetGraphicsRootDescriptorTable(6, z != nullptr ? z->texture_srv(textures::kNone) : textures::view(textures::kNone));
+				list->SetGraphicsRootDescriptorTable(6, z != nullptr ? z->game_srv(textures::kNone) : textures::view(textures::kNone));
 			}
 			if (e.env != kNone && z == nullptr)
 				list->SetGraphicsRootDescriptorTable(6, textures::view(e.env));
@@ -819,7 +819,7 @@ float4 ps_grab(g2p i) : SV_Target
 					list->SetGraphicsRootDescriptorTable(2, dist_gpu);
 				}
 				else if (zoned)
-					list->SetGraphicsRootDescriptorTable(2, z->texture_srv((dr.stages & (stage_mmb_textured | stage_mmb_textured_d)) != 0 ? dr.texture : textures::kNone));
+					list->SetGraphicsRootDescriptorTable(2, z->game_srv((dr.stages & (stage_mmb_textured | stage_mmb_textured_d)) != 0 ? dr.texture : textures::kNone));
 				else
 					list->SetGraphicsRootDescriptorTable(2, textures::view((dr.stages & stage_texture) != 0 ? dr.texture : textures::kNone));
 				list->DrawInstanced(dr.count, 1, 0, 0);

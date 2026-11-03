@@ -102,10 +102,22 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   since (`heap_generation`). Bound in `chardraw.cpp:1696`,
   `1902`, `1926`, `1954`, `2254`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1474`) and 1 for the aura
   (`chardraw.cpp:2133`).
-- Zone: `src/zone/zone_gpu.cpp:218-222` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:886-894`
+- Zone: `src/zone/zone_gpu.cpp:258-299` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:922-933`
   switches heap only when the next object's zone differs (the second map), and binds that zone's vertex and index
   buffers as root SRVs with it; the breadcrumb
   step `kStepHeap` marks it. `zoneshadow.cpp:494` binds it for the shadow casters.
+- The zone heap's texture pack region (docs/texture-pack/zones.md): a zone read in the pack's mode from the game's own
+  file gets `textures.size()` more slots after white and flat (`zone_gpu.cpp:261-266`), each written at upload with the
+  game texture's own view (:281-297), so a slot bound by mistake still reads a valid texture. A pack slot is written
+  once at most in that gpu_zone's life, by the glue (`src/zone/zonepack.cpp:183`: `stream::write_view` of a ticket
+  `take_done` handed over ready, on the game's thread, no lock of ours held), before its word is stored drawn with
+  release (`set_pack_word`, `zone_gpu.cpp:402`); `texture_srv` (:367) names it only once it reads drawn (acquire) and
+  compare is off. Never written again: off, reload, a ticket gone all turn the word spent, and a new visit is a new
+  gpu_zone with a new heap. So the rule above holds: until drawn no list references the slot, after it nothing writes
+  it. `game_srv` (:381) is the game's slot always: the effects' MMB meshes (`src/fx/fxrender.cpp:782`, :822) and the
+  shadow cut-outs (`zoneshadow.cpp:508`, :523) use it. zonenative_test's slot-write log checks the order per gpu_zone.
+  `tests/zone_view.cpp:232` (`ZONE_VIEW_PACK`) writes the slots the same way, each before its word, all before its one
+  list is recorded.
 - Effects: `src/fx/fxtextures.cpp:285-287` one heap of `kReserved` 8 + `kMax` 4096. `src/fx/fxrender.cpp:777-783`
   switches between its heap and a zone's heap for MMB meshes and **sets table 6 again right after**;
   `fxrender.cpp:846-847` ends on its own heap. Root signature with 3 static samplers (`fxrender.cpp:402`).
@@ -115,16 +127,17 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   line 48) + 6 root SRV/UAVs x 2 = **64 DWORDs, full**. No tables at all, so no heap. Its other heaps (lamp map DSVs
   `4818`, sun map DSVs `4113`, RTV/DSV) are CPU only or used by its own passes.
 - 2D: `src/ui2d/render2d.cpp:667-671` its own SRV and sampler heaps, bound at `render2d.cpp:1066`.
-- Upscale: `upscale.cpp:304`, `temporal.cpp:309/348` own heaps; FSR 2 binds its own, so `upscale.cpp:459` and `562`
+- Upscale: `upscale.cpp:294`, `temporal.cpp:309/348` own heaps; FSR 2 binds its own, so `upscale.cpp:419` and `525`
   put the list's heaps back (`upscale::on_heaps`, fed by `ev_heaps`, `backend.cpp:778-782`).
 - The texture pack's streamer (`src/pack/stream.cpp`) has **no shader-visible heap** and writes into nobody's.
-  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1788`):
+  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1872`):
   `CreateShaderResourceView` with the ticket's format, the levels uploaded, most detailed 0, on the owner's thread,
   with none of the owner's locks held (a device call), into a slot the owner alone decides is free (the rule above:
   no list in flight may read it). It holds the texture and the device for the call (AddRef'd with the ticket checked,
   under the streamer's mutex), so another thread's epoch change can't free them under it; a view made just before an
-  epoch change is the owner's to drop. One texture shared by several owners gets one view in each owner's heap.
-  packstream_test samples through such views in its own heap.
+  epoch change keeps its texture till the owner drops the ticket (zones.md decision 1). One texture shared by several
+  owners gets one view in each owner's heap. packstream_test samples through such views in its own heap; the zones'
+  glue writes them into the zone heap's pack region (above).
 - Views made or copied by anyone are followed by the backend (`backend.cpp:808` `ev_view`, `814` `ev_copy`), so
   `port_resource_of_view` (`backend.cpp:223`) stays right after a slot is refilled.
 

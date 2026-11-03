@@ -95,30 +95,36 @@ When the device is lost:
   the added sections to `bootloader\worldfx-gpu-crash.txt` (`worldfx_core.cpp:2502`).
 - `report()` (`gpu_crash.cpp:470-584`): reason, GPU and video memory, page fault and the objects there, then each
   unfinished list's ops with `>` at the first one not done.
-- After `lost()` HiFi XI records nothing and calls no AMD code (`src/plugin/main.cpp:1261-1272`).
+- After `lost()` HiFi XI records nothing and calls no AMD code (`src/plugin/main.cpp:1270-1281`).
 - Our d3d8.dll logs the removed reason when Present fails (`src/d3d8/present.cpp:286`).
 
 Breadcrumbs:
 
 - Markers: `gpu_crash::mark` (`src/render/gpu_crash.hpp:59`) is `SetMarker` with metadata 0, a UTF-16 string.
   World FX's sections ("worldfx: grass", ...) are these.
-- Native zone pass: `src/zone/draw.cpp`. Buffer made in `make_breadcrumbs` (:444-472). Word 2 = setup steps
-  (`step`, :850-855; steps in `src/zone/draw.hpp:120`). Word 0 = `MARKER_IN` before each piece's draw, word 1 =
-  `MARKER_OUT` after it (:924-935). Each word is frame low 16 bits << 16 | draw. Read in `breadcrumbs()`
-  (:479-520); added to the crash report by `src/plugin/main.cpp:1010`.
+- Native zone pass: `src/zone/draw.cpp`. Buffer made in `make_breadcrumbs` (:470-503). Word 2 = setup steps
+  (`step`, :885-891; steps in `src/zone/draw.hpp:124`). Word 0 = `MARKER_IN` before each piece's draw, word 1 =
+  `MARKER_OUT` after it (:962-973). Each word is frame low 16 bits << 16 | draw. Read in `breadcrumbs()`
+  (:505-603); added to the crash report by `src/plugin/main.cpp:1014`.
+- Each piece's note says whose texture was bound (`piece_note::pack`, `src/zone/draw.hpp:102`, from
+  `gpu_zone::texture_srv(texture, &pack)` at draw.cpp:959; printed by `note_text` :444 as "texture N (the texture
+  pack's)" or "(the game's)"), so a zone-pass hang report tells a pack texture from the game's own
+  (docs/texture-pack/zones.md "Risks": run the same build with the pack off first).
 - World FX: `src/render/grass_render.cpp:2214-2322`. `crumb()` writes both IN and OUT at every section marker;
   the report names the section the GPU stopped in, or says the stop came outside World FX.
 - `draw.cpp` must not link `gpu_crash` (tests link draw without it): hence `add_section`. The sections are added at
-  `src/plugin/main.cpp:1010-1012` and written by `gpu_crash::sections_text()` (which the tests call without a removed
+  `src/plugin/main.cpp:1014-1016` and written by `gpu_crash::sections_text()` (which the tests call without a removed
   device).
-- Texture pack (`src/pack/memwatch.cpp` `crash_section`, added at `main.cpp:1012`, also at the end of the hang
-  report's lines, `main.cpp:264`): "Texture pack:" with the free address space and its lowest this zone, the largest
+- Texture pack (`src/pack/memwatch.cpp` `crash_section`, added at `main.cpp:1016`, also at the end of the hang
+  report's lines, `main.cpp:268`): "Texture pack:" with the free address space and its lowest this zone, the largest
   free block, the video memory and the characters' and zone's bytes as of the last half second, and whether a texture
   bake (bakeall.py, realesrgan-ncnn-vulkan) was running: a report from a session with a bake running is kept out of
   the hang analysis. It reads atomics only (no lock, no DXGI call). memwatch_test checks it.
 - The streamer's lines in that section (`src/pack/stream_crumbs.hpp`, read at `src/pack/memwatch.cpp:347-369`):
-  "streamer: not started" while nothing started it (M3: the plugin doesn't), else running or stopped, what the
-  worker is doing (reading, recording a copy, waiting for ring space, ...), the epoch and pause bits, how many are
+  "streamer: not started" until the pack is first turned on in the session (the "textures" module starts it then and
+  keeps it, src/pack/pack_module.cpp:220-231; a session with the pack off reads "not started"), else running or
+  stopped, what the worker is doing (reading, recording a copy, waiting for ring space, ...), the epoch and pause bits
+  (`kOff` while the pack is off, `kQuiet` while an area settles), how many are
   queued, in flight and resident; the last record's key, data file, offset, bytes and levels; the copy fence's last
   signal and the last completed value the worker read; the ring's size, head and tail; and how long since the worker
   last moved. A hang with "reading" for seconds is the disk; "waiting for ring space" with signalled ahead of

@@ -21,11 +21,17 @@ namespace hifi::zone
 
 namespace hifi::zone::actordata
 {
-	// Each present: loads finished uploaded, the next started, DATs unused lately let go; all let go while not wanted
-	void frame(ID3D12Device *device, bool wanted);
+	// Each present: loads finished uploaded, the next started, DATs unused lately let go; all let go while not wanted.
+	// zone: the zone now (feed::zone()): at a change, DATs read in the texture pack's other mode are let go too
+	void frame(ID3D12Device *device, bool wanted, uint32_t zone = 0);
 	// A DAT's data once it's on the GPU (the file id: its root resource's +0x34), else nullptr: it's asked for then (read
 	// at a later present), and stays nullptr for one that couldn't be read
 	gpu_zone *find(uint32_t file);
+	// The DATs on the GPU now (the texture pack's glue: their textures asked for), appended
+	void ready_files(std::vector<gpu_zone *> &out);
+	// The texture pack's mode for loads starting from now (docs/texture-pack/zones.md decision 5): hifi-textures passed
+	// over, the textures' pack keys made (zonemesh::load_file's pack). Off by default; the glue sets it while in use
+	void set_pack_mode(bool on);
 	std::vector<std::string> status();
 	// Everything let go (waits for a load in flight)
 	void stop();

@@ -98,10 +98,10 @@ The +2 rule (src/host/retire.hpp)
   as long as `on_present` and `release_all` are never called with that lock held).
 - New device: what the old device held is freed at once (src/host/retire.hpp:124). Device removed: the fence reads
   `UINT64_MAX` (src/host/retire.hpp:148), so everything is freed.
-- At unload `retire::release_all` (src/host/retire.hpp:168, called at src/plugin/main.cpp:1066) signals once more and
+- At unload `retire::release_all` (src/host/retire.hpp:168, called at src/plugin/main.cpp:1075) signals once more and
   waits at most 2 s. What was handed over since the last present may be on the open list, so it is leaked on purpose,
   never freed under it, and a `then` closure is left unrun (src/host/retire.hpp:195).
-- Users: zone slots (src/zone/native.cpp:60), model-actor DATs (src/zone/actordata.cpp:98, :120), effect textures and
+- Users: zone slots (src/zone/native.cpp:66), model-actor DATs (src/zone/actordata.cpp:69, from :112 and :141), effect textures and
   upload buffers (src/fx/fxtextures.cpp:196, :350), effect distortion targets (src/fx/fxrender.cpp:494), character
   objects (src/chars/cache.cpp:176, :1194-1199), and the characters' descriptor pairs through `retire::then`
   (src/chars/cache.cpp:178-185): a pair let go goes back to `free_slots` only behind the fence, and only while
@@ -112,14 +112,23 @@ The +2 rule (src/host/retire.hpp)
 
 The zone's copy queue (src/zone/zone_gpu.cpp)
 
-- The copy queue is made in src/zone/native.cpp:172 (model actors: src/zone/actordata.cpp:109). Resources are created
-  in COMMON (src/zone/zone_gpu.cpp:159-170) so the copy queue can write them and the direct queue can read them after
+- The copy queue is made in src/zone/native.cpp:180 (model actors: src/zone/actordata.cpp:123). Resources are created
+  in COMMON (src/zone/zone_gpu.cpp:196-208) so the copy queue can write them and the direct queue can read them after
   decay.
-- `_copying` (src/zone/zone_gpu.cpp:212-215): 1 once the list is submitted, 2 once its fence signal is queued.
-- `ready()` (src/zone/zone_gpu.cpp:249) is the cross-queue order: the zone is drawn only after the CPU saw the copy
-  fence reach 1 (src/zone/native.cpp:190). There is no GPU `Wait`.
-- `release()` (src/zone/zone_gpu.cpp:92) waits up to 5 s for a running copy, because the game's fence says nothing
-  about the copy queue. If the copy is still running or its signal never got queued, the objects are leaked, not freed.
+- `_copying` (src/zone/zone_gpu.cpp:253-256): 1 once the list is submitted, 2 once its fence signal is queued.
+- `ready()` (src/zone/zone_gpu.cpp:314) is the cross-queue order: the zone is drawn only after the CPU saw the copy
+  fence reach 1 (src/zone/native.cpp:198). There is no GPU `Wait`.
+- `release()` (src/zone/zone_gpu.cpp:111) waits up to 5 s for a running copy (:118), because the game's fence says
+  nothing about the copy queue. If the copy is still running or its signal never got queued, the objects are leaked,
+  not freed.
+- The texture pack's textures a zone draws (its pack region, docs/texture-pack/zones.md) are the streamer's, held by
+  the zone's tickets. They are let go with the zone, at the same fence: native and actordata call
+  `gpu_zone::pack_let_go()` (src/zone/zone_gpu.cpp:425) just before each `retire::later` of a gpu_zone
+  (src/zone/native.cpp:65, src/zone/actordata.cpp:68), which runs the glue's drop hook (`drop_zone`,
+  src/zone/zonepack.cpp:80: `stream::drop_owner`, every word spent), and the drop hands each texture whose last ticket
+  it was to `retire::later` itself. A zone destroyed at once (a new device, `forget_all`, stop) runs the hook from
+  `release()` (also inside `retire::on_present`'s free, where retire's mutex isn't held). Nothing waits: an owner may go
+  right after `drop_owner`.
 
 The characters' cache worker (src/chars/cache.cpp)
 
@@ -132,51 +141,69 @@ The characters' cache worker (src/chars/cache.cpp)
 - When the device goes, the queue and fence go through `retire::later` (src/chars/cache.cpp:1194-1199). That is safe
   because nothing is left running on the copy queue.
 
-The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md; M3: only packstream_test starts it)
+The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md; started by the module
+src/pack/pack_module.cpp, docs/texture-pack/zones.md)
+
+- Started once a session by the "textures" module at the first enable with a device (`begin_open`,
+  src/pack/pack_module.cpp:220-236) and kept: turning the pack off closes it and pauses the streamer (`kOff`,
+  `turn_off` :256-273), never stops it (its ring's address space isn't given back). `stop()` only in the module's stop
+  (:673-699), first in the plugin's Release (src/plugin/main.cpp:1029-1036), before `retire::release_all` (:1075).
+- Every `close`, `open` (on, reload) and `stop` the module makes is preceded in the same call by the owners'
+  `clear_all` (the consumer's, src/zone/zonepack.cpp `clear_all`; `begin_open` :238, `turn_off` :259, `stop` :677): no
+  owner holds a ticket of the epoch the call ends when the worker gets to it. A device change: the owners cleared, then
+  `set_device` (`device`, :754-774), the epoch the owners ask in read again at once.
+- The zones' glue reads its tickets (`take_done`, src/zone/zonepack.cpp:329) and writes their views in the module's
+  present (src/pack/pack_module.cpp:467-468), before `backend::present`'s `retire::on_present`
+  (src/backend/backend.cpp:766). That is safe because a gone ticket keeps its texture (below): a view's texture lives
+  while its ticket is held, whatever the epoch does meanwhile.
 
 - Its own copy queue, one fence and four allocators and lists (`kInFlight`), made on the worker thread
-  (src/pack/stream.cpp:485-491) and used by it alone. The fence is signalled only by the worker, after each
-  `ExecuteCommandLists` (:1072-1073): one writer, values only going up. An allocator is reset only once the fence has
-  passed the value after its last list (`list_value`, :1042); at most 4 copies are in flight (`pick_locked`, :1101).
+  (src/pack/stream.cpp:534-540) and used by it alone. The fence is signalled only by the worker, after each
+  `ExecuteCommandLists` (:1121-1122): one writer, values only going up. An allocator is reset only once the fence has
+  passed the value after its last list (`list_value`, :1080, reset :1091); at most 4 copies are in flight
+  (`pick_locked`, :1155).
 - No GPU `Wait`: a ticket is stored ready (`memory_order_release`) only after the worker read the copy fence past its
-  copy (`complete`, :712, :745), so any list the game's thread records after it saw ready is submitted after the copy
+  copy (`complete`, :761, :794), so any list the game's thread records after it saw ready is submitted after the copy
   finished. Same scheme as the zone's `ready()`. packstream_test holds copies on the GPU (below) and checks that no
   ticket reads ready meanwhile.
 - Every wait on the copy fence is `SetEventOnCompletion` plus `WaitForMultipleObjects` with the stop event and a
-  timeout: 1 s while running (:782-785, :1350-1352), 1 s at a device change and 50 ms at stop (`wait_copies`, :590).
+  timeout: 1 s while running (:831-834, :1411-1413), 1 s at a device change and 50 ms at stop (`wait_copies`, :639).
   Never INFINITE, never under the streamer's mutex.
 - `wait_copies` loops on `GetCompletedValue()` until the last copy's value or the deadline, never trusting the event
-  alone (:590-610): the one auto-reset event is registered for the oldest copy by the idle wait and `wait_oldest`, and
+  alone (:639-659): the one auto-reset event is registered for the oldest copy by the idle wait and `wait_oldest`, and
   when the stop event or a request ends that wait the registration stays and fires later, so a wait for the last
   copy returned at the oldest one's. Before the M3 review that leaked the ring, queue, lists and four textures at
   about half the stops with copies in flight. A spurious wake of the idle wait or `wait_oldest` only costs a pass.
 - What is released where: textures that were ready may be on the game's lists, so they go through `retire::later`
-  (:399-402), after the mutex is left. What only the copy queue saw (a texture never ready, the ring, queue, lists,
-  fence) is released by the worker once its own fence passed (:758, :817, `drop_parts` :452), never through retire
+  (:448-451), after the mutex is left. What only the copy queue saw (a texture never ready, the ring, queue, lists,
+  fence) is released by the worker once its own fence passed (:807, :889, `drop_parts` :501), never through retire
   (wrong queue). At stop or a device change, if the copies don't finish within the wait, they are left (counted
   `leaked`), not freed under the GPU.
-- An epoch change made on the worker (`do_open`, :1191: an open, close or reload) hands every resident texture to
-  `retire::later` (`end_epoch_locked`, :367) whenever the worker gets there, while owners may still hold views of
-  them (a gone ticket holds no reference). Retire's +2 rule covers lists recorded up to the next `retire::on_present`
-  (src/backend/backend.cpp:766), not the frame after it. So an owner reads its tickets (`poll`, `take_done`) after
-  the last present's `retire::on_present` and before it records, and records no view of one that isn't ready; a look
-  taken before that `on_present` in the same present can miss an epoch change landing in between and record the next
-  frame with a texture the fence passes too early. An owner that calls `open` or `close` itself stops recording its
-  views right then (docs/texture-pack/streamer.md "Notes for M4").
+- An epoch change made on the worker (`do_open`, :1240: an open, close or reload) happens whenever the worker gets
+  there, while owners may still record views of resident textures. So it lets none of them go (`end_epoch_locked`,
+  :399, keep, called at :1265): each ready ticket turns gone but keeps its texture (`finish`'s keep, :258), the texture
+  leaves the residency map (a new request streams it again) for the `held` list, and the last drop of its tickets
+  hands it to `retire::later` as any drop does (`drop_locked`'s gone case, :377). Its +2 rule then covers every list
+  recorded before the drop (docs/texture-pack/zones.md decision 1). Stop, a device change and a loss let go at once
+  (let-go mode, :1310, :1497, :693): the owners are cleared before stop, retire frees a device's objects at once when it sees
+  the next device, and nothing runs on a lost one; a gone ticket's hold is forgotten then, so its drop frees nothing
+  twice. Until M4 part B an open, close or reload let go at once too, and owners had to read their tickets after the
+  last present's `retire::on_present` and stop recording views before calling `open`/`close` (a gone ticket held no
+  reference); packstream_test's "gone tickets keep their texture" fails against that code.
 - Device removed: the worker stops submitting and never waits again, and releases what the copy queue used only if it
-  had seen every copy done before the loss. All three paths decide the same way: `lose_parts` (:617-624), and
-  `wait_copies` (:599-600) for `switch_device` and `shut_down`, which can run first (stop() or set_device() right after
+  had seen every copy done before the loss. All three paths decide the same way: `lose_parts` (:666-673), and
+  `wait_copies` (:648-649) for `switch_device` and `shut_down`, which can run first (stop() or set_device() right after
   device_lost()). A fence reading `UINT64_MAX` there means "removed", not "done": only `w.completed`, the last real
   value read, counts. A removed device needn't stop running what was submitted: WARP's `RemoveDevice` doesn't, and
   packstream_test crashed when the worker released a ring and a texture a copy still used. Otherwise they are left: a
   lost device ends the session anyway.
 - A device change stops new work at once: `pick_locked` starts nothing while `set_device`, an open or stop is pending
-  or the parts were made on another device (:1110), so no ticket of the new epoch is copied on the old device's queue
-  and ring, which `switch_device` (:1226) then lets go. Each job still in flight there leaves the residency map with
-  it (`let_flight_go_locked`, :563).
-- The ring is a CUSTOM heap buffer, CPU write-back in L0 (:499-511), because the reader reads the CPU's copy back for
+  or the parts were made on another device (:1159), so no ticket of the new epoch is copied on the old device's queue
+  and ring, which `switch_device` (:1279) then lets go. Each job still in flight there leaves the residency map with
+  it (`let_flight_go_locked`, :612).
+- The ring is a CUSTOM heap buffer, CPU write-back in L0 (:548-560), because the reader reads the CPU's copy back for
   its CRC.
-- Tests only: `stream::test::gate_copies` makes the copy queue `Wait` on a test fence before each copy (:1071), the one
+- Tests only: `stream::test::gate_copies` makes the copy queue `Wait` on a test fence before each copy (:1120), the one
   GPU wait in the streamer. packstream_test holds copies there to see nothing ready and the ring not reused under a
   copy, and to stop or remove the device with copies held; it signals the fence from the CPU.
 
@@ -237,10 +264,10 @@ AMD frame generation (src/framegen)
   the Mithra go between a frame's recording and its run and checks a new texture gets another pair.
 - Freed under a removed device's last copy (M3, 2026-11-02, packstream_test only). The streamer released its ring
   and textures at once on device loss, trusting "removed: nothing runs". On WARP the submitted copy went on running
-  and the test crashed in 4 of 6 runs. Now what a copy not yet seen done uses is left (src/pack/stream.cpp:617-624).
+  and the test crashed in 4 of 6 runs. Now what a copy not yet seen done uses is left (src/pack/stream.cpp:666-673).
   The M3 review found `switch_device` and `shut_down` still read `UINT64_MAX` as "done" when they ran before the
   worker handled the loss (stop() or set_device() right after device_lost()): a scratch run crashed 3 times in 22.
-  Fixed in `wait_copies` (:599-600); the "lost-stop" and "lost-switch" children hold the copies on the GPU and check
+  Fixed in `wait_copies` (:648-649); the "lost-stop" and "lost-switch" children hold the copies on the GPU and check
   nothing is released.
 - A stale fence event ended a wait early (M3 review, packstream_test only). `shut_down` and `switch_device` waited
   once on the auto-reset event, which an older registration set at the oldest copy, so they saw the last copy not
@@ -248,7 +275,10 @@ AMD frame generation (src/framegen)
 - Work started on the old device during a device change (M3 review). `pick_locked` didn't look at a pending
   `set_device`, so a ticket asked right after it could be copied on the old queue, and `switch_device` then left its
   entry in the residency map pointing at a released texture, the ticket "copying" for good. Fixed in `pick_locked`
-  (:1110); packstream_test makes the change on the worker in exactly that window (`test::before_pick`).
+  (:1159); packstream_test makes the change on the worker in exactly that window (`test::before_pick`).
+- An open lost to a device change (M4, packmodule_test on the 4070 Ti). The streamer's worker took a pending open
+  together with a pending `set_device` and returned after the device change, so the open was never done and the
+  module waited for its epoch for good. Now the open stays posted for the next pass (src/pack/stream.cpp:1359-1369).
 - Running on after the device was removed. Before 0.62 (a923d56) HiFi XI kept recording and submitting after a GPU
   hang and ended in "abnormal program termination". Now `gpu_crash::lost()` stops our passes, FSR and frame
   generation, and `retire::on_present` is no longer called.

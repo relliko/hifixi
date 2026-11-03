@@ -7,7 +7,8 @@
  *   6  table t4    the piece's texture                   7  table t5  its normal map
  *   s0             anisotropic x8, wrapping, mip bias -0.5 (the zone pass draws without mips: MIPFILTER NONE; the
  *                  game's textures have one level, an overlay's bigger copies step down to the game's size:
- *                  zm::texture::levels)
+ *                  zm::texture::levels, as do the texture pack's); the colour map sampled with draw_options'
+ *                  texture_bias more (the pack's under FSR) when it isn't 0
  * Pipelines are made as targets of new formats or sample counts come, one for each (blended, cull, door) set, and with
  * the light split as a second target when it's given (light_split.hpp; blended pieces leave it as it is).
  */
@@ -47,6 +48,7 @@ cbuffer frame_constants : register(b0)
 	row_major float4x4 view_proj;
 	float4 options;      // x: per-pixel lighting; yzw: the camera (the fixed-function pieces' range fog)
 	env_t envs[8];
+	float4 tex_bias;     // x: the colour map's extra mip bias (the texture pack's under FSR); 0: Sample as ever
 };
 cbuffer draw_constants : register(b1)
 {
@@ -221,7 +223,12 @@ v2p vs(uint vid : SV_VertexID)
 // The piece's colour; share: the sun's share of its light (light_share)
 float4 shade(v2p i, out float share)
 {
-	const float4 t = colour_map.Sample(wrap, i.uv);
+	// (a branch on a constant, the same for every pixel: with no bias, the instruction as it always was)
+	float4 t;
+	[branch] if (tex_bias.x != 0)
+		t = colour_map.SampleBias(wrap, i.uv, tex_bias.x);
+	else
+		t = colour_map.Sample(wrap, i.uv);
 	const float a = saturate(4 * t.a * i.vcol.a);
 	if ((piece & kTested) != 0 && a <= 96.0 / 255.0)
 		discard;
@@ -338,6 +345,7 @@ light_out ps_light(v2p i)
 			float view_proj[16];
 			float options[4];
 			gpu_env envs[kMaxEnvs];
+			float tex_bias[4]; // (x: draw_options::texture_bias)
 		};
 		static_assert(kMaxEnvs == 8); // (the shader's envs[8])
 		static_assert(sizeof(gpu_constants) <= kConstantsBytes);
@@ -441,9 +449,10 @@ light_out ps_light(v2p i)
 			for (int i = 15; i >= 0 && (name[i] == ' ' || name[i] == 0); --i)
 				name[i] = 0;
 			std::snprintf(line, sizeof(line), "  %s: draw %u: object %u (model %u \"%s\", at %.1f %.1f %.1f, flags 0x%X, %s), its piece %u (index %u, %u triangles, "
-				"texture %d, normal map %d, shader flags 0x%X); its game lamps (bytes, 255 none): %u %u %u %u\n",
+				"texture %d (%s), normal map %d, shader flags 0x%X); its game lamps (bytes, 255 none): %u %u %u %u\n",
 				what, draw, n.object, n.model, name, n.at[0], n.at[1], n.at[2], n.object_flags, n.zone == 0 ? "the zone's" : "the second map's", n.piece,
-				n.first_index, n.triangles, int(n.texture), int(n.normal_map), n.flags, n.lamps & 255, (n.lamps >> 8) & 255, (n.lamps >> 16) & 255, n.lamps >> 24);
+				n.first_index, n.triangles, int(n.texture), n.pack ? "the texture pack's" : "the game's", int(n.normal_map), n.flags, n.lamps & 255, (n.lamps >> 8) & 255,
+				(n.lamps >> 16) & 255, n.lamps >> 24);
 			return line;
 		}
 	}
@@ -825,6 +834,7 @@ light_out ps_light(v2p i)
 		std::memcpy(c.view_proj, p.view_proj, sizeof(c.view_proj));
 		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
 		std::memcpy(c.options + 1, p.camera, 12);
+		c.tex_bias[0] = std::isfinite(o.texture_bias) ? o.texture_bias : 0.0f;
 		// (the pass's environments; any not filled are its first's)
 		for (uint32_t i = 0; i < kMaxEnvs; ++i)
 		{
@@ -944,7 +954,9 @@ light_out ps_light(v2p i)
 					(blended ? kBlended : 0);
 				const uint32_t dc[4] = { i, pc.first_index, flags, 0 };
 				list->SetGraphicsRoot32BitConstants(1, 4, dc, 0);
-				list->SetGraphicsRootDescriptorTable(6, z->texture_srv(pc.texture));
+				// (the texture pack's view once its word says drawn: gpu_zone::texture_srv; whether it was, for the breadcrumbs)
+				bool pack = false;
+				list->SetGraphicsRootDescriptorTable(6, z->texture_srv(pc.texture, &pack));
 				list->SetGraphicsRootDescriptorTable(7, z->normal_srv(pc.normal_map));
 				// (the breadcrumbs: begun before draw n, then draw n finished)
 				const uint32_t crumb = tag | (st.draws & 0xFFFFu);
@@ -968,6 +980,7 @@ light_out ps_light(v2p i)
 					n.object_flags = fo.flags;
 					n.texture = pc.texture;
 					n.normal_map = pc.normal_map;
+					n.pack = pack;
 					n.lamps = go[i].lamps[0];
 					n.zone = fo.zone;
 					std::memcpy(n.name, mo.name, sizeof(n.name));

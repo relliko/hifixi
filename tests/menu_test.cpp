@@ -12,7 +12,11 @@
  *     updated under the same name, deleted; names that can't be one refused;
  *   - the Upscaling tab with what FSR and frame generation are doing; a line under each section's heading; the
  *     weather debug on Advanced; settings waiting for the next start said under the presets; right-click "Reset to
- *     default"; Custom saying the preset it was changed from, what's changed, and "Back to" it.
+ *     default"; Custom saying the preset it was changed from, what's changed, and "Back to" it;
+ *   - the texture pack's setting (src/pack/pack_module): hidden without a pack folder, in the Game tab and in a search;
+ *     shown once the module has found one, with its lines under it and the Files line; the Off preset sets it 0, the
+ *     others leave it; a click saves it and makes the preset Custom; drawing the menu makes no file, DXGI or streamer
+ *     call of the module's.
  *
  *   build\menu_test.exe     (from this folder: it works in build\test\menu)
  */
@@ -20,6 +24,8 @@
 #include "../src/ui/menu.hpp"
 #include "../src/backend/backend.hpp"
 #include "../src/game/game.hpp"
+#include "../src/host/passes.hpp"
+#include "../src/pack/pack_module.hpp"
 #include "../src/render/worldfx_core.hpp"
 #include <cstdio>
 #include <cstring>
@@ -568,6 +574,96 @@ int main()
 		check(value("GrassDistance") == 140.0f && hifi::backend::preset() == "saved:Mine too", "Back to Mine too: its values again");
 		std::string why;
 		hifi::ui::delete_preset("Mine too", why);
+	}
+
+	// 12. The texture pack: its setting shown only while a pack folder is on this PC (the module's answer, cached at its
+	// first update and a reload), in the Game tab and in a search; the Off preset sets it 0, the others leave it; a click
+	// saves it, the preset Custom; drawing the menu makes no file, DXGI or streamer call of the module's (its I/O counter)
+	{
+		const hifi::passes::module *textures = nullptr;
+		for (const hifi::passes::module &m : hifi::passes::modules())
+			if (m.name != nullptr && std::strcmp(m.name, "textures") == 0)
+				textures = &m;
+		check(textures != nullptr && textures->update != nullptr && textures->command != nullptr && textures->stop != nullptr, "the texture pack's module registered");
+		const std::wstring pack = folder + L"hifixi-pack\\";
+		DeleteFileW((pack + L"pack.idx").c_str());
+		SetEnvironmentVariableW(L"HIFIXI_PACK", pack.c_str());
+		SetEnvironmentVariableW(L"HIFIXI_PIVOT_INI", (folder + L"no-pivot.ini").c_str());
+		auto option = [] {
+			std::string v;
+			return hifi::backend::option("textures", "pack", v) ? v : std::string("(none)");
+		};
+		auto command = [&](const char *what) {
+			std::vector<std::string> args { "textures", what }, out;
+			textures->command(args, out);
+			return out;
+		};
+		textures->update(1.0); // (its first: the folder looked for; no device, nothing started)
+		hifi::ui::show_tab(hifi::settings::tab::game);
+		bool balanced = draw();
+		check(balanced && !hifi::pack::folder_exists() && fake::has("En-spell effects") && !fake::has("Texture pack") && !fake::has("Use the texture pack") &&
+			!fake::has("Off: turn it on above."), "no pack folder: the Game tab without the texture pack's section, setting or lines");
+		hifi::ui::set_search("texture");
+		draw();
+		check(!fake::has("[Use the texture pack]"), "and a search for \"texture\" doesn't find it");
+		hifi::ui::set_search("");
+
+		CreateDirectoryW(pack.c_str(), nullptr);
+		write_text(pack + L"pack.idx", "not read: pack=0"); // (only looked for: with pack=0 nothing opens it)
+		hifi::backend::set_option("textures", "pack", "0");
+		command("reload");
+		textures->update(1.5);
+		balanced = draw();
+		check(balanced && hifi::pack::folder_exists() && fake::has("Texture pack") && fake::has("[Use the texture pack]") && fake::has("Off: turn it on above.") &&
+			fake::has("To remove the texture pack: turn it off, then delete the hifixi-pack folder") && fake::has("Higher-resolution textures kept on the graphics card"),
+			"a pack folder found by /hifi textures reload: the Game tab's Texture pack section, its line, the setting off, the module's lines under it");
+		hifi::ui::set_search("texture");
+		draw();
+		check(fake::has("[Use the texture pack]") && fake::has("The game's own / Texture pack"), "a search for \"texture\" finds it, under the Game tab");
+		hifi::ui::set_search("");
+		hifi::ui::show_tab(hifi::settings::tab::advanced);
+		draw();
+		check(fake::has("Texture pack: ") && fake::has("hifixi-pack\\"), "Advanced's Files: the texture pack's folder");
+
+		hifi::backend::set_option("textures", "pack", "1");
+		fake::click = "Off";
+		draw();
+		const std::string after_off = option();
+		bool left = true;
+		for (const char *p : { "Balanced", "High", "Ultra" })
+		{
+			hifi::backend::set_option("textures", "pack", "1");
+			fake::click = p;
+			draw();
+			left &= option() == "1";
+		}
+		check(after_off == "0" && left, ("the Off preset sets [textures] pack=0 (\"" + after_off + "\"); Balanced, High and Ultra leave it as it is").c_str());
+
+		hifi::backend::set_option("textures", "pack", "0");
+		fake::click = "Balanced";
+		draw();
+		hifi::ui::show_tab(hifi::settings::tab::game);
+		fake::click = "Use the texture pack";
+		draw();
+		draw();
+		check(option() == "1" && hifi::backend::preset() == "custom" && fake::has("[Use the texture pack]*"), "clicked: [textures] pack=1 saved, the preset Custom, shown ticked");
+
+		const uint64_t io0 = hifi::pack::test::io_calls();
+		for (hifi::settings::tab t : { hifi::settings::tab::game, hifi::settings::tab::advanced, hifi::settings::tab::overview })
+		{
+			hifi::ui::show_tab(t);
+			draw();
+		}
+		hifi::ui::set_search("texture");
+		draw();
+		hifi::ui::set_search("");
+		check(io0 > 0 && hifi::pack::test::io_calls() == io0, ("drawing the menu (the Game and Advanced tabs, a search) made no file, DXGI or streamer call of the module's (" +
+			std::to_string(io0) + " in its update and reload)").c_str());
+		hifi::backend::set_option("textures", "pack", "0");
+		std::string why;
+		textures->stop(why);
+		DeleteFileW((pack + L"pack.idx").c_str());
+		RemoveDirectoryW(pack.substr(0, pack.size() - 1).c_str());
 	}
 
 	// A safe start: the GPU stopped last session (the core's GpuStopped=1), so this one reads World FX's costliest parts

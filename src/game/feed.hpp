@@ -37,4 +37,7 @@ namespace hifi::game::feed
 	std::vector<std::string> status();
 	// The zone told to World FX (1000 + the room's model in a Mog House), 0 before the first
 	uint32_t zone();
+	// A character in, as World FX is told: logged in, not zoning, and after a zone change the zone-in packet come (or
+	// kZoneInWait gone by). The texture pack's quiet window waits for it (src/pack/pack_module.cpp)
+	bool in();
 }

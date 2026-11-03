@@ -12,7 +12,13 @@
  *     environment's light from the renderer; in a Mog House the light table's l_01 as lamp 0 of each;
  *   - the walk's end publishes the frame under its seq;
  *   - the frame drawn by the zone renderer's object-list record on WARP with the debug layer: the model's pixels in the
- *     target, nothing said by the debug layer.
+ *     target, nothing said by the debug layer;
+ *   - the texture pack's model actors (src/zone/zonepack; docs/texture-pack/zones.md): the DAT read in pack mode (keys)
+ *     with a made-up pack of its textures under build\test\modelactor; its textures asked for and drawn; then mid-stream
+ *     (copies held on the GPU) let go as unused, and again by forget_all (stop): its owner dropped each time, nothing
+ *     queued for it, nothing written after, nothing left; a reload (or off and on) in the same zone: the DAT's visit done,
+ *     kept in that zone, let go at the next zone change and read again with an owner; a DAT read in the other mode let
+ *     go at the next zone change.
  */
 
 #include <d3d12.h>
@@ -24,6 +30,11 @@
 #include "../src/zone/draw.hpp"
 #include "../src/zone/frame.hpp"
 #include "../src/zone/zone_gpu.hpp"
+#include "../src/zone/zonepack.hpp"
+#include "../src/host/retire.hpp"
+#include "../src/pack/pack_write.hpp"
+#include "../src/pack/stream.hpp"
+#include "../src/pack/validate.hpp"
 #include "game_dump.hpp"
 #include <cmath>
 #include <cstdio>
@@ -38,6 +49,7 @@ namespace
 	namespace zn = hifi::zone;
 
 	int failures = 0, passes = 0;
+	uint64_t g_writes = 0; // (the texture pack's slot writes: gpu_zone's test log)
 	void check(bool ok, const std::string &what)
 	{
 		std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what.c_str());
@@ -242,6 +254,193 @@ int main(int argc, char **argv)
 		check(got != nullptr && got->data().map == g_file && got->data().find(model_name) == model, "actordata: read, uploaded and handed over a few presents later");
 		zn::actordata::stop();
 		check(zn::actordata::find(g_file) == nullptr, "actordata: nothing after stop()");
+	}
+
+	// The texture pack's model actors: the DAT in pack mode, a made-up pack of its textures (2x copies)
+	{
+		namespace st = hifi::pack::stream;
+		namespace pk = hifi::pack;
+		namespace zp = hifi::zone::zonepack;
+		SetEnvironmentVariableW(L"HIFIXI_PIVOT_INI", L"build\\test\\modelactor\\none.ini");
+		zm::zone keyed_dat;
+		hifi::bake::result kr;
+		bool made = zm::load_file(g_file, keyed_dat, kr, true);
+		uint32_t keys = 0;
+		{
+			const std::wstring folder = L"build\\test\\modelactor\\pack\\";
+			CreateDirectoryW(L"build\\test\\modelactor", nullptr);
+			pk::writer w;
+			pk::writer_options o;
+			o.folder = folder;
+			o.source = "modelactor_test";
+			made = made && w.open(o, why);
+			for (const zm::texture &t : keyed_dat.textures)
+			{
+				if (!made || t.key.bytes == 0)
+					continue;
+				keys++;
+				pk::entry e;
+				e.hash = t.key.hash;
+				e.bytes = t.key.bytes;
+				e.w = t.key.w;
+				e.h = t.key.h;
+				e.source_kind = pk::kSourceModel;
+				std::memcpy(e.name, t.name, 16);
+				pk::map_in m;
+				m.format = pk::kBC2;
+				m.w = t.key.w * 2;
+				m.h = t.key.h * 2;
+				for (uint32_t l = 0; l < pk::full_levels(m.w, m.h); ++l)
+					m.levels.push_back(std::vector<uint8_t>(size_t((std::max(1u, m.w >> l) + 3) / 4) * ((std::max(1u, m.h >> l) + 3) / 4) * 16, uint8_t(0x40 + l)));
+				made = w.add(e, { m }, why) != pk::add_result::refused;
+			}
+			made = made && w.commit(why);
+			w.close();
+			made = made && keys == keyed_dat.textures.size();
+			check(made, "the model DAT in pack mode: " + std::to_string(keys) + " textures keyed, a made-up pack of them" + (why.empty() ? "" : ": " + why));
+			ID3D12Fence *gate = nullptr, *idle = nullptr;
+			device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate));
+			device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&idle));
+			uint64_t gate_value = 1, idle_value = 0;
+			uint64_t writes = 0;
+			hifi::zone::gpu_zone::set_test_log([](const hifi::zone::gpu_zone &, uint32_t, char what) {
+				if (what == 'w')
+					g_writes++;
+			});
+			st::start(device, 32);
+			const uint32_t e0 = st::epoch();
+			st::open(folder);
+			for (int i = 0; i < 10000 && st::epoch() == e0; ++i)
+				Sleep(1);
+			const uint32_t epoch = st::epoch();
+			zp::set_mode(false, true);
+			double now = 10.0;
+			auto present = [&](uint32_t zone) {
+				zn::actordata::frame(device, true, zone);
+				st::on_present();
+				zp::frame(now, epoch);
+				now += 0.016;
+				hifi::retire::on_present(direct);
+				direct->Signal(idle, ++idle_value);
+			};
+			auto until_up = [&](uint32_t zone) {
+				zn::gpu_zone *got = nullptr;
+				for (int i = 0; i < 3000 && got == nullptr; ++i)
+				{
+					present(zone);
+					got = zn::actordata::find(g_file);
+					if (got == nullptr)
+						Sleep(1);
+				}
+				return got;
+			};
+			// (read and drawn from the pack)
+			zn::gpu_zone *got = until_up(1);
+			// (up to 20 s, a ms apart: WARP's copies on a busy PC, the suites side by side; found each present, so it isn't
+			// let go as unused meanwhile)
+			for (int i = 0; i < 20000 && got != nullptr && got->pack_summary().drawn + got->pack_summary().spent < keys; ++i)
+			{
+				present(1);
+				got = zn::actordata::find(g_file);
+				Sleep(1);
+			}
+			const zn::gpu_zone::pack_counts c0 = got != nullptr ? got->pack_summary() : zn::gpu_zone::pack_counts();
+			check(got != nullptr && got->data().pack && got->has_pack() && c0.drawn == keys, "the DAT's textures from the pack: " + std::to_string(c0.drawn) + " of " +
+				std::to_string(keys) + " drawn");
+			// (let go as unused mid-stream: a new visit held by the gate first)
+			zn::actordata::stop();
+			st::test::gate_copies(gate, gate_value);
+			got = until_up(1);
+			// (the worker is below normal: on a busy PC it may take a while to pick them up)
+			for (int i = 0; i < 5000 && st::get_counts().in_flight == 0; ++i)
+			{
+				present(1);
+				Sleep(1);
+			}
+			const uint64_t flying = st::get_counts().in_flight;
+			writes = g_writes;
+			for (int i = 0; i < 3700; ++i) // (no find: unused for kUnusedPresents)
+				present(1);
+			const st::counts c1 = st::get_counts();
+			gate->Signal(gate_value);
+			// (the held copies done: the worker sees them pass at a time of its own, up to 10 s on a busy PC)
+			for (int i = 0; i < 50 || (i < 10000 && st::get_counts().in_flight != 0); ++i)
+			{
+				present(1);
+				Sleep(1);
+			}
+			const st::counts c1b = st::get_counts();
+			check(got != nullptr && flying > 0 && c1.owners == 0 && c1.queued == 0 && g_writes == writes && c1b.in_flight == 0 && c1b.leaked == 0,
+				"let go as unused with " + std::to_string(flying) + " copies in flight: its owner dropped, nothing queued, nothing written after, nothing left (owners " +
+					std::to_string(c1.owners) + ", queued " + std::to_string(c1.queued) + ", writes after " + std::to_string(g_writes - writes) + ", then in flight " +
+					std::to_string(c1b.in_flight) + ", leaked " + std::to_string(c1b.leaked) + ")");
+			// (forget_all mid-stream: stop)
+			gate_value++;
+			st::test::gate_copies(gate, gate_value);
+			got = until_up(1);
+			// (the worker is below normal: on a busy PC it may take a while to pick them up)
+			for (int i = 0; i < 5000 && st::get_counts().in_flight == 0; ++i)
+			{
+				present(1);
+				Sleep(1);
+			}
+			const uint64_t flying2 = st::get_counts().in_flight;
+			writes = g_writes;
+			zn::actordata::stop();
+			const st::counts c2 = st::get_counts();
+			gate->Signal(gate_value);
+			for (int i = 0; i < 50 || (i < 10000 && st::get_counts().in_flight != 0); ++i)
+			{
+				present(0);
+				Sleep(1);
+			}
+			const uint64_t in_flight2 = st::get_counts().in_flight;
+			check(got != nullptr && flying2 > 0 && c2.owners == 0 && c2.queued == 0 && g_writes == writes && in_flight2 == 0,
+				"forget_all (stop) with " + std::to_string(flying2) + " copies in flight: its owner dropped, nothing queued, nothing written after (owners " +
+					std::to_string(c2.owners) + ", queued " + std::to_string(c2.queued) + ", writes after " + std::to_string(g_writes - writes) + ", then in flight " +
+					std::to_string(in_flight2) + ")");
+			// (a reload, or off and on, in one zone: the module's clear_all and the mode off, then on again once the pack is
+			// back; the DAT's visit done and the mode the same: let go at the next zone change all the same, read again,
+			// a new visit with an owner)
+			got = until_up(1);
+			zp::clear_all();
+			zp::set_mode(false, false);
+			present(1);
+			zp::set_mode(false, true);
+			present(1);
+			const bool done_kept = got != nullptr && zn::actordata::find(g_file) == got && got->pack().done && got->pack().owner == 0;
+			present(2); // (a zone change)
+			const bool done_let_go = zn::actordata::find(g_file) == nullptr;
+			zn::gpu_zone *fresh = until_up(2);
+			for (int i = 0; i < 100 && fresh != nullptr && fresh->pack().owner == 0; ++i)
+			{
+				present(2);
+				fresh = zn::actordata::find(g_file);
+			}
+			check(done_kept && done_let_go && fresh != nullptr && fresh->data().pack && !fresh->pack().done && fresh->pack().owner != 0,
+				"a reload in the zone: the DAT's visit done, kept there; let go at the next zone change though read in the same mode, read again with an owner");
+			// (read in pack mode, then the pack off: let go at the next zone change, read again without it)
+			got = until_up(1);
+			zp::clear_all();
+			zp::set_mode(false, false);
+			present(1);
+			const bool kept_in_zone = zn::actordata::find(g_file) == got;
+			present(2); // (a zone change)
+			const bool let_go = zn::actordata::find(g_file) == nullptr;
+			zn::gpu_zone *again = until_up(2);
+			check(got != nullptr && kept_in_zone && let_go && again != nullptr && !again->data().pack,
+				"read in pack mode, the pack then off: kept in that zone, let go at the next, read again without it");
+			zn::actordata::stop();
+			st::stop();
+			for (int i = 0; i < 4; ++i)
+				present(0);
+			const st::counts end = st::get_counts();
+			check(end.leaked == 0 && !end.started, "the streamer stopped: nothing left");
+			hifi::zone::gpu_zone::set_test_log(nullptr);
+			gate->Release();
+			idle->Release();
+			SetEnvironmentVariableW(L"HIFIXI_PIVOT_INI", nullptr);
+		}
 	}
 
 	const bool started = ma::start(why);

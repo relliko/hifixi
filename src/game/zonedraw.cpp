@@ -103,6 +103,9 @@ namespace hifi::game::zonedraw
 			zone::gpu_zone *models_for[2] = {};
 			std::unordered_map<uintptr_t, uint32_t> model_of[2];
 			counts n;
+			// The last native pass's camera and its zone's map (camera(); map 0: none yet)
+			float camera[3] = {};
+			uint32_t camera_map = 0;
 		};
 		state g;
 		// The game's own count of the zone objects drawn in its last pass (renderer +0x39448, after 17B510: ours counted
@@ -483,6 +486,9 @@ namespace hifi::game::zonedraw
 		else if (kind == 1 && g.native && g.f != nullptr && seq == g.seq)
 		{
 			snapshot(*g.f, g.renderer);
+			// (the camera of the last pass drawn here, for the texture pack's request order: camera())
+			std::memcpy(g.camera, g.f->camera, sizeof(g.camera));
+			g.camera_map = g.f->map;
 			g.n.last_recorded = g.f->count;
 			g.n.last_left = uint32_t(g.n.left) - g.n.last_left;
 			g.n.last_envs = g.f->env_count - 1;
@@ -500,6 +506,15 @@ namespace hifi::game::zonedraw
 			g.native = false;
 			g.f = nullptr;
 		}
+	}
+
+	bool camera(float out[3], uint32_t &map)
+	{
+		if (g.camera_map == 0)
+			return false;
+		std::memcpy(out, g.camera, sizeof(g.camera));
+		map = g.camera_map;
+		return true;
 	}
 
 	bool start(std::string &why)

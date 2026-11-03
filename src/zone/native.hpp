@@ -29,6 +29,11 @@ namespace hifi::zone::native
 	// present asked for (nullptr until then, while the next is read, and while not wanted)
 	gpu_zone *ready_zone(uint32_t i = 0);
 	std::vector<std::string> status();
+	// The texture pack's mode for loads starting from now (docs/texture-pack/zones.md decision 5: a map keeps the mode it
+	// was read in): hifi-textures passed over, the textures' pack keys made (zonemesh::load's pack). Off by default; the
+	// texture pack's glue sets it while the pack is in use
+	void set_pack_mode(bool on);
+	bool pack_mode();
 	// Everything let go (waits for a load in flight)
 	void stop();
 }

@@ -40,9 +40,11 @@
  *   /hifi nativechars [perpixel|detail [on|off]]   HiFi XI drawing the characters in the game's place (src/chars;
  *                  [chars] perpixel its per-pixel lighting, [chars] detail the detail maps); the game draws any model
  *                  whose data isn't up yet, and for good one with a texture that couldn't be read
- *   /hifi textures [status]   the texture pack (src/pack; docs/texture-pack-plan.md): for now only the game's memory as
- *                  the pack will need it (the address space and its largest free block, video memory, the characters'
- *                  and the zone's bytes, each zone's lowest), and whether a texture bake is running
+ *   /hifi textures [status|on|off|compare|reload]   the texture pack (src/pack; docs/texture-pack-plan.md,
+ *                  docs/texture-pack/zones.md): on or off ([textures] pack, saved; on also for a session after a GPU
+ *                  stop), the game's own textures drawn to compare (not saved), the pack looked for and opened again;
+ *                  status: what it found and streams, and the game's memory as the pack needs it (the address space and
+ *                  its largest free block, video memory, each zone's lowest) and whether a texture bake is running
  *   /hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]   the world upscaled to the screen with AMD FSR 1 when the background
  *                  resolution is below the screen's (src/upscale; [upscale] fsr, sharpen)
  *   /hifi weather [<name>|off|flash]   World FX's own weather forced to one of the game's weathers (fine, suny, clod,
@@ -89,6 +91,8 @@
 #include "../render/gpu_crash.hpp"
 #include "../ui/menu.hpp"
 #include "../pack/memwatch.hpp"
+#include "../pack/pack_module.hpp"
+#include "../zone/zonepack.hpp"
 #include "hangwatch.hpp"
 #include <cctype>
 #include <cmath>
@@ -99,7 +103,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.65;
+	constexpr double kVersion = 0.66;
 	// A present's steps on the game's thread, timed; the lot in the log when they took over kSlowPresentMs (at most
 	// kSlowPresentLines a session: a zone change takes a second or two every time)
 	struct slow_present
@@ -1010,6 +1014,11 @@ public:
 		gpu_crash::add_section(hifi::zone::breadcrumb_report); // (the native zone pass's breadcrumbs in a GPU crash report)
 		gpu_crash::add_section(rate_section);                   // (and the frame rate's state: on, the cap, the speed-ups)
 		gpu_crash::add_section(hifi::pack::crash_section);      // (and the game's memory, whether a bake runs: src/pack/memwatch)
+		// (the texture pack's module calls the zones' and model actors' glue: src/zone/zonepack; it orders a zone's
+		// textures from the last zone pass's camera and logs each zone's coverage)
+		hifi::zone::zonepack::set_camera_source(hifi::game::zonedraw::camera);
+		hifi::zone::zonepack::set_log(hifi::backend::log);
+		hifi::pack::set_consumer(hifi::zone::zonepack::consumer());
 		return true;
 	}
 
@@ -1214,7 +1223,7 @@ public:
 				say("HiFi XI's passes can't go in: " + why, true);
 		}
 		else
-			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi textures: the game's memory for the texture pack; /hifi reset: its counts again; /hifi off|on: its passes off or on again.");
+			say("/hifi: the menu; /hifi status: what HiFi XI has seen; /hifi glows: the glows lighting the scene now; /hifi gpu: World FX's GPU time by section; /hifi gamedraw zone|chars [on|off]: the game's own drawing off (debug); /hifi zoneslot: the zone pass's markers; /hifi charslot: the character passes' markers; /hifi chardata: the characters' data on the GPU; /hifi nativechars [perpixel|detail [on|off]]: HiFi XI drawing the characters; /hifi enspell [auto|off|<element>]: the en-spell effect on your blades; /hifi zonedata: each zone's data on the GPU; /hifi nativezone [perpixel on|off]: HiFi XI drawing the zone; /hifi weather <name>|off|flash: World FX's own weather forced (debug); /hifi textures [on|off|compare|reload|status]: the texture pack; /hifi reset: its counts again; /hifi off|on: its passes off or on again.");
 		return true;
 	}
 
@@ -1306,8 +1315,14 @@ public:
 			native_gate();
 			slow.step("the native zone's data");
 			// (the model actors' DATs, as they're seen)
-			hifi::zone::actordata::frame(worldfx::attached(), p.in_game && hifi::game::modelactor::in());
+			hifi::zone::actordata::frame(worldfx::attached(), p.in_game && hifi::game::modelactor::in(), p.in_game ? hifi::game::feed::zone() : 0);
 			slow.step("the model actors' data");
+			// (the texture pack's textures sampled with more detail under FSR while the pack is in use: log2 of the world's
+			// width over the screen's, at least -1.0 more; none else: docs/texture-pack/zones.md "The FSR bias")
+			{
+				float ratio = 1.0f;
+				hifi::zone::inject::set_texture_bias(hifi::pack::fsr_bias_on() && hifi::upscale::world_scale(ratio) ? hifi::pack::fsr_bias(ratio) : 0.0f);
+			}
 			// (the own-frame passes, src/host/passes.hpp: the device as it's known, then each present)
 			if (ID3D12Device *const device = worldfx::attached(); device != m_pass_device)
 			{

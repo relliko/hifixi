@@ -24,6 +24,7 @@
 //     own objects).
 
 #include "bake.hpp"
+#include "../pack/pack.hpp" // (pack::key, header-only)
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -87,6 +88,9 @@ namespace hifi::bake::zonemesh
 		// size (4x: 3), so it's sharper close up and unchanged at the distance the game's own was seen at
 		uint32_t levels = 1;
 		std::vector<std::vector<uint8_t>> mips; // (the levels after the first, made by load on the loader's thread)
+		// Its texture pack key (docs/texture-pack/zones.md): the chunk's whole body as read, made only in pack mode for a
+		// DAT read from the game's own file (an overlay's copy gets none); empty (bytes 0) otherwise
+		hifi::pack::key key;
 	};
 
 	struct normal_map
@@ -120,6 +124,9 @@ namespace hifi::bake::zonemesh
 		std::vector<normal_map> normal_maps;
 		std::vector<placement> placements;
 		uint32_t missing_textures = 0; // (pieces whose texture isn't in the DAT: drawn untextured)
+		// Read in the texture pack's mode (load's pack): hifi-textures passed over, keys made for the game's own file
+		bool pack = false;
+		bool overlaid = false; // (the DAT read was an XIPivot overlay's copy, not the game's own file: no keys)
 
 		// A model by its 16-character name (the live model's +8), kNone when there's none
 		uint32_t find(const char name[16]) const;
@@ -130,11 +137,14 @@ namespace hifi::bake::zonemesh
 	uint32_t map_dat(uint32_t map);
 	uint32_t bump_dat(uint32_t map);
 
-	// The zone's data; false with r.why (or r.none: no such DAT) when it can't be read
-	bool load(uint32_t map, zone &out, result &r);
+	// The zone's data; false with r.why (or r.none: no such DAT) when it can't be read. pack: the texture pack's mode
+	// (docs/texture-pack/zones.md): the DAT read through every XIPivot overlay but hifi-textures (bake::overlaid's
+	// exclude), and each texture's pack key made from the chunk read when that's the game's own file; off, today's read
+	// byte for byte (hifi-textures' bigger copies and their smaller levels)
+	bool load(uint32_t map, zone &out, result &r, bool pack = false);
 	// Any DAT's models and textures by its file id (a model actor's: a ship, furniture, a plant; no normal maps, no
 	// placements); out.map is the file id
-	bool load_file(uint32_t file, zone &out, result &r);
+	bool load_file(uint32_t file, zone &out, result &r, bool pack = false);
 
 	// 01E0A0: a height map (w x h bytes, rows top first) made into normals, wrapping at the edges. With gy = (the row
 	// above's 1 2 1) - (the row below's) and gx = (the left column's 1 2 1) - (the right's), and k = 127 /

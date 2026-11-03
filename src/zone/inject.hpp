@@ -27,6 +27,10 @@ namespace hifi::zone::inject
 	bool prepare(ID3D12Device *device, std::string &why);
 	void release();
 	void set_options(bool per_pixel);
+	// The colour maps' extra mip bias for the passes from now (draw_options::texture_bias): the texture pack's under FSR,
+	// set each present by the plugin (docs/texture-pack/zones.md "The FSR bias"); 0: none, the shader's Sample as ever
+	void set_texture_bias(float bias);
+	float texture_bias();
 	// Whether passes can be handed over: the renderer is up and the last ones handed over were drawn (none failed in
 	// the last two seconds)
 	bool ready();

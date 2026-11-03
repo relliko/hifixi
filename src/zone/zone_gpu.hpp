@@ -12,14 +12,26 @@
 //                 levels down to the game's size (zonemesh::texture::mips, made on the loader's thread)
 //   normal maps   B8G8R8A8_UNORM, as the game makes them (zonemesh::sobel)
 //   descriptors   a shader-visible heap of its own: the textures, then the normal maps, then two stand-ins: white (a
-//                 piece without a texture) and flat (one without a normal map)
+//                 piece without a texture) and flat (one without a normal map); for a zone read in the texture pack's
+//                 mode with keys (zonemesh::zone::pack, not overlaid), then a pack region of one slot a texture
 //
 // The CPU side keeps what drawing needs (models, pieces, placements); the vertex and texture data are dropped once
 // they're on their way.
+//
+// The texture pack's region (docs/texture-pack/zones.md "The gpu_zone's pack region and the write-once slot rule"):
+// each slot starts as the game texture's own view, and is written once at most in this gpu_zone's life, by its owner's
+// glue (src/zone/zonepack: stream::write_view of a ready ticket), before its word says drawn; nothing written after.
+// So no list in flight ever reads a slot that is written: until drawn texture_srv names the game's slot, after it no
+// one writes. A word: none (no key, or not asked yet), asked, drawn (texture_srv names the pack slot), spent (missed,
+// gone, cleared, the pack off in this visit: never asked again). The glue's stream calls live in zonepack; this file
+// keeps only the data (the owner, the tickets: plain numbers) and calls the glue's drop hook when it's let go.
 
 #include <d3d12.h>
 #include "../bake/zonemesh.hpp"
+#include "../pack/stream.hpp" // (the owner and ticket types only: nothing of the streamer's is called here)
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,12 +61,64 @@ namespace hifi::zone
 		D3D12_VERTEX_BUFFER_VIEW vertex_view() const;
 		D3D12_INDEX_BUFFER_VIEW index_view() const;
 		ID3D12DescriptorHeap *heap() const { return _heap; }
-		// A piece's texture and normal map descriptors (the stand-ins for none)
-		D3D12_GPU_DESCRIPTOR_HANDLE texture_srv(uint32_t texture) const;
+		// A piece's texture and normal map descriptors (the stand-ins for none). texture_srv: the texture pack's slot when
+		// its word says drawn and compare is off (pack: set whether it was), else the game's; game_srv: the game's always
+		// (the effects' zone meshes and the zone shadows' cut-outs: zones.md "Selection")
+		D3D12_GPU_DESCRIPTOR_HANDLE texture_srv(uint32_t texture, bool *pack = nullptr) const;
+		D3D12_GPU_DESCRIPTOR_HANDLE game_srv(uint32_t texture) const;
 		D3D12_GPU_DESCRIPTOR_HANDLE normal_srv(uint32_t normal_map) const;
-		// Bytes on the GPU, and how long the copies took (ms from upload to ready; 0 until then)
-		uint64_t bytes() const { return _bytes; }
+		// Bytes on the GPU (the texture pack's textures its tickets hold counted in: one shared by two owners in each), and
+		// how long the copies took (ms from upload to ready; 0 until then)
+		uint64_t bytes() const { return _bytes + _pack.bytes; }
 		double upload_ms() const { return _upload_ms; }
+
+		// ---- The texture pack's region (zones.md; the game's thread)
+		enum pack_word : uint8_t
+		{
+			kPackNone = 0,  // (no key, or not asked yet)
+			kPackAsked = 1, // (a ticket out)
+			kPackDrawn = 2, // (its slot holds the pack's view: texture_srv names it)
+			kPackSpent = 3, // (missed, gone, cleared, or the pack off in this visit: never asked again)
+		};
+		// What the glue keeps here as plain data (src/zone/zonepack): the owner (0: none), the epoch it asked in, a
+		// ticket a texture, the bytes of the ready ones, and whether this visit is done (its owner dropped: never asked
+		// again)
+		struct pack_data
+		{
+			hifi::pack::stream::owner owner = 0;
+			uint32_t epoch = 0;
+			std::vector<hifi::pack::stream::ticket> tickets;
+			uint64_t bytes = 0;
+			bool done = false;
+		};
+		// Whether it has a pack region (read in pack mode from the game's own file, with textures)
+		bool has_pack() const { return _pack_words != nullptr; }
+		pack_data &pack() { return _pack; }
+		const pack_data &pack() const { return _pack; }
+		uint8_t pack_word(uint32_t texture) const;
+		// (release: after the view is written, drawn is stored last)
+		void set_pack_word(uint32_t texture, uint8_t word);
+		// The texture's pack slot for stream::write_view (CPU side of the shader-visible heap: written, never read)
+		D3D12_CPU_DESCRIPTOR_HANDLE pack_cpu(uint32_t texture) const;
+		// The glue says it wrote a slot (the test log's 'w')
+		void pack_written(uint32_t texture) const;
+		// Its pack textures let go now (the drop hook, when it has an owner): before a hand-over to retire::later, so the
+		// textures and the zone are freed at the same fence. release() and the destructor call it too
+		void pack_let_go();
+		// Counts of the words (status lines)
+		struct pack_counts
+		{
+			uint32_t textures = 0, keyed = 0, asked = 0, drawn = 0, spent = 0;
+		};
+		pack_counts pack_summary() const;
+		// /hifi textures compare: the game's own textures drawn where the pack's are ready (every gpu_zone; nothing freed)
+		static void set_compare(bool on);
+		static bool comparing();
+		// The glue's drop hook (zonepack: stream::drop_owner, every word spent, the owner 0, out of its list), run by
+		// pack_let_go and release() when the zone has an owner; nullptr: none (nothing gets one then)
+		static void set_pack_drop(void (*fn)(gpu_zone &));
+		// (tests) Each pack slot write ('w') and word change ('a' asked, 'd' drawn, 's' spent); nullptr in the plugin
+		static void set_test_log(void (*fn)(const gpu_zone &, uint32_t texture, char what));
 
 	private:
 		bake::zonemesh::zone _z;
@@ -74,5 +138,9 @@ namespace hifi::zone
 		// with it (release waits for it)
 		uint32_t _copying = 0;
 		uint32_t _vertex_count = 0, _index_count = 0;
+		// The texture pack's region: its first slot (the images' count), a word a texture (nullptr: no region)
+		uint32_t _pack_base = 0;
+		std::unique_ptr<std::atomic<uint8_t>[]> _pack_words;
+		pack_data _pack;
 	};
 }

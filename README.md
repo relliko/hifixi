@@ -78,6 +78,12 @@ Grass, water, the sea past the zone's edge, rain, wet ground and the lamps come 
 
 They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
+## Texture pack (optional)
+
+A texture pack is higher-resolution textures made on your own PC from your game's files, kept in `bootloader\hifixi-pack\` and streamed to the graphics card as you play. Nothing of it ships with HiFi XI. When that folder is there, the menu's **The game's own** tab shows **Use the texture pack** (off by default) with what it found; scenery, ships and furniture switch to the pack's textures at the next area you enter, and anything the pack doesn't have is drawn as the game's own. The **Off** preset turns it off.
+
+To remove it: turn it off (the setting, or `/hifi textures off`), then delete the `bootloader\hifixi-pack` folder. Turned off, HiFi XI has none of its files open, so the folder can be deleted while the game runs.
+
 ## Commands
 
 - `/hifi`: the menu.
@@ -87,6 +93,7 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 - `/hifi nativezone`, `/hifi nativechars`: what HiFi XI's own drawing of the zone, or the characters, is doing; `perpixel on|off` after either for its per-pixel light.
 - `/hifi upscale [on|off] [sharpen <0..1>] [framegen on|off]`: FSR on or off, its sharpening, frame generation (on from the next start, off at once), and whether they're drawing now.
 - `/hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]`: the en-spell effect on your weapons. `auto` (the default) follows the en-spell on you; an element shows that one now, to see it. The same buttons are in the menu's Game tab.
+- `/hifi textures [on|off|compare|reload|status]`: the texture pack on or off (saved), the game's own textures drawn instead to compare (not saved), the pack looked for and opened again, or what it's doing.
 - `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
 - `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
 - `/hifi reset`: its counts started again.

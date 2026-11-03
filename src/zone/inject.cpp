@@ -49,6 +49,7 @@ namespace hifi::zone::inject
 			std::atomic<ULONGLONG> movers_at { 0 };
 			std::atomic<bool> shadow_up { false };
 			std::atomic<bool> per_pixel { false };
+			std::atomic<float> texture_bias { 0.0f }; // (the texture pack's under FSR: set_texture_bias)
 			// The world's depth and its planes' states as recorded (dgVoodoo's one thread)
 			ID3D12Resource *depth = nullptr;
 			D3D12_RESOURCE_STATES plane[2] = { kUnknown, kUnknown };
@@ -173,6 +174,7 @@ namespace hifi::zone::inject
 			t.height = float(rd.Height);
 			draw_options o;
 			o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
+			o.texture_bias = g.texture_bias.load(std::memory_order_relaxed);
 
 			// Depth and stencil planes writable, the target a target; the pass; all as it was
 			const D3D12_RESOURCE_STATES p0 = g.plane[0], p1 = g.plane[1];
@@ -285,6 +287,16 @@ namespace hifi::zone::inject
 	void set_options(bool per_pixel)
 	{
 		g.per_pixel.store(per_pixel, std::memory_order_relaxed);
+	}
+
+	void set_texture_bias(float bias)
+	{
+		g.texture_bias.store(bias, std::memory_order_relaxed);
+	}
+
+	float texture_bias()
+	{
+		return g.texture_bias.load(std::memory_order_relaxed);
 	}
 
 	bool ready()

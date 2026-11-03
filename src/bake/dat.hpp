@@ -25,7 +25,12 @@ namespace hifi::bake
 	// XIPivot's copy of a game file when one of its overlays has it (Ashita's config\pivot\pivot.ini beside the
 	// plugins folder, or the one HIFIXI_PIVOT_INI names: [settings] root_path, [overlays] N=name, the lowest N first),
 	// else the path as given. The game loads that copy, so what's drawn natively from its textures reads it too.
-	std::wstring overlaid(const std::wstring &path);
+	// exclude: an overlay of that name (any case) passed over, as if pivot.ini didn't list it (the texture pack's zones
+	// read L"hifi-textures"'s original: docs/texture-pack/zones.md)
+	std::wstring overlaid(const std::wstring &path, const wchar_t *exclude = nullptr);
+	// The overlays pivot.ini lists, by name, the lowest N first (none: no pivot.ini, or none listed). Reads the file:
+	// never per frame (the texture pack's module, at its first update and a reload: is hifi-textures still listed?)
+	std::vector<std::wstring> overlays();
 	// A whole file; false when it can't be read
 	bool read_file(const std::wstring &path, std::vector<uint8_t> &out);
 

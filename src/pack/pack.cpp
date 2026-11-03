@@ -139,6 +139,8 @@ namespace hifi::pack
 		out.level_crcs.resize(h.crc_count);
 		if (h.crc_count != 0)
 			std::memcpy(out.level_crcs.data(), p, size_t(h.crc_count) * 4);
+		out.by_source[0] = out.by_source[1] = out.by_source[2] = 0;
+		out.colour_bytes = 0;
 		for (size_t i = 0; i < out.entries.size(); ++i)
 		{
 			const entry &e = out.entries[i];
@@ -147,10 +149,13 @@ namespace hifi::pack
 				why = "pack.idx's entries aren't sorted by key (entry " + std::to_string(i) + ")";
 				return false;
 			}
+			out.by_source[e.source_kind == kSourceZone || e.source_kind == kSourceModel ? e.source_kind : kSourceUnknown]++;
 			for (const record &r : e.maps)
 			{
 				if (r.kind != kColour && r.kind != kHeight && r.kind != kMaterial)
 					continue; // (unused, or a kind of a later version: skipped)
+				if (r.kind == kColour)
+					out.colour_bytes += r.bytes;
 				if (r.file >= h.file_count || uint64_t(r.offset) + r.bytes > out.file_bytes[r.file])
 				{
 					why = "an entry's map lies past the end of " + narrow(data_path(L"", r.file)) + " (entry " + std::to_string(i) + ")";

@@ -3,7 +3,9 @@
  * slots (the zone, and a second map such as a building's interior), each one load at a time: a thread reads the map's
  * DATs (zonemesh::load: 3-35 ms offline), then the game's thread uploads them at its next present (gpu_zone::upload on
  * our copy queue) and polls the copy's fence at the presents after. A map left is let go once the GPU is past every
- * list that may draw it (host/retire.hpp).
+ * list that may draw it (host/retire.hpp). In the texture pack's mode (set_pack_mode, read as a load starts) a map is
+ * read with hifi-textures passed over and its textures' pack keys made; its pack textures are let go as it's handed to
+ * the retire list (gpu_zone::pack_let_go), the zone itself with them at the same fence.
  */
 
 #include <windows.h>
@@ -48,6 +50,7 @@ namespace hifi::zone::native
 			slot slots[2];
 		};
 		state g;
+		std::atomic<bool> g_pack_mode { false }; // (set_pack_mode: read as a load starts)
 
 		void join(slot &s)
 		{
@@ -57,6 +60,9 @@ namespace hifi::zone::native
 
 		void retire(slot &s)
 		{
+			// (its texture pack textures let go now, so they go at the same fence as the zone: zones.md "Destruction points")
+			if (s.current != nullptr)
+				s.current->pack_let_go();
 			retire::later(std::move(s.current));
 			s.map = 0;
 		}
@@ -132,13 +138,15 @@ namespace hifi::zone::native
 				s.loading = map;
 				s.loaded = false;
 				slot *const p = &s;
-				s.thread = std::thread([p, map] {
+				// (the texture pack's mode as the load starts: it stays with the map's gpu_zone, zones.md decision 5)
+				const bool pack = g_pack_mode.load();
+				s.thread = std::thread([p, map, pack] {
 					const auto t0 = std::chrono::steady_clock::now();
 					// (anything thrown, out of memory in the 32-bit game: the map failed; an exception leaving a thread
 					// ends the game)
 					try
 					{
-						p->read_ok = zm::load(map, p->data, p->result);
+						p->read_ok = zm::load(map, p->data, p->result, pack);
 					}
 					catch (...)
 					{
@@ -208,6 +216,16 @@ namespace hifi::zone::native
 				else
 					std::snprintf(line, sizeof(line), "native zone data: %s %u being copied to the GPU (%.1f MB)", what, s.map, double(s.current->bytes()) / 1048576.0);
 				lines.push_back(line);
+				// (the texture pack's coverage: zones.md "Settings, menu, status")
+				if (z.pack && z.overlaid)
+					lines.push_back(std::string("native zone data: ") + what + ": read from an XIPivot overlay's copy: no texture pack textures");
+				else if (s.current->has_pack())
+				{
+					const gpu_zone::pack_counts c = s.current->pack_summary();
+					std::snprintf(line, sizeof(line), "native zone data: %s: texture pack: %u of %u textures from it, %u not (not in it, or failed), %u waiting, %u with no key%s",
+						what, c.drawn, c.textures, c.spent, c.asked, c.textures - c.keyed, gpu_zone::comparing() ? " (comparing: the game's drawn)" : "");
+					lines.push_back(line);
+				}
 			}
 			else if (i == 0 && g.device == nullptr)
 				lines.push_back("native zone data: not loaded (off: /hifi zonedata on reads each zone's meshes, textures and normal maps onto the GPU)");
@@ -217,6 +235,16 @@ namespace hifi::zone::native
 				lines.push_back(std::string("native zone data: ") + what + " " + std::to_string(s.failed_map) + " not loaded: " + s.why);
 		}
 		return lines;
+	}
+
+	void set_pack_mode(bool on)
+	{
+		g_pack_mode.store(on);
+	}
+
+	bool pack_mode()
+	{
+		return g_pack_mode.load();
 	}
 
 	void stop()

@@ -1,7 +1,11 @@
 /*
  * The model actors' data on the GPU (actordata.hpp). One DAT read at a time on a thread (zonemesh::load_file: a ship's or
  * a furniture DAT is small), uploaded at the next present on our copy queue, its fence polled at the presents after.
- * The DATs asked for wait in a short queue (a Mog House full of furniture asks for a dozen at once).
+ * The DATs asked for wait in a short queue (a Mog House full of furniture asks for a dozen at once). In the texture
+ * pack's mode (set_pack_mode, read as a load starts) a DAT is read with hifi-textures passed over and its textures' pack
+ * keys made; a DAT read in the other mode, or whose pack visit was ended (a reload, off and on), is let go at the next
+ * zone change (and read again as it's seen). Every DAT
+ * handed to the retire list lets go of its pack textures first (gpu_zone::pack_let_go).
  */
 
 #include <windows.h>
@@ -51,8 +55,19 @@ namespace hifi::zone::actordata
 			bool read_ok = false;
 			double read_ms = 0.0;
 			uint64_t asked = 0, uploaded = 0, failed = 0, let_go = 0;
+			uint32_t zone = 0; // (the zone the last present was in: a change lets go of the DATs read in the other mode)
 		};
 		state g;
+		std::atomic<bool> g_pack_mode { false }; // (set_pack_mode: read as a load starts)
+
+		// A DAT's data to the retire list, its texture pack textures let go first (the same fence for both)
+		void hand_over(std::unique_ptr<gpu_zone> &z)
+		{
+			if (z == nullptr)
+				return;
+			z->pack_let_go();
+			retire::later(std::move(z));
+		}
 
 		void join()
 		{
@@ -80,7 +95,7 @@ namespace hifi::zone::actordata
 		}
 	}
 
-	void frame(ID3D12Device *device, bool wanted)
+	void frame(ID3D12Device *device, bool wanted, uint32_t zone)
 	{
 		g.presents++;
 		if (device != g.device)
@@ -94,8 +109,7 @@ namespace hifi::zone::actordata
 				g.loading = 0;
 				g.loaded = false;
 				for (auto &f : g.files)
-					if (f.second.z != nullptr)
-						retire::later(std::move(f.second.z));
+					hand_over(f.second.z);
 				g.files.clear();
 				g.queue.clear();
 			}
@@ -113,11 +127,18 @@ namespace hifi::zone::actordata
 			}
 		}
 
-		// DATs no model actor has drawn from lately let go
+		// DATs no model actor has drawn from lately let go; at a zone change, those read in the texture pack's other mode
+		// too, and those whose pack visit is done (a reload, or off and on, dropped their owner: a done visit never gets
+		// one again, and the mode is the same once the pack is back). zones.md decision 5: read again as they're seen,
+		// the game drawing them meanwhile
+		const bool zone_changed = zone != g.zone;
+		g.zone = zone;
+		const bool pack = g_pack_mode.load();
+		auto stale = [&](const gpu_zone &z) { return z.data().pack != pack || (pack && z.pack().done); };
 		for (auto i = g.files.begin(); i != g.files.end();)
-			if (i->second.z != nullptr && g.presents - i->second.used_at > kUnusedPresents)
+			if (i->second.z != nullptr && (g.presents - i->second.used_at > kUnusedPresents || (zone_changed && stale(*i->second.z))))
 			{
-				retire::later(std::move(i->second.z));
+				hand_over(i->second.z);
 				g.let_go++;
 				i = g.files.erase(i);
 			}
@@ -166,13 +187,13 @@ namespace hifi::zone::actordata
 			g.queue.pop_front();
 			g.loading = id;
 			g.loaded = false;
-			g.thread = std::thread([id] {
+			g.thread = std::thread([id, pack] {
 				const auto t0 = std::chrono::steady_clock::now();
 				// (anything thrown, out of memory in the 32-bit game: the DAT failed; an exception leaving a thread ends
 				// the game)
 				try
 				{
-					g.read_ok = zm::load_file(id, g.data, g.result);
+					g.read_ok = zm::load_file(id, g.data, g.result, pack);
 				}
 				catch (...)
 				{
@@ -185,6 +206,20 @@ namespace hifi::zone::actordata
 				g.loaded.store(true, std::memory_order_release);
 			});
 		}
+	}
+
+	void ready_files(std::vector<gpu_zone *> &out)
+	{
+		if (!g.wanted)
+			return;
+		for (auto &f : g.files)
+			if (f.second.z != nullptr && f.second.z->ready())
+				out.push_back(f.second.z.get());
+	}
+
+	void set_pack_mode(bool on)
+	{
+		g_pack_mode.store(on);
 	}
 
 	gpu_zone *find(uint32_t id)

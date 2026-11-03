@@ -38,6 +38,9 @@ namespace hifi::game::zonedraw
 	void set_state(bool wanted, zone::gpu_zone *zone, zone::gpu_zone *second, bool d3d12_ready);
 	// The renderer's second map (its slot 1: a building's interior), 0 when there's none (renderer 0: the last pass's)
 	uint32_t second_map(uintptr_t renderer = 0);
+	// The camera of the last zone pass HiFi XI drew, and its zone's map (the texture pack's request order: nearest
+	// first, src/zone/zonepack); false before the first
+	bool camera(float out[3], uint32_t &map);
 
 	// zoneslot's listener: the zone pass's begin (kind 0, the renderer) and end (kind 1)
 	void on_slot(uint32_t kind, uint32_t seq, uintptr_t renderer);

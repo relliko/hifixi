@@ -15,13 +15,25 @@
  * Needs the game closed (the GPU; or --warp) and the FFXiMain dump (the key tables). Exit code: 0 when written. It
  * prints the load's memory (its peak commit above what was committed before it, the free address space and its largest
  * block before and after) for the texture pack's baseline (docs/texture-pack-plan.md M1).
+ *
+ * The texture pack (docs/texture-pack/zones.md; M4's pictures):
+ *   ZONE_VIEW_PACK=<folder>: the map read in the pack's mode (pivot.ini's overlays but hifi-textures, keys only for the
+ *     game's own file: zm::load's pack) and every keyed texture streamed from that pack (read only) as the plugin's
+ *     glue asks for it (src/zone/zonepack: the colour record down to the game's size), its view written into the zone's
+ *     pack slot and its word set drawn before the picture; it prints what came of them. A map another overlay serves
+ *     (Zi'Tah's canopy) gets no pack region: the picture is the one without the pack
+ *   ZONE_VIEW_BIAS=<b>: the colour maps' extra mip bias (draw_options::texture_bias), for the FSR A/B: e.g. Quality's
+ *     -0.585 at ZONE_VIEW_SIZE 2/3 of the full size
+ *   HIFIXI_PIVOT_INI: the overlays (zonemesh's dat_core; unset: config\pivot\pivot.ini beside build\, none here)
  */
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <psapi.h>
 #include "../src/bake/zonemesh.hpp"
+#include "../src/host/retire.hpp"
 #include "../src/pack/memwatch.hpp"
+#include "../src/pack/stream.hpp"
 #include "../src/zone/draw.hpp"
 #include "../src/zone/frame.hpp"
 #include "../src/zone/zone_gpu.hpp"
@@ -122,6 +134,134 @@ namespace
 		for (int k = 0; k < 3; ++k)
 			v[k] /= l;
 	}
+
+	namespace st = hifi::pack::stream;
+
+	// The zone's keyed textures from the pack in folder (ZONE_VIEW_PACK), asked as the plugin's glue asks (zonepack.cpp
+	// frame and settle: the colour record from its top down to the game's size, the most used first): a ready one's view
+	// written into its pack slot, then its word drawn; a missed one's spent. A present every 2 ms (the streamer's pacing)
+	// until none is out. The owner is kept, so the views stay valid for the picture. False when the pack couldn't be
+	// opened
+	bool stream_pack(ID3D12Device *device, hifi::zone::gpu_zone &gz, const std::wstring &folder, st::owner &o)
+	{
+		using clock = std::chrono::steady_clock;
+		const zm::zone &d = gz.data();
+		st::start(device, st::kRingDefaultMb);
+		const uint32_t before = st::epoch();
+		auto t0 = clock::now();
+		st::open(folder);
+		while (st::epoch() == before && clock::now() - t0 < std::chrono::seconds(60))
+			Sleep(5);
+		const std::shared_ptr<const hifi::pack::index> idx = st::current();
+		if (idx == nullptr)
+		{
+			std::printf("the texture pack: %s\n", st::open_status().empty() ? "not opened in 60 s" : st::open_status().c_str());
+			return false;
+		}
+		std::printf("the texture pack: %zu entries (zones %u, models %u), %.1f GB of colour, opened in %.0f ms%s%s\n", idx->entries.size(), idx->by_source[1],
+			idx->by_source[2], double(idx->colour_bytes) / 1073741824.0, std::chrono::duration<double, std::milli>(clock::now() - t0).count(),
+			idx->status.empty() ? "" : "; ", idx->status.c_str());
+		if (!gz.has_pack())
+		{
+			std::printf("map %u: no pack region (%s): the game's or the overlay's textures as without the pack\n", d.map,
+				d.overlaid ? "read from another overlay's copy" : "no keyed texture");
+			return true;
+		}
+		const uint32_t epoch = st::epoch();
+		o = st::add_owner("zone_view");
+		gz.pack().owner = o;
+		gz.pack().epoch = epoch;
+		gz.pack().tickets.assign(d.textures.size(), st::ticket {});
+
+		// (the order: the most used first, by the triangles naming each texture times its model's placements)
+		std::vector<uint64_t> placed(d.models.size(), 0), uses(d.textures.size(), 0);
+		for (const zm::placement &p : d.placements)
+			if (p.model < placed.size())
+				placed[p.model]++;
+		for (size_t m = 0; m < d.models.size(); ++m)
+			for (uint32_t k = d.models[m].first_piece; k < d.models[m].first_piece + d.models[m].pieces && k < d.pieces.size(); ++k)
+				if (d.pieces[k].texture < uses.size())
+					uses[d.pieces[k].texture] += uint64_t(d.pieces[k].triangles) * std::max<uint64_t>(placed[m], 1);
+		std::vector<uint32_t> order;
+		for (uint32_t i = 0; i < d.textures.size(); ++i)
+			if (d.textures[i].key.bytes != 0)
+				order.push_back(i);
+		std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return uses[a] > uses[b]; });
+		t0 = clock::now();
+		std::vector<std::pair<uint32_t, uint32_t>> by_slot; // (ticket slot, texture)
+		for (size_t rank = 0; rank < order.size(); ++rank)
+		{
+			const uint32_t i = order[rank];
+			const zm::texture &t = d.textures[i];
+			st::want w;
+			w.k = t.key;
+			w.kind = hifi::pack::kColour;
+			w.down_to_w = t.key.w;
+			w.down_to_h = t.key.h;
+			w.priority = int32_t(order.size() - rank);
+			w.epoch = epoch;
+			const st::ticket tk = st::request(o, w);
+			if (tk.generation == 0)
+			{
+				gz.set_pack_word(i, hifi::zone::gpu_zone::kPackSpent);
+				continue;
+			}
+			gz.pack().tickets[i] = tk;
+			by_slot.emplace_back(tk.slot, i);
+			gz.set_pack_word(i, hifi::zone::gpu_zone::kPackAsked);
+		}
+
+		// The tickets as they come: views for the ready ones (the levels counted), the rest spent by why
+		uint32_t drawn = 0, levels[8] = {}, bigger = 0;
+		uint64_t reasons[size_t(st::miss::count_)] = {}, gone = 0;
+		std::vector<std::pair<st::ticket, st::state>> done;
+		size_t outstanding = by_slot.size();
+		while (outstanding != 0 && clock::now() - t0 < std::chrono::seconds(120))
+		{
+			st::on_present();
+			done.clear();
+			st::take_done(o, done);
+			for (const auto &[tk, s] : done)
+			{
+				const auto at = std::find_if(by_slot.begin(), by_slot.end(), [&](const auto &e) { return e.first == tk.slot; });
+				if (at == by_slot.end() || !(gz.pack().tickets[at->second] == tk))
+					continue;
+				const uint32_t i = at->second;
+				outstanding--;
+				st::view v;
+				if (s == st::state::ready && st::get(tk, v) && st::write_view(tk, gz.pack_cpu(i)))
+				{
+					gz.pack_written(i);
+					gz.pack().bytes += v.bytes;
+					gz.set_pack_word(i, hifi::zone::gpu_zone::kPackDrawn);
+					drawn++;
+					levels[std::min<uint32_t>(v.levels, 7)]++;
+					bigger += v.w > d.textures[i].w || v.h > d.textures[i].h;
+					continue;
+				}
+				if (s == st::state::missed)
+					reasons[size_t(st::reason(tk))]++;
+				else
+					gone++;
+				st::drop(tk);
+				gz.pack().tickets[i] = st::ticket {};
+				gz.set_pack_word(i, hifi::zone::gpu_zone::kPackSpent);
+			}
+			Sleep(2);
+		}
+		const double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+		std::string missed;
+		for (size_t m = 1; m < size_t(st::miss::count_); ++m)
+			if (reasons[m] != 0)
+				missed += std::string(missed.empty() ? "" : ", ") + std::to_string(reasons[m]) + " " + st::text(st::miss(m));
+		std::printf("map %u from the pack: %u of %zu textures (%zu keyed) drawn from it, %u of them bigger than the game's; views of 1/2/3/4+ levels %u/%u/%u/%u; missed: %s; "
+			"%llu gone, %zu not back; %.1f MB in %.0f ms\n", d.map, drawn, d.textures.size(), order.size(), bigger, levels[1], levels[2], levels[3],
+			levels[4] + levels[5] + levels[6] + levels[7], missed.empty() ? "none" : missed.c_str(), static_cast<unsigned long long>(gone), outstanding,
+			double(gz.pack().bytes) / 1048576.0, ms);
+		for (const std::string &l : st::status())
+			std::printf("  %s\n", l.c_str());
+		return true;
+	}
 }
 
 // (HiFi XI's options and World FX's settings: not looked at)
@@ -183,7 +323,10 @@ int main(int argc, char **argv)
 	PROCESS_MEMORY_COUNTERS pm_before = {};
 	pm_before.cb = sizeof(pm_before);
 	GetProcessMemoryInfo(GetCurrentProcess(), &pm_before, sizeof(pm_before));
-	if (!zm::load(map, z, r))
+	// (ZONE_VIEW_PACK: the texture pack's mode; without it the load as it always was)
+	wchar_t pack_folder[MAX_PATH] = L"";
+	const bool pack = GetEnvironmentVariableW(L"ZONE_VIEW_PACK", pack_folder, MAX_PATH) != 0;
+	if (!(pack ? zm::load(map, z, r, true) : zm::load(map, z, r)))
 	{
 		std::printf("map %u: %s\n", map, r.why.c_str());
 		return 1;
@@ -229,6 +372,9 @@ int main(int argc, char **argv)
 		std::printf("upload: %s\n", why.empty() ? "not finished in 10 s" : why.c_str());
 		return 1;
 	}
+	st::owner pack_owner = 0;
+	if (pack && !stream_pack(device, gz, pack_folder, pack_owner))
+		return 1;
 	const zm::zone &d = gz.data();
 #ifdef ZONE_GBUF
 	// (with the buffers: each piece's first index, texture and model, for the mock-up's materials)
@@ -413,6 +559,8 @@ int main(int argc, char **argv)
 	list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 	hifi::zone::draw_options o;
 	o.per_pixel = per_pixel;
+	if (char b[32] = ""; GetEnvironmentVariableA("ZONE_VIEW_BIAS", b, sizeof(b)) != 0)
+		o.texture_bias = std::strtof(b, nullptr);
 	t0 = std::chrono::steady_clock::now();
 	const hifi::zone::draw_stats st = renderer.record(list, t, *hifi::zone::published(1), o, 1);
 	const double record_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -465,6 +613,16 @@ int main(int argc, char **argv)
 	const bool written = write_bmp(out, pixels, W, H, pitch);
 	std::printf("map %u from %.1f %.1f %.1f: renderer made in %.0f ms; %u objects, %u draws, %u triangles (%u skipped), recorded in %.1f ms, drawn in %.0f ms -> %s\n",
 		map, eye[0], eye[1], eye[2], init_ms, st.objects, st.draws, st.triangles, st.skipped, record_ms, gpu_ms, written ? out : "NOT WRITTEN");
+	if (pack)
+	{
+		// (the frame is done: the owner's textures handed to retire, the streamer joined, all of it freed)
+		readback->Unmap(0, nullptr);
+		if (pack_owner != 0)
+			hifi::pack::stream::drop_owner(pack_owner);
+		gz.pack().owner = 0;
+		hifi::pack::stream::stop();
+		hifi::retire::release_all();
+	}
 	dump::unmap(base);
 	return written ? 0 : 1;
 }

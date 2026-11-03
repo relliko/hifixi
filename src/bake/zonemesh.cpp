@@ -238,7 +238,8 @@ namespace hifi::bake::zonemesh
 	}
 
 	// A DAT's models (and, given one, the bump DAT's normal maps; with placements, its MZB's)
-	static bool load_dat(uint32_t dat_id, uint32_t bump_id, bool with_placements, zone &z, result &r)
+	// (pack: the texture pack's mode: hifi-textures passed over, keys for the game's own file)
+	static bool load_dat(uint32_t dat_id, uint32_t bump_id, bool with_placements, bool pack, zone &z, result &r)
 	{
 		std::string why;
 		const std::wstring own = dat_path(dat_id, why);
@@ -248,7 +249,13 @@ namespace hifi::bake::zonemesh
 			r.why = why;
 			return false;
 		}
-		const std::wstring path = overlaid(own);
+		const std::wstring path = overlaid(own, pack ? L"hifi-textures" : nullptr);
+		// (keys only for the game's own file: a DAT another overlay serves (Zi'Tah's canopy, EraDATs) has none, even where
+		// a chunk of its happens to be the original's bytes: zones.md decision 6. The width pass below runs only for an
+		// overlay's copy, as without the pack, so in pack mode the game's own file has one level a texture)
+		z.pack = pack;
+		z.overlaid = path != own;
+		const bool keys = pack && path == own;
 		std::vector<uint8_t> dat;
 		if (!read_file(path, dat))
 			return fail(r, "the map's DAT can't be read");
@@ -421,6 +428,8 @@ namespace hifi::bake::zonemesh
 								std::memcpy(t.data.data() + i * 4, pal + size_t(px[i]) * 4, 4);
 						}
 						t.mips = bc2::smaller_levels(t.data, t.w, t.h, t.format == kBC2, t.levels);
+						if (keys)
+							t.key = hifi::pack::key_of(im.body, im.size); // (the chunk's whole body: M0's span)
 						known = texture_of.emplace(tex, uint32_t(z.textures.size())).first;
 						z.textures.push_back(std::move(t));
 					}
@@ -507,19 +516,19 @@ namespace hifi::bake::zonemesh
 		return true;
 	}
 
-	bool load(uint32_t map, zone &z, result &r)
+	bool load(uint32_t map, zone &z, result &r, bool pack)
 	{
 		r = result();
 		z = zone();
 		z.map = map;
-		return load_dat(map_dat(map), bump_dat(map), true, z, r);
+		return load_dat(map_dat(map), bump_dat(map), true, pack, z, r);
 	}
 
-	bool load_file(uint32_t file, zone &z, result &r)
+	bool load_file(uint32_t file, zone &z, result &r, bool pack)
 	{
 		r = result();
 		z = zone();
 		z.map = file;
-		return load_dat(file, 0, false, z, r);
+		return load_dat(file, 0, false, pack, z, r);
 	}
 }
