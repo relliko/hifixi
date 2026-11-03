@@ -15,6 +15,12 @@
  * with the debug layer a device call takes the runtime's own locks, and the game's thread asks the cache for views
  * while it records (docs/d3d12/threads-pso.md). A pair of descriptors let go goes back to `free_slots` only once the
  * GPU is past every list recorded with it (retire::then): lists in flight still read the views it holds.
+ *
+ * The texture pack's part (docs/texture-pack/characters.md): the key hashed on the worker from the bytes the game held,
+ * before they're freed; everything else on the game's thread, under the mutex (charpack.cpp makes the streamer's calls
+ * and the device calls with it left). A pack pair is taken only for a ticket that is ready, only over kPackSlotFloor,
+ * written once before the state says ready, and let go like a game pair (retire::then, the heap's generation). Its
+ * ticket goes to the drop hook from bury(), outside the mutex: the texture is let go behind the same fence.
  */
 
 #include <windows.h>
@@ -96,11 +102,34 @@ namespace hifi::chars::cache
 			uint64_t upload_bytes = 0; // (its share of a batch's upload buffer, known once decoded)
 		};
 
+		// A texture's pack part (cache.hpp; docs/texture-pack/characters.md "The upgrade state machine")
+		enum class pack_state : uint8_t
+		{
+			none,    // (a key, nothing asked; or no key)
+			asked,   // (a ticket on its way: "upgrading")
+			writing, // (its ticket ready, a pair taken: the views being written, the mutex left)
+			ready,   // (the pair written: texture_view_of hands it out)
+			spent,   // (missed or gone: the game's until the pack part is forgotten)
+			evicted, // (let go under the streamer's pressure: the game's until pack_unevict)
+		};
+
 		struct texture_entry
 		{
 			key k;
 			std::vector<uint8_t> raw;
 			state s = state::queued;
+			uint32_t id = kNone, serial = 0; // (its id, and which texture held it: ids are reused)
+			// The texture pack's part: the key (from raw, by the worker before it's freed; bytes 0: none), its state, the
+			// ticket and the pack's pair, the epoch it asked in, the view's bytes, when the pair was last handed out, why
+			// it's spent
+			hifi::pack::key pack;
+			pack_state ps = pack_state::none;
+			hifi::pack::stream::ticket ticket;
+			uint32_t pack_slot = kNoSlot;
+			uint32_t pack_epoch = 0;
+			uint64_t pack_bytes = 0;
+			double pack_drawn = 0.0;
+			pack_miss spent_why = pack_miss::not_in_pack;
 			bool with_detail = false; // (whether its decode makes a detail map: [chars] detail when it was picked)
 			tex::texture decoded; // (dropped once uploaded)
 			tex::texture detail;  // its detail map (tex::make_detail; dropped once uploaded)
@@ -148,15 +177,27 @@ namespace hifi::chars::cache
 			counts n;
 			std::vector<IUnknown *> dead; // (to be released once the mutex is left)
 			std::vector<uint32_t> slots_dead; // (pairs let go: given back behind the GPU once the mutex is left)
+			std::vector<hifi::pack::stream::ticket> tickets_dead; // (pack tickets let go: to the drop hook once it's left)
+
+			// The texture pack's part (the game's thread; the worker only pushes onto the asks' list)
+			uint32_t next_serial = 0;
+			bool pack_on = false;                              // (set_pack_on)
+			std::vector<std::pair<uint32_t, uint32_t>> pack_asks; // (id, serial: textures to ask the pack for)
+			std::unordered_map<uint32_t, uint32_t> pack_by_ticket; // (a held ticket's slot -> its texture)
+			double pack_now = 0.0;
+			std::vector<uint32_t> held_slots;                  // (test::hold_slots)
 		};
 		state_all g;
 		std::atomic<bool> g_detail { options::kDetailByDefault };
+		std::atomic<bool> g_pack_compare { false };
+		std::atomic<pack_drop_fn> g_pack_drop { nullptr };
 
 		// What's been let go under the lock, handed over once it's left
 		struct dead_things
 		{
 			std::vector<IUnknown *> objects;
 			std::vector<uint32_t> slots;
+			std::vector<hifi::pack::stream::ticket> tickets;
 			uint64_t generation = 0;
 		};
 		// (the mutex held)
@@ -165,13 +206,19 @@ namespace hifi::chars::cache
 			dead_things d;
 			d.objects.swap(g.dead);
 			d.slots.swap(g.slots_dead);
+			d.tickets.swap(g.tickets_dead);
 			d.generation = g.heap_generation;
 			return d;
 		}
 		// (lists recorded this frame or before may still draw them, or read the views in a pair: let go behind the GPU,
-		// not at once; a pair back to free_slots only then, and only into the heap it came from)
+		// not at once; a pair back to free_slots only then, and only into the heap it came from. A pack ticket to the drop
+		// hook: the streamer hands its texture to retire::later at the last drop, the same fence and +2 as the pair)
 		void bury(dead_things &&d)
 		{
+			if (!d.tickets.empty())
+				if (const pack_drop_fn drop = g_pack_drop.load())
+					for (const hifi::pack::stream::ticket &t : d.tickets)
+						drop(t);
 			for (IUnknown *p : d.objects)
 				retire::later(p);
 			if (!d.slots.empty())
@@ -208,11 +255,47 @@ namespace hifi::chars::cache
 			later(e.cb);
 			release_slot(e.slot);
 		}
+		// (under the lock) A texture's pack part let go: its pair behind the GPU, its ticket to the drop hook (both once the
+		// mutex is left), none again. Whatever its state: an asked ticket is dropped wherever the streamer has it (drop never
+		// blocks; what only the copy queue saw the worker lets go behind its own fence)
+		void release_pack(texture_entry &e)
+		{
+			if (e.pack_slot != kNoSlot)
+				g.n.pack_pairs -= std::min(g.n.pack_pairs, 1u);
+			release_slot(e.pack_slot);
+			if (e.ticket.generation != 0)
+			{
+				const auto it = g.pack_by_ticket.find(e.ticket.slot);
+				if (it != g.pack_by_ticket.end() && it->second == e.id)
+					g.pack_by_ticket.erase(it);
+				g.tickets_dead.push_back(e.ticket);
+				g.n.pack_dropped++;
+			}
+			e.ticket = hifi::pack::stream::ticket {};
+			e.ps = pack_state::none;
+			e.pack_bytes = 0;
+		}
 		void release_texture(texture_entry &e)
 		{
 			later(e.t);
 			later(e.d);
 			release_slot(e.slot);
+			release_pack(e);
+		}
+		// (under the lock) A texture on the GPU with a key and no pack part onto the asks' list, while pack parts are wanted
+		void pack_ask_later(const texture_entry &e)
+		{
+			if (g.pack_on && e.s == state::ready && e.pack.bytes != 0 && e.ps == pack_state::none)
+				g.pack_asks.emplace_back(e.id, e.serial);
+		}
+		// (under the lock) The texture a ticket of the cache's is held by (nullptr: none; a ticket let go isn't anyone's)
+		texture_entry *pack_holder(hifi::pack::stream::ticket t)
+		{
+			const auto it = g.pack_by_ticket.find(t.slot);
+			if (it == g.pack_by_ticket.end() || it->second >= g.textures.size() || !g.textures[it->second])
+				return nullptr;
+			texture_entry &e = *g.textures[it->second];
+			return e.ticket == t ? &e : nullptr;
 		}
 		// (under the lock) A texture's decoded bytes no longer held (on the GPU, failed or let go)
 		void drop_decoded(texture_entry &e)
@@ -356,6 +439,9 @@ namespace hifi::chars::cache
 			const bool ok = tex::decode(e.raw.data(), e.raw.size(), e.decoded, why);
 			if (ok)
 			{
+				// (the texture pack's key: the chunk's bytes as the game holds them, before they're freed. About 20 us a
+				// texture; read by the game's thread only once the entry is marked, under the mutex)
+				e.pack = hifi::pack::key_of(e.raw.data(), e.raw.size());
 				tex::make_mips(e.decoded);
 				if (e.with_detail)
 					tex::make_detail(e.decoded, e.detail);
@@ -676,6 +762,7 @@ namespace hifi::chars::cache
 						texture_entry *e = decode_t[i];
 						e->decoded = tex::texture();
 						e->detail = tex::texture();
+						e->pack = hifi::pack::key {};
 						std::vector<uint8_t>().swap(e->raw);
 						thrown("a texture");
 					}
@@ -770,6 +857,7 @@ namespace hifi::chars::cache
 					{
 						e->s = state::ready;
 						g.n.gpu_bytes += e->gpu_bytes;
+						pack_ask_later(*e);
 					}
 					else
 					{
@@ -934,8 +1022,10 @@ namespace hifi::chars::cache
 		e->raw = std::move(data);
 		std::lock_guard<std::mutex> lock(g.mutex);
 		e->seen = g.now;
+		e->serial = ++g.next_serial;
 		g.n.bytes_in += e->raw.size();
 		const uint32_t id = add(g.textures, g.free_textures, g.texture_of, std::move(e));
+		g.textures[id]->id = id;
 		start_worker();
 		g.held = false; // (settle: the worker looks again before it counts as idle)
 		g.wake.notify_one();
@@ -1055,13 +1145,24 @@ namespace hifi::chars::cache
 		return true;
 	}
 
-	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out)
+	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out, bool allow_pack, bool *is_pack)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
+		if (is_pack != nullptr)
+			*is_pack = false;
 		if (id >= g.textures.size() || !g.textures[id] || g.textures[id]->s != state::ready)
 			return false;
+		texture_entry &e = *g.textures[id];
+		// (the pack's pair only once it's written and its ticket held ready: nothing of the streamer's is read here)
+		const bool pack = allow_pack && e.ps == pack_state::ready && e.pack_slot != kNoSlot && !g_pack_compare.load(std::memory_order_relaxed);
 		out = g.heap->GetGPUDescriptorHandleForHeapStart();
-		out.ptr += uint64_t(2 * g.textures[id]->slot) * g.step;
+		out.ptr += uint64_t(2 * (pack ? e.pack_slot : e.slot)) * g.step;
+		if (pack)
+		{
+			e.pack_drawn = g.pack_now;
+			if (is_pack != nullptr)
+				*is_pack = true;
+		}
 		return true;
 	}
 
@@ -1116,6 +1217,17 @@ namespace hifi::chars::cache
 				c.textures_ready += e->s == state::ready;
 				c.textures_failed += e->s == state::failed;
 				c.detail_textures += e->s == state::ready && e->d != nullptr;
+				if (e->s != state::ready)
+					continue;
+				// (the pack's part: a texture with no key counts as not in it)
+				c.pack_keyed += e->pack.bytes != 0;
+				c.pack_ready += e->ps == pack_state::ready;
+				c.pack_bytes += e->ps == pack_state::ready ? e->pack_bytes : 0;
+				c.pack_asked += e->ps == pack_state::asked || e->ps == pack_state::writing;
+				c.pack_not_in += e->pack.bytes == 0 || (e->ps == pack_state::spent && e->spent_why == pack_miss::not_in_pack);
+				c.pack_failed += e->ps == pack_state::spent && e->spent_why == pack_miss::failed;
+				c.pack_gone += e->ps == pack_state::spent && e->spent_why == pack_miss::gone;
+				c.pack_evicted += e->ps == pack_state::evicted;
 			}
 		c.decoded_bytes = g.decoded_bytes;
 		c.slots_free = uint32_t(g.free_slots.size());
@@ -1140,7 +1252,415 @@ namespace hifi::chars::cache
 			double(c.decoded_bytes) / 1048576.0, double(c.decoded_peak) / 1048576.0, c.batches, double(c.batch_bytes_max) / 1048576.0, c.too_big, c.detail_textures,
 			c.detail_skipped, c.slots_free, c.slots_retiring, c.meshes_left_failed);
 		out.push_back(line);
+		std::snprintf(line, sizeof(line), "character data: texture pack: %u ready (%.1f MB), %u asked, %u not in it, %u failed, %u gone, %u evicted (%llu in all, the video "
+			"memory over 95%%); %llu skipped for want of descriptors (%u waiting); %u pairs for pack views; %llu tickets let go",
+			c.pack_ready, double(c.pack_bytes) / 1048576.0, c.pack_asked, c.pack_not_in, c.pack_failed, c.pack_gone, c.pack_evicted,
+			static_cast<unsigned long long>(c.pack_evictions), static_cast<unsigned long long>(c.pack_skipped_slots), c.pack_waiting_slots, c.pack_pairs,
+			static_cast<unsigned long long>(c.pack_dropped));
+		out.push_back(line);
 		return out;
+	}
+
+	// ---- The texture pack's part (cache.hpp; src/chars/charpack.cpp drives it on the game's thread)
+
+	namespace
+	{
+		// (each call that may let go of a pack part: what it let go buried once the mutex is left, as mesh() and texture()
+		// do; constructed before the lock, so destroyed after it)
+		struct pack_graves
+		{
+			dead_things d;
+			~pack_graves() { bury(std::move(d)); }
+		};
+	}
+
+	void set_pack_drop(pack_drop_fn fn)
+	{
+		g_pack_drop.store(fn);
+	}
+
+	void set_pack_on(bool on)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (on == g.pack_on)
+			return;
+		g.pack_on = on;
+		g.pack_asks.clear();
+		for (const auto &e : g.textures)
+			if (e)
+				pack_ask_later(*e);
+	}
+
+	void forget_pack_textures()
+	{
+		pack_graves dead;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.pack_asks.clear();
+		for (const auto &e : g.textures)
+			if (e && (e->ps != pack_state::none || e->ticket.generation != 0 || e->pack_slot != kNoSlot))
+				release_pack(*e);
+		// (none again: asked again in the next epoch while wanted)
+		for (const auto &e : g.textures)
+			if (e)
+				pack_ask_later(*e);
+		dead.d = take_dead();
+	}
+
+	void set_pack_compare(bool on)
+	{
+		g_pack_compare.store(on);
+	}
+
+	void pack_tick(double now)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.pack_now = now;
+	}
+
+	ID3D12Device *device()
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		return g.device;
+	}
+
+	void take_pack_asks(uint32_t max, std::vector<pack_ask> &out)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		g.n.pack_waiting_slots = 0;
+		if (g.heap == nullptr || g.free_slots.size() <= kPackSlotFloor)
+		{
+			// (held: the game's own textures and the meshes keep the pairs left)
+			if (g.heap != nullptr)
+				g.n.pack_waiting_slots = uint32_t(g.pack_asks.size());
+			return;
+		}
+		// (no more than there are pairs to spare over the floor, less the ones already on their way: each ready ticket takes
+		// one, and one past them would be read, uploaded and let go for nothing in pack_begin. A walk only while asks wait)
+		if (g.pack_asks.empty())
+			return;
+		size_t coming = 0;
+		for (const auto &e : g.textures)
+			coming += e && (e->ps == pack_state::asked || e->ps == pack_state::writing);
+		const size_t spare = g.free_slots.size() - kPackSlotFloor;
+		if (coming >= spare)
+		{
+			g.n.pack_waiting_slots = uint32_t(g.pack_asks.size());
+			return;
+		}
+		max = uint32_t(std::min<size_t>(max, spare - coming));
+		const size_t first = out.size();
+		size_t k = 0;
+		for (; k < g.pack_asks.size() && out.size() - first < max; ++k)
+		{
+			const auto [id, serial] = g.pack_asks[k];
+			if (id >= g.textures.size() || !g.textures[id])
+				continue;
+			const texture_entry &e = *g.textures[id];
+			if (e.serial != serial || e.s != state::ready || e.ps != pack_state::none || e.pack.bytes == 0)
+				continue;
+			bool twice = false;
+			for (size_t j = first; j < out.size() && !twice; ++j)
+				twice = out[j].id == id;
+			if (twice)
+				continue;
+			pack_ask a;
+			a.id = id;
+			a.serial = serial;
+			a.k = e.pack;
+			// (the game's own smallest level: 6 levels, or 1 with a side under 32. A 4x record then has its levels down to
+			// that size, at most its stored chain; one the game draws with one level, down to the game's own size)
+			const uint32_t n = tex::mip_count(e.pack.w, e.pack.h);
+			a.down_to_w = e.pack.w >> (n - 1);
+			a.down_to_h = e.pack.h >> (n - 1);
+			out.push_back(a);
+		}
+		g.pack_asks.erase(g.pack_asks.begin(), g.pack_asks.begin() + ptrdiff_t(k));
+	}
+
+	bool pack_asked(uint32_t id, uint32_t serial, hifi::pack::stream::ticket t, uint32_t epoch)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (t.generation == 0 || id >= g.textures.size() || !g.textures[id])
+			return false;
+		texture_entry &e = *g.textures[id];
+		if (e.serial != serial || e.s != state::ready || e.ps != pack_state::none)
+			return false;
+		e.ps = pack_state::asked;
+		e.ticket = t;
+		e.pack_epoch = epoch;
+		g.pack_by_ticket[t.slot] = id;
+		return true;
+	}
+
+	void pack_refused(uint32_t id, uint32_t serial)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (id >= g.textures.size() || !g.textures[id])
+			return;
+		texture_entry &e = *g.textures[id];
+		if (e.serial == serial && e.ps == pack_state::none)
+		{
+			e.ps = pack_state::spent;
+			e.spent_why = pack_miss::failed;
+		}
+	}
+
+	bool pack_begin(hifi::pack::stream::ticket t, pack_writing &out)
+	{
+		pack_graves dead;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		bool ok = false;
+		texture_entry *const e = pack_holder(t);
+		if (e != nullptr && e->ps == pack_state::asked && e->s == state::ready && g.heap != nullptr)
+		{
+			if (g.free_slots.size() <= kPackSlotFloor)
+			{
+				// (no pair to spare: the ticket let go, the texture none again, asked again once there are)
+				release_pack(*e);
+				g.n.pack_skipped_slots++;
+				pack_ask_later(*e);
+			}
+			else
+			{
+				// (taken now, written once by the caller with the mutex left, before the state says ready: no list can be
+				// reading it before then, and none is given it again until it's let go behind the GPU)
+				e->pack_slot = g.free_slots.back();
+				g.free_slots.pop_back();
+				g.n.pack_pairs++;
+				e->ps = pack_state::writing;
+				out = pack_writing {};
+				out.id = e->id;
+				out.serial = e->serial;
+				out.slot = e->pack_slot;
+				out.t = t;
+				out.colour = cpu_descriptor(2 * e->pack_slot);
+				out.detail = cpu_descriptor(2 * e->pack_slot + 1);
+				out.detail_map = e->d;
+				if (out.detail_map != nullptr)
+					out.detail_map->AddRef(); // (an interlocked count, no lock of the runtime's: the view is made after the mutex is left)
+				ok = true;
+			}
+		}
+		dead.d = take_dead();
+		return ok;
+	}
+
+	void write_pack_detail(pack_writing &w)
+	{
+		ID3D12Device *device = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			device = g.device;
+		}
+		if (device != nullptr)
+		{
+			// (a second view of the game texture's own detail map, its levels from the resource (the decoded ones are freed
+			// after the upload); or the null view the game's pair has. Never CopyDescriptors: the heap is shader visible,
+			// and a copy's source must be a CPU-only heap)
+			D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+			v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			v.Texture2D.MipLevels = w.detail_map != nullptr ? UINT(w.detail_map->GetDesc().MipLevels) : 1;
+			device->CreateShaderResourceView(w.detail_map, &v, w.detail);
+		}
+		if (w.detail_map != nullptr)
+			w.detail_map->Release();
+		w.detail_map = nullptr;
+	}
+
+	void pack_end(const pack_writing &w, bool ok, uint64_t bytes)
+	{
+		pack_graves dead;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		if (w.id < g.textures.size() && g.textures[w.id])
+		{
+			texture_entry &e = *g.textures[w.id];
+			if (e.serial == w.serial && e.ps == pack_state::writing && e.ticket == w.t && e.pack_slot == w.slot)
+			{
+				if (ok)
+				{
+					e.ps = pack_state::ready;
+					e.pack_bytes = bytes;
+					e.pack_drawn = g.pack_now;
+				}
+				else
+				{
+					release_pack(e);
+					e.ps = pack_state::spent;
+					e.spent_why = pack_miss::failed;
+				}
+			}
+		}
+		dead.d = take_dead();
+	}
+
+	void pack_spent(hifi::pack::stream::ticket t, pack_miss why)
+	{
+		pack_graves dead;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		// (only one still on its way: a ready texture's ticket turned gone keeps its texture till it's let go, zones.md
+		// decision 1, and the module forgets every pack part before it ends an epoch)
+		if (texture_entry *const e = pack_holder(t); e != nullptr && e->ps == pack_state::asked)
+		{
+			release_pack(*e);
+			e->ps = pack_state::spent;
+			e->spent_why = why;
+		}
+		dead.d = take_dead();
+	}
+
+	uint32_t pack_evict(uint64_t max_bytes, uint64_t &bytes)
+	{
+		pack_graves dead;
+		std::lock_guard<std::mutex> lock(g.mutex);
+		bytes = 0;
+		// (the ready ones, the longest since a model drew them first: texture_view_of stamps pack_drawn as it hands the
+		// pair out. A walk every half second while the card is nearly full: a few thousand entries at most)
+		std::vector<std::pair<double, uint32_t>> ready;
+		for (const auto &e : g.textures)
+			if (e && e->ps == pack_state::ready)
+				ready.emplace_back(e->pack_drawn, e->id);
+		std::sort(ready.begin(), ready.end());
+		uint32_t n = 0;
+		for (const auto &[drawn, id] : ready)
+		{
+			if (n != 0 && bytes >= max_bytes)
+				break;
+			texture_entry &e = *g.textures[id];
+			const uint64_t view_bytes = e.pack_bytes;
+			bytes += view_bytes;
+			// (the pair behind the GPU and the ticket to the drop hook, as any let go: the lists recorded with it are behind
+			// the same fence; the streamer's texture goes at its last ticket, a texture shared with a zone stays. Its bytes
+			// kept, for pack_unevict's pace)
+			release_pack(e);
+			e.ps = pack_state::evicted;
+			e.pack_bytes = view_bytes;
+			n++;
+		}
+		g.n.pack_evictions += n;
+		dead.d = take_dead();
+		return n;
+	}
+
+	uint32_t pack_unevict(uint64_t max_bytes, uint32_t &left)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		// (the ones a model drew last first: the likeliest to be on screen still)
+		std::vector<std::pair<double, uint32_t>> evicted;
+		for (const auto &e : g.textures)
+			if (e && e->ps == pack_state::evicted)
+				evicted.emplace_back(e->pack_drawn, e->id);
+		std::sort(evicted.begin(), evicted.end(), [](const auto &a, const auto &b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+		uint32_t n = 0;
+		uint64_t bytes = 0;
+		for (const auto &[drawn, id] : evicted)
+		{
+			if (n != 0 && bytes >= max_bytes)
+				break;
+			texture_entry &e = *g.textures[id];
+			bytes += e.pack_bytes;
+			e.pack_bytes = 0;
+			e.ps = pack_state::none;
+			pack_ask_later(e);
+			n++;
+		}
+		left = uint32_t(evicted.size()) - n;
+		return n;
+	}
+
+	namespace test
+	{
+		hifi::pack::key pack_key_of(uint32_t id)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			// (only once the worker has let go of it: it writes the key outside the lock)
+			if (id >= g.textures.size() || !g.textures[id] || g.textures[id]->s == state::queued || g.textures[id]->s == state::uploading)
+				return hifi::pack::key {};
+			return g.textures[id]->pack;
+		}
+
+		const char *pack_state_of(uint32_t id)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			if (id >= g.textures.size() || !g.textures[id])
+				return "";
+			static const char *const names[] = { "none", "asked", "writing", "ready", "spent", "evicted" };
+			return names[size_t(g.textures[id]->ps)];
+		}
+
+		hifi::pack::stream::ticket pack_ticket_of(uint32_t id)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			return id < g.textures.size() && g.textures[id] ? g.textures[id]->ticket : hifi::pack::stream::ticket {};
+		}
+
+		uint32_t pack_slot_of(uint32_t id)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			return id < g.textures.size() && g.textures[id] && g.textures[id]->pack_slot != kNoSlot ? g.textures[id]->pack_slot : kNone;
+		}
+
+		uint32_t game_slot_of(uint32_t id)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			return id < g.textures.size() && g.textures[id] && g.textures[id]->slot != kNoSlot ? g.textures[id]->slot : kNone;
+		}
+
+		void hold_slots(uint32_t leave_free)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			while (g.free_slots.size() > leave_free)
+			{
+				g.held_slots.push_back(g.free_slots.back());
+				g.free_slots.pop_back();
+			}
+		}
+
+		void give_back_slots()
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			g.free_slots.insert(g.free_slots.end(), g.held_slots.begin(), g.held_slots.end());
+			g.held_slots.clear();
+			g.wake.notify_one();
+		}
+
+		bool slot_free(uint32_t slot)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			return std::find(g.free_slots.begin(), g.free_slots.end(), slot) != g.free_slots.end();
+		}
+
+		bool slots_consistent(std::string &why)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			std::vector<uint8_t> uses(kDescriptors / 2, 0);
+			bool ok = true;
+			auto use = [&](uint32_t s, const char *what) {
+				if (s == kNoSlot)
+					return;
+				if (s >= uses.size() || ++uses[s] > 1)
+				{
+					if (ok)
+						why = std::string("pair ") + std::to_string(s) + " twice (" + what + ")";
+					ok = false;
+				}
+			};
+			for (uint32_t s : g.free_slots)
+				use(s, "free");
+			for (uint32_t s : g.held_slots)
+				use(s, "held by the test");
+			for (const auto &e : g.meshes)
+				if (e)
+					use(e->slot, "a mesh's");
+			for (const auto &e : g.textures)
+				if (e)
+				{
+					use(e->slot, "a texture's");
+					use(e->pack_slot, "a texture's pack pair");
+				}
+			return ok;
+		}
 	}
 
 	bool settle(uint32_t ms)
@@ -1182,6 +1702,13 @@ namespace hifi::chars::cache
 					release_texture(*e);
 			g.slots_dead.clear(); // (the heap goes too; pairs let go before are left out by the generation)
 			g.heap_generation++;
+			// (the pack's part: every ticket went to tickets_dead above, for the drop hook; the module's clear_all has
+			// dropped them all before this in the plugin's Release, so the stopped streamer frees nothing twice)
+			g.pack_on = false;
+			g.pack_asks.clear();
+			g.pack_by_ticket.clear();
+			g.held_slots.clear();
+			g.pack_now = 0.0;
 			g.meshes.clear();
 			g.textures.clear();
 			g.free_meshes.clear();

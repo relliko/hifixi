@@ -80,7 +80,9 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
 ## Texture pack (optional)
 
-A texture pack is higher-resolution textures made on your own PC from your game's files, kept in `bootloader\hifixi-pack\` and streamed to the graphics card as you play. Nothing of it ships with HiFi XI. When that folder is there, the menu's **The game's own** tab shows **Use the texture pack** (off by default) with what it found; scenery, ships and furniture switch to the pack's textures at the next area you enter, and anything the pack doesn't have is drawn as the game's own. The **Off** preset turns it off.
+A texture pack is higher-resolution textures made on your own PC from your game's files, kept in `bootloader\hifixi-pack\` and streamed to the graphics card as you play. Nothing of it ships with HiFi XI. It sharpens scenery and characters (gear, NPCs and monsters), and as it is kept on the graphics card the game's own memory stays small. When that folder is there, the menu's **The game's own** tab shows **Use the texture pack** (off by default) with what it found; characters switch to the pack's textures at once, scenery, ships and furniture at the next area you enter, and anything the pack doesn't have is drawn as the game's own. The **Off** preset turns it off.
+
+If you installed the `hifi-textures` XIPivot overlay (the bigger game files the pack was made beside), remove it from XIPivot first: while it is listed the game loads its own bigger copies, which take the game's memory, and the characters keep them instead of the pack's. The menu says so while it's listed.
 
 To remove it: turn it off (the setting, or `/hifi textures off`), then delete the `bootloader\hifixi-pack` folder. Turned off, HiFi XI has none of its files open, so the folder can be deleted while the game runs.
 

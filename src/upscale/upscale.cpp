@@ -595,6 +595,14 @@ namespace hifi::upscale
 		return true;
 	}
 
+	namespace test
+	{
+		void drawn(UINT in_w, UINT out_w)
+		{
+			note_drawn(in_w, out_w); // (its stores are atomics: the mutex only orders FSR's own paths)
+		}
+	}
+
 	uint32_t jitter_phases()
 	{
 		return g.phases.load(std::memory_order_relaxed);

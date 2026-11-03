@@ -232,9 +232,9 @@ namespace hifi::settings
 			// (the texture pack: src/pack/packoptions.hpp; shown only while a pack folder is on this PC, the module's cached
 			// answer. The Game tab's last section: the menu draws the pack's lines right after it)
 			{ "textures.pack", tab::game, "Texture pack", "Use the texture pack",
-				"Sharper scenery, ships and furniture, from a texture pack made on this PC from your own game files and kept on "
-				"the graphics card. Anything the pack doesn't have is drawn as the game's own. Takes effect at the next area you "
-				"enter. (/hifi textures)", nullptr, nullptr, false, { 0.0f, _, _, _ },
+				"Sharper scenery and characters, from a texture pack made on this PC from your own game files. It is kept on the "
+				"graphics card, so the game's own memory stays small. Anything the pack doesn't have is drawn as the game's own. "
+				"Characters switch at once; scenery switches at the next area you enter. (/hifi textures)", nullptr, nullptr, false, { 0.0f, _, _, _ },
 				flag, 0.0f, 1.0f, pack::options::kPackByDefault ? 1.0f : 0.0f, &pack::folder_exists },
 			// (the upscale: src/upscale)
 			{ "upscale.fsr", tab::upscaling, "AMD FSR", "Upscale the world with AMD FSR",

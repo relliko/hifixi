@@ -94,7 +94,7 @@ The game-thread-only rule:
   `open`, `close`, `pause`/`resume`, `set_limits`, `take_log`, `set_device`, `device_lost` and `on_present` take only
   the streamer's leaf mutex for queue work and never wait on the worker (an open or close is posted and returns its
   number; the module reads `posts_done()` at its next updates to see its own done, then `epoch()`/`current()`,
-  `check_open` :278). `stop` alone joins (under 100 ms), in
+  `check_open` :289). `stop` alone joins (under 100 ms), in
   the module's stop, first in the plugin's Release. The module's own lock (`g_text_mutex`) only guards the cached
   status and menu strings: held to copy them, never across a streamer, D3D12 or DXGI call, so the menu (drawn on the
   game's thread) reads them with no file, DXGI or streamer call (menu_test and packmodule_test count the module's).
@@ -106,26 +106,37 @@ The game-thread-only rule:
   zone (retire's mutex isn't held then: src/host/retire.hpp, `then`'s rule) and from native's and actordata's
   `forget_device`; it only takes the streamer's leaf mutex and hands what it lets go to `retire::later` after leaving
   it. zonenative_test measures the worst of those presents with copies in flight.
+- The texture pack's characters' glue (`src/chars/charpack.cpp`, the module's second consumer) makes its streamer calls
+  on the game's thread with no lock of ours held: `add_owner`, `request` (at most 64 a present, :198), `take_done`
+  (:213), `get` and `write_view` (:106: into the characters' heap, the pack pair's first descriptor), `drop_owner` (:52).
+  The cache (`src/chars/cache.cpp`) keeps every texture's pack part under its own mutex and makes no streamer call: its
+  calls (`take_pack_asks`, `pack_asked`, `pack_begin`, `pack_end`, `pack_spent`, `pack_evict`, `pack_unevict`) take the mutex and leave it before
+  they return, so `write_view` and the detail view (`write_pack_detail`, :1434-1451, a device call) run with it left.
+  `pack_begin` AddRefs the detail map under the mutex (an interlocked count, :1426), released after its view is made.
+  The tickets the cache lets go go to its drop hook (`stream::drop`) from `bury` (:218-220), after the mutex is left,
+  on the game's thread or the cache's worker (its idle `bury`): `drop` takes only the streamer's leaf mutex and never
+  blocks. `texture_view_of`'s new stores (the pack pair's last drawn) are made under the cache's mutex, no device
+  call.
 - The texture pack's streamer (`src/pack/stream.cpp`; started by the module above, once a session): one worker thread
-  (`worker`, :1334), below normal (:1336), raised above normal in `stop()` before the join (:1562, memwatch's lesson).
-  Its mutex `g.mutex` (:150) is a leaf, held only for the ticket table, owners, the residency map, the snapshot
+  (`worker`, :1338), below normal (:1340), raised above normal in `stop()` before the join (:1566, memwatch's lesson).
+  Its mutex `g.mutex` (:152) is a leaf, held only for the ticket table, owners, the residency map, the snapshot
   pointer, limits and pause bits: never across ReadFile, any D3D12 or DXGI call (`Create*`, `GetCompletedValue`,
   `Signal`, `SetEventOnCompletion`, `ExecuteCommandLists`, `CreateShaderResourceView`, `Release`), a fence wait,
-  `pack::load` or a call into retire. One exception, `write_view` (:1872): it AddRefs the texture and the device under
+  `pack::load` or a call into retire. One exception, `write_view` (:1876): it AddRefs the texture and the device under
   the mutex (an interlocked count, no lock of the runtime's), so an epoch change on another thread can't free them
   before its `CreateShaderResourceView`; their `Release` comes after the mutex is left. It calls back into nobody, so
   an owner may call it with its own lock held (owner lock, then the streamer's), never the other way. `poll()` takes
-  no lock (:1784). `stop()` cancels the reader's read (CancelIoEx), and an open loading `pack.idx` at its next 256 KB
-  piece (`g_cancel_open`, :1554; `pack::load`'s cancel), sets the stop event and joins: 0.9-6 ms measured, also with a
+  no lock (:1788). `stop()` cancels the reader's read (CancelIoEx), and an open loading `pack.idx` at its next 256 KB
+  piece (`g_cancel_open`, :1558; `pack::load`'s cancel), sets the stop event and joins: 0.9-6 ms measured, also with a
   read stalled on a pipe and with 1,000 queued; 18-21 ms with four copies in flight held until 5 ms in; 46-50 ms with
   an open reading a slow `pack.idx` at 40 ms a piece (packstream_test, WARP and the 4070 Ti, also under GPU-based
   validation).
 - What the worker reads at its loop's top (a device change, an open, stop) can change before it picks the next
   texture: the mutex is let go in between (it makes its parts, sees copies done). So `pick_locked` checks them again
-  under the mutex and starts nothing while one is pending (:1159); packstream_test calls `set_device` and `request`
+  under the mutex and starts nothing while one is pending (:1163); packstream_test calls `set_device` and `request`
   on the worker in that window (`test::before_pick`). A device change (or a loss) and an open or close waiting
   together at the loop's top: the change is done on this pass and the open or close left posted for the next
-  (:1359-1369). Until M4 the loop took both and returned after the change, so the open was dropped: the module's
+  (:1363-1373). Until M4 the loop took both and returned after the change, so the open was dropped: the module's
   `set_device` then `open` in one update left the pack unopened for good on the 4070 Ti (packmodule_test's device
   change; packstream_test now makes both on the worker in that window).
 - The reader's cancel race (`src/pack/pack.cpp:317`, the fix :334-337): `cancel()` sets the flag and then CancelIoEx's every handle;
@@ -137,16 +148,16 @@ Lists, allocators, queues:
 
 - `src/d3d8/gpu.hpp:12-27`: three frames in flight, each with its own allocator, upload pages and shader-visible
   descriptors. `src/d3d8/gpu.cpp:318-328` (`end_frame`) waits on the next set's fence before reusing its allocator.
-- Own copy queues for loaders: `src/chars/cache.cpp:265-287` (the characters' worker: queue, allocator, list, fence
+- Own copy queues for loaders: `src/chars/cache.cpp:340-371` (the characters' worker: queue, allocator, list, fence
   of its own), `src/zone/native.cpp:180`, `src/zone/actordata.cpp:123`, the texture pack's streamer
-  `src/pack/stream.cpp:534-540` (four allocators and lists, one per copy in flight).
+  `src/pack/stream.cpp:536-542` (four allocators and lists, one per copy in flight).
 - `src/ui2d/render2d.cpp:702-704`: the 2D pass's own queue, allocator and list.
 
 Shader and PSO creation:
 
 - `src/host/shadercache.hpp:1-10, 103`: HiFi XI's own shaders' D3DCompile results kept on disk
   (`bootloader\hifixi-shader-cache`), keyed by source, entry, target, flags, defines and the build stamp. Folder set
-  at `src/backend/backend.cpp:397`. Callers: chardraw.cpp:1445, fxrender.cpp:356, render2d.cpp:627, temporal.cpp:275,
+  at `src/backend/backend.cpp:397`. Callers: chardraw.cpp:1452, fxrender.cpp:356, render2d.cpp:627, temporal.cpp:275,
   upscale.cpp:253, world_render.cpp:218, zone/draw.cpp:651, zoneshadow.cpp:192. These still compile on the game thread when nothing is cached.
 - `src/d3d8/compile.cpp:1-10, 316-324`: our d3d8.dll keeps every shader key met in `keys.bin` and compiles missing
   ones on up to 4 below-normal worker threads at device creation (`src/d3d8/device.cpp:233`). A shipped cache covers

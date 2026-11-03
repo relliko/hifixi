@@ -75,12 +75,17 @@ set "PASSES_WORLD=src\world\world_frames.cpp src\world\world_dome.cpp src\world\
 set "PASSES_ACTORS="
 set "PASSES_2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\ui2d\ui2d.cpp src\game\uidraw.cpp"
 rem (the texture pack: docs\texture-pack-plan.md; its module (src\pack\pack_module: the pack opened as [textures] pack
-rem says), the streamer and the pack's reader, the memory watch and the reports, and the zones' and model actors' glue
-rem (src\zone\zonepack: docs\texture-pack\zones.md))
-set "PASSES_PACK=src\pack\memwatch.cpp src\pack\pack_module.cpp src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp src\zone\zonepack.cpp"
+rem says), the streamer and the pack's reader, the memory watch and the reports, the zones' and model actors' glue
+rem (src\zone\zonepack: docs\texture-pack\zones.md) and the characters' (src\chars\charpack:
+rem docs\texture-pack\characters.md), and the plugin's wiring of the two (src\plugin\pack_wiring: main.cpp and
+rem packjoin_test call it))
+set "PASSES_PACK=src\pack\memwatch.cpp src\pack\pack_module.cpp src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp src\zone\zonepack.cpp src\chars\charpack.cpp src\plugin\pack_wiring.cpp"
 rem (what a test that streams zone textures links besides the zone's own files: the streamer, the reader, the glue and
 rem both loaders it asks)
 set "PACK_ZONES=src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\zone\zonepack.cpp"
+rem (what a test that streams character textures links besides the cache: the streamer, the reader, the writer for its
+rem made-up pack and the characters' glue; the other lines that link cache.cpp need none of it)
+set "PACK_CHARS=src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\chars\charpack.cpp"
 set "PASSES=%PASSES% %PASSES_FX% %PASSES_WORLD% %PASSES_ACTORS% %PASSES_2D% %PASSES_PACK%"
 
 rem The plugin: the Ashita side, the backend (World FX's core at our d3d8.dll's marks), with the engine
@@ -253,15 +258,15 @@ echo Built build\charmodel_test.exe
 rem The cache's batches (decoded only as far as the next batch, real upload bytes, an entry too big, the detail maps, the
 rem descriptor pairs behind the GPU) with made-up textures, on WARP: build\charcache_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\charcache_test.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp ^
+  tests\charcache_test.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp %PACK_CHARS% ^
   /Fo"build\test\\" /Fe"build\charcache_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\charcache_test.exe
 rem The character draw on a list recorded as dgVoodoo records (WARP, debug layer), the Mithra posed by chars.py:
 rem build\charinject_test.exe build\test\chars_pose.bin [out.bmp]
 python tests\chars_pose.py build\test\chars_pose.bin || exit /b 1
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
-  tests\charinject_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
-  /Fo"build\test\\" /Fe"build\charinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  tests\charinject_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp %PACK_CHARS% ^
+  build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\charinject_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\charinject_test.exe
 rem The en-spell effects offline, on the GPU (tests\enspell_view.cpp; poses from tests\enspell_poses.py, a GIF from
 rem tools\enspell_gif.py): build\enspell_view.exe <poses.bin> <out folder> <frames> <dat> [dat...]
@@ -309,6 +314,14 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" ^
   /Fe"build\packmodule_test.exe" /link /NOLOGO /LARGEADDRESSAWARE user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\packmodule_test.exe
+rem The texture pack's module with its real consumers as the plugin wires them (src\plugin\pack_wiring: the zones',
+rem then the characters'; off, on, reload, a device change, eviction, the ring refused, unload) on WARP, a made-up pack under
+rem build\test\packjoin: build\packjoin_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I build\gen ^
+  tests\packjoin_test.cpp src\backend\backend.cpp src\pack\pack_write.cpp src\pack\bc2.cpp ^
+  %PASSES% %GAME% %ZONE% %CHARS% %CHARS_DRAW% %UPSCALE% build\engine\worldfx_engine.lib build\framegen\ffx_fg.lib /Fo"build\test\\" ^
+  /Fe"build\packjoin_test.exe" /link /NOLOGO /LARGEADDRESSAWARE user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\packjoin_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\memwatch.cpp ^
   src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp /Fo"build\test\\" /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1

@@ -38,6 +38,7 @@ namespace hifi::chars::inject
 			std::unique_ptr<aura_ring> aura;         // (a see-through model's aura ring: made with it)
 			std::atomic<bool> per_pixel { false };
 			std::atomic<bool> detail { false };
+			std::atomic<float> texture_bias { 0.0f }; // (the texture pack's textures under FSR: set_texture_bias)
 			// Toward the zone's sun (set_sun: the plugin's, from the zone pass), for the light split's share
 			std::mutex sun_mutex;
 			bool sun_known = false;
@@ -461,6 +462,16 @@ namespace hifi::chars::inject
 		g.detail.store(detail, std::memory_order_relaxed);
 	}
 
+	void set_texture_bias(float bias)
+	{
+		g.texture_bias.store(bias, std::memory_order_relaxed);
+	}
+
+	float texture_bias()
+	{
+		return g.texture_bias.load(std::memory_order_relaxed);
+	}
+
 	void set_clock(double seconds)
 	{
 		g.clock.store(seconds, std::memory_order_relaxed);
@@ -543,6 +554,7 @@ namespace hifi::chars::inject
 		char_options o;
 		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
 		o.detail = g.detail.load(std::memory_order_relaxed);
+		o.texture_bias = g.texture_bias.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;
@@ -644,6 +656,7 @@ namespace hifi::chars::inject
 			return false;
 		g.n.caster_frames++;
 		g.n.caster_models += st.models;
+		g.n.caster_pack_draws += st.pack_draws;
 		return true;
 	}
 
@@ -685,6 +698,7 @@ namespace hifi::chars::inject
 		char_options o;
 		o.per_pixel = g.per_pixel.load(std::memory_order_relaxed);
 		o.detail = g.detail.load(std::memory_order_relaxed);
+		o.texture_bias = g.texture_bias.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> sun_lock(g.sun_mutex);
 			o.sun_known = g.sun_known;

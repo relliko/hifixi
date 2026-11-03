@@ -24,6 +24,9 @@
  *     gone and holds its texture (counted held) till it's dropped, then the retire list lets it go behind the fence; a
  *     device change lets go of the held ones at once;
  *   - want::down_to: a record down to half its size 2 levels, a quarter 3, its own size 1;
+ *   - the characters' asks of the real pack (M5; skipped without it): four 1024 x 1024 records of 256 x 256 game textures
+ *     at once down to the game's last level, 8 levels each, and a 4x record of a one-level game texture down to its
+ *     size, 3 levels, read back level by level;
  *   - failures at the worker: a level CRC that doesn't match and a data file that can't be opened: missed "a CRC
  *     mismatch" and "a read failed", the texture made for each released at once, a good one between them ready, one
  *     take_log line each with the reader's why, handed over once;
@@ -1615,6 +1618,81 @@ int main(int argc, char **argv)
 	}
 	else
 		note("the real pack's 2,000 entries: skipped (no real pack); the made-up pack's 2,000 stood in");
+
+	// ---- The real pack's character records as the characters ask (M5: docs/texture-pack/characters.md "Requests,
+	// levels and pacing"): four 1024 x 1024 records of 256 x 256 game textures at once, down to the game's last level
+	// (8 x 8: 8 levels, the stored 9 less the 4 x 4), and a 4x record of a game texture with a side under 32 (one level
+	// in the game) down to the game's own size (3 levels); read back level by level against the records
+	if (real)
+	{
+		std::vector<const pk::entry *> big_ones;
+		const pk::entry *one_level = nullptr;
+		for (const pk::entry &e : real->entries)
+		{
+			const pk::record *r = e.map(pk::kColour);
+			if (r == nullptr || (e.flags & pk::kNoPack) != 0)
+				continue;
+			if (e.source_kind == pk::kSourceModel && r->w == 1024 && r->h == 1024 && e.w == 256 && e.h == 256 && r->levels == 9 && big_ones.size() < 4)
+				big_ones.push_back(&e);
+			if (one_level == nullptr && std::min(e.w, e.h) < 32 && r->w == 4 * e.w && r->h == 4 * e.h && r->levels >= 3)
+				one_level = &e;
+		}
+		check(open_and_wait(real), "the real pack opened again (read only)");
+		pk::reader real_own(real);
+		const st::owner o = st::add_owner("characters");
+		std::vector<st::ticket> ts;
+		std::vector<pk::record> recs;
+		for (const pk::entry *e : big_ones)
+		{
+			// (cache::take_pack_asks' down_to: the key's size halved tex::mip_count - 1 times, 6 levels for 256 x 256)
+			st::want w = want_of(e->the_key(), 0, 0, 1500000);
+			w.down_to_w = e->w >> 5;
+			w.down_to_h = e->h >> 5;
+			ts.push_back(st::request(o, w));
+			recs.push_back(*e->map(pk::kColour));
+		}
+		if (one_level != nullptr)
+		{
+			st::want w = want_of(one_level->the_key(), 0, 0, 1500000);
+			w.down_to_w = one_level->w;
+			w.down_to_h = one_level->h;
+			ts.push_back(st::request(o, w));
+			recs.push_back(*one_level->map(pk::kColour));
+		}
+		const tally t = wait_all(ts);
+		std::vector<item> items;
+		bool levels = big_ones.size() == 4 && one_level != nullptr;
+		std::string seen;
+		for (size_t i = 0; i < ts.size(); ++i)
+		{
+			item it;
+			it.t = ts[i];
+			it.rec = recs[i];
+			if (!st::get(ts[i], it.v))
+			{
+				levels = false;
+				continue;
+			}
+			const bool is_one_level = one_level != nullptr && i == ts.size() - 1;
+			levels = levels && it.v.format == DXGI_FORMAT_BC2_UNORM && it.v.first == 0 && it.v.levels == (is_one_level ? 3u : 8u) && it.v.w == recs[i].w;
+			seen += (seen.empty() ? "" : ", ") + std::to_string(it.v.w) + "x" + std::to_string(it.v.h) + " " + std::to_string(it.v.levels) + " levels";
+			items.push_back(it);
+		}
+		std::string bad;
+		const int matched = read_back(items, real_own, rb, bad);
+		check(t.ready == int(ts.size()) && levels && matched == int(items.size()),
+			"the characters' asks of the real pack: " + seen + "; " + std::to_string(matched) + " read back equal to their records" + (bad.empty() ? std::string() : ": " + bad));
+		if (one_level != nullptr)
+			note("  (the one-level game texture: " + std::to_string(one_level->w) + "x" + std::to_string(one_level->h) + ", " + std::string(one_level->name, strnlen(one_level->name, 16)) + ")");
+		for (const st::ticket &t2 : ts)
+			st::drop(t2);
+		st::drop_owner(o);
+		settle();
+		check(open_and_wait(nullptr, synthetic), "the made-up pack opened again");
+		messages_check("the characters' asks of the real pack");
+	}
+	else
+		note("the real pack's character records: skipped (no real pack)");
 
 	// ---- Misses at the request
 	{

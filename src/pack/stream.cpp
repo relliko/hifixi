@@ -56,6 +56,8 @@ namespace hifi::pack::stream
 		std::atomic<void (*)()> g_before_pick { nullptr };
 		// (tests only: test::after_load)
 		std::atomic<void (*)()> g_after_load { nullptr };
+		// (tests only: test::fail_parts)
+		std::atomic<const char *> g_fail_parts { nullptr };
 
 		uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 		unsigned long long megabytes(uint64_t bytes) { return static_cast<unsigned long long>((bytes + 524288) / 1048576); }
@@ -539,6 +541,8 @@ namespace hifi::pack::stream
 					why = "the copy lists couldn't be made";
 			if (why == nullptr && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&w.fence))))
 				why = "the copy fence couldn't be made";
+			if (why == nullptr)
+				why = g_fail_parts.load(); // (tests only: the ring refused, as a card short of it would)
 			if (why == nullptr)
 			{
 				// (CPU write-back in L0: the reader checks each level's CRC over the bytes it just read into it, and an UPLOAD
@@ -2043,6 +2047,11 @@ namespace hifi::pack::stream
 		void after_load(void (*fn)())
 		{
 			g_after_load = fn;
+		}
+
+		void fail_parts(const char *why)
+		{
+			g_fail_parts = why;
 		}
 
 		size_t done_waiting(owner o)

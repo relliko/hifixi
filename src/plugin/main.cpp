@@ -41,7 +41,8 @@
  *                  [chars] perpixel its per-pixel lighting, [chars] detail the detail maps); the game draws any model
  *                  whose data isn't up yet, and for good one with a texture that couldn't be read
  *   /hifi textures [status|on|off|compare|reload]   the texture pack (src/pack; docs/texture-pack-plan.md,
- *                  docs/texture-pack/zones.md): on or off ([textures] pack, saved; on also for a session after a GPU
+ *                  docs/texture-pack/zones.md, characters.md): scenery and characters (characters at once, scenery at the
+ *                  next area); on or off ([textures] pack, saved; on also for a session after a GPU
  *                  stop), the game's own textures drawn to compare (not saved), the pack looked for and opened again;
  *                  status: what it found and streams, and the game's memory as the pack needs it (the address space and
  *                  its largest free block, video memory, each zone's lowest) and whether a texture bake is running
@@ -92,7 +93,7 @@
 #include "../ui/menu.hpp"
 #include "../pack/memwatch.hpp"
 #include "../pack/pack_module.hpp"
-#include "../zone/zonepack.hpp"
+#include "pack_wiring.hpp"               // (the texture pack's consumers and the FSR bias: zones, then characters)
 #include "hangwatch.hpp"
 #include <cctype>
 #include <cmath>
@@ -103,7 +104,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.66;
+	constexpr double kVersion = 0.67;
 	// A present's steps on the game's thread, timed; the lot in the log when they took over kSlowPresentMs (at most
 	// kSlowPresentLines a session: a zone change takes a second or two every time)
 	struct slow_present
@@ -1014,11 +1015,10 @@ public:
 		gpu_crash::add_section(hifi::zone::breadcrumb_report); // (the native zone pass's breadcrumbs in a GPU crash report)
 		gpu_crash::add_section(rate_section);                   // (and the frame rate's state: on, the cap, the speed-ups)
 		gpu_crash::add_section(hifi::pack::crash_section);      // (and the game's memory, whether a bake runs: src/pack/memwatch)
-		// (the texture pack's module calls the zones' and model actors' glue: src/zone/zonepack; it orders a zone's
-		// textures from the last zone pass's camera and logs each zone's coverage)
-		hifi::zone::zonepack::set_camera_source(hifi::game::zonedraw::camera);
-		hifi::zone::zonepack::set_log(hifi::backend::log);
-		hifi::pack::set_consumer(hifi::zone::zonepack::consumer());
+		// (the texture pack's module calls the zones' and model actors' glue first (src/zone/zonepack: ordered by the last
+		// zone pass's camera), then the characters' (src/chars/charpack: the models the game drew itself in its line); in
+		// pack_wiring so packjoin_test makes the same calls)
+		hifi::pack_wiring::wire(hifi::game::zonedraw::camera, hifi::backend::log, hifi::pack_wiring::game_drawn_models);
 		return true;
 	}
 
@@ -1317,12 +1317,9 @@ public:
 			// (the model actors' DATs, as they're seen)
 			hifi::zone::actordata::frame(worldfx::attached(), p.in_game && hifi::game::modelactor::in(), p.in_game ? hifi::game::feed::zone() : 0);
 			slow.step("the model actors' data");
-			// (the texture pack's textures sampled with more detail under FSR while the pack is in use: log2 of the world's
-			// width over the screen's, at least -1.0 more; none else: docs/texture-pack/zones.md "The FSR bias")
-			{
-				float ratio = 1.0f;
-				hifi::zone::inject::set_texture_bias(hifi::pack::fsr_bias_on() && hifi::upscale::world_scale(ratio) ? hifi::pack::fsr_bias(ratio) : 0.0f);
-			}
+			// (the texture pack's textures sampled with more detail under FSR while the pack is in use, the zone's and the
+			// characters': log2 of the world's width over the screen's, at least -1.0 more; none else)
+			hifi::pack_wiring::follow_texture_bias();
 			// (the own-frame passes, src/host/passes.hpp: the device as it's known, then each present)
 			if (ID3D12Device *const device = worldfx::attached(); device != m_pass_device)
 			{

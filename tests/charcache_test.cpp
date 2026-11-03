@@ -15,7 +15,19 @@
  *     game) while one naming a ready texture is;
  *   - the pairs of descriptors let go wait for the GPU (retire::then): not free after the next present, free once the
  *     fence has passed two; let go before stop() never come back into the next heap (counted once the retire list is
- *     empty, so the last heap's closures have run).
+ *     empty, so the last heap's closures have run);
+ *   - the texture pack's part (docs/texture-pack/characters.md; the streamer on WARP, a made-up pack of 160 4x records
+ *     under build\test\charcache, src/chars/charpack driven as the module drives it): with no glue, keys made and nothing
+ *     asked; 64 in the pack ready through pairs of their own (BC2, the record's levels down to the game's last, at most
+ *     its chain), one not in it spent, the line; compare; the same bytes under two resources one texture, one let go and
+ *     the other still holding it; clear_all lets go of the pack's part only; the free pairs at kPackSlotFloor: nothing
+ *     asked, and ready tickets let go for want of a pair, asked again once there are; 1,000 and more let go while
+ *     upgrading (asked, between pack_begin and pack_end, ready): no pair twice, none free before the fence, all back
+ *     after; five pairs over the floor: five asked, none read for nothing; under the streamer's pressure (set_limits over
+ *     95%) the least recently drawn (not the first ready) back to the game's a round each half second, nothing asked
+ *     meanwhile (a new texture among it), asked again once it's been gone kEvictHoldS, a round at a time; back just after:
+ *     held twice as long, then 10 s again; stop() drops every ticket, and
+ *     no pack pair of the last heap comes back into the next.
  *
  *   build\charcache_test.exe     (built by build.cmd)
  */
@@ -24,12 +36,19 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include "../src/chars/cache.hpp"
+#include "../src/chars/charpack.hpp"
 #include "../src/chars/tex.hpp"
 #include "../src/host/retire.hpp"
+#include "../src/pack/bc2.hpp"
+#include "../src/pack/pack.hpp"
+#include "../src/pack/pack_write.hpp"
+#include "../src/pack/stream.hpp"
+#include "../src/pack/validate.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -151,6 +170,100 @@ namespace
 			gpu_past_signals();
 		}
 		return -1;
+	}
+
+	// ---- The texture pack's part (docs/texture-pack/characters.md)
+
+	namespace pk = hifi::pack;
+	namespace st = hifi::pack::stream;
+	namespace cp = hifi::chars::charpack;
+
+	// A DXT1 chunk with its blocks and a name of its own (i): a key of its own
+	std::vector<uint8_t> named(uint32_t w, uint32_t h, uint32_t i)
+	{
+		std::vector<uint8_t> c = chunk(w, h, true);
+		char name[17];
+		std::snprintf(name, sizeof(name), "cc pack %08u", i);
+		std::memcpy(c.data() + 1, name, 16);
+		return c;
+	}
+
+	void remove_tree(const std::wstring &folder)
+	{
+		WIN32_FIND_DATAW f;
+		HANDLE h = FindFirstFileW((folder + L"*").c_str(), &f);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			do
+				if ((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+					DeleteFileW((folder + f.cFileName).c_str());
+			while (FindNextFileW(h, &f));
+			FindClose(h);
+		}
+		RemoveDirectoryW(folder.substr(0, folder.size() - 1).c_str());
+	}
+
+	// A made-up pack: for each of `keys` named(64, 64, i) a 4x record (256 x 256 BC2, its chain to 4 x 4, flat grey)
+	bool make_pack(const std::wstring &folder, uint32_t keys, std::string &why)
+	{
+		remove_tree(folder);
+		pk::writer w;
+		pk::writer_options o;
+		o.folder = folder;
+		o.source = "charcache_test";
+		if (!w.open(o, why))
+			return false;
+		for (uint32_t i = 0; i < keys; ++i)
+		{
+			const std::vector<uint8_t> c = named(64, 64, i);
+			const pk::key k = pk::key_of(c.data(), c.size());
+			pk::entry e;
+			e.hash = k.hash;
+			e.bytes = k.bytes;
+			e.w = k.w;
+			e.h = k.h;
+			e.orig_format = c[0];
+			e.source_kind = pk::kSourceModel;
+			std::memcpy(e.name, c.data() + 1, 16);
+			pk::map_in m;
+			m.format = pk::kBC2;
+			m.w = m.h = 256;
+			std::vector<uint8_t> px(size_t(256) * 256 * 4, 0x80);
+			const std::vector<uint8_t> top = pk::bc2::encode_bc2(px.data(), 256, 256);
+			m.levels = pk::bc2::full_chain(top.data(), 256, 256, pk::kAlphaNone, pk::bc2::kCharsCutThreshold);
+			if (w.add(e, { m }, why) != pk::add_result::ok)
+				return false;
+		}
+		const bool ok = w.commit(why);
+		w.close();
+		return ok;
+	}
+
+	ID3D12Device *g_device = nullptr;
+	ID3D12Device *device_of() { return g_device; }
+
+	// The module's present as the plugin makes it, then backend::present's retire::on_present, the GPU idle after
+	void present_pack(ID3D12CommandQueue *queue, double &now)
+	{
+		now += 1.0 / 60.0;
+		cache::frame_tick(g_device, now);
+		st::on_present();
+		cp::frame(now, st::epoch());
+		hifi::retire::on_present(queue);
+		gpu_past_signals();
+	}
+	// Presents until every texture asked has come back one way or the other (at most n)
+	bool presents_until_settled(ID3D12CommandQueue *queue, double &now, int n = 400)
+	{
+		for (int i = 0; i < n; ++i)
+		{
+			present_pack(queue, now);
+			const cache::counts c = cache::get_counts();
+			if (c.pack_asked == 0 && i > 2)
+				return true;
+			Sleep(2);
+		}
+		return false;
 	}
 }
 
@@ -288,6 +401,479 @@ int main()
 	check(runs > 0 && c.textures_ready == 1 && c.slots_free == kAllPairs - 1 && c.slots_retiring == 0,
 		"  stopped, made again, one texture: " + std::to_string(c.slots_free) + " free once the retire list is empty (" + std::to_string(runs) +
 			" presents; none of the last heap's given back to this one)");
+
+	// ---- The texture pack's part (docs/texture-pack/characters.md; the streamer on WARP, a made-up pack)
+	g_device = device;
+	{
+		// The key path with no glue (no drop hook, nothing wanted): keys made from the bytes given, nothing asked, every
+		// view the game's
+		std::vector<uint32_t> plain;
+		std::vector<pk::key> plain_keys;
+		for (uint32_t i = 0; i < 3; ++i)
+		{
+			std::vector<uint8_t> b = named(64, 64, 1000 + i);
+			plain_keys.push_back(pk::key_of(b.data(), b.size()));
+			plain.push_back(cache::add_texture(key_of(), std::move(b)));
+		}
+		cache::settle(60000);
+		bool keyed = true, game_views = true;
+		for (size_t i = 0; i < plain.size(); ++i)
+		{
+			keyed = keyed && plain_keys[i].bytes != 0 && cache::test::pack_key_of(plain[i]) == plain_keys[i] && std::strcmp(cache::test::pack_state_of(plain[i]), "none") == 0;
+			bool is_pack = true;
+			D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+			game_views = game_views && cache::texture_view_of(plain[i], h, true, &is_pack) && !is_pack;
+		}
+		std::vector<cache::pack_ask> asks;
+		cache::take_pack_asks(64, asks);
+		c = cache::get_counts();
+		check(keyed && game_views && asks.empty() && c.pack_keyed == 4 && c.pack_ready == 0 && c.pack_pairs == 0,
+			"the texture pack's keys with no glue: each texture keyed from its bytes (pack::key_of), none asked, every view the game's (" +
+				std::to_string(c.pack_keyed) + " keyed)");
+	}
+	wchar_t exe[MAX_PATH];
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	const std::wstring build = std::wstring(exe).substr(0, std::wstring(exe).find_last_of(L'\\') + 1);
+	CreateDirectoryW((build + L"test").c_str(), nullptr);
+	CreateDirectoryW((build + L"test\\charcache").c_str(), nullptr);
+	const std::wstring pack_folder = build + L"test\\charcache\\hifixi-pack\\";
+	constexpr uint32_t kKeys = 160;
+	{
+		std::string why;
+		const bool made = make_pack(pack_folder, kKeys, why);
+		const bool started = st::start(device);
+		const uint64_t posted = st::open(pack_folder);
+		for (int i = 0; i < 2000 && st::posts_done() < posted; ++i)
+			Sleep(5);
+		check(made && started && st::current() != nullptr, "a made-up pack of " + std::to_string(kKeys) + " (64 x 64 textures' 4x records, 256 x 256 BC2), the streamer on WARP: opened" +
+			(why.empty() ? std::string() : ": " + why));
+	}
+	cp::sources sources;
+	sources.device = device_of;
+	cp::set_sources(sources);
+	{
+		pk::modes m;
+		m.chars = true;
+		cp::set_mode(m);
+	}
+	const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	std::vector<uint32_t> hits;
+	std::vector<cache::key> hit_keys; // (named again by the eviction's long waits: never let go as unused)
+	uint32_t miss = cache::kNone;
+	{
+		// 64 in the pack and one not: the pack's pairs for the 64, ready, BC2 with the record's levels down to the game's
+		// last (the chain stops at 4 x 4: 7 of the 8 that would reach 2 x 2); the other spent, its game pair kept
+		for (uint32_t i = 0; i < 64; ++i)
+		{
+			hit_keys.push_back(key_of());
+			hits.push_back(cache::add_texture(hit_keys.back(), named(64, 64, i)));
+		}
+		miss = cache::add_texture(key_of(), named(64, 64, 5000));
+		cache::settle(60000);
+		const bool settled = presents_until_settled(queue, now);
+		c = cache::get_counts();
+		bool states = std::strcmp(cache::test::pack_state_of(miss), "spent") == 0, views = true, levels = true;
+		const D3D12_GPU_DESCRIPTOR_HANDLE start = cache::heap()->GetGPUDescriptorHandleForHeapStart();
+		std::string level_line;
+		for (uint32_t id : hits)
+		{
+			states = states && std::strcmp(cache::test::pack_state_of(id), "ready") == 0;
+			D3D12_GPU_DESCRIPTOR_HANDLE h = {}, g = {};
+			bool is_pack = false, game_is_pack = true;
+			views = views && cache::texture_view_of(id, h, true, &is_pack) && is_pack && h.ptr == start.ptr + uint64_t(2 * cache::test::pack_slot_of(id)) * step &&
+				cache::texture_view_of(id, g, false, &game_is_pack) && !game_is_pack && g.ptr == start.ptr + uint64_t(2 * cache::test::game_slot_of(id)) * step;
+			st::view v;
+			const bool got = st::get(cache::test::pack_ticket_of(id), v);
+			levels = levels && got && v.format == DXGI_FORMAT_BC2_UNORM && v.w == 256 && v.h == 256 && v.levels == 7;
+			if (level_line.empty() && got)
+				level_line = std::to_string(v.w) + " x " + std::to_string(v.h) + " format " + std::to_string(int(v.format)) + ", " + std::to_string(v.levels) + " levels";
+		}
+		bool miss_game = false, miss_is_pack = true;
+		D3D12_GPU_DESCRIPTOR_HANDLE mh = {};
+		miss_game = cache::texture_view_of(miss, mh, true, &miss_is_pack) && !miss_is_pack;
+		std::string why;
+		const bool consistent = cache::test::slots_consistent(why);
+		check(settled && states && c.pack_ready == 64 && c.pack_pairs == 64 && c.pack_asked == 0, "64 in the pack ready, one not spent: " + cache::status().back());
+		check(views && miss_game, "  texture_view_of: the pack's pair for those (the game's with the pack refused: the casters), the game's for the other");
+		check(levels, "  their views' textures: " + level_line + " (BC2, from the record down to the game's last level, at most its chain)");
+		check(consistent, "  no pair twice" + (why.empty() ? std::string() : ": " + why));
+		std::vector<std::string> lines;
+		cp::lines(lines);
+		check(lines.size() == 1 && lines[0].rfind("Characters: 64 of " + std::to_string(c.textures_ready) + " textures from the pack (" + std::to_string(c.pack_not_in) + " not in it, 0 coming)", 0) == 0,
+			"  the line: " + (lines.empty() ? std::string() : lines[0]));
+		// /hifi textures compare: the game's pair handed out, nothing let go
+		cp::set_compare(true);
+		bool is_pack = true;
+		D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+		const bool compared = cache::texture_view_of(hits[0], h, true, &is_pack) && !is_pack;
+		cp::set_compare(false);
+		check(compared && cache::texture_view_of(hits[0], h, true, &is_pack) && is_pack && cache::get_counts().pack_pairs == 64,
+			"  compare: the game's pair while it's on, the pack's again after, nothing let go");
+	}
+	{
+		// Two textures with the same bytes (two game resources): two tickets, one texture of the streamer's; one let go, the
+		// other's still there
+		const st::counts s0 = st::get_counts();
+		const cache::key twin_key = key_of();
+		const uint32_t twin = cache::add_texture(twin_key, named(64, 64, 7));
+		cache::settle(60000);
+		presents_until_settled(queue, now);
+		const st::counts s1 = st::get_counts();
+		st::view a, b;
+		const bool both = st::get(cache::test::pack_ticket_of(hits[7]), a) && st::get(cache::test::pack_ticket_of(twin), b) && a.resource == b.resource &&
+			!(cache::test::pack_ticket_of(hits[7]) == cache::test::pack_ticket_of(twin));
+		check(both && s1.resident == s0.resident && s1.shared == s0.shared + 1 && std::strcmp(cache::test::pack_state_of(twin), "ready") == 0,
+			"the same bytes under two game resources: two tickets, one texture (resident " + std::to_string(s1.resident) + ", shared +" + std::to_string(s1.shared - s0.shared) + ")");
+		cache::key moved = twin_key;
+		moved.handle++;
+		cache::texture(moved); // (another resource at its address: the twin let go)
+		for (int i = 0; i < 4; ++i)
+			present_pack(queue, now);
+		st::view a2;
+		check(st::get(cache::test::pack_ticket_of(hits[7]), a2) && a2.resource == a.resource && st::get_counts().resident == s0.resident,
+			"  one let go: the other still holds the texture");
+	}
+	{
+		// Every pack part let go (the module's clear_all): the game's pairs stay, the pack's behind the GPU
+		const uint32_t pairs = cache::get_counts().pack_pairs;
+		const uint32_t retiring0 = cache::get_counts().slots_retiring;
+		cp::clear_all();
+		c = cache::get_counts();
+		bool none = true;
+		for (uint32_t id : hits)
+			none = none && std::strcmp(cache::test::pack_state_of(id), "none") == 0;
+		check(none && c.pack_pairs == 0 && c.slots_retiring == retiring0 + pairs && c.textures_ready >= 65 && !cp::get_counts().owner,
+			"clear_all: every pack part let go (" + std::to_string(pairs) + " pairs behind the GPU), the game's kept, the owner dropped");
+		presents_until_back(queue);
+		// Exhaustion: with kPackSlotFloor pairs free (1,024: the rest held by the test) nothing is asked
+		cache::test::hold_slots(cache::kPackSlotFloor);
+		const uint64_t asked0 = cp::get_counts().asked;
+		for (int i = 0; i < 10; ++i)
+			present_pack(queue, now);
+		c = cache::get_counts();
+		check(cp::get_counts().asked == asked0 && c.pack_ready == 0 && c.pack_waiting_slots >= 64 && c.slots_free == cache::kPackSlotFloor,
+			"the free pairs down to the floor (" + std::to_string(c.slots_free) + "): nothing asked, " + std::to_string(c.pack_waiting_slots) + " waiting");
+		std::vector<std::string> lines;
+		cp::lines(lines);
+		check(!lines.empty() && lines[0].find("skipped (the characters' descriptors are nearly all in use)") != std::string::npos, "  the line says so: " + lines[0]);
+		// Five pairs over the floor: five asked (not the 64 a present may), each given a pair once ready, none read and let
+		// go for want of one; nothing more asked while the five are on their way or the floor is reached
+		cache::test::give_back_slots();
+		cache::test::hold_slots(cache::kPackSlotFloor + 5);
+		const uint64_t skipped5 = cache::get_counts().pack_skipped_slots;
+		present_pack(queue, now);
+		const uint64_t asked5 = cp::get_counts().asked - asked0;
+		// (a few of the textures first on the list aren't in the pack: their misses free their share for the next)
+		for (int i = 0; i < 300 && (cache::get_counts().pack_asked != 0 || cache::get_counts().slots_free > cache::kPackSlotFloor); ++i)
+		{
+			present_pack(queue, now);
+			Sleep(2);
+		}
+		const uint64_t asked_floor = cp::get_counts().asked - asked0;
+		for (int i = 0; i < 5; ++i)
+			present_pack(queue, now);
+		c = cache::get_counts();
+		check(asked5 == 5 && c.pack_skipped_slots == skipped5 && c.pack_ready == 5 && c.slots_free == cache::kPackSlotFloor && cp::get_counts().asked - asked0 == asked_floor,
+			"  five pairs over the floor: " + std::to_string(asked5) + " asked in the first present (" + std::to_string(asked_floor) + " in all, the misses' share asked "
+				"again), " + std::to_string(c.pack_ready) + " ready, " + std::to_string(c.pack_skipped_slots - skipped5) + " let go for want of a pair, none asked at the floor");
+		cp::clear_all();
+		presents_until_back(queue);
+		cache::test::give_back_slots();
+		cache::test::hold_slots(cache::kPackSlotFloor);
+		// Asked above it, then the floor reached before they're ready: each ready ticket let go for want of a pair, the
+		// texture asked again once there are pairs
+		cache::test::give_back_slots();
+		present_pack(queue, now);
+		const uint64_t asked1 = cp::get_counts().asked;
+		cache::test::hold_slots(cache::kPackSlotFloor);
+		for (int i = 0; i < 300 && cache::get_counts().pack_asked != 0; ++i)
+		{
+			present_pack(queue, now);
+			Sleep(2);
+		}
+		c = cache::get_counts();
+		check(asked1 > asked0 && c.pack_skipped_slots > 0 && c.pack_ready + c.pack_skipped_slots + c.pack_not_in >= 64 && c.slots_free == cache::kPackSlotFloor,
+			"  asked above the floor, then the floor reached: " + std::to_string(c.pack_skipped_slots) + " ready tickets let go for want of a pair (" +
+				std::to_string(c.pack_ready) + " got one first)");
+		cache::test::give_back_slots();
+		const bool again = presents_until_settled(queue, now);
+		c = cache::get_counts();
+		std::string why;
+		check(again && c.pack_ready == 64 && cache::test::slots_consistent(why), "  pairs again: asked again, all ready (" + std::to_string(c.pack_ready) + ")" +
+			(why.empty() ? std::string() : ": " + why));
+	}
+	{
+		// 1,000 textures let go while upgrading: a third with the ticket asked, a third between pack_begin and pack_end
+		// (the views written after), a third once ready. No pair is ever both free and in use, or in use twice; none let
+		// go is free before the fence has passed it; all of them back once the retire list has passed them
+		pk::modes off;
+		cp::set_mode(off); // (the glue out of the way: the test drives the cache's calls itself)
+		cache::set_pack_drop(&st::drop);
+		cache::set_pack_on(true);
+		const st::owner o = st::add_owner("charcache_test");
+		uint32_t forgotten = 0, rounds = 0, begun = 0, early = 0;
+		bool consistent = true, back = true;
+		std::string why;
+		while (forgotten < 1000 && rounds < 40)
+		{
+			rounds++;
+			std::vector<std::pair<uint32_t, cache::key>> made;
+			for (uint32_t i = 0; i < 99; ++i)
+			{
+				const cache::key k = key_of();
+				made.emplace_back(cache::add_texture(k, named(64, 64, (rounds * 99 + i) % kKeys)), k);
+			}
+			cache::settle(60000);
+			now += 0.01;
+			cache::frame_tick(device, now);
+			std::vector<cache::pack_ask> asks;
+			cache::take_pack_asks(200, asks);
+			for (const cache::pack_ask &a : asks)
+			{
+				// (only this round's: the textures from before stay as they are)
+				if (std::none_of(made.begin(), made.end(), [&](const auto &m) { return m.first == a.id; }))
+					continue;
+				st::want w;
+				w.k = a.k;
+				w.down_to_w = a.down_to_w;
+				w.down_to_h = a.down_to_h;
+				w.epoch = st::epoch();
+				const st::ticket t = st::request(o, w);
+				if (!cache::pack_asked(a.id, a.serial, t, w.epoch))
+					st::drop(t);
+			}
+			auto forget = [&](const cache::key &k) {
+				cache::key moved = k;
+				moved.handle++;
+				cache::texture(moved);
+				forgotten++;
+			};
+			std::vector<uint32_t> let_go;
+			for (size_t j = 0; j < made.size(); j += 3)
+				forget(made[j].second); // (asked: its ticket dropped wherever it is)
+			// The rest's tickets ready
+			for (int i = 0; i < 2000; ++i)
+			{
+				bool all = true;
+				for (size_t j = 0; j < made.size() && all; ++j)
+					if (j % 3 != 0)
+						all = st::poll(cache::test::pack_ticket_of(made[j].first)) == st::state::ready;
+				if (all)
+					break;
+				st::on_present();
+				Sleep(1);
+			}
+			for (size_t j = 0; j < made.size(); ++j)
+			{
+				if (j % 3 == 0)
+					continue;
+				const st::ticket t = cache::test::pack_ticket_of(made[j].first);
+				cache::pack_writing w;
+				if (!cache::pack_begin(t, w))
+					continue;
+				begun++;
+				let_go.push_back(w.slot);
+				if (j % 3 == 1)
+					forget(made[j].second); // (between pack_begin and pack_end: the pair let go before it's even written)
+				st::view v;
+				const bool ok = st::get(t, v) && st::write_view(t, w.colour);
+				cache::write_pack_detail(w);
+				cache::pack_end(w, ok, v.bytes);
+				if (j % 3 == 2)
+					forget(made[j].second); // (ready)
+			}
+			for (uint32_t s : let_go)
+				early += cache::test::slot_free(s);
+			std::string w;
+			if (!cache::test::slots_consistent(w))
+			{
+				consistent = false;
+				if (why.empty())
+					why = w;
+			}
+			// (what take_done hands over now is no one's: let go already)
+			std::vector<std::pair<st::ticket, st::state>> done;
+			st::take_done(o, done);
+			for (const auto &[t, s] : done)
+			{
+				cache::pack_writing w2;
+				if (s == st::state::ready && cache::pack_begin(t, w2))
+				{
+					consistent = false;
+					why = "a ticket let go was still the cache's";
+				}
+			}
+			hifi::retire::on_present(queue);
+			for (uint32_t s : let_go)
+				early += cache::test::slot_free(s); // (one present on: still not past the fence's +2)
+			presents_until_back(queue);
+			for (uint32_t s : let_go)
+				back = back && cache::test::slot_free(s);
+		}
+		cache::forget_pack_textures(); // (the test's tickets let go, as the module's clear_all would)
+		st::drop_owner(o);
+		presents_until_back(queue);
+		c = cache::get_counts();
+		std::string w;
+		check(forgotten >= 1000 && consistent && cache::test::slots_consistent(w), std::to_string(forgotten) + " textures let go while upgrading (" + std::to_string(begun) +
+			" pairs taken, half of them let go before they were written): no pair twice" + (why.empty() ? std::string() : ": " + why));
+		check(early == 0 && back && c.slots_retiring == 0 && c.slots_free == kAllPairs - c.textures_ready - c.meshes_ready - c.pack_pairs,
+			"  none of their pairs free before the fence (" + std::to_string(early) + "), all back after (" + std::to_string(c.slots_free) + " free, " + std::to_string(c.pack_pairs) +
+				" pack pairs in use, " + std::to_string(c.textures_ready) + " textures)");
+	}
+	{
+		// Eviction under the streamer's pressure (plan section 5, characters.md "Eviction under pressure"): the 64 drawn one
+		// after another and then the first three again, the video memory over 95% (set_limits): each half second the ones
+		// drawn longest ago back to the game's (not the first ready: those were drawn last), up to the round's bytes (three
+		// textures' worth here); a new texture meanwhile not asked; held while the pressure's been gone under the hold, then
+		// asked again a round at a time, the ones drawn last first; the pressure back just after: the next hold twice as
+		// long, and 10 s again once it's stayed away kBackoffWindowS
+		pk::modes on;
+		on.chars = true;
+		cp::set_mode(on);
+		presents_until_settled(queue, now);
+		cache::key late_key = key_of();
+		const uint32_t ready0 = cache::get_counts().pack_ready;
+		st::view v0;
+		st::get(cache::test::pack_ticket_of(hits[0]), v0);
+		cp::test::set_evict_bytes(3 * v0.bytes);
+		// (hits[i] drawn at now + 1 + i / 100, then hits[0..2] again at now + 1.9: hits[3] the longest ago, though hits[0]
+		// was ready first and asked first)
+		auto draw = [&](uint32_t i, double at) {
+			cache::pack_tick(at);
+			D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+			bool is_pack = false;
+			cache::texture_view_of(hits[i], h, true, &is_pack);
+		};
+		for (uint32_t i = 0; i < hits.size(); ++i)
+			draw(i, now + 1.0 + i * 0.01);
+		for (uint32_t i = 0; i < 3; ++i)
+			draw(i, now + 1.9);
+		now += 2.0;
+		// (seconds on, a present at most each 5 s with every texture named again: the cache lets go of one unnamed for
+		// kForgetSeconds)
+		auto wait = [&](double seconds) {
+			const double until = now + seconds;
+			while (now < until)
+			{
+				now = std::min(until, now + 5.0);
+				present_pack(queue, now);
+				for (const cache::key &k : hit_keys)
+					cache::texture(k);
+				cache::texture(late_key);
+			}
+		};
+		auto in_state = [&](uint32_t from, uint32_t to, const char *s) {
+			bool all = true;
+			for (uint32_t i = from; i < to; ++i)
+				all = all && std::strcmp(cache::test::pack_state_of(hits[i]), s) == 0;
+			return all;
+		};
+		st::limits full;
+		full.vram_usage = 99ull << 20;
+		full.vram_budget = 100ull << 20;
+		st::set_limits(full);
+		const uint64_t asked0 = cp::get_counts().asked;
+		present_pack(queue, now);
+		c = cache::get_counts();
+		check(st::pressure() && ready0 == 64 && c.pack_evicted == 3 && in_state(3, 6, "evicted") && in_state(0, 3, "ready") && in_state(6, 7, "ready") &&
+			cp::get_counts().evict_rounds == 1, "the video memory over 95%: the 3 drawn longest ago back to the game's in the first round, the 3 ready first but drawn "
+				"since kept (" + std::to_string(c.pack_evicted) + " evicted, the round's bytes " + mb(3 * v0.bytes) + ")");
+		bool game_view = true;
+		for (uint32_t i = 3; i < 6; ++i)
+		{
+			D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+			bool is_pack = true;
+			game_view = game_view && cache::texture_view_of(hits[i], h, true, &is_pack) && !is_pack;
+		}
+		// (a new character's texture while it holds, in the pack: not asked)
+		late_key = key_of();
+		const uint32_t late = cache::add_texture(late_key, named(64, 64, 100));
+		cache::settle(60000);
+		for (int i = 0; i < 12; ++i)
+			present_pack(queue, now); // (0.2 s: no second round yet)
+		const uint32_t after_quarter = cache::get_counts().pack_evicted;
+		for (int i = 0; i < 20; ++i)
+			present_pack(queue, now); // (past the half second)
+		c = cache::get_counts();
+		check(game_view && after_quarter == 3 && c.pack_evicted == 6 && in_state(6, 9, "evicted") && in_state(0, 3, "ready") && cp::get_counts().evict_rounds == 2,
+			"  their views the game's; the next 3 half a second on, not before (" + std::to_string(c.pack_evicted) + " evicted)");
+		check(cp::get_counts().asked == asked0 && std::strcmp(cache::test::pack_state_of(late), "none") == 0,
+			"  nothing asked meanwhile, a texture new since in the pack among it (" + std::string(cache::test::pack_state_of(late)) + ")");
+		std::vector<std::string> lines;
+		cp::lines(lines);
+		check(!lines.empty() && lines[0].find("6 back to the game's while the graphics card is nearly full") != std::string::npos, "  the line: " + (lines.empty() ? std::string() : lines[0]));
+		std::string why;
+		check(c.pack_pairs == ready0 - 6 && cache::test::slots_consistent(why), "  their pairs let go (" + std::to_string(c.pack_pairs) + " in use)" + (why.empty() ? std::string() : ": " + why));
+		// The pressure gone: the new one asked at once, the evicted held for kEvictHoldS, then asked again a round each half
+		// second, the ones drawn last first
+		st::set_limits(st::limits {});
+		present_pack(queue, now);
+		const bool late_asked = cp::get_counts().asked == asked0 + 1 && std::strcmp(cache::test::pack_state_of(late), "none") != 0;
+		wait(cp::kEvictHoldS - 1.0);
+		c = cache::get_counts();
+		const bool held = !st::pressure() && c.pack_evicted == 6 && cp::get_counts().asked == asked0 + 1;
+		wait(1.5);
+		const bool first_round = cache::get_counts().pack_evicted == 3 && in_state(3, 6, "evicted") && cp::get_counts().asked == asked0 + 4;
+		// (until none is evicted and none coming: the rounds are half a second apart)
+		auto until_back = [&]() {
+			for (int i = 0; i < 600; ++i)
+			{
+				present_pack(queue, now);
+				const cache::counts k = cache::get_counts();
+				if (k.pack_asked == 0 && k.pack_evicted == 0)
+					return true;
+				Sleep(1);
+			}
+			return false;
+		};
+		const bool back = until_back();
+		c = cache::get_counts();
+		check(late_asked && held && first_round && back && c.pack_evicted == 0 && c.pack_ready == ready0 + 1 && cp::get_counts().asked == asked0 + 7,
+			"  the pressure gone: the new one asked at once; the evicted still the game's " + std::to_string(int(cp::kEvictHoldS - 1.0)) + " s on, after " +
+				std::to_string(int(cp::kEvictHoldS)) + " s the 3 drawn last asked first, the rest half a second on, all ready (" + std::to_string(c.pack_ready) + ")");
+		// The pressure back just after: they don't fit, the next hold 20 s; 10 s again once it's stayed away kBackoffWindowS
+		now += 1.0;
+		st::set_limits(full);
+		present_pack(queue, now);
+		const uint32_t again = cache::get_counts().pack_evicted;
+		const double hold = cp::get_counts().hold_s;
+		st::set_limits(st::limits {});
+		present_pack(queue, now);
+		wait(2.0 * cp::kEvictHoldS - 1.0);
+		const bool held_longer = cache::get_counts().pack_evicted == again;
+		wait(1.5);
+		const bool back_again = until_back();
+		check(again == 3 && hold == 2.0 * cp::kEvictHoldS && held_longer && back_again,
+			"  the pressure back 1 s after: " + std::to_string(again) + " evicted, held " + std::to_string(int(hold)) + " s (still the game's " +
+				std::to_string(int(2.0 * cp::kEvictHoldS - 1.0)) + " s on: " + (held_longer ? "yes" : "no") + "), then back (" + (back_again ? "yes" : "no") + ", pressure " + (st::pressure() ? "on" : "off") + ", " +
+				std::to_string(cache::get_counts().pack_evicted) + " evicted, " + std::to_string(cache::get_counts().pack_asked) + " asked)");
+		wait(cp::kBackoffWindowS + 1.0);
+		check(cp::get_counts().hold_s == cp::kEvictHoldS, "  the pressure away " + std::to_string(int(cp::kBackoffWindowS)) + " s: the hold " +
+			std::to_string(int(cp::get_counts().hold_s)) + " s again");
+		cp::test::set_evict_bytes(0);
+	}
+	{
+		// stop(): every ticket to the drop hook, the pack pairs of the last heap never into the next one
+		pk::modes on;
+		on.chars = true;
+		cp::set_mode(on);
+		presents_until_settled(queue, now);
+		const uint32_t held = cache::get_counts().pack_pairs;
+		const uint64_t resident = st::get_counts().resident;
+		cache::stop();
+		check(held != 0 && resident != 0 && st::get_counts().resident == 0, "cache::stop() with " + std::to_string(held) + " pack pairs: every ticket to the drop hook, the streamer's " +
+			std::to_string(resident) + " textures let go");
+		cache::frame_tick(device, now);
+		cache::add_texture(key_of(), chunk(64, 64));
+		cache::settle(60000);
+		const int remade = presents_until_none_held(queue);
+		c = cache::get_counts();
+		check(remade > 0 && c.slots_free == kAllPairs - 1 && st::get_counts().resident == 0, "  made again: " + std::to_string(c.slots_free) +
+			" free (none of the last heap's pack pairs given back to this one), the streamer's textures all let go");
+	}
+	cp::clear_all();
+	st::stop();
 
 	cache::stop();
 	hifi::retire::release_all();

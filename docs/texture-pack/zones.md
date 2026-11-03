@@ -485,7 +485,7 @@ region, `zonepack`, the streamer's decision 1, the FSR bias in the shader). Wher
 - **A streamer fix**: the worker dropped an open posted together with a device change (it took both at its loop's top
   and returned after the change). The module's device change while opening, and `set_device` then `open` within one
   update, hit it on the 4070 Ti (packmodule_test). Now an open or close waits for a pass of its own
-  (`stream.cpp:1350-1369`; streamer.md "As built", threads-pso.md, sync.md); packstream_test checks it.
+  (`stream.cpp:1354-1373`; streamer.md "As built", threads-pso.md, sync.md); packstream_test checks it.
 - **Build**: `PASSES_PACK` gains `stream.cpp pack.cpp validate.cpp hash.cpp` (zonepack.cpp: part B); new
   `packmodule_test` (links like menu_test, plus pack_write and bc2 for its made-up pack).
 - **Tests (part A)**: `packmodule_test` (new: the quiet window over made-up timelines; no folder, a folder found by

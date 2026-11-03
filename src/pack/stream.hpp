@@ -224,6 +224,9 @@ namespace hifi::pack::stream
 		// (tests only) Called on the worker in each open, after pack.idx is loaded and before it's put in use, no lock
 		// held (nullptr: none): a test holds an open there while it asks for another, or changes the device
 		void after_load(void (*fn)());
+		// (tests only) The worker's GPU parts refused from the next time they're made (a start, a device change), with this
+		// as the why, as a card that can't give the ring would (nullptr: made as usual)
+		void fail_parts(const char *why);
 		// (tests only) How many tickets the owner's next take_done would hand over
 		size_t done_waiting(owner o);
 	}

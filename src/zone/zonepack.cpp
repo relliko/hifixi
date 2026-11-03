@@ -209,7 +209,7 @@ namespace hifi::zone::zonepack
 	{
 		pack::consumer c;
 		c.clear_all = &clear_all;
-		c.set_mode = &set_mode;
+		c.set_mode = [](const pack::modes &m) { set_mode(m.zones, m.actors); };
 		c.frame = &frame;
 		c.set_compare = &set_compare;
 		c.lines = &lines;

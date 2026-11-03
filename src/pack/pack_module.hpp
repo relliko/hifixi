@@ -7,13 +7,16 @@
 // What the menu and the settings read (the game's thread, while the menu is drawn): answers the module cached in its
 // update. None of them reads a file, asks DXGI or calls the streamer.
 //
-// What the owners read (the zone's and the model actors' glue, src/zone/zonepack: the game's thread) and what they
-// hand the module (a consumer): the module drops every owner before it closes, opens or stops (decision 2), and calls
-// their frame each present while the pack is in use, after the streamer's on_present.
+// What the owners read (the zone's and the model actors' glue, src/zone/zonepack; the characters', src/chars/charpack:
+// the game's thread) and what they hand the module (a consumer each): the module drops every owner before it closes,
+// opens or stops (decision 2), and calls their frame each present while the pack is in use, after the streamer's
+// on_present, in the order they were added.
 
 #include <cstdint>
 #include <string>
 #include <vector>
+
+struct ID3D12Device;
 
 namespace hifi::pack
 {
@@ -44,15 +47,29 @@ namespace hifi::pack
 	bool fsr_bias_on();
 	float fsr_bias(float ratio);
 
-	// What the owners give the module (any of them nullptr: nothing to call)
+	// The device the pack is in use on (nullptr while it isn't): the characters' glue writes views only for textures of
+	// its own cache's device, and that must be this one (docs/texture-pack/characters.md decision 14)
+	ID3D12Device *device_in_use();
+	// Whether pivot.ini listed the hifi-textures XIPivot overlay at the last look (the first update, on, reload): while
+	// it does the game holds the overlay's copies, and no character texture's key is in the pack
+	bool overlay_listed();
+
+	// Who asks for the pack's textures, as the hidden [textures] keys say: the zone and its second map (zone), the model
+	// actors (actors), the characters (chars); all false while the pack isn't in use
+	struct modes
+	{
+		bool zones = false, actors = false, chars = false;
+	};
+
+	// What an owner gives the module (any of them nullptr: nothing to call)
 	struct consumer
 	{
 		// Every owner's pack textures let go (drop_owner), every slot of this visit spent, flags cleared: before every
 		// close, open (on, reload) and stop, in the same call (zones.md decision 2); also at a device change and loss
 		void (*clear_all)() = nullptr;
-		// The loaders' pack mode for loads starting from now: the zone and its second map ([textures] zone), the model
-		// actors ([textures] actors); both false while the pack isn't in use
-		void (*set_mode)(bool zones, bool actors) = nullptr;
+		// The pack's modes from now on (each consumer takes its own: the zones' loaders for loads starting from now, the
+		// characters at once)
+		void (*set_mode)(const modes &m) = nullptr;
 		// Each present while the pack is in use, after stream::on_present: requests (in `epoch`, epoch_in_use()'s),
 		// take_done, write_view
 		void (*frame)(double now, uint32_t epoch) = nullptr;
@@ -61,7 +78,10 @@ namespace hifi::pack
 		// (update, every half second) Lines for the menu and the status: this area's textures from the pack
 		void (*lines)(std::vector<std::string> &out) = nullptr;
 	};
-	void set_consumer(const consumer &c);
+	// The consumers, called in the order they were added (the zones', then the characters': main.cpp); at most
+	// kMaxConsumers, the same clear_all twice is added once. Constant-initialized: may run in another file's static init
+	constexpr uint32_t kMaxConsumers = 4;
+	void add_consumer(const consumer &c);
 
 	// ---- The quiet window as a function of its inputs (the module feeds it each present; tests drive it)
 	struct quiet_inputs
@@ -87,5 +107,9 @@ namespace hifi::pack
 		uint32_t stream_starts();
 		// (tests) The quiet window forced: -1 as the inputs say, 0 never quiet, 1 always
 		void force_quiet(int v);
+		// (tests) Every consumer taken out (a fake stands in)
+		void clear_consumers();
+		// (tests) The consumers as added, in the order they're called (packjoin_test: pack_wiring's)
+		std::vector<consumer> consumers();
 	}
 }

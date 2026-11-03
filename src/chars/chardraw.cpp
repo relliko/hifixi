@@ -33,7 +33,8 @@ cbuffer frame_constants : register(b0)
 	row_major float4x4 view_proj;
 	float4 fog;          // rgb; w: 1 / (end - start), 0 for none
 	float4 fog_end;      // x: end
-	float4 options;      // x: per-pixel lighting; y: the frame's models; z: the detail maps ([chars] detail, per pixel only)
+	float4 options;      // x: per-pixel lighting; y: the frame's models; z: the detail maps ([chars] detail, per pixel only);
+	                     // w: the texture pack's mip bias (FSR, the pack's textures only: flags 2)
 	float4 sun_dir;      // toward the zone's sun (world), w: 1 when it's known (the light split's share: which light is it)
 	float4 camera;       // the camera (world), w: 1 when it's known (the sun's highlight)
 };
@@ -41,7 +42,7 @@ cbuffer draw_constants : register(b1)
 {
 	uint model_index;
 	float light_scale;   // the material's dword 4
-	uint flags;          // 1: shine (the alpha always passes)
+	uint flags;          // 1: shine (the alpha always passes); 2: the texture is the pack's (sampled with options.w's bias)
 	uint vertex_count;
 	uint bone_count;
 	uint composite;      // the actor colour (0xAARRGGBB) for the composite
@@ -201,7 +202,7 @@ float4 lit(model_t m, float3 n, float3 world, out float share)
 	share = light_share(saturate(c), saturate(c - kMaterialDiffuse * sun));
 	return float4(saturate(c), kMaterialDiffuse);
 }
-
+)" R"(
 struct v2p
 {
 	float4 pos : SV_Position;
@@ -246,7 +247,13 @@ v2p vs(uint vid : SV_VertexID)
 float4 shade(v2p i, out float share)
 {
 	const model_t m = models[min(model_index, (uint)options.y - 1)];
-	const float4 t = colour_map.Sample(clamp_linear, i.uv);
+	// (the texture pack's texture under FSR: sampled as finely as the screen's pixels, not the world's. A root constant,
+	// the same for the whole draw: the game's textures run Sample as before)
+	float4 t;
+	[branch] if ((flags & 2) != 0)
+		t = colour_map.SampleBias(clamp_linear, i.uv, options.w);
+	else
+		t = colour_map.Sample(clamp_linear, i.uv);
 	const detail_t dt = detail_at(normalize(i.normal), i.world, i.uv);
 	share = i.share;
 	float4 colour = options.x > 0 ? lit(m, dt.n, i.world, share) : i.colour;
@@ -1674,6 +1681,7 @@ float4 pps(p2p i) : SV_Target
 		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
 		c.options[2] = o.detail ? 1.0f : 0.0f;
 		c.options[1] = float(std::min(f.models, kMaxModels));
+		c.options[3] = o.texture_bias;
 		if (o.sun_known)
 		{
 			std::memcpy(c.sun_dir, o.sun, 12);
@@ -1719,7 +1727,7 @@ float4 pps(p2p i) : SV_Target
 	}
 
 	void char_renderer::draw_model(ID3D12GraphicsCommandList *list, const char_target &, const frame &f, uint32_t mi, char_stats &st, const frame *last, int pass,
-		D3D12_GPU_DESCRIPTOR_HANDLE pass_texture)
+		D3D12_GPU_DESCRIPTOR_HANDLE pass_texture, bool allow_pack)
 	{
 		const model_entry &m = f.model[mi];
 		const D3D12_GPU_VIRTUAL_ADDRESS palettes = cache::palettes(f.seq.load(std::memory_order_relaxed));
@@ -1771,6 +1779,7 @@ float4 pps(p2p i) : SV_Target
 				// (a texture command whose texture wasn't found keeps the one bound before it in the mesh)
 				D3D12_GPU_DESCRIPTOR_HANDLE bound = {};
 				int32_t bound_texture = -2;
+				bool bound_pack = false; // (the bound texture is the pack's: flags 2, its mip bias)
 				for (const os2::group &gr : mv.groups)
 				{
 					if (gr.count == 0 || gr.first + gr.count > mv.corners)
@@ -1785,9 +1794,12 @@ float4 pps(p2p i) : SV_Target
 					{
 						D3D12_GPU_DESCRIPTOR_HANDLE h;
 						const uint32_t tid = gr.texture >= 0 && size_t(gr.texture) < mv.textures.size() ? mv.textures[gr.texture] : cache::kNone;
-						if (tid != cache::kNone && cache::texture_view_of(tid, h))
+						// (the texture pack's pair once it's ready, unless refused: the shadow casters keep the game's cut-outs)
+						bool pack = false;
+						if (tid != cache::kNone && cache::texture_view_of(tid, h, allow_pack, &pack))
 						{
 							bound = h;
+							bound_pack = pack;
 							if (pass == 0)
 								list->SetGraphicsRootDescriptorTable(5, h);
 						}
@@ -1805,11 +1817,14 @@ float4 pps(p2p i) : SV_Target
 					float env;
 					std::memcpy(&env, &gr.material[10], 4);
 					const uint32_t shine = gr.has_material && env != 0.0f ? 1u : 0u;
-					uint32_t dc[9] = { mi, 0, shine, mv.vertices, ie.bones, 0, gr.first, mv.corners, has_last };
+					// (the pack's flag only in the model's own pass: the extra passes bind their own texture)
+					const uint32_t flags = shine | (pass == 0 && bound_pack ? 2u : 0u);
+					uint32_t dc[9] = { mi, 0, flags, mv.vertices, ie.bones, 0, gr.first, mv.corners, has_last };
 					std::memcpy(&dc[1], &scale, 4);
 					list->SetGraphicsRoot32BitConstants(1, 9, dc, 0);
 					list->DrawInstanced(gr.count, 1, 0, 0);
 					st.draws++;
+					st.pack_draws += bound_pack;
 					if (pass == 0)
 						st.triangles += gr.count / 3;
 				}
@@ -1924,7 +1939,7 @@ float4 pps(p2p i) : SV_Target
 		const char_target none;
 		for (uint32_t i = 0; i < models; ++i)
 			if ((f.model[i].flags & kNative) != 0 && (f.model[i].colour >> 24) != 0)
-				draw_model(list, none, f, i, st);
+				draw_model(list, none, f, i, st, nullptr, 0, {}, false); // (the game's textures: the sun map's cut-outs as today's)
 		return st;
 	}
 

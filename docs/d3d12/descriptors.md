@@ -96,12 +96,25 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
 
 **Plugin passes with their own heaps** (each switches away from the d3d8 heaps and must hand them back):
 
-- Characters: `src/chars/cache.cpp:269-277` one shader-visible heap of `kDescriptors` 16384 (`cache.hpp:33`), the
-  last `kReserved` 4 for the renderer's own targets (`cache.hpp:91`, `cache.cpp:1090`). A forgotten pair's slots go
-  back to `free_slots` only behind the game queue's fence (`retire::then`, `cache.cpp:173-186`), never into a heap made
-  since (`heap_generation`). Bound in `chardraw.cpp:1696`,
-  `1902`, `1926`, `1954`, `2254`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1474`) and 1 for the aura
-  (`chardraw.cpp:2133`).
+- Characters: `src/chars/cache.cpp:352-360` one shader-visible heap of `kDescriptors` 16384 (`cache.hpp:41`), the
+  last `kReserved` 4 for the renderer's own targets (`cache.hpp:103`, `cache.cpp:1191`). A forgotten pair's slots go
+  back to `free_slots` only behind the game queue's fence (`retire::then`, `cache.cpp:224-233`), never into a heap made
+  since (`heap_generation`). Bound in `chardraw.cpp:1720`,
+  `1933`, `1957`, `1985`, `2285`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1487`) and 1 for the aura
+  (`chardraw.cpp:2160`).
+- The characters' texture pack pairs (docs/texture-pack/characters.md): a texture on the GPU may hold a second pair
+  from the same `free_slots`, the pack's view of it. Taken only for a ticket `take_done` handed over ready
+  (`pack_begin`, `cache.cpp:1408`, :1427), and only while more than `kPackSlotFloor` 1,024 pairs are free (:1416; asks
+  are held then too, :1330, and never more are asked than the pairs over it less those on their way, :1337-1350): the meshes and the game's own textures always find one. Written once, on the game's
+  thread, with the cache's mutex left (`src/chars/charpack.cpp:137-138`): descriptor `2s` is `stream::write_view` of the
+  ticket (BC2, its levels), `2s + 1` a **new view** of the game texture's detail map (`write_pack_detail`,
+  `cache.cpp:1448-1465`, its `MipLevels` from the resource's desc) or the null view the game's pair has. Never a
+  `CopyDescriptors` from the game's pair: the cache's heap is shader visible, so it can't be a copy's source (the rule
+  above). Only then does the state say ready (`pack_end`, :1472), and only a ready pair is handed out
+  (`texture_view_of`, :1148; the shadow casters ask with the pack refused, `chardraw.cpp:1942`; counted, `char_stats::pack_draws`: charinject_test checks the casters draw none). Let go like a game
+  pair (`release_pack`, `cache.cpp:261`): behind the fence, never into a heap made since. charcache_test lets 1,000
+  textures go while upgrading, between `pack_begin` and `pack_end` too, and finds no pair twice and none free before
+  the fence.
 - Zone: `src/zone/zone_gpu.cpp:258-299` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:922-933`
   switches heap only when the next object's zone differs (the second map), and binds that zone's vertex and index
   buffers as root SRVs with it; the breadcrumb
@@ -130,7 +143,7 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
 - Upscale: `upscale.cpp:294`, `temporal.cpp:309/348` own heaps; FSR 2 binds its own, so `upscale.cpp:419` and `525`
   put the list's heaps back (`upscale::on_heaps`, fed by `ev_heaps`, `backend.cpp:778-782`).
 - The texture pack's streamer (`src/pack/stream.cpp`) has **no shader-visible heap** and writes into nobody's.
-  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1872`):
+  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1876`):
   `CreateShaderResourceView` with the ticket's format, the levels uploaded, most detailed 0, on the owner's thread,
   with none of the owner's locks held (a device call), into a slot the owner alone decides is free (the rule above:
   no list in flight may read it). It holds the texture and the device for the call (AddRef'd with the ticket checked,

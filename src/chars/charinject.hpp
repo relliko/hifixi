@@ -20,6 +20,10 @@ namespace hifi::chars::inject
 	bool prepare(ID3D12Device *device, std::string &why);
 	void release();
 	void set_options(bool per_pixel, bool detail = false);
+	// The mip bias the texture pack's textures are sampled with (log2 of the world's width over the screen's under FSR, at
+	// least -1; 0 for none: pack::fsr_bias). Only the pack's (draw flag 2): the game's own keep their six levels as drawn
+	void set_texture_bias(float bias);
+	float texture_bias();
 	// The en-spell effects' time (chardraw.hpp record_enspells) held at `seconds` (the tests, the offline viewer); below 0,
 	// the real clock again
 	void set_clock(double seconds);
@@ -61,6 +65,7 @@ namespace hifi::chars::inject
 	{
 		uint64_t frames = 0, models = 0, see_through = 0, failed = 0;
 		uint64_t caster_frames = 0, caster_models = 0; // (drawn into the sun's casters' map)
+		uint64_t caster_pack_draws = 0; // (casters' draws with a pack view bound: always 0, they keep the game's cut-outs)
 		uint64_t enspell_models = 0; // (models drawn with an en-spell effect)
 		uint64_t overlays = 0, cloaks = 0, cloak_failed = 0; // (models drawn with their extra passes; scene copies that couldn't be made)
 		uint64_t auras = 0, aura_failed = 0; // (see-through models drawn with their aura ring; ones whose ring couldn't be: a multisampled world)

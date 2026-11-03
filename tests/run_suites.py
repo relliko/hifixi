@@ -2,8 +2,8 @@
 
   python -I tests\\run_suites.py [hifixi folder] [log folder]     (defaults: this repo, build\\suites)
 
-The suites that need an argument get it (the oracle files build.cmd made, our d3d8.dll); zoneinject_test, packstream_test and zonenative_test
-run again on the GPU (ZONE_GPU=1, alone, after the rest). A suite that fails is run once more on
+The suites that need an argument get it (the oracle files build.cmd made, our d3d8.dll); zoneinject_test, packstream_test, zonenative_test and
+charinject_test run again on the GPU (ZONE_GPU=1, alone, after the rest). A suite that fails is run once more on
 its own: zonedraw_test's "mapped at its base" sometimes fails when the address it wants is taken, and passes alone.
 The exit code is the number of suites that failed. Each suite's whole output is in the log folder.
 """
@@ -34,10 +34,13 @@ for exe in sorted(glob.glob(os.path.join(build, '*_test.exe'))):
 runs.append(('engine_check', [os.path.join(build, 'engine_check.exe')], None))
 runs.append(('d3d8_unit', [os.path.join(build, 'd3d8', 'd3d8_unit.exe')], None))
 runs.append(('d3d8_host', [os.path.join(build, 'd3d8', 'd3d8_host.exe'), r'build\d3d8\d3d8.dll'], None))
+# (install.py --unlist / --relist of the hifi-textures overlay, on copies of pivot.ini only: no build)
+runs.append(('install_unlist', [sys.executable, '-I', os.path.join(here, 'install_unlist_test.py')], None))
 runs.append(('zoneinject_gpu', [os.path.join(build, 'zoneinject_test.exe')], {'ZONE_GPU': '1'}))
 runs.append(('packstream_gpu', [os.path.join(build, 'packstream_test.exe')], {'ZONE_GPU': '1'}))
 runs.append(('zonenative_gpu', [os.path.join(build, 'zonenative_test.exe')], {'ZONE_GPU': '1'}))
-GPU = {'zoneinject_gpu', 'packstream_gpu', 'zonenative_gpu'}
+runs.append(('charinject_gpu', [os.path.join(build, 'charinject_test.exe'), r'build\test\chars_pose.bin'], {'ZONE_GPU': '1'}))
+GPU = {'zoneinject_gpu', 'packstream_gpu', 'zonenative_gpu', 'charinject_gpu'}
 
 missing = [r[0] for r in runs if not os.path.exists(r[1][0])]
 runs = [r for r in runs if os.path.exists(r[1][0])]

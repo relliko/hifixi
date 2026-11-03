@@ -14,7 +14,8 @@
  *     weather debug on Advanced; settings waiting for the next start said under the presets; right-click "Reset to
  *     default"; Custom saying the preset it was changed from, what's changed, and "Back to" it;
  *   - the texture pack's setting (src/pack/pack_module): hidden without a pack folder, in the Game tab and in a search;
- *     shown once the module has found one, with its lines under it and the Files line; the Off preset sets it 0, the
+ *     shown once the module has found one, with its lines under it and the Files line, its help naming scenery and
+ *     characters; the Off preset sets it 0, the
  *     others leave it; a click saves it and makes the preset Custom; drawing the menu makes no file, DXGI or streamer
  *     call of the module's.
  *
@@ -617,6 +618,14 @@ int main()
 		check(balanced && hifi::pack::folder_exists() && fake::has("Texture pack") && fake::has("[Use the texture pack]") && fake::has("Off: turn it on above.") &&
 			fake::has("To remove the texture pack: turn it off, then delete the hifixi-pack folder") && fake::has("Higher-resolution textures kept on the graphics card"),
 			"a pack folder found by /hifi textures reload: the Game tab's Texture pack section, its line, the setting off, the module's lines under it");
+		{
+			// (its help: scenery and characters, the game's memory kept small, characters at once and scenery at the next area)
+			bool help = false;
+			for (const std::string &t : fake::tips)
+				help |= t.find("Sharper scenery and characters") != std::string::npos && t.find("the game's own memory stays small") != std::string::npos &&
+					t.find("Characters switch at once; scenery switches at the next area you enter.") != std::string::npos;
+			check(help, "  its help says scenery and characters, the game's memory kept small, characters at once and scenery at the next area");
+		}
 		hifi::ui::set_search("texture");
 		draw();
 		check(fake::has("[Use the texture pack]") && fake::has("The game's own / Texture pack"), "a search for \"texture\" finds it, under the Game tab");

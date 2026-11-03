@@ -8,15 +8,15 @@
  *     read here), owners told the epoch they ask in once it's open. Turned off: every owner dropped first, the loaders
  *     out of pack mode, the pack closed on the worker (its files let go: the folder can be deleted), the streamer
  *     paused (kOff) but kept (its ring's address space isn't given back: streamer.md "As built").
- *   - The order at every close, open (on, reload) and stop is the consumer's clear_all first, in the same call (zones.md
- *     decision 2): no owner holds a ticket of the epoch the call ends.
+ *   - The order at every close, open (on, reload) and stop is the consumers' clear_all first (the zones', then the
+ *     characters'), in the same call (zones.md decision 2): no owner holds a ticket of the epoch the call ends.
  *   - States: off, opening, on, failed (the open refused the pack: why in the status), lost (the device removed: nothing
  *     more for the session). After a GPU stop (backend::safe_start) the pack stays off for the session unless /hifi
  *     textures on says otherwise.
  *   - Each update: the streamer's limits (video memory from gpu_crash::video_memory, [textures] budget_mb, the address
  *     space from memwatch, [textures] per_present_mb), its log lines into hifixi.log, the status and menu strings
  *     (status() and menu_lines() only hand them out). Each present: stream::on_present, the quiet window (kQuiet), then
- *     the consumer's frame.
+ *     the consumers' frames, in the order they were added.
  *   - As in M1, the game's memory measured and reported: the address space and its largest free block (memwatch, on its
  *     own thread), the video memory, the characters' and the zone's bytes on the GPU, each zone's lowest free memory
  *     (logged once as the next zone comes), and whether a texture bake runs.
@@ -74,7 +74,7 @@ namespace hifi::pack
 			std::string why;              // (failed: what the open said)
 			bool session_on = false;      // (/hifi textures on: a safe start doesn't keep it off this session)
 			bool lost_seen = false;
-			bool zones = false, actors = false; // (the loaders' pack mode as last set)
+			modes mode;                   // (the consumers' modes as last set)
 			// (on: the index's summary)
 			uint64_t entries = 0, scenery = 0, pack_bytes = 0;
 			// (the quiet window: the zone it's for, when the character came in, native's slot 0 and how long it's been ready)
@@ -97,7 +97,11 @@ namespace hifi::pack
 		std::atomic<uint32_t> g_epoch { 0 }, g_starts { 0 };
 		std::atomic<uint64_t> g_io { 0 };
 		std::atomic<int> g_force_quiet { -1 };
-		consumer g_consumer; // (constant-initialized: set_consumer may run in another file's static init)
+		std::atomic<bool> g_overlay_listed { false };
+		std::atomic<ID3D12Device *> g_device_in_use { nullptr };
+		// (constant-initialized: add_consumer may run in another file's static init)
+		consumer g_consumers[kMaxConsumers];
+		uint32_t g_consumer_count = 0;
 		// The strings status() and menu_lines() hand out, made in update (a leaf: held only to copy them)
 		std::mutex g_text_mutex;
 		std::vector<std::string> g_status, g_menu;
@@ -138,32 +142,35 @@ namespace hifi::pack
 			backend::log(level, ("HiFi XI: " + line).c_str());
 		}
 
-		// The consumer's calls (none set: nothing to call)
+		// The consumers' calls, each in the order they were added (none set: nothing to call)
 		void clear_all()
 		{
-			if (g_consumer.clear_all != nullptr)
-				g_consumer.clear_all();
+			for (uint32_t i = 0; i < g_consumer_count; ++i)
+				if (g_consumers[i].clear_all != nullptr)
+					g_consumers[i].clear_all();
 		}
 
-		void set_mode(bool zones, bool actors)
+		void set_mode(const modes &m)
 		{
-			g.zones = zones;
-			g.actors = actors;
-			if (g_consumer.set_mode != nullptr)
-				g_consumer.set_mode(zones, actors);
+			g.mode = m;
+			for (uint32_t i = 0; i < g_consumer_count; ++i)
+				if (g_consumers[i].set_mode != nullptr)
+					g_consumers[i].set_mode(m);
 		}
 
 		void set_compare(bool on)
 		{
 			g_compare.store(on);
-			if (g_consumer.set_compare != nullptr)
-				g_consumer.set_compare(on);
+			for (uint32_t i = 0; i < g_consumer_count; ++i)
+				if (g_consumers[i].set_compare != nullptr)
+					g_consumers[i].set_compare(on);
 		}
 
 		void publish()
 		{
 			g_epoch.store(g.m == mode::on ? g.epoch : 0);
 			g_in_use.store(g.m == mode::on);
+			g_device_in_use.store(g.m == mode::on ? g.device : nullptr);
 			if (g.m != mode::on)
 				g_fsr.store(false);
 		}
@@ -192,6 +199,7 @@ namespace hifi::pack
 			g.overlay_listed = false;
 			for (const std::wstring &name : bake::overlays())
 				g.overlay_listed |= CompareStringOrdinal(name.c_str(), -1, L"hifi-textures", -1, TRUE) == CSTR_EQUAL;
+			g_overlay_listed.store(g.overlay_listed);
 			g_folder_exists.store(exists);
 			std::lock_guard<std::mutex> lock(g_text_mutex);
 			g_folder_text = narrow(g.folder);
@@ -208,12 +216,15 @@ namespace hifi::pack
 			return why == nullptr;
 		}
 
-		// The loaders' pack mode from the hidden keys (while in use)
+		// The consumers' modes from the hidden keys (while in use)
 		void follow_mode()
 		{
-			const bool zones = game::option_on("textures", "zone", opt::kZoneByDefault), actors = game::option_on("textures", "actors", opt::kActorsByDefault);
-			if (zones != g.zones || actors != g.actors)
-				set_mode(zones, actors);
+			modes m;
+			m.zones = game::option_on("textures", "zone", opt::kZoneByDefault);
+			m.actors = game::option_on("textures", "actors", opt::kActorsByDefault);
+			m.chars = game::option_on("textures", "chars", opt::kCharsByDefault);
+			if (m.zones != g.mode.zones || m.actors != g.mode.actors || m.chars != g.mode.chars)
+				set_mode(m);
 		}
 
 		// off -> opening: the streamer started (once a session), the pack posted to its worker
@@ -236,7 +247,7 @@ namespace hifi::pack
 			}
 			// (nothing should hold a ticket here; after a failure or a device change, belt and braces)
 			clear_all();
-			set_mode(false, false);
+			set_mode(modes {});
 			io();
 			g.asked = stream::open(g.folder);
 			io();
@@ -257,7 +268,7 @@ namespace hifi::pack
 		{
 			const mode was = g.m;
 			clear_all();
-			set_mode(false, false);
+			set_mode(modes {});
 			set_compare(false);
 			if (g.stream_started)
 			{
@@ -296,7 +307,7 @@ namespace hifi::pack
 				g.m = mode::failed;
 				io();
 				stream::pause(stream::kOff);
-				set_mode(false, false);
+				set_mode(modes {});
 				publish();
 				log(1, "texture pack: " + narrow(g.folder) + " can't be used: " + g.why);
 				return;
@@ -312,9 +323,9 @@ namespace hifi::pack
 			set_compare(g_compare.load());
 			publish();
 			char line[400];
-			std::snprintf(line, sizeof(line), "texture pack: %s: %s textures (scenery %s, the rest %s), %.1f GB, opened (epoch %u; zones %s, model actors %s)",
+			std::snprintf(line, sizeof(line), "texture pack: %s: %s textures (scenery %s, the rest %s), %.1f GB, opened (epoch %u; zones %s, model actors %s, characters %s)",
 				narrow(g.folder).c_str(), thousands(g.entries).c_str(), thousands(g.scenery).c_str(), thousands(g.entries - g.scenery).c_str(),
-				gigabytes(g.pack_bytes), g.epoch, g.zones ? "on" : "off", g.actors ? "on" : "off");
+				gigabytes(g.pack_bytes), g.epoch, g.mode.zones ? "on" : "off", g.mode.actors ? "on" : "off", g.mode.chars ? "on" : "off");
 			log(0, line);
 			if (!idx->status.empty())
 				log(1, "texture pack: " + idx->status);
@@ -384,7 +395,7 @@ namespace hifi::pack
 				stream::device_lost();
 			}
 			clear_all();
-			set_mode(false, false);
+			set_mode(modes {});
 			set_compare(false);
 			const bool was_off = g.m == mode::off;
 			g.m = mode::lost;
@@ -464,16 +475,20 @@ namespace hifi::pack
 			// (a new present's bytes for the streamer's pacing, then the owners: requests, ready tickets read, views written)
 			io();
 			stream::on_present();
-			if (g.m == mode::on && g_consumer.frame != nullptr)
-				g_consumer.frame(now, g.epoch);
+			if (g.m == mode::on)
+				for (uint32_t i = 0; i < g_consumer_count; ++i)
+					if (g_consumers[i].frame != nullptr)
+						g_consumers[i].frame(now, g.epoch);
 		}
 
 		// The status and the menu's lines, from what the module knows now (the streamer's counts asked once)
 		void make_lines(const mw::values &v, uint64_t chars, uint64_t zone0, uint64_t zone1)
 		{
 			std::vector<std::string> status, menu, area;
-			if (g.m == mode::on && g_consumer.lines != nullptr)
-				g_consumer.lines(area);
+			if (g.m == mode::on)
+				for (uint32_t i = 0; i < g_consumer_count; ++i)
+					if (g_consumers[i].lines != nullptr)
+						g_consumers[i].lines(area);
 			stream::counts c;
 			if (g.stream_started)
 			{
@@ -493,8 +508,16 @@ namespace hifi::pack
 			switch (g.m)
 			{
 			case mode::on:
+				if (!c.failure.empty())
+				{
+					// (the streamer's own GPU parts couldn't be made at its start, once a session: every request misses, so
+					// "Found" would be untrue. A restart starts it again)
+					status.push_back("textures: " + folder + " can't be used: " + c.failure + ". Restart the game to try again.");
+					menu.push_back("Texture pack can't be used: " + c.failure + ". Restart the game to try again.");
+					break;
+				}
 				status.push_back("textures: on, " + folder + ": " + found.substr(7) + " (epoch " + std::to_string(g.epoch) + "; zones " +
-					(g.zones ? "on" : "off") + ", model actors " + (g.actors ? "on" : "off") + ")");
+					(g.mode.zones ? "on" : "off") + ", model actors " + (g.mode.actors ? "on" : "off") + ", characters " + (g.mode.chars ? "on" : "off") + ")");
 				menu.push_back(found);
 				break;
 			case mode::opening:
@@ -675,7 +698,7 @@ namespace hifi::pack
 			// (every owner dropped before the streamer goes: then stop() joins its worker, under 100 ms, the resident textures
 			// to the retire list, which the plugin's retire::release_all deals with last)
 			clear_all();
-			set_mode(false, false);
+			set_mode(modes {});
 			set_compare(false);
 			if (g.stream_started)
 			{
@@ -689,6 +712,7 @@ namespace hifi::pack
 			publish();
 			g_quiet.store(false);
 			g_folder_exists.store(false);
+			g_overlay_listed.store(false);
 			{
 				std::lock_guard<std::mutex> lock(g_text_mutex);
 				g_status.clear();
@@ -713,7 +737,7 @@ namespace hifi::pack
 				else
 				{
 					out.push_back(std::string("textures: on (saved)") + (lifted ? "; used this session despite the graphics card's stop last session" : "") +
-						": scenery, ships and furniture switch at the next area you enter");
+						": characters switch now; scenery, ships and furniture at the next area you enter");
 					if (lifted)
 						log(0, "texture pack: on for this session despite last session's GPU stop (/hifi textures on)");
 				}
@@ -806,9 +830,16 @@ namespace hifi::pack
 		return std::clamp(std::log2(ratio), -1.0f, 0.0f);
 	}
 
-	void set_consumer(const consumer &c)
+	ID3D12Device *device_in_use() { return g_device_in_use.load(); }
+	bool overlay_listed() { return g_overlay_listed.load(); }
+
+	void add_consumer(const consumer &c)
 	{
-		g_consumer = c;
+		for (uint32_t i = 0; i < g_consumer_count; ++i)
+			if (c.clear_all != nullptr && g_consumers[i].clear_all == c.clear_all)
+				return; // (wired twice: once)
+		if (g_consumer_count < kMaxConsumers)
+			g_consumers[g_consumer_count++] = c;
 	}
 
 	bool quiet_window(const quiet_inputs &q)
@@ -825,5 +856,15 @@ namespace hifi::pack
 		uint64_t io_calls() { return g_io.load(); }
 		uint32_t stream_starts() { return g_starts.load(); }
 		void force_quiet(int v) { g_force_quiet.store(v); }
+		void clear_consumers()
+		{
+			for (consumer &c : g_consumers)
+				c = consumer {};
+			g_consumer_count = 0;
+		}
+		std::vector<consumer> consumers()
+		{
+			return std::vector<consumer>(g_consumers, g_consumers + g_consumer_count);
+		}
 	}
 }

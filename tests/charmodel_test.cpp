@@ -17,8 +17,9 @@
  *   - with the game's drawing off: the early return taken;
  *   - the cache: every mesh and texture taken once (the texture of the drawn command through its object, the rest by
  *     name in the mesh's folder), decoded with no failures; then on WARP: all on the GPU, a mesh's vertices and a
- *     texture's level 0 read back equal to the decoders' own; the palettes' buffer there; everything let go once not
- *     named for a while;
+ *     texture's level 0 read back equal to the decoders' own; each texture keyed for the texture pack from the bytes
+ *     the game holds, the same keys as its DAT chunks' (pack::key_of); the palettes' buffer there; everything let go
+ *     once not named for a while;
  *   - stop(): the dump again, byte for byte.
  *
  *   build\charmodel_test.exe
@@ -40,6 +41,7 @@
 #include <cstring>
 #include <fstream>
 #include <set>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -658,6 +660,28 @@ namespace
 			check(tsame, "  the drawn command's texture (through its object) read back as decoded, with its mips");
 			D3D12_GPU_DESCRIPTOR_HANDLE th;
 			check(have && mv.textures.size() > 0 && ch::cache::texture_view_of(mv.textures[0], th), "  its texture's view");
+			// The texture pack's keys (docs/texture-pack/characters.md): each texture the cache took from the game's memory
+			// (through charmodel's copy of the chunk: the resource's +0x30, the header's size at +0x24) keyed as the pack
+			// keys the DAT's own chunk (pack::key_of over the body), the one key each
+			{
+				std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> dat_keys, cache_keys;
+				for (uintptr_t r : L.textures)
+				{
+					const uint32_t body = (((*reinterpret_cast<const uint32_t *>(r + 0x24)) >> 7) & 0x7FFFF) * 16 - 16;
+					const hifi::pack::key k = hifi::pack::key_of(reinterpret_cast<const uint8_t *>(r + 0x30), body);
+					dat_keys.emplace(k.hash, k.bytes, k.w, k.h);
+				}
+				uint32_t keyed = 0;
+				for (uint32_t id = 0; id < c.textures + 16; ++id)
+					if (const hifi::pack::key k = ch::cache::test::pack_key_of(id); k.bytes != 0)
+					{
+						cache_keys.emplace(k.hash, k.bytes, k.w, k.h);
+						keyed++;
+					}
+				check(keyed == c.textures && cache_keys == dat_keys && !dat_keys.empty(),
+					"  the texture pack's keys: " + std::to_string(keyed) + " of " + std::to_string(c.textures) + " textures keyed from the bytes the game holds, the same " +
+						std::to_string(cache_keys.size()) + " keys as their DAT chunks' (pack::key_of)");
+			}
 
 			// HiFi XI's draw wanted, every mesh on the GPU: both models left to it (the game's draw left out)
 			cm::set_native(true);

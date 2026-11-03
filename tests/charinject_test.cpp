@@ -18,6 +18,24 @@
  *   - the Mithra let go between a frame's recording and its run, a new texture uploaded meanwhile: it gets a pair of
  *     descriptors the list doesn't read (those wait for the GPU: retire::then), the picture is unchanged, the debug layer
  *     says nothing (HIFIXI_GBV=1: with GPU-based validation).
+ *   - the texture pack (docs/texture-pack/characters.md; the streamer on this device, src/chars/charpack driven as the
+ *     module drives it, made-up packs under build\test\charinject): the Mithra again from its original file's bytes,
+ *     each texture keyed as its DAT chunk. A flat pack (level 0 green, the rest blue) with one key left out and one
+ *     no_pack: the hits ready through the second pair, BC2 with the record's levels down to the game's last; the two
+ *     spent; every changed pixel the pack's, the two's groups unchanged; four times as far a lower level sampled; the
+ *     casters' map byte for byte the game's. The FSR bias (-1): more of level 0 on the pack's textures, the game's own
+ *     (compare) and the casters' map as without it. Evicted under the streamer's pressure while a frame is in flight: that
+ *     frame as recorded, the next the game's, the pack's again once the pressure's been gone. Off between a frame's recording and its run, on again, 50 times (every
+ *     fifth with the copies held on the GPU and let go while held): each frame as recorded, no pair twice, the debug
+ *     layer silent. A pack of the Mithra's own pictures 4x: the cut-outs' coverage within 2% of the game's near and four
+ *     times as far, the colours within 2 of brightness. The real pack (read only; skipped without): the original bytes'
+ *     keys in it; the overlay's copies' (what the game holds while hifi-textures is listed) none, and the line says why.
+ *     Per pixel too: the shine groups' highlight (by the texture's alpha) as bright with the pack as with the game's.
+ *     CHARS_DETAIL=1: the pack's pairs' second view of each detail map too.
+ *   ZONE_GPU=1 runs it on the first GPU in place of WARP. For a look, not the checks: CHARS_DATS="ROM\a\b.DAT;..." draws
+ *   those DATs read as one (a race's base file, then its gear) in place of the Mithra (the pose: tests/chars_pose.py on
+ *   the base file), and CHARS_PICTURES=<folder> writes game, pack and overlay BMPs there (whole and close up: the game's
+ *   textures, the real pack's, the hifi-textures overlay's copies).
  *
  *   build\charinject_test.exe <pose.bin> [out.bmp]
  */
@@ -30,15 +48,24 @@
 #include "../src/chars/cache.hpp"
 #include "../src/chars/charframe.hpp"
 #include "../src/chars/charinject.hpp"
+#include "../src/chars/charpack.hpp"
 #include "../src/chars/os2.hpp"
+#include "../src/chars/tex.hpp"
 #include "../src/host/retire.hpp"
+#include "../src/pack/bc2.hpp"
+#include "../src/pack/pack.hpp"
+#include "../src/pack/pack_write.hpp"
+#include "../src/pack/stream.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -179,9 +206,8 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 		size_t folder; // (the index of the folder chunk it's in)
 		std::vector<uint8_t> data;
 	};
-	std::vector<dat_chunk> read_dat(const char *rel)
+	std::vector<dat_chunk> read_dat_at(const std::string &path)
 	{
-		std::string path = std::string("C:\\Games\\PhoenixXI\\SquareEnix\\FINAL FANTASY XI\\") + rel;
 		std::ifstream f(path, std::ios::binary);
 		std::vector<uint8_t> dat((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 		std::vector<dat_chunk> out;
@@ -206,6 +232,66 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 			off += size;
 		}
 		return out;
+	}
+	std::vector<dat_chunk> read_dat(const char *rel)
+	{
+		return read_dat_at(std::string("C:\\Games\\PhoenixXI\\SquareEnix\\FINAL FANTASY XI\\") + rel);
+	}
+
+	// CHARS_DATS (for pictures, not the checks: they're the Mithra's): DATs (';' between, relative to the game folder) read
+	// one after another as one, each one's folders shifted by where it starts (a race's base file for nothing but its
+	// skeleton, then the gear: face, head, body, hands, legs, feet, weapons); in_overlay reads each from the hifi-textures
+	// overlay instead where it has a copy (what the game holds while it's listed)
+	std::vector<dat_chunk> read_dats(const std::string &list, bool in_overlay)
+	{
+		std::vector<dat_chunk> out;
+		size_t at = 0;
+		while (at < list.size())
+		{
+			const size_t end = std::min(list.find(';', at), list.size());
+			const std::string rel = list.substr(at, end - at);
+			at = end + 1;
+			if (rel.empty())
+				continue;
+			std::vector<dat_chunk> one;
+			if (in_overlay)
+				one = read_dat_at("C:\\Games\\PhoenixXI\\polplugins\\DATs\\hifi-textures\\" + rel);
+			if (one.empty() && in_overlay)
+				std::printf("      (no overlay copy of %s: the original's)\n", rel.c_str());
+			if (one.empty())
+				one = read_dat(rel.c_str());
+			const size_t base = out.size();
+			for (dat_chunk &c : one)
+			{
+				c.folder += base;
+				out.push_back(std::move(c));
+			}
+		}
+		return out;
+	}
+
+	// A frame read back (RGBA, W x H) as a 32-bit top-down BMP
+	void write_bmp(const std::string &path, const std::vector<uint8_t> &px)
+	{
+		FILE *fo = nullptr;
+		if (fopen_s(&fo, path.c_str(), "wb") != 0 || fo == nullptr)
+			return;
+		uint8_t head[54] = { 'B', 'M' };
+		auto put = [&](int at, uint32_t v) { std::memcpy(head + at, &v, 4); };
+		put(2, 54 + W * H * 4);
+		put(10, 54);
+		put(14, 40);
+		put(18, W);
+		put(22, uint32_t(-int32_t(H)));
+		head[26] = 1;
+		head[28] = 32;
+		fwrite(head, 1, 54, fo);
+		for (size_t i = 0; i < size_t(W) * H && i * 4 + 3 < px.size(); ++i)
+		{
+			const uint8_t bgra[4] = { px[i * 4 + 2], px[i * 4 + 1], px[i * 4 + 0], 255 };
+			fwrite(bgra, 1, 4, fo);
+		}
+		fclose(fo);
 	}
 
 	struct loaded
@@ -328,6 +414,97 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 		}
 		return r;
 	}
+
+	// ------------------------------------------------------------------------------------------ the texture pack
+	void remove_tree(const std::wstring &folder)
+	{
+		WIN32_FIND_DATAW f;
+		HANDLE h = FindFirstFileW((folder + L"*").c_str(), &f);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			do
+				if ((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+					DeleteFileW((folder + f.cFileName).c_str());
+			while (FindNextFileW(h, &f));
+			FindClose(h);
+		}
+		RemoveDirectoryW(folder.substr(0, folder.size() - 1).c_str());
+	}
+
+	// A made-up pack of the Mithra's textures (each key once, with its chunk's bytes): left_out not in it, no_pack flagged
+	// so (the game's drawn). flat: level 0 green and every other level blue, alpha 0x88 (passing the alpha test
+	// everywhere); else the game's own picture 4x (each texel 4 x 4), its mips by bc2::full_chain (a cut-out's keeping
+	// level 0's coverage, as the converter makes them)
+	bool make_mithra_pack(const std::wstring &folder, const std::vector<std::pair<hifi::pack::key, const std::vector<uint8_t> *>> &textures,
+		const hifi::pack::key &left_out, const hifi::pack::key &no_pack, bool flat, std::string &why)
+	{
+		namespace pk = hifi::pack;
+		remove_tree(folder);
+		pk::writer w;
+		pk::writer_options o;
+		o.folder = folder;
+		o.source = "charinject_test";
+		if (!w.open(o, why))
+			return false;
+		for (const auto &[k, bytes] : textures)
+		{
+			if (k == left_out)
+				continue;
+			pk::entry e;
+			e.hash = k.hash;
+			e.bytes = k.bytes;
+			e.w = k.w;
+			e.h = k.h;
+			e.orig_format = (*bytes)[0];
+			e.source_kind = pk::kSourceModel;
+			std::memcpy(e.name, bytes->data() + 1, 16);
+			if (k == no_pack)
+				e.flags = pk::kNoPack;
+			pk::map_in m;
+			m.format = pk::kBC2;
+			m.w = 4 * k.w;
+			m.h = 4 * k.h;
+			if (flat)
+			{
+				for (uint32_t l = 0, n = pk::bc2::chain_levels(m.w, m.h); l < n; ++l)
+				{
+					const uint32_t lw = m.w >> l, lh = m.h >> l;
+					const uint8_t texel[4] = { 0, uint8_t(l == 0 ? 255 : 0), uint8_t(l == 0 ? 0 : 255), 0x88 };
+					std::vector<uint8_t> px(size_t(lw) * lh * 4);
+					for (size_t i = 0; i < px.size(); i += 4)
+						std::memcpy(px.data() + i, texel, 4);
+					m.levels.push_back(pk::bc2::encode_bc2(px.data(), lw, lh));
+				}
+			}
+			else
+			{
+				ch::tex::texture t;
+				std::string bad;
+				if (!ch::tex::decode(bytes->data(), bytes->size(), t, bad) || t.w != k.w || t.h != k.h)
+				{
+					why = "a texture couldn't be decoded: " + bad;
+					return false;
+				}
+				std::vector<uint8_t> px(size_t(m.w) * m.h * 4);
+				bool cut = false;
+				for (uint32_t y = 0; y < m.h; ++y)
+					for (uint32_t x = 0; x < m.w; ++x)
+					{
+						const uint8_t *s = t.levels[0].rgba.data() + (size_t(y / 4) * t.w + x / 4) * 4;
+						std::memcpy(px.data() + (size_t(y) * m.w + x) * 4, s, 4);
+						cut = cut || s[3] <= 0x22;
+					}
+				e.alpha_kind = cut ? pk::kAlphaCut : pk::kAlphaNone;
+				const std::vector<uint8_t> top = pk::bc2::encode_bc2(px.data(), m.w, m.h);
+				m.levels = pk::bc2::full_chain(top.data(), m.w, m.h, e.alpha_kind, pk::bc2::kCharsCutThreshold);
+			}
+			if (w.add(e, { m }, why) != pk::add_result::ok)
+				return false;
+		}
+		const bool ok = w.commit(why);
+		w.close();
+		return ok;
+	}
 }
 
 // A crash says where (code, address, module and offset) before the process goes, and what the debug layer said
@@ -429,11 +606,16 @@ int main(int argc, char **argv)
 	CreateDXGIFactory1(IID_PPV_ARGS(&factory));
 	factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
 	ID3D12Device *device = nullptr;
-	if (FAILED(D3D12CreateDevice(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+	// (ZONE_GPU=1: the first GPU in place of WARP, as zoneinject_test has it: the pack's BC2 levels and the FSR bias as a
+	// real card samples them)
+	const bool on_gpu = GetEnvironmentVariableA("ZONE_GPU", nullptr, 0) != 0;
+	if (FAILED(D3D12CreateDevice(on_gpu ? nullptr : warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
 	{
-		check(false, "a WARP device");
+		check(false, on_gpu ? "a device on the GPU" : "a WARP device");
 		return 1;
 	}
+	if (on_gpu)
+		std::printf("      (on the GPU)\n");
 	ID3D12InfoQueue *info = nullptr;
 	device->QueryInterface(IID_PPV_ARGS(&info));
 	g_info = info;
@@ -442,7 +624,10 @@ int main(int argc, char **argv)
 	device->CreateCommandQueue(&qd, IID_PPV_ARGS(&direct));
 
 	// The Mithra into the cache, on the GPU
-	const std::vector<dat_chunk> dat = read_dat("ROM2\\0\\52.DAT");
+	const char *dats = getenv("CHARS_DATS");
+	const std::vector<dat_chunk> dat = dats != nullptr ? read_dats(dats, false) : read_dat("ROM2\\0\\52.DAT");
+	if (dats != nullptr)
+		std::printf("      CHARS_DATS: %s (%zu chunks; the checks are the Mithra's, the pictures this one's)\n", dats, dat.size());
 	ch::cache::set_detail(getenv("CHARS_DETAIL") != nullptr); // (the detail maps made only with the option on, as the plugin has it)
 	const loaded L = load_into_cache(dat);
 	ch::cache::frame_tick(device, 1.0);
@@ -1274,6 +1459,545 @@ int main(int argc, char **argv)
 		}
 		check(after_one == in_flight.size() && ch::cache::get_counts().slots_retiring == 0,
 			"  the pairs not given back at the next present, all back " + std::to_string(presents) + " presents on");
+
+		// ---- The texture pack (docs/texture-pack/characters.md): the Mithra into the cache again from its original
+		// file's bytes (as the game holds it once the hifi-textures overlay is unlisted), the streamer on this device,
+		// charpack driven as the module drives it (each present: the streamer's on_present, then its frame; then
+		// retire::on_present), made-up packs under build\test\charinject
+		{
+			namespace pk = hifi::pack;
+			namespace st = hifi::pack::stream;
+			namespace cp = hifi::chars::charpack;
+			wchar_t exe[MAX_PATH];
+			GetModuleFileNameW(nullptr, exe, MAX_PATH);
+			const std::wstring build = std::wstring(exe).substr(0, std::wstring(exe).find_last_of(L'\\') + 1), here = build + L"test\\charinject\\";
+			CreateDirectoryW((build + L"test").c_str(), nullptr);
+			CreateDirectoryW(here.c_str(), nullptr);
+			double pnow = 23.0;
+			uint64_t fv = 10;
+			uint32_t next_seq = 40;
+			ID3D12Resource *pic = nullptr;
+			bd.Width = UINT64(W) * 4 * H;
+			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pic));
+			const loaded P = load_into_cache(dat);
+			ch::cache::frame_tick(device, pnow);
+			ch::cache::settle(60000);
+			for (int i = 0; i < 400 && ch::cache::get_counts().meshes_ready < P.meshes.size(); ++i)
+				Sleep(50);
+			ch::cache::settle(60000);
+			// (its textures, each once: their ids, keys and chunks)
+			std::vector<uint32_t> tids;
+			for (uint32_t id : P.meshes)
+				if (ch::cache::mesh_view mv; ch::cache::mesh_view_of(id, mv))
+					for (uint32_t t : mv.textures)
+						if (t != ch::cache::kNone && std::find(tids.begin(), tids.end(), t) == tids.end())
+							tids.push_back(t);
+			std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>, const std::vector<uint8_t> *> chunk_of;
+			for (const dat_chunk &dc : dat)
+				if (dc.kind == 0x20)
+				{
+					const pk::key k = pk::key_of(dc.data.data(), dc.data.size());
+					chunk_of.emplace(std::make_tuple(k.hash, k.bytes, k.w, k.h), &dc.data);
+				}
+			std::vector<pk::key> keys;
+			std::vector<std::pair<pk::key, const std::vector<uint8_t> *>> textures;
+			for (uint32_t t : tids)
+			{
+				const pk::key k = ch::cache::test::pack_key_of(t);
+				keys.push_back(k);
+				const auto found = chunk_of.find(std::make_tuple(k.hash, k.bytes, k.w, k.h));
+				if (found != chunk_of.end() && std::none_of(textures.begin(), textures.end(), [&](const auto &p) { return p.first == k; }))
+					textures.emplace_back(k, found->second);
+			}
+			std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> unique;
+			for (const pk::key &k : keys)
+				unique.emplace(k.hash, k.bytes, k.w, k.h);
+			check(tids.size() >= 3 && textures.size() == unique.size() && unique.size() == tids.size(), "the texture pack: the Mithra again, its " + std::to_string(tids.size()) + " textures keyed from the bytes given, each its DAT chunk's key");
+			if (tids.size() < 3)
+				return failures;
+			const pk::key left_out = keys[0], no_pack = keys[1];
+			static ID3D12Device *s_device = nullptr;
+			static bool s_overlay = false;
+			s_device = device;
+			cp::sources sources;
+			sources.device = []() { return s_device; };
+			sources.overlay_listed = []() { return s_overlay; };
+			cp::set_sources(sources);
+
+			// The frame: the middle one alone (as the lamp frames), its meshes the new ones (or, for the pictures, the
+			// overlay's copies)
+			const std::vector<uint32_t> *frame_meshes = &P.meshes;
+			auto pack_frame = [&](uint32_t s, const mat4 &m) {
+				ch::frame &pf = ch::begin_frame(s);
+				std::memcpy(pf.view_proj, m.m, 64);
+				pf.camera = true;
+				pf.model[0] = mm;
+				pf.model[0].first_instance = 0;
+				pf.model[0].actor = 0xAC720000u;
+				pf.instance[0] = mi;
+				pf.instance[0].first_bone = 0;
+				pf.instance[0].first_mesh = 0;
+				pf.instance[0].meshes = uint32_t(frame_meshes->size());
+				for (uint32_t b = 0; b < mi.bones; ++b)
+					pf.palette[b] = f.palette[mi.first_bone + b];
+				for (uint32_t k = 0; k < frame_meshes->size(); ++k)
+					pf.mesh[k].mesh = (*frame_meshes)[k];
+				pf.models = 1;
+				pf.instances = 1;
+				pf.bones = mi.bones;
+				pf.meshes = uint32_t(frame_meshes->size());
+				ch::publish_opaque(pf);
+				ch::publish_see_through(pf);
+				ch::cache::publish_palettes(pf, 0, pf.bones);
+			};
+			// One frame recorded, run and read back (the casters' map too, when asked); between: called after the list is
+			// closed and before it runs (a toggle while it's in flight)
+			auto render = [&](const mat4 &m, std::vector<uint8_t> &out, std::vector<float> *casters = nullptr, const std::function<void()> &between = nullptr) {
+				const uint32_t s = next_seq++;
+				pack_frame(s, m);
+				alloc->Reset();
+				list->Reset(alloc, nullptr);
+				list->SetDescriptorHeaps(1, &srvh);
+				inj::set_sun(sun_toward);
+				list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
+				list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+				inj::on_chars_end(list, w, s & 15);
+				inj::set_sun(nullptr);
+				if (casters != nullptr)
+				{
+					barrier(list, caster_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+					list->ClearDepthStencilView(caster_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+					inj::record_casters(list, caster_m, caster_dsv, kCasterSize);
+					list->SetDescriptorHeaps(1, &srvh);
+					barrier(list, caster_map, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					D3D12_TEXTURE_COPY_LOCATION cdst = {}, csrc = {};
+					cdst.pResource = caster_back;
+					cdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+					cdst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_TYPELESS, kCasterSize, kCasterSize, 1, kCasterSize * 4 };
+					csrc.pResource = caster_map;
+					csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					list->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
+				}
+				barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+				to.pResource = pic;
+				to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_TYPELESS, W, H, 1, W * 4 };
+				from.pResource = A;
+				from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+				barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				list->Close();
+				if (between)
+					between();
+				direct->ExecuteCommandLists(1, lists);
+				direct->Signal(fence, ++fv);
+				fence->SetEventOnCompletion(fv, e);
+				WaitForSingleObject(e, 60000);
+				uint8_t *img = nullptr;
+				pic->Map(0, nullptr, reinterpret_cast<void **>(&img));
+				out.assign(img, img + size_t(W) * H * 4);
+				pic->Unmap(0, nullptr);
+				if (casters != nullptr)
+				{
+					float *cz = nullptr;
+					caster_back->Map(0, nullptr, reinterpret_cast<void **>(&cz));
+					casters->assign(cz, cz + size_t(kCasterSize) * kCasterSize);
+					caster_back->Unmap(0, nullptr);
+				}
+			};
+			// The module's present: the cache's tick, the streamer's present, the glue's frame, then backend::present's
+			// retire::on_present (the GPU idle: each frame above is waited for)
+			auto pump = [&](int n) {
+				for (int i = 0; i < n; ++i)
+				{
+					pnow += 0.002;
+					ch::cache::frame_tick(device, pnow);
+					st::on_present();
+					cp::frame(pnow, st::epoch());
+					hifi::retire::on_present(direct);
+					Sleep(1);
+				}
+			};
+			auto pump_settled = [&] {
+				for (int i = 0; i < 2000; ++i)
+				{
+					pump(1);
+					if (i > 2 && ch::cache::get_counts().pack_asked == 0)
+						return true;
+				}
+				return false;
+			};
+			auto open = [&](const std::wstring &folder) {
+				const uint64_t n = st::open(folder);
+				for (int i = 0; i < 4000 && st::posts_done() < n; ++i)
+					Sleep(5);
+				return st::current() != nullptr;
+			};
+			auto quiet_check = [&](const std::string &part) {
+				const uint32_t n = debug_messages(info, first);
+				check(n == 0 && device->GetDeviceRemovedReason() == S_OK, part + ": the debug layer says nothing (" + std::to_string(n) + (n != 0 ? ": " + first : std::string()) + ")");
+			};
+			// (the Mithra's pixels: inside its box, not the sky)
+			const float eye_far[3] = { centre[0] + 4.0f * (eye[0] - centre[0]), centre[1] + 4.0f * (eye[1] - centre[1]), centre[2] + 4.0f * (eye[2] - centre[2]) };
+			const mat4 vp_far = camera(eye_far, centre);
+			const rect far_box = project(vp_far, lo, hi, 0.0f);
+			auto mithra = [&](const std::vector<uint8_t> &img, const rect &r, size_t i) {
+				return r.inside(float(i % W) + 0.5f, float(i / W) + 0.5f, 2) && !is_sky(img.data() + i * 4);
+			};
+			auto covered = [&](const std::vector<uint8_t> &img, const rect &r) {
+				uint32_t n = 0;
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+					n += mithra(img, r, i);
+				return n;
+			};
+			// (the flat pack's texels have no red: green level 0, blue below it, a mix of the two between levels)
+			auto pack_coloured = [](const uint8_t *p) { return int(p[0]) + 24 < int(std::max(p[1], p[2])); };
+			auto blue = [](const uint8_t *p) { return int(p[2]) > int(p[0]) + 24 && int(p[2]) > int(p[1]) + 24; };
+
+			// The game's own textures (no pack yet): near, far and the casters' map
+			std::vector<uint8_t> p0, p0_far, p1, p1_far;
+			std::vector<float> c0, c1;
+			render(vp, p0, &c0);
+			render(vp_far, p0_far);
+			quiet_check("the Mithra again, the game's textures");
+
+			// A hit: the pack's BC2 with the record's levels down to the game's last, through the second pair; a miss (left
+			// out) and a no_pack entry: the game's, those groups' pixels unchanged
+			std::string pack_why;
+			const bool made = make_mithra_pack(here + L"flat\\", textures, left_out, no_pack, true, pack_why);
+			const bool started = st::start(device);
+			const bool opened = made && open(here + L"flat\\");
+			check(made && started && opened, "a made-up pack of the Mithra's keys (one left out, one no_pack; level 0 green, the rest blue), the streamer on this device: opened" +
+				(pack_why.empty() ? std::string() : ": " + pack_why));
+			{
+				pk::modes m;
+				m.chars = true;
+				cp::set_mode(m);
+			}
+			const bool flat_settled = pump_settled();
+			bool states = true, views = true, levels = true;
+			std::string level_text;
+			for (size_t i = 0; i < tids.size(); ++i)
+			{
+				const bool hit = !(keys[i] == left_out) && !(keys[i] == no_pack);
+				states = states && std::strcmp(ch::cache::test::pack_state_of(tids[i]), hit ? "ready" : "spent") == 0;
+				D3D12_GPU_DESCRIPTOR_HANDLE h = {}, g = {};
+				bool is_pack = false, g_pack = true;
+				views = views && ch::cache::texture_view_of(tids[i], h, true, &is_pack) && is_pack == hit && ch::cache::texture_view_of(tids[i], g, false, &g_pack) && !g_pack &&
+					(h.ptr != g.ptr) == hit;
+				if (!hit)
+					continue;
+				// (the streamer's count: from the record down to the first level at most the game's last, at most its chain)
+				const uint32_t game_levels = ch::tex::mip_count(keys[i].w, keys[i].h), dw = keys[i].w >> (game_levels - 1), dh = keys[i].h >> (game_levels - 1);
+				const uint32_t stored = pk::bc2::chain_levels(4 * keys[i].w, 4 * keys[i].h);
+				uint32_t want = 1;
+				while (want < stored && ((4 * keys[i].w) >> (want - 1) > dw || (4 * keys[i].h) >> (want - 1) > dh))
+					++want;
+				st::view v;
+				const bool got = st::get(ch::cache::test::pack_ticket_of(tids[i]), v);
+				levels = levels && got && v.format == DXGI_FORMAT_BC2_UNORM && v.w == 4 * keys[i].w && v.h == 4 * keys[i].h && v.levels == want;
+				level_text += (level_text.empty() ? "" : ", ") + std::to_string(keys[i].w) + "x" + std::to_string(keys[i].h) + ": " + std::to_string(v.w) + "x" +
+					std::to_string(v.h) + " " + std::to_string(v.levels) + " levels (game " + std::to_string(game_levels) + ")";
+			}
+			const cp::counts pc = cp::get_counts();
+			check(flat_settled && states && pc.not_in_pack >= 2, "  " + std::to_string(tids.size() - 2) + " ready, the one left out and the no_pack one spent as not in it: " +
+				ch::cache::status().back());
+			check(views, "  texture_view_of: the pack's pair (the second) for the hits, the game's for the two, the game's always with the pack refused");
+			check(levels, "  the hits' views: BC2 " + level_text);
+			const inj::counts before_casters = inj::get_counts();
+			render(vp, p1, &c1);
+			const inj::counts after_casters = inj::get_counts();
+			render(vp_far, p1_far);
+			quiet_check("the pack's textures drawn");
+			{
+				uint32_t changed = 0, unexplained = 0, kept = 0, mithra_px = 0, far_changed = 0, far_blue = 0;
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+				{
+					const uint8_t *a = p0.data() + i * 4, *b = p1.data() + i * 4;
+					const bool same = std::memcmp(a, b, 4) == 0;
+					mithra_px += mithra(p1, middle, i);
+					if (!same)
+					{
+						changed++;
+						unexplained += !pack_coloured(b);
+					}
+					else
+						kept += mithra(p1, middle, i);
+					const uint8_t *fa = p0_far.data() + i * 4, *fb = p1_far.data() + i * 4;
+					if (std::memcmp(fa, fb, 4) != 0)
+					{
+						far_changed++;
+						far_blue += blue(fb);
+					}
+				}
+				std::snprintf(line, sizeof(line), "  the picture: %u of the Mithra's %u pixels the pack's (green or blue), %u not (%u unchanged: the two kept the game's); %u changed otherwise",
+					changed - unexplained, mithra_px, mithra_px - (changed - unexplained), kept, unexplained);
+				check(changed > mithra_px / 3 && unexplained == 0 && kept > 100, line);
+				std::snprintf(line, sizeof(line), "  four times as far: %u of %u changed pixels blue (a lower level sampled: the view has the levels)", far_blue, far_changed);
+				check(far_changed > 100 && far_blue >= far_changed * 9 / 10, line);
+				check(c0 == c1 && !c0.empty(), "  the casters' map byte for byte as with the game's textures (the casters keep the game's views)");
+				// (the map alone can't tell: the flat records' alpha passes the cut-out test wherever the game's does here)
+				check(after_casters.caster_frames == before_casters.caster_frames + 1 && after_casters.caster_pack_draws == before_casters.caster_pack_draws,
+					"  the casters drew with none of the pack's views bound (" + std::to_string(after_casters.caster_pack_draws - before_casters.caster_pack_draws) +
+						" pack draws in the casters' frame, the pack's " + std::to_string(cp::get_counts().views) + " views ready)");
+			}
+
+			// The FSR bias (inject::set_texture_bias, as pack_wiring sets it: -1 at most): closer than the test's distance, the pack's
+			// textures sampled a level finer (more of level 0's green); the game's own (compare: every texture the game's)
+			// and the casters' map as without it (flag 2 only on the pack's)
+			{
+				std::vector<uint8_t> pb, p_unbiased, pg_far, pg0_far;
+				std::vector<float> cb;
+				// (lit and fogged, level 0's green and the lower levels' blue aren't pure: pixels leaning green (green over blue
+				// by 8) counted. At the test's own distance the 4x textures are sampled at level 1 and below already, all one
+				// blue; closer, from 0.3 to 0.75 of it, level 0 shows, and one level finer shows more of it)
+				auto leaning_green = [](const std::vector<uint8_t> &img) {
+					uint32_t n = 0;
+					for (size_t i = 0; i < size_t(W) * H; ++i)
+						n += int(img[i * 4 + 1]) > int(img[i * 4 + 2]) + 8;
+					return n;
+				};
+				int64_t more = 0;
+				bool never_less = true;
+				std::string by_distance;
+				for (const float k : { 0.3f, 0.4f, 0.5f, 0.6f, 0.75f })
+				{
+					const float eye_k[3] = { centre[0] + k * (eye[0] - centre[0]), centre[1] + k * (eye[1] - centre[1]), centre[2] + k * (eye[2] - centre[2]) };
+					const mat4 vp_k = camera(eye_k, centre);
+					inj::set_texture_bias(0.0f);
+					render(vp_k, p_unbiased);
+					inj::set_texture_bias(-1.0f);
+					render(vp_k, pb);
+					const int64_t d = int64_t(leaning_green(pb)) - int64_t(leaning_green(p_unbiased));
+					more += d;
+					never_less = never_less && d >= 0;
+					by_distance += (by_distance.empty() ? "" : ", ") + std::to_string(d);
+				}
+				render(vp, pb, &cb);
+				cp::set_compare(true);
+				render(vp_far, pg_far);
+				inj::set_texture_bias(0.0f);
+				render(vp_far, pg0_far);
+				cp::set_compare(false);
+				check(never_less && more > 200, "the FSR bias -1 on the pack's textures: more of level 0's green from 0.3 to 0.75 of the distance (pixels leaning green, more by " +
+					by_distance + ")");
+				check(pg_far == pg0_far && pg_far == p0_far, "  the game's textures (compare) with the bias: the same picture as without, and as before the pack (no flag 2: their own six levels as drawn)");
+				check(cb == c0, "  the casters' map with the bias: byte for byte the game's");
+				quiet_check("  the FSR bias");
+			}
+
+			// Eviction with a list in flight: the video memory over 95% (set_limits) between a frame's recording and its run,
+			// the glue's frame there evicting every texture (the round's bytes past them all); the frame drawn as recorded,
+			// then the game's picture; the pressure gone, back once it's been gone kEvictHoldS; the debug layer silent
+			{
+				cp::test::set_evict_bytes(1ull << 40);
+				st::limits full;
+				full.vram_usage = 99ull << 20;
+				full.vram_budget = 100ull << 20;
+				std::vector<uint8_t> pe, pe_after;
+				uint32_t evicted_in_flight = 0;
+				render(vp, pe, nullptr, [&] {
+					st::set_limits(full);
+					pnow += 1.0;
+					cp::frame(pnow, st::epoch());
+					evicted_in_flight = ch::cache::get_counts().pack_evicted;
+				});
+				render(vp, pe_after);
+				std::string w2;
+				const bool consistent = ch::cache::test::slots_consistent(w2);
+				check(pe == p1 && evicted_in_flight == tids.size() - 2 && pe_after == p0 && consistent,
+					"evicted under the pressure while a frame was in flight: " + std::to_string(evicted_in_flight) + " back to the game's; that frame as recorded (the pack's), the next the game's" +
+						(w2.empty() ? std::string() : ": " + w2));
+				st::set_limits(st::limits {});
+				pump(3);
+				pnow += cp::kEvictHoldS + 1.0;
+				const bool back = pump_settled() && ch::cache::get_counts().pack_ready == tids.size() - 2;
+				std::vector<uint8_t> pe_back;
+				render(vp, pe_back);
+				check(back && pe_back == p1, "  the pressure gone " + std::to_string(int(cp::kEvictHoldS)) + " s: asked again, the pack's picture again");
+				cp::test::set_evict_bytes(0);
+				quiet_check("  the eviction");
+			}
+
+			// Off between a frame's recording and its run, on again, 50 times (every fifth with the copies held on the GPU
+			// and let go while held): the frame drawn as recorded (the pack's), no pair twice, the debug layer silent
+			{
+				ID3D12Fence *gate = nullptr;
+				device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate));
+				uint64_t gate_value = 0;
+				uint32_t same = 0, consistent = 0, ready_again = 0, held_drops = 0;
+				std::string bad;
+				std::vector<uint8_t> p;
+				for (int k = 0; k < 50; ++k)
+				{
+					render(vp, p, nullptr, [] { cp::clear_all(); });
+					same += p == p1;
+					std::string w2;
+					consistent += ch::cache::test::slots_consistent(w2);
+					if (!w2.empty() && bad.empty())
+						bad = w2;
+					if (k % 5 == 4 && gate != nullptr)
+					{
+						st::test::gate_copies(gate, ++gate_value);
+						pump(3);
+						const uint32_t coming = ch::cache::get_counts().pack_asked;
+						cp::clear_all();
+						held_drops += coming != 0 && ch::cache::get_counts().pack_asked == 0;
+						gate->Signal(gate_value);
+						st::test::gate_copies(nullptr, 0);
+					}
+					ready_again += pump_settled() && ch::cache::get_counts().pack_ready == tids.size() - 2;
+				}
+				if (gate != nullptr)
+					gate->Release();
+				std::snprintf(line, sizeof(line), "off while a frame is in flight, on again, 50 times: %u frames as recorded, %u with no pair twice, %u ready again, %u let go with the copies held",
+					same, consistent, ready_again, held_drops);
+				check(same == 50 && consistent == 50 && ready_again == 50 && held_drops == 10, line + (bad.empty() ? std::string() : ": " + bad));
+				quiet_check("  the toggles");
+			}
+
+			// The game's own picture 4x: the cut-outs (hair, lace) cover what the game's do, near and far (a lower level
+			// sampled: the coverage kept in the mips), and the colours (a shine's mask in alpha too) as the game's
+			{
+				cp::clear_all();
+				const bool content = make_mithra_pack(here + L"content\\", textures, pk::key {}, pk::key {}, false, pack_why) && open(here + L"content\\");
+				const bool ready = pump_settled() && ch::cache::get_counts().pack_ready == tids.size();
+				std::vector<uint8_t> pc_near, pc_far;
+				render(vp, pc_near);
+				render(vp_far, pc_far);
+				const uint32_t n0 = covered(p0, middle), n1 = covered(pc_near, middle), f0 = covered(p0_far, far_box), f1 = covered(pc_far, far_box);
+				double mean0 = 0.0, mean1 = 0.0;
+				uint32_t both = 0;
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+					if (mithra(p0, middle, i) && mithra(pc_near, middle, i))
+					{
+						const uint8_t *a = p0.data() + i * 4, *b = pc_near.data() + i * 4;
+						mean0 += 0.3 * a[0] + 0.59 * a[1] + 0.11 * a[2];
+						mean1 += 0.3 * b[0] + 0.59 * b[1] + 0.11 * b[2];
+						both++;
+					}
+				mean0 /= std::max(both, 1u);
+				mean1 /= std::max(both, 1u);
+				check(content && ready, "a made-up pack of the Mithra's own pictures 4x (its cut-outs' mips keeping their coverage): all " + std::to_string(tids.size()) + " ready" +
+					(pack_why.empty() ? std::string() : ": " + pack_why));
+				std::snprintf(line, sizeof(line), "  the cut-outs' coverage: near %u pixels against the game's %u (%.2f%%), four times as far %u against %u (%.2f%%)", n1, n0,
+					100.0 * (double(n1) - n0) / std::max(n0, 1u), f1, f0, 100.0 * (double(f1) - f0) / std::max(f0, 1u));
+				check(std::fabs(double(n1) - n0) <= 0.02 * n0 && std::fabs(double(f1) - f0) <= 0.02 * f0 && n0 > 1000, line);
+				std::snprintf(line, sizeof(line), "  the colours: brightness %.2f against the game's %.2f over %u pixels (within 2)", mean1, mean0, both);
+				check(std::fabs(mean1 - mean0) <= 2.0, line);
+				// (per pixel, the sun's highlight on the shine groups (flags 1) by the texture's alpha, kSpec * saturate(2 * t.a):
+				// the shine pixels alone, the game's (compare) against the pack's, so a mask lost in the pack's alpha shows)
+				{
+					inj::set_options(true, getenv("CHARS_DETAIL") != nullptr);
+					inj::set_sun(sun_toward);
+					std::vector<uint8_t> ps_game, ps_pack;
+					cp::set_compare(true);
+					render(vp, ps_game);
+					cp::set_compare(false);
+					render(vp, ps_pack);
+					inj::set_options(getenv("CHARS_PERPIXEL") != nullptr, getenv("CHARS_DETAIL") != nullptr);
+					inj::set_sun(getenv("CHARS_PERPIXEL") != nullptr ? toward_sun : nullptr);
+					// (over the pixels all four pictures cover: the highlight in it, a mask lost or doubled moves it)
+					double hl_game = 0.0, hl_pack = 0.0;
+					uint32_t lit_px = 0;
+					for (size_t i = 0; i < size_t(W) * H; ++i)
+						if (mithra(p0, middle, i) && mithra(pc_near, middle, i) && mithra(ps_game, middle, i) && mithra(ps_pack, middle, i))
+						{
+							const uint8_t *a = ps_game.data() + i * 4, *b = ps_pack.data() + i * 4;
+							hl_game += 0.3 * a[0] + 0.59 * a[1] + 0.11 * a[2];
+							hl_pack += 0.3 * b[0] + 0.59 * b[1] + 0.11 * b[2];
+							lit_px++;
+						}
+					hl_game /= std::max(lit_px, 1u);
+					hl_pack /= std::max(lit_px, 1u);
+					std::snprintf(line, sizeof(line), "  per pixel (the shine groups' highlight by the texture's alpha): brightness %.2f against the game's %.2f over %u pixels (within 2)",
+						hl_pack, hl_game, lit_px);
+					check(lit_px > 1000 && std::fabs(hl_pack - hl_game) <= 2.0, line);
+				}
+				quiet_check("  the Mithra's own pictures");
+			}
+
+			// The real pack (read only; skipped without it): the Mithra's original bytes' keys in it; the overlay's copies'
+			// (the game's bytes while hifi-textures is listed) none, and the line says pack_why
+			{
+				cp::clear_all();
+				const std::wstring real = pk::folder_in(L"C:\\Games\\PhoenixXI\\bootloader");
+				const std::vector<dat_chunk> overlay = dats != nullptr ? read_dats(dats, true) : read_dat_at("C:\\Games\\PhoenixXI\\polplugins\\DATs\\hifi-textures\\ROM2\\0\\52.DAT");
+				// (CHARS_PICTURES=<folder>: the game's textures, the real pack's and the overlay's copies drawn whole and close
+				// up, as BMPs there: for a look, no check reads them)
+				const char *pictures = getenv("CHARS_PICTURES");
+				const float close_at[3] = { centre[0], lo[1] + 0.3f * (hi[1] - lo[1]), centre[2] };
+				const float eye_close[3] = { close_at[0] + 0.3f * (eye[0] - centre[0]), close_at[1] + 0.3f * (eye[1] - centre[1]), close_at[2] + 0.3f * (eye[2] - centre[2]) };
+				const mat4 vp_close = camera(eye_close, close_at);
+				auto picture = [&](const char *name) {
+					if (pictures == nullptr)
+						return;
+					std::vector<uint8_t> whole, close;
+					render(vp, whole);
+					render(vp_close, close);
+					write_bmp(std::string(pictures) + "\\" + name + ".bmp", whole);
+					write_bmp(std::string(pictures) + "\\" + name + "-close.bmp", close);
+					std::printf("      (pictures: %s\\%s.bmp, %s-close.bmp)\n", pictures, name, name);
+				};
+				picture("game");
+				if (GetFileAttributesW((real + L"pack.idx").c_str()) == INVALID_FILE_ATTRIBUTES)
+					std::printf("      the real pack: skipped (none at %ls)\n", real.c_str());
+				else if (!open(real))
+					check(false, "the real pack opened (read only)");
+				else
+				{
+					const bool settled_real = pump_settled();
+					picture("pack");
+					uint32_t hits = 0, misses = 0;
+					for (uint32_t t : tids)
+					{
+						hits += std::strcmp(ch::cache::test::pack_state_of(t), "ready") == 0;
+						misses += std::strcmp(ch::cache::test::pack_state_of(t), "spent") == 0;
+					}
+					check(settled_real && hits != 0 && hits + misses == tids.size(), "the real pack (read only): " + std::to_string(hits) + " of the Mithra's " +
+						std::to_string(tids.size()) + " textures, keyed from its original file's bytes, from the pack (" + std::to_string(misses) + " not in it)");
+					if (overlay.empty())
+						std::printf("      the overlay's copy: skipped (no hifi-textures\\ROM2\\0\\52.DAT)\n");
+					else
+					{
+						const cp::counts before = cp::get_counts();
+						const loaded O = load_into_cache(overlay);
+						ch::cache::frame_tick(device, pnow);
+						ch::cache::settle(120000);
+						for (int i = 0; i < 400 && ch::cache::get_counts().meshes_ready < P.meshes.size() + O.meshes.size(); ++i)
+							Sleep(50);
+						const bool settled_overlay = pump_settled();
+						frame_meshes = &O.meshes;
+						picture("overlay");
+						frame_meshes = &P.meshes;
+						const cp::counts after = cp::get_counts();
+						std::vector<uint32_t> otids;
+						for (uint32_t id : O.meshes)
+							if (ch::cache::mesh_view mv; ch::cache::mesh_view_of(id, mv))
+								for (uint32_t t : mv.textures)
+									if (t != ch::cache::kNone && std::find(otids.begin(), otids.end(), t) == otids.end())
+										otids.push_back(t);
+						uint32_t spent = 0;
+						for (uint32_t t : otids)
+							spent += ch::cache::test::pack_key_of(t).bytes != 0 && std::strcmp(ch::cache::test::pack_state_of(t), "spent") == 0;
+						check(settled_overlay && !otids.empty() && after.not_in_pack - before.not_in_pack >= otids.size() && spent == otids.size() && after.views == before.views,
+							"  the overlay's copies of its " + std::to_string(otids.size()) + " textures (what the game holds while it's listed): every key missed, not in the pack");
+						s_overlay = true;
+						cp::clear_all();
+						std::vector<std::string> out;
+						cp::lines(out);
+						check(!out.empty() && out[0].find("the hifi-textures overlay is still installed") != std::string::npos, "  the line: " + (out.empty() ? std::string() : out[0]));
+						s_overlay = false;
+					}
+				}
+				quiet_check("  the real pack");
+			}
+			cp::clear_all();
+			st::stop();
+			pump(4);
+			pic->Release();
+		}
 	}
 	if (argc > 2)
 	{

@@ -15,9 +15,17 @@
 //
 // Entries are keyed by the game's resource and checked against its handle, size and data pointer each frame (a freed
 // resource's memory can be reused for another); an entry not named for kForgetSeconds is let go.
+//
+// The texture pack's part (docs/texture-pack/characters.md): each texture's key is made from the bytes the game holds
+// (pack::key_of, on the worker, before they're freed), and a texture on the GPU may get a second pair of descriptors
+// with the pack's view of it, which the renderer then binds. The cache makes no streamer call (it holds the tickets,
+// the pairs and the states); src/chars/charpack.cpp asks, reads the tickets and writes the views on the game's thread,
+// and the tickets the cache lets go are handed to its drop hook outside the mutex.
 
 #include <d3d12.h>
 #include "os2.hpp"
+#include "../pack/pack.hpp"
+#include "../pack/stream.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -87,7 +95,10 @@ namespace hifi::chars::cache
 	// Whether a mesh and the textures it found are all on the GPU (the game's thread asks before leaving a model out). A
 	// texture that couldn't be read (or was too big) never will be: its models stay the game's for good.
 	bool mesh_ready(uint32_t id);
-	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out);
+	// A texture's pair once it's on the GPU: the texture pack's when it has one ready and allow_pack (the shadow casters
+	// refuse it: they keep the game's cut-outs) and /hifi textures compare is off, else the game's; is_pack says which
+	// (the game's thread: the time a pack pair is handed out is kept, its "last drawn")
+	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out, bool allow_pack = true, bool *is_pack = nullptr);
 	ID3D12DescriptorHeap *heap();
 	// The renderer's own descriptors in that heap (k < kReserved: 0 the see-through target's view, 1 the scene's copy, 2
 	// the aura ring's 256 x 256 target); false before the heap. (The heap's last kReserved / 2 pairs.)
@@ -111,15 +122,125 @@ namespace hifi::chars::cache
 		uint32_t detail_textures = 0, detail_skipped = 0, meshes_left_failed = 0;
 		// Descriptor pairs free, and let go but not given back yet (lists in flight may still read them: retire::then)
 		uint32_t slots_free = 0, slots_retiring = 0;
+		// The texture pack's part. Now: textures on the GPU with a key, with the pack's view ready (and its view bytes),
+		// asked (a ticket on its way), spent as not in the pack (or no_pack) or with no key at all, failed, gone (the
+		// ticket's epoch ended before it was read), and pairs held for pack views. In all: tickets handed to the drop hook,
+		// ready tickets dropped for want of descriptors (kPackSlotFloor), and textures not asked for that reason the last
+		// time asks were taken
+		uint32_t pack_keyed = 0, pack_ready = 0, pack_asked = 0, pack_not_in = 0, pack_failed = 0, pack_gone = 0, pack_pairs = 0;
+		uint64_t pack_bytes = 0;
+		uint64_t pack_dropped = 0, pack_skipped_slots = 0;
+		uint32_t pack_waiting_slots = 0;
+		// Textures evicted now (the streamer's pressure: the game's until it's gone a while), and evictions in all
+		uint32_t pack_evicted = 0;
+		uint64_t pack_evictions = 0;
 	};
 	counts get_counts();
 	std::vector<std::string> status();
 	// For the tests: a mesh's two buffers and a texture's resource once on the GPU (nullptr otherwise)
 	void resources_of(uint32_t mesh, uint32_t texture, ID3D12Resource *&vertices, ID3D12Resource *&corners, ID3D12Resource *&tex);
 
+	// ---- The texture pack's part (src/chars/charpack.cpp, the game's thread; docs/texture-pack/characters.md "The
+	// upgrade state machine"). A texture's pack part: none (a key, nothing asked), asked (a ticket on its way), ready (the
+	// ticket ready and the pack's pair written: texture_view_of hands it out), spent (missed or gone: the game's until
+	// the pack's part is forgotten), evicted (let go under the streamer's pressure: the game's until pack_unevict). Every
+	// change is made under the cache's mutex; device calls and the streamer's outside
+
+	// While fewer pairs than this are free none is taken for a pack view (the heap is shared with the meshes and the
+	// game's textures, which must always find one): asks are held and a ready ticket is dropped (the entry asks again)
+	constexpr uint32_t kPackSlotFloor = 1024;
+	// Where the tickets the cache lets go are dropped (charpack: stream::drop), from the thread that lets them go (the
+	// game's, or the cache's worker) with the mutex left. nullptr: none (the cache never asks then)
+	using pack_drop_fn = void (*)(hifi::pack::stream::ticket t);
+	void set_pack_drop(pack_drop_fn fn);
+	// Whether pack parts are wanted (charpack, while the pack is in use with [textures] chars on the cache's device): on,
+	// every keyed texture on the GPU with no pack part is put on the asks' list, and each one ready from then on; off,
+	// the list emptied. Cheap when unchanged
+	void set_pack_on(bool on);
+	// Every texture's pack part let go (its ticket to the drop hook, its pair behind the GPU: retire::then), all of them
+	// none again (and asked again while set_pack_on): the game's textures and pairs stay. Before every close, open,
+	// reload, stop, device change and loss (the module's clear_all through charpack)
+	void forget_pack_textures();
+	// /hifi textures compare: the game's pairs handed out while it's on (nothing let go)
+	void set_pack_compare(bool on);
+	// The present's time, kept as a pack pair's "last drawn" when texture_view_of hands it out
+	void pack_tick(double now);
+	// The device the cache's heap and textures were made on (nullptr: none yet): the pack's views are written only for
+	// textures of this device
+	ID3D12Device *device();
+
+	// A texture to ask the pack for: its id and serial (ids are reused), its key, and the game's own smallest level
+	// (the levels down_to: the key's size halved tex::mip_count - 1 times)
+	struct pack_ask
+	{
+		uint32_t id = kNone, serial = 0;
+		hifi::pack::key k;
+		uint32_t down_to_w = 0, down_to_h = 0;
+	};
+	// At most max of the asks' list (still none, still the same texture), out appended. While kPackSlotFloor pairs or
+	// fewer are free none is handed out (pack_waiting_slots: how many wait); over it, no more than the pairs over the
+	// floor less the textures already asked or being written (each ready ticket takes a pair)
+	void take_pack_asks(uint32_t max, std::vector<pack_ask> &out);
+	// The ticket a request gave: kept (asked, in epoch), or false when the texture went meanwhile (drop it)
+	bool pack_asked(uint32_t id, uint32_t serial, hifi::pack::stream::ticket t, uint32_t epoch);
+	// A request that gave no ticket (the owner gone, the table full): spent, failed
+	void pack_refused(uint32_t id, uint32_t serial);
+	// A ticket take_done handed over ready: a pair taken (over kPackSlotFloor) and the texture marked as being written.
+	// false: not the cache's ticket any more, or no pair (the ticket let go, the texture asks again). The detail map is
+	// AddRef'd for write_pack_detail
+	struct pack_writing
+	{
+		uint32_t id = kNone, serial = 0, slot = 0;
+		hifi::pack::stream::ticket t;
+		D3D12_CPU_DESCRIPTOR_HANDLE colour {}, detail {}; // (the pair's two descriptors)
+		ID3D12Resource *detail_map = nullptr;
+	};
+	bool pack_begin(hifi::pack::stream::ticket t, pack_writing &out);
+	// (the mutex not held: a device call) The pair's second descriptor: a new view of the game texture's detail map (its
+	// levels from its desc), or the null view the game's pair has when it has none. Never a copy from the shader-visible
+	// heap. The detail map Released
+	void write_pack_detail(pack_writing &w);
+	// The colour view written (stream::write_view: ok) or not: ready with its view bytes, or the pair and the ticket let
+	// go and the texture spent (failed). Nothing when the texture's pack part was let go meanwhile
+	void pack_end(const pack_writing &w, bool ok, uint64_t bytes);
+	// A ticket take_done handed over missed or gone: let go, the texture spent (until its pack part is forgotten)
+	enum class pack_miss : uint8_t
+	{
+		not_in_pack, // (not in the pack, or its no_pack flag)
+		failed,
+		gone,
+	};
+	void pack_spent(hifi::pack::stream::ticket t, pack_miss why);
+	// The streamer's pressure (charpack, each half second while it holds: plan section 5): the ready textures whose pack
+	// pair was handed out longest ago let go (pair and ticket behind the GPU, as any), at least one, until their view bytes
+	// reach max_bytes; each evicted, not asked again until pack_unevict. How many (their view bytes in bytes)
+	uint32_t pack_evict(uint64_t max_bytes, uint64_t &bytes);
+	// The evicted textures a model drew last none again, and on the asks' list while pack parts are wanted (the pressure
+	// gone a while), at least one, until their view bytes reach max_bytes (charpack paces them a round each half second,
+	// so a pressure that comes back stops them part way): how many, and how many are still evicted in left
+	uint32_t pack_unevict(uint64_t max_bytes, uint32_t &left);
+
 	// Waits until nothing is queued or being uploaded (the tests); false on timeout. With no device to upload to, textures
 	// the batch holds back (kBatchBytes already decoded) count as settled.
 	bool settle(uint32_t ms);
 	// Everything let go (the thread stopped, the GPU's copies waited for)
 	void stop();
+
+	namespace test
+	{
+		// (tests) A texture's key as the worker made it (empty: none yet, or none), its pack state ("none", "asked",
+		// "writing", "ready", "spent", "evicted"; "" for no texture), its ticket and pack pair (kNone: none)
+		hifi::pack::key pack_key_of(uint32_t id);
+		const char *pack_state_of(uint32_t id);
+		hifi::pack::stream::ticket pack_ticket_of(uint32_t id);
+		uint32_t pack_slot_of(uint32_t id);
+		uint32_t game_slot_of(uint32_t id);
+		// (tests) Pairs taken out of free_slots till leave_free are left (the floor reached by hand), and given back
+		void hold_slots(uint32_t leave_free);
+		void give_back_slots();
+		// (tests) Whether a pair is in free_slots now; whether free_slots and every entry's pairs are all different (no
+		// pair handed out twice, none both free and in use)
+		bool slot_free(uint32_t slot);
+		bool slots_consistent(std::string &why);
+	}
 }

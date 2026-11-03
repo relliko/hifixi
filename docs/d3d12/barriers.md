@@ -109,7 +109,7 @@ The direct channel (exact states, no guessing):
   and the world module after it read them there. An older d3d8.dll (channel 1, no world fields) is refused by
   `direct_channel`: its passes stay off rather than read planes nothing keeps current.
 - Since step 3 of the re-architecture nothing follows barriers for the zone or the characters: `on_barrier` is gone
-  from both. `on_marker` (`src/zone/inject.cpp:342`, `src/chars/charinject.cpp:511`) still resets a NEW depth's planes
+  from both. `on_marker` (`src/zone/inject.cpp:342`, `src/chars/charinject.cpp:519`) still resets a NEW depth's planes
   to unknown; the mark's exact planes come right after, or the pass refuses ("the world's depth planes' states aren't
   known yet").
 
@@ -124,7 +124,7 @@ No barrier inference is left (step 5b, 2026-11-02): HiFi XI hooks nothing of Dir
 
 Our own passes on the game's depth:
 
-- `src/chars/charinject.cpp:570-573,717-719`: both planes to DEPTH_WRITE from their known states, the target to
+- `src/chars/charinject.cpp:562-564,712-713`: both planes to DEPTH_WRITE from their known states, the target to
   RENDER_TARGET from `w.rt_state`; put back after.
 - `src/upscale/temporal.cpp:459-460,529`: plane 0 only to `DEPTH_READ | NON_PIXEL_SHADER_RESOURCE` for FSR's motion pass,
   then back. `:430` refuses a depth made with DENY_SHADER_RESOURCE.
@@ -135,7 +135,7 @@ Our own resources:
 - `src/render/grass_render.cpp:4692,5295`, `src/fx/fxrender.cpp:596`: our private depths (floor map, blade depth, fx)
   are DENY_SHADER_RESOURCE on purpose: nothing samples them. Keep it that way, or drop the flag first.
 - `src/render/grass_render.cpp:3564,6120`: UAV barriers between World FX's passes over the same buffer.
-- The texture pack's textures (`src/pack/stream.cpp:1002`): committed, made in COMMON, written once on the streamer's
+- The texture pack's textures (`src/pack/stream.cpp:1006`): committed, made in COMMON, written once on the streamer's
   copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
   queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.
   **Nobody ever puts a barrier on a pack texture**: an explicit transition on the direct queue would stop it decaying,
@@ -143,8 +143,11 @@ Our own resources:
   packstream_test reads them back both ways with no barrier, 0 messages under GPU-based validation (WARP and the
   4070 Ti). Since M4 the zone pass reads them too (the colour map of a piece whose pack word says drawn,
   `src/zone/draw.cpp:959`): a pixel shader read, promoted from COMMON, no barrier, as the zone's own textures are read;
-  zonenative_test draws a zone from them, 0 messages under GPU-based validation (WARP and the 4070 Ti).
-- The streamer's ring (`src/pack/stream.cpp:548-560`): a CUSTOM heap buffer (CPU write-back, L0) made in COMMON; a
+  zonenative_test draws a zone from them, 0 messages under GPU-based validation (WARP and the 4070 Ti). Since M5 the
+  character pass reads them as well (the colour map of a group whose texture's pack pair is ready,
+  `src/chars/chardraw.cpp:1799`): the same promotion, no barrier; charinject_test draws the Mithra from them and turns
+  them off and on 50 times between recording and running, 0 messages under GPU-based validation (WARP).
+- The streamer's ring (`src/pack/stream.cpp:552-564`): a CUSTOM heap buffer (CPU write-back, L0) made in COMMON; a
   buffer promotes to COPY_SOURCE on the copy queue and decays. Not an UPLOAD heap (GENERIC_READ for life, and
   write-combined: docs/d3d12/sync.md).
 - `src/d3d8/gpu.cpp:60`, `src/render/gpu_crash.cpp:204,211`, `src/render/worldfx_core.cpp:2384`: debug layer and GPU

@@ -3,6 +3,10 @@
  * plugin drives it, through passes::modules() ("textures": update, present, device, command, stop), on WARP with the
  * debug layer (HIFIXI_GBV=1: GPU-based validation too), its settings in a folder of its own, a made-up pack under
  * build\test\packmodule, and a fake consumer standing in for the zones' glue (it asks for textures and drops them):
+ *   - a second fake consumer (the characters' glue's place: main.cpp adds src/chars/charpack after the zones'), the
+ *     first one added twice (kept once): [textures] chars on by default for both, their frames, the second's line after
+ *     the first's, the hidden chars key off and on, and off clearing the first then the second; the module's device
+ *     published while in use (pack::device_in_use);
  *   - the quiet window over made-up timelines (quiet_window), and nothing read while the module holds kQuiet;
  *   - no pack folder: nothing started, nothing in use; the folder made, a reload finds it; pack=0: the streamer not
  *     started (it starts at the first enable with a device);
@@ -287,14 +291,16 @@ namespace
 		std::vector<std::string> calls;
 		st::owner owner = 0;
 		std::vector<st::ticket> tickets;
-		bool zones = false, actors = false, compare = false;
+		bool zones = false, actors = false, chars = false, compare = false;
 		int frames = 0;
 		uint32_t epoch_at_clear = 0;      // (the streamer's epoch when clear_all was last called)
 		bool snapshot_at_clear = false;   // (and whether a pack was open then)
 
+		std::vector<std::string> order; // (both fakes' clear_all and set_mode, in the order the module called them)
 		void clear_all()
 		{
 			calls.push_back("clear");
+			order.push_back("1 clear");
 			epoch_at_clear = st::epoch();
 			snapshot_at_clear = st::current() != nullptr;
 			if (owner != 0)
@@ -302,11 +308,13 @@ namespace
 			owner = 0;
 			tickets.clear();
 		}
-		void set_mode(bool z, bool a)
+		void set_mode(const pk::modes &m)
 		{
-			calls.push_back(std::string("mode ") + (z ? "1" : "0") + (a ? "1" : "0"));
-			zones = z;
-			actors = a;
+			calls.push_back(std::string("mode ") + (m.zones ? "1" : "0") + (m.actors ? "1" : "0"));
+			order.push_back("1 mode");
+			zones = m.zones;
+			actors = m.actors;
+			chars = m.chars;
 		}
 		void frame(double, uint32_t) { frames++; }
 		void set_compare(bool on)
@@ -344,6 +352,37 @@ namespace
 					return i;
 			return SIZE_MAX;
 		}
+		// Whether every call a in order came before the next b (each pair in turn, none left over): the first consumer
+		// called first each time
+		bool in_turn(const std::string &a, const std::string &b)
+		{
+			size_t pairs = 0;
+			bool want_a = true;
+			for (const std::string &o : order)
+				if (o == a || o == b)
+				{
+					if ((o == a) != want_a)
+						return false;
+					pairs += o == b;
+					want_a = !want_a;
+				}
+			return want_a && pairs != 0;
+		}
+	}
+
+	// ---- A second fake consumer (the characters' glue stands there in main.cpp): its calls after the first's
+	namespace fake2
+	{
+		bool chars = false;
+		int frames = 0;
+		void clear_all() { fake::order.push_back("2 clear"); }
+		void set_mode(const pk::modes &m)
+		{
+			fake::order.push_back("2 mode");
+			chars = m.chars;
+		}
+		void frame(double, uint32_t) { frames++; }
+		void lines(std::vector<std::string> &out) { out.push_back("Characters: the test's second line"); }
 	}
 
 	// ---- The module, as the plugin calls it
@@ -564,7 +603,17 @@ int main()
 	c.frame = fake::frame;
 	c.set_compare = fake::set_compare;
 	c.lines = fake::lines;
-	pk::set_consumer(c);
+	pk::test::clear_consumers();
+	pk::add_consumer(c);
+	pk::add_consumer(c); // (wired twice: added once)
+	{
+		pk::consumer c2;
+		c2.clear_all = fake2::clear_all;
+		c2.set_mode = fake2::set_mode;
+		c2.frame = fake2::frame;
+		c2.lines = fake2::lines;
+		pk::add_consumer(c2);
+	}
 	pk::test::force_quiet(0);
 	settle(); // (the retire list's own fence made first: it holds the device too)
 	const ULONG refs_before = device_refs();
@@ -622,6 +671,22 @@ int main()
 		const std::vector<std::string> menu = pk::menu_lines();
 		check(has(menu, found) && has(menu, "This area: the test's textures") && has(menu, "On the graphics card:"),
 			std::string("the menu: \"") + (menu.empty() ? "" : menu[0]) + "\", the consumer's line, the graphics card's");
+		// (the second consumer: the characters' mode on by default, its frame called, its line after the first's)
+		const int frames2 = fake2::frames;
+		present();
+		const auto at = [&](const std::string &l) { return size_t(std::find(menu.begin(), menu.end(), l) - menu.begin()); };
+		check(fake::chars && fake2::chars && fake2::frames == frames2 + 1 && logged("characters on") &&
+				at("Characters: the test's second line") == at("This area: the test's textures") + 1 && pk::device_in_use() == G.device,
+			"the second consumer: [textures] chars on by default for both, its frame each present, its line after the first's; the module's device published");
+		// ([textures] chars, hidden: off and on again, to both consumers, each time the first one first)
+		fake::order.clear();
+		hifi::game::set_option_on("textures", "chars", false);
+		update();
+		const bool chars_off = !fake::chars && !fake2::chars && fake::zones && fake::actors;
+		hifi::game::set_option_on("textures", "chars", true);
+		update();
+		check(chars_off && fake::chars && fake2::chars && fake::in_turn("1 mode", "2 mode") && fake::order.size() == 4,
+			"[textures] chars=0: the modes with chars off to both (zones and actors still on), then on again; the first consumer first each time");
 		// (the rest of the test as an ordinary session: the safe start gone)
 		write_text(settings_file, "[hifixi]\r\npreset=custom\r\n\r\n[textures]\r\npack=1\r\n");
 		hifi::backend::start_settings_only(settings_file.c_str(), here.c_str());
@@ -755,8 +820,12 @@ int main()
 		};
 		const bool held_while_on = !rename_and_back();
 		fake::calls.clear();
+		fake::order.clear();
 		command("off");
 		const bool cleared_first = fake::index_of("clear") == 0 && fake::epoch_at_clear == e0 && fake::snapshot_at_clear && fake::index_of("mode 00") == 1;
+		check(fake::in_turn("1 clear", "2 clear") && fake::in_turn("1 mode", "2 mode") && fake::order.size() == 4 && fake::order[0] == "1 clear" &&
+				fake::order[1] == "2 clear" && pk::device_in_use() == nullptr && !fake2::chars,
+			"off: both consumers cleared (the first, then the second, each once: the first wired twice), then both modes off; no device in use");
 		const bool closed = wait_epoch_past(e0) && st::current() == nullptr;
 		update();
 		check(cleared_first && closed && !pk::in_use() && pk::epoch_in_use() == 0 && (st::paused() & st::kOff) != 0 && st::running() &&

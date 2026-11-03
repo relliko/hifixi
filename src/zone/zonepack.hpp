@@ -1,7 +1,7 @@
 #pragma once
 
 // The texture pack's glue for the zone, its second map and the model actors (docs/texture-pack/zones.md): the consumer
-// the "textures" module calls (src/pack/pack_module.hpp, pack::consumer; main.cpp hands it over). Everything here runs
+// the "textures" module calls (src/pack/pack_module.hpp, pack::consumer; main.cpp adds it first). Everything here runs
 // on the game's thread: the module's update and present, the gpu_zones' destruction (the drop hook).
 //
 //   - The loaders' pack mode (set_mode): native::set_pack_mode, actordata::set_pack_mode. A gpu_zone read in pack mode
@@ -37,7 +37,7 @@ namespace hifi::zone::zonepack
 	// (a zone's requests wait at most this long for a zone pass of its own to order them by distance; then by use only)
 	constexpr double kCameraWaitS = 2.0;
 
-	// The module's consumer (pack::set_consumer, main.cpp)
+	// The module's consumer (pack::add_consumer, main.cpp: the first; its set_mode takes the zones' and actors' modes)
 	pack::consumer consumer();
 	void clear_all();
 	void set_mode(bool zones, bool actors);

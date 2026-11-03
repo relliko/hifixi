@@ -95,6 +95,7 @@ namespace hifi::chars
 	{
 		bool per_pixel = false;
 		bool detail = false;    // the detail maps (tex::make_detail), per pixel only ([chars] detail)
+		float texture_bias = 0.0f; // the texture pack's textures' mip bias (FSR, pack on; inject::set_texture_bias): pack textures only
 		bool sun_known = false; // sun: toward the zone's sun (world), for the light split's share
 		float sun[3] = {};
 		float sun_fade = 1.0f;  // the share of the sun the zone's lit by (zone::horizon_fade): the models' sun light the same
@@ -107,6 +108,7 @@ namespace hifi::chars
 		uint32_t models = 0, draws = 0, triangles = 0;
 		uint32_t not_ready = 0, hidden = 0, untextured = 0; // groups (or models, not ready) left out
 		uint32_t overlays = 0, cloaks = 0;                  // models drawn with their extra passes
+		uint32_t pack_draws = 0;                            // draws with the texture pack's view bound (record_casters: never)
 	};
 
 	class char_renderer
@@ -143,7 +145,7 @@ namespace hifi::chars
 		bool begin(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, const char_options &o);
 		D3D12_GPU_VIRTUAL_ADDRESS write_frame(const frame &f, const char_options &o, const float view_proj[16], uint32_t part);
 		void draw_model(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t model, char_stats &st, const frame *last = nullptr,
-			int pass = 0, D3D12_GPU_DESCRIPTOR_HANDLE texture = {});
+			int pass = 0, D3D12_GPU_DESCRIPTOR_HANDLE texture = {}, bool allow_pack = true);
 		// The extra passes of models [from, to) (opaque: overlays; one see-through model: its overlay and cloak), RT 0 alone
 		void draw_passes(ID3D12GraphicsCommandList *list, const char_target &t, const frame &f, uint32_t from, uint32_t to, D3D12_GPU_DESCRIPTOR_HANDLE scene, char_stats &st);
 		ID3D12PipelineState *pipeline(const char_target &t, int kind);

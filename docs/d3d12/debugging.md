@@ -105,7 +105,7 @@ Breadcrumbs:
 - Native zone pass: `src/zone/draw.cpp`. Buffer made in `make_breadcrumbs` (:470-503). Word 2 = setup steps
   (`step`, :885-891; steps in `src/zone/draw.hpp:124`). Word 0 = `MARKER_IN` before each piece's draw, word 1 =
   `MARKER_OUT` after it (:962-973). Each word is frame low 16 bits << 16 | draw. Read in `breadcrumbs()`
-  (:505-603); added to the crash report by `src/plugin/main.cpp:1014`.
+  (:505-603); added to the crash report by `src/plugin/main.cpp:1015`.
 - Each piece's note says whose texture was bound (`piece_note::pack`, `src/zone/draw.hpp:102`, from
   `gpu_zone::texture_srv(texture, &pack)` at draw.cpp:959; printed by `note_text` :444 as "texture N (the texture
   pack's)" or "(the game's)"), so a zone-pass hang report tells a pack texture from the game's own
@@ -113,16 +113,16 @@ Breadcrumbs:
 - World FX: `src/render/grass_render.cpp:2214-2322`. `crumb()` writes both IN and OUT at every section marker;
   the report names the section the GPU stopped in, or says the stop came outside World FX.
 - `draw.cpp` must not link `gpu_crash` (tests link draw without it): hence `add_section`. The sections are added at
-  `src/plugin/main.cpp:1014-1016` and written by `gpu_crash::sections_text()` (which the tests call without a removed
+  `src/plugin/main.cpp:1015-1017` and written by `gpu_crash::sections_text()` (which the tests call without a removed
   device).
-- Texture pack (`src/pack/memwatch.cpp` `crash_section`, added at `main.cpp:1016`, also at the end of the hang
-  report's lines, `main.cpp:268`): "Texture pack:" with the free address space and its lowest this zone, the largest
+- Texture pack (`src/pack/memwatch.cpp` `crash_section`, added at `main.cpp:1017`, also at the end of the hang
+  report's lines, `main.cpp:269`): "Texture pack:" with the free address space and its lowest this zone, the largest
   free block, the video memory and the characters' and zone's bytes as of the last half second, and whether a texture
   bake (bakeall.py, realesrgan-ncnn-vulkan) was running: a report from a session with a bake running is kept out of
   the hang analysis. It reads atomics only (no lock, no DXGI call). memwatch_test checks it.
 - The streamer's lines in that section (`src/pack/stream_crumbs.hpp`, read at `src/pack/memwatch.cpp:347-369`):
   "streamer: not started" until the pack is first turned on in the session (the "textures" module starts it then and
-  keeps it, src/pack/pack_module.cpp:220-231; a session with the pack off reads "not started"), else running or
+  keeps it, src/pack/pack_module.cpp:231-242; a session with the pack off reads "not started"), else running or
   stopped, what the worker is doing (reading, recording a copy, waiting for ring space, ...), the epoch and pause bits
   (`kOff` while the pack is off, `kQuiet` while an area settles), how many are
   queued, in flight and resident; the last record's key, data file, offset, bytes and levels; the copy fence's last
@@ -132,6 +132,12 @@ Breadcrumbs:
   by the worker; the counts, epoch and pause bits by any caller holding the streamer's mutex), in a header-only struct so
   memwatch.cpp needs no link to the streamer. packstream_test calls `crash_section()` while it holds the streamer's
   mutex: it returns at once.
+- The characters' pack textures add nothing to the hang report (the streamer's lines above already say what it reads
+  and copies, and the characters' pairs aren't bound at a breadcrumb of their own). `/hifi status` has their line
+  ("character data: texture pack: N ready (M MB), A asked, S not in it, F failed, G gone, E evicted (...); K skipped
+  for want of descriptors (W waiting); P pairs for pack views; T tickets let go", `src/chars/cache.cpp:1255-1259`
+  `status`; the menu's "Characters:" line from `src/chars/charpack.cpp` `lines`): run the same build with the pack off, or
+  `[textures] chars=0`, to tell a character pass hang that follows the pack from one that doesn't.
 - The debug layer costs address space of its own per object: 1,000 pack textures took 16.5 MB of address space with
   it on and 8.7 MB without on the 4070 Ti. packstream_test measures the streamer's address space in a child process
   with the debug layer off.
