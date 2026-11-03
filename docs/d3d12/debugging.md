@@ -122,7 +122,7 @@ Breadcrumbs:
   the hang analysis. It reads atomics only (no lock, no DXGI call). memwatch_test checks it.
 - The streamer's lines in that section (`src/pack/stream_crumbs.hpp`, read at `src/pack/memwatch.cpp:347-369`):
   "streamer: not started" until the pack is first turned on in the session (the "textures" module starts it then and
-  keeps it, src/pack/pack_module.cpp:231-242; a session with the pack off reads "not started"), else running or
+  keeps it, src/pack/pack_module.cpp:311-322; a session with the pack off reads "not started"), else running or
   stopped, what the worker is doing (reading, recording a copy, waiting for ring space, ...), the epoch and pause bits
   (`kOff` while the pack is off, `kQuiet` while an area settles), how many are
   queued, in flight and resident; the last record's key, data file, offset, bytes and levels; the copy fence's last

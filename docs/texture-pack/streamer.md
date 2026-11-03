@@ -229,7 +229,7 @@ COMMON), one per uploaded record.
 
 ### Index snapshots
 
-- `open(folder)` and `close()` are posted to the worker: `pack::load` (pack.cpp:175) runs there, never on the game's
+- `open(folder, client)` (client: the game's fingerprint, M6) and `close()` are posted to the worker: `pack::load` (pack.cpp:175) runs there, never on the game's
   thread (4.5 MB read and CRC-checked). The snapshot is published as a `std::shared_ptr<const index>` under the
   streamer's mutex; `current()` copies it (plan §4 "Snapshot and loading"). Each open, close or reload raises the epoch.
 - The worker reads data files through one `pack::reader` per snapshot. `close()` cancels its reads and closes its
@@ -600,7 +600,7 @@ something it didn't know:
 - **An open or close waits for its own pass** (found in M4 part A): the worker's loop top took a pending open with a
   pending device change (or loss) and returned after the change, dropping the open; the module's `set_device` then
   `open` in one update never opened the pack (packmodule_test on the 4070 Ti). Now the post is taken only on a pass
-  that isn't a device change or loss (stream.cpp:1363-1373); packstream_test makes both on the worker at once.
+  that isn't a device change or loss (stream.cpp:1365-1375); packstream_test makes both on the worker at once.
 - **Whose open is done** (found in M4's review): an open still in `pack::load` isn't cancelled by a newer open or
   close (only `stop` cancels it), so it raises the epoch too, before the newer one does. A caller that took the
   first epoch raised as its own open's went on in an epoch the next open ended. `open` and `close` now return their

@@ -80,23 +80,28 @@ namespace hifi::pack
 		header h;
 		if (size < sizeof(header))
 		{
-			why = "pack.idx is cut short (" + std::to_string(size) + " bytes, not even a header)";
+			why = "pack.idx is cut short (" + std::to_string(size) + " bytes, not even a header): copied only in part? copy the pack again";
 			return false;
 		}
 		std::memcpy(&h, bytes, sizeof(h));
 		if (std::memcmp(h.magic, kMagic, 4) != 0)
 		{
-			why = "pack.idx isn't a HiFi XI texture pack index";
+			// (a copy cut off while writing pack.idx leaves zeros where its start should be: copy tools set the file's
+			// length first)
+			why = "pack.idx isn't a HiFi XI texture pack index (damaged or copied only in part? copy the pack again)";
 			return false;
 		}
 		if (h.version != kVersion)
 		{
-			why = "pack.idx is version " + std::to_string(h.version) + "; this HiFi XI reads version " + std::to_string(kVersion);
+			// (a pack copied from another PC may be another HiFi XI's: say which way round, so the player knows what to
+			// update. Checked before the CRC: a later version may checksum its header otherwise)
+			why = "pack.idx is version " + std::to_string(h.version) + "; this HiFi XI reads version " + std::to_string(kVersion) +
+				(h.version > kVersion ? " (the pack was made for a newer HiFi XI: update HiFi XI)" : " (the pack was made for an older HiFi XI: get one made for this version)");
 			return false;
 		}
 		if (crc32(0, bytes, offsetof(header, header_crc)) != h.header_crc)
 		{
-			why = "pack.idx's header is damaged (CRC)";
+			why = "pack.idx's header is damaged (CRC): copy the pack again";
 			return false;
 		}
 		if (h.header_bytes != sizeof(header) || h.entry_bytes != sizeof(entry) || h.record_bytes != sizeof(record) || h.records_per_entry != 3)
@@ -117,13 +122,13 @@ namespace hifi::pack
 		const uint64_t want = sizeof(header) + uint64_t(h.file_count) * 8 + uint64_t(h.entry_count) * sizeof(entry) + uint64_t(h.crc_count) * 4;
 		if (size != want)
 		{
-			why = size < want ? "pack.idx is cut short (" + std::to_string(size) + " of " + std::to_string(want) + " bytes)"
+			why = size < want ? "pack.idx is cut short (" + std::to_string(size) + " of " + std::to_string(want) + " bytes: copied only in part?)"
 							  : "pack.idx has bytes past its tables";
 			return false;
 		}
 		if (crc32(0, bytes + sizeof(header), size - sizeof(header)) != h.table_crc)
 		{
-			why = "pack.idx's tables are damaged (CRC)";
+			why = "pack.idx's tables are damaged (CRC): copy the pack again";
 			return false;
 		}
 		out.head = h;
@@ -201,7 +206,13 @@ namespace hifi::pack
 				return nullptr;
 			}
 			LARGE_INTEGER size = {};
-			bool ok = GetFileSizeEx(f, &size) != 0 && uint64_t(size.QuadPart) <= kMaxIndexBytes;
+			bool ok = GetFileSizeEx(f, &size) != 0;
+			if (ok && uint64_t(size.QuadPart) > kMaxIndexBytes)
+			{
+				CloseHandle(f);
+				why = "pack.idx is " + std::to_string(uint64_t(size.QuadPart) >> 20) + " MB: no HiFi XI texture pack index is that big";
+				return nullptr;
+			}
 			if (ok)
 			{
 				bytes.resize(size_t(size.QuadPart));
@@ -238,21 +249,36 @@ namespace hifi::pack
 				return nullptr;
 			uint64_t real = 0;
 			const std::wstring path = data_path(folder, i);
+			// (a pack copied from another PC, the copy not finished or a file left out: said so, the whole pack refused)
 			if (!size_of(path, real))
 			{
-				why = narrow(data_path(L"", i)) + " is missing";
+				why = narrow(data_path(L"", i)) + " is missing (the pack copied only in part? pack.idx names " + std::to_string(out->head.file_count) + " data files)";
 				return nullptr;
 			}
 			if (real < out->file_bytes[i])
 			{
-				why = narrow(data_path(L"", i)) + " is shorter than pack.idx says (" + std::to_string(real) + " of " + std::to_string(out->file_bytes[i]) + " bytes)";
+				why = narrow(data_path(L"", i)) + " is shorter than pack.idx says (" + std::to_string(real) + " of " + std::to_string(out->file_bytes[i]) +
+					" bytes: the pack copied only in part?)";
 				return nullptr;
 			}
 		}
 		const header &h = out->head;
 		const fingerprint made { h.vtable_size, h.vtable_mtime, h.ftable_size, h.ftable_mtime };
-		if (client != nullptr && made != fingerprint {} && !(made == *client))
-			out->status = "The texture pack was made from other game files (VTABLE.DAT or FTABLE.DAT changed since): textures the game changed are drawn as the game's";
+		if (client != nullptr && made != fingerprint {} && *client != fingerprint {} && !(made == *client))
+		{
+			if (made.vtable_size != client->vtable_size || made.ftable_size != client->ftable_size)
+			{
+				out->client_differs = kClientSizes;
+				out->status = "The texture pack was made from another version of the game's files (VTABLE.DAT or FTABLE.DAT is another size): "
+							  "textures the game changed since are drawn as the game's own";
+			}
+			else
+			{
+				out->client_differs = kClientDates;
+				out->status = "The texture pack was made from game files dated otherwise (VTABLE.DAT and FTABLE.DAT the same sizes: made on another "
+							  "PC, or the game's files written again since): any texture the game changed is drawn as the game's own";
+			}
+		}
 		return out;
 	}
 

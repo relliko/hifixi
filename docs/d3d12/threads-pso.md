@@ -150,7 +150,7 @@ Lists, allocators, queues:
   descriptors. `src/d3d8/gpu.cpp:318-328` (`end_frame`) waits on the next set's fence before reusing its allocator.
 - Own copy queues for loaders: `src/chars/cache.cpp:340-371` (the characters' worker: queue, allocator, list, fence
   of its own), `src/zone/native.cpp:180`, `src/zone/actordata.cpp:123`, the texture pack's streamer
-  `src/pack/stream.cpp:536-542` (four allocators and lists, one per copy in flight).
+  `src/pack/stream.cpp:537-543` (four allocators and lists, one per copy in flight).
 - `src/ui2d/render2d.cpp:702-704`: the 2D pass's own queue, allocator and list.
 
 Shader and PSO creation:

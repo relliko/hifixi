@@ -1133,6 +1133,15 @@ namespace hifi::game::feed
 		return g_zone.in_game == 1;
 	}
 
+	namespace test
+	{
+		void set_zone(uint32_t zone, bool in)
+		{
+			g_zone.last = zone;
+			g_zone.in_game = in ? 1 : 0;
+		}
+	}
+
 	std::vector<std::string> status()
 	{
 		std::vector<std::string> out;

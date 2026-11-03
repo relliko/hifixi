@@ -12,7 +12,10 @@
  *     at each pixel's own place shifted by the offsets through PROJECTION: half the screen's height here, so each
  *     pixel takes the other half's colour;
  *   - the same model through the see-through marker (charinject: the world's target copied, then T, then the
- *     composite), the debug layer saying nothing; the counts.
+ *     composite), the debug layer saying nothing; the counts;
+ *   - the texture pack (M6, M5's leftover): the banner's and the overlay's textures from a made-up pack (each one flat
+ *     colour), the streamer on this device, src/chars/charpack driven as the module drives it: the banner's pixels the
+ *     pack's, the cloth's motion unchanged; the overlay pass adds the pack's texel; let go, the game's again at once.
  *
  *   build\actors_draw_test.exe build\test\cloth_oracle.bin
  */
@@ -25,6 +28,12 @@
 #include "../src/chars/charframe.hpp"
 #include "../src/chars/charinject.hpp"
 #include "../src/chars/os2.hpp"
+#include "../src/chars/charpack.hpp"
+#include "../src/host/retire.hpp"
+#include "../src/pack/bc2.hpp"
+#include "../src/pack/pack.hpp"
+#include "../src/pack/pack_write.hpp"
+#include "../src/pack/stream.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -898,6 +907,204 @@ int main(int argc, char **argv)
 			"aura: the ring beside the model (" + std::to_string(halo) + " pixels where it alone leaves the sky, " + std::to_string(red) + " of them reddened, " + std::to_string(full) + " all red; the model " +
 				std::to_string(model) + ")");
 		inj::release();
+	}
+
+	// ---- The texture pack (M5's leftover): the banner's textures and the overlay's from a made-up pack (each key one
+	// flat colour on every level), the streamer on this device, charpack driven as the module drives it. The cloth's
+	// pixels the pack's colour through the second pair, its motion unchanged; the overlay pass adds the pack's texel
+	{
+		namespace pk = hifi::pack;
+		namespace st = hifi::pack::stream;
+		namespace cp = hifi::chars::charpack;
+		wchar_t exe[MAX_PATH];
+		GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		const std::wstring build = std::wstring(exe).substr(0, std::wstring(exe).find_last_of(L'\\') + 1), folder = build + L"test\\actors_draw_pack\\";
+		CreateDirectoryW((build + L"test").c_str(), nullptr);
+		CreateDirectoryW(folder.c_str(), nullptr);
+		DeleteFileW((folder + L"pack.idx").c_str());
+		DeleteFileW((folder + L"pack.src").c_str());
+		DeleteFileW((folder + L"pack-000.bin").c_str());
+		// (the textures: the pole's, the cloth's and the overlay's, each key once)
+		std::vector<uint32_t> tids;
+		for (uint32_t mesh : { L.pole, L.cloth })
+			if (ch::cache::mesh_view mv; ch::cache::mesh_view_of(mesh, mv))
+				for (uint32_t tx : mv.textures)
+					if (tx != ch::cache::kNone && std::find(tids.begin(), tids.end(), tx) == tids.end())
+						tids.push_back(tx);
+		tids.push_back(overlay);
+		// Banner textures green (0, 0xC0, 0); the overlay's texel (0x10, 0x40, 0x20, 0x80): every level alike, so the
+		// level sampled doesn't matter
+		const uint8_t kBanner[4] = { 0, 0xC0, 0, 0x88 }, kOverlay[4] = { 0x10, 0x40, 0x20, 0x80 };
+		std::string why_pack;
+		bool made = true;
+		std::vector<pk::key> keys;
+		{
+			pk::writer w;
+			pk::writer_options wo;
+			wo.folder = folder;
+			wo.source = "actors_draw_test";
+			made = w.open(wo, why_pack);
+			for (uint32_t tid : tids)
+			{
+				const pk::key k = ch::cache::test::pack_key_of(tid);
+				if (k.bytes == 0 || std::find(keys.begin(), keys.end(), k) != keys.end())
+					continue;
+				keys.push_back(k);
+				pk::entry e;
+				e.hash = k.hash;
+				e.bytes = k.bytes;
+				e.w = k.w;
+				e.h = k.h;
+				e.orig_format = 0xA1;
+				e.source_kind = pk::kSourceModel;
+				std::memcpy(e.name, tid == overlay ? "test    overlay " : "test    banner  ", 16);
+				pk::map_in m;
+				m.format = pk::kBC2;
+				m.w = std::max(4u, 4 * uint32_t(k.w));
+				m.h = std::max(4u, 4 * uint32_t(k.h));
+				const uint8_t *texel = tid == overlay ? kOverlay : kBanner;
+				for (uint32_t l = 0, levels = pk::bc2::chain_levels(m.w, m.h); l < levels; ++l)
+				{
+					const uint32_t lw = m.w >> l, lh = m.h >> l;
+					std::vector<uint8_t> px(size_t(lw) * lh * 4);
+					for (size_t i = 0; i < px.size(); i += 4)
+						std::memcpy(px.data() + i, texel, 4);
+					m.levels.push_back(pk::bc2::encode_bc2(px.data(), lw, lh));
+				}
+				made = made && w.add(e, { m }, why_pack) == pk::add_result::ok;
+			}
+			made = made && w.commit(why_pack);
+			w.close();
+		}
+		static ID3D12Device *s_device = nullptr;
+		s_device = g.device;
+		cp::sources sources;
+		sources.device = []() { return s_device; };
+		sources.overlay_listed = []() { return false; };
+		cp::set_sources(sources);
+		const bool started = st::start(g.device);
+		const uint64_t posted = st::open(folder);
+		for (int i = 0; i < 4000 && st::posts_done() < posted; ++i)
+			Sleep(5);
+		const bool opened = st::current() != nullptr;
+		check(made && started && opened && keys.size() == tids.size(), "texture pack: a made-up pack of the banner's " + std::to_string(tids.size() - 1) +
+			" textures and the overlay's (" + std::to_string(keys.size()) + " keys), the streamer on this device: opened" + (why_pack.empty() ? "" : ": " + why_pack));
+		{
+			pk::modes m;
+			m.chars = true;
+			cp::set_mode(m);
+		}
+		// (the module's present: the cache's tick, the streamer's present, the glue's frame, the retire list's signal)
+		double pnow = 1.5; // (close to the cache's last tick (1.0): textures unused 20 s are let go)
+		bool settled = false;
+		for (int i = 0; i < 2000 && !settled; ++i)
+		{
+			pnow += 0.002;
+			ch::cache::frame_tick(g.device, pnow);
+			st::on_present();
+			cp::frame(pnow, st::epoch());
+			hifi::retire::on_present(g.queue);
+			settled = i > 2 && ch::cache::get_counts().pack_asked == 0;
+			Sleep(1);
+		}
+		bool all_pack = true;
+		for (uint32_t tid : tids)
+		{
+			D3D12_GPU_DESCRIPTOR_HANDLE h;
+			bool is_pack = false;
+			all_pack = all_pack && ch::cache::texture_view_of(tid, h, true, &is_pack) && is_pack;
+		}
+		const cp::counts pc = cp::get_counts();
+		check(settled && all_pack, "  every one ready through its second pair (" + std::to_string(ch::cache::get_counts().pack_keyed) + " keyed, " +
+			std::to_string(pc.asked) + " asked, another device " + std::to_string(pc.other_device) + "): " + ch::cache::status().back());
+
+		// The cloth (and the pole) drawn: their pixels the pack's green; the cloth's motion the oracle's move as before
+		make_frame(60, before, 0x80808080u, ch::kNative, 0);
+		const ch::frame &f = make_frame(61, now, 0x80808080u, ch::kNative, 0);
+		std::vector<uint8_t> px, mv;
+		ch::char_stats st0;
+		draw_opaque(f, true, px, mv, st0);
+		std::string first;
+		uint32_t messages = debug_messages(g.info, first);
+		uint32_t drawn = 0, green = 0;
+		for (size_t i = 0; i < size_t(W) * H; ++i)
+		{
+			const uint8_t *p = &px[i * 4];
+			if (is_sky(p))
+				continue;
+			drawn++;
+			green += int(p[1]) > int(p[0]) + 24 && int(p[1]) > int(p[2]) + 24;
+		}
+		uint32_t right = 0, checked = 0;
+		float largest = 0.0f;
+		for (uint32_t i = 0; i < n; ++i)
+			largest = std::max(largest, std::sqrt(std::pow(now.pos[3 * i] - before.pos[3 * i], 2.0f) + std::pow(now.pos[3 * i + 1] - before.pos[3 * i + 1], 2.0f) +
+															  std::pow(now.pos[3 * i + 2] - before.pos[3 * i + 2], 2.0f)));
+		for (uint32_t i = 0; i < n; ++i)
+		{
+			float sx, sy, w;
+			if (!project(vp, &now.pos[3 * i], sx, sy, w))
+				continue;
+			const uint16_t *q = reinterpret_cast<const uint16_t *>(&mv[(size_t(int(sy)) * W + int(sx)) * 8]);
+			const float m[4] = { half_to_float(q[0]), half_to_float(q[1]), half_to_float(q[2]), half_to_float(q[3]) };
+			if (m[3] <= 0.0f)
+				continue;
+			checked++;
+			float d2 = 0.0f;
+			for (int k = 0; k < 3; ++k)
+				d2 += std::pow(m[k] - (now.pos[3 * i + k] - before.pos[3 * i + k]), 2.0f);
+			right += std::sqrt(d2) <= 0.4f * largest + 1e-4f;
+		}
+		check(messages == 0 && drawn > 1000 && green >= drawn * 95 / 100 && st0.pack_draws != 0,
+			"texture pack: the banner drawn from the pack (" + std::to_string(green) + " of its " + std::to_string(drawn) + " pixels the pack's green; " +
+				std::to_string(st0.pack_draws) + " draws with a pack view), the debug layer nothing (" + std::to_string(messages) + (messages ? ": " + first : "") + ")");
+		check(checked > n / 2 && right >= checked * 9 / 10, "  the cloth's motion with the pack's texture: " + std::to_string(right) + " of " + std::to_string(checked) +
+			" vertex pixels the oracle's move");
+
+		// The overlay pass: the pack's texel (0x10, 0x40, 0x20) added as the stages make it, on the pack's banner
+		const ch::frame &f1 = make_frame(62, now, 0x80808080u, ch::kNative, ch::kPassOverlay);
+		std::vector<uint8_t> lit;
+		ch::char_stats st1;
+		draw_opaque(f1, false, lit, mv, st1);
+		messages = debug_messages(g.info, first);
+		const double want[3] = { 2 * (2 * kOverlay[0] / 255.0) * (0x40 / 255.0) * 255, 2 * (2 * kOverlay[1] / 255.0) * (0x40 / 255.0) * 255,
+			2 * (2 * kOverlay[2] / 255.0) * (0x40 / 255.0) * 255 };
+		uint32_t changed = 0, added = 0, model = 0;
+		for (size_t i = 0; i < size_t(W) * H; ++i)
+		{
+			const uint8_t *a = &px[i * 4], *b = &lit[i * 4];
+			model += !is_sky(a);
+			if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2])
+				continue;
+			changed++;
+			bool ok = true;
+			for (int k = 0; k < 3; ++k)
+				ok = ok && std::fabs(b[k] - std::min(255.0, a[k] + want[k])) <= 3.0;
+			added += ok;
+		}
+		char line[300];
+		std::snprintf(line, sizeof(line), "texture pack: the overlay pass from the pack's texture: (%.0f, %.0f, %.0f) added on %u of the %u pixels it changed (the banner's %u)",
+			want[0], want[1], want[2], added, changed, model);
+		check(messages == 0 && st1.overlays == 1 && model > 1000 && changed >= model * 9 / 10 && added >= changed * 97 / 100, line);
+
+		// Off (clear_all, as the module's close): the game's own textures again, the picture the one before the pack
+		cp::clear_all();
+		const ch::frame &f2 = make_frame(63, now, 0x80808080u, ch::kNative, 0);
+		std::vector<uint8_t> back;
+		ch::char_stats st2;
+		draw_opaque(f2, false, back, mv, st2);
+		uint32_t green_back = 0;
+		for (size_t i = 0; i < size_t(W) * H; ++i)
+			green_back += !is_sky(&back[i * 4]) && int(back[i * 4 + 1]) > int(back[i * 4]) + 24 && int(back[i * 4 + 1]) > int(back[i * 4 + 2]) + 24;
+		check(st2.pack_draws == 0 && green_back < green / 20, "texture pack: let go (clear_all): the game's textures again at once (" + std::to_string(st2.pack_draws) +
+			" pack draws, " + std::to_string(green_back) + " green pixels)");
+		st::stop();
+		for (int i = 0; i < 4; ++i)
+		{
+			hifi::retire::on_present(g.queue);
+			begin_list(g);
+			run(g);
+		}
 	}
 
 	renderer.release();

@@ -137,7 +137,9 @@ namespace hifi::pack::stream
 	// and posts_done() the number of the last the worker has done: an open still loading isn't cancelled by a newer
 	// open or close, so it raises the epoch too, before the newer one does. Whoever waits for its own post waits for
 	// posts_done() to reach it, not for the epoch to move (the module's check_open)
-	uint64_t open(const std::wstring &folder);
+	// client: the game's files' fingerprint (pack::client_fingerprint), compared with the one the pack was made from
+	// (index::status, client_differs); nullptr or all zeros: not compared
+	uint64_t open(const std::wstring &folder, const fingerprint *client = nullptr);
 	uint64_t open(std::shared_ptr<const index> pack); // (tests: an index they built)
 	uint64_t close();
 	uint64_t posts_done();

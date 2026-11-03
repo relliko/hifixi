@@ -230,7 +230,7 @@ group as it records). The glue runs in the module's present, between two frames:
   `cache::pack_end(id, serial, ok, view.bytes)`: `ready`, or the pair to `slots_dead` and the ticket to the drop list.
   For `missed` and `gone`: `spent`, the ticket dropped, counted by `stream::reason`. The glue keeps a map ticket slot ->
   (id, serial), as zonepack's `by_slot`.
-- **Pauses:** `kQuiet` holds the whole streamer from a zone change till the area settles (pack_module.cpp:397-439), so
+- **Pauses:** `kQuiet` holds the whole streamer from a zone change till the area settles (pack_module.cpp:499-541), so
   characters' textures wait too: pack work stays off zoning's path. Requests are made meanwhile and wait queued.
 - **Compare:** `cache::set_pack_compare(bool)`, an atomic `texture_view_of` reads: the game pair while it's on. Frees
   nothing, writes nothing.
@@ -384,7 +384,7 @@ Unchanged in shape (plan section 4 "Shutdown and device order", zones.md "The mo
    `forget_pack_textures`, `drop_owner`), `stream::stop` (joins, under 100 ms), memwatch.
 2. Then `charmodel::stop`, `chars::clear_frames`, `cache::stop` (:1058-1059): no character ticket is left; `stop`'s
    `release_texture` would hand any to the hook, whose `stream::drop` of a ticket the stopped streamer forgot frees
-   nothing (generation and `live` checks, stream.cpp:1852, :355).
+   nothing (generation and `live` checks, stream.cpp:1856, :355).
 3. `retire::release_all` last (:1075).
 
 A device change: native and actordata let go of the old device's zones in their frames; the module's `device`

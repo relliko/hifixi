@@ -143,7 +143,7 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
 - Upscale: `upscale.cpp:294`, `temporal.cpp:309/348` own heaps; FSR 2 binds its own, so `upscale.cpp:419` and `525`
   put the list's heaps back (`upscale::on_heaps`, fed by `ev_heaps`, `backend.cpp:778-782`).
 - The texture pack's streamer (`src/pack/stream.cpp`) has **no shader-visible heap** and writes into nobody's.
-  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1876`):
+  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1880`):
   `CreateShaderResourceView` with the ticket's format, the levels uploaded, most detailed 0, on the owner's thread,
   with none of the owner's locks held (a device call), into a slot the owner alone decides is free (the rule above:
   no list in flight may read it). It holds the texture and the device for the call (AddRef'd with the ticket checked,

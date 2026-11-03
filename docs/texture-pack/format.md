@@ -190,7 +190,10 @@ used: <why>"):
 - a data file missing, or shorter than the index says (longer is fine: a writer may be appending).
 
 A **client fingerprint** that differs from the game's `VTABLE.DAT`/`FTABLE.DAT` (size and last write time) is only a
-status line: textures the game changed simply miss.
+status line: textures the game changed simply miss. Other sizes (`index::client_differs` = `kClientSizes`: another
+version of the game's files) also put a line in the menu; the same sizes at other times (`kClientDates`: a pack made on
+another PC, or the files written again) the status and the log only. A fingerprint of zeros, the pack's or the game's
+(not found), compares nothing. The plugin passes the game's from `bake::ffxi_folder()` with each open (M6).
 
 **A record that can't be used** is a miss (the game's texture is drawn) plus a log line. Checked before upload
 (`pack::check`) and after reading:

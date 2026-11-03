@@ -135,7 +135,7 @@ Our own resources:
 - `src/render/grass_render.cpp:4692,5295`, `src/fx/fxrender.cpp:596`: our private depths (floor map, blade depth, fx)
   are DENY_SHADER_RESOURCE on purpose: nothing samples them. Keep it that way, or drop the flag first.
 - `src/render/grass_render.cpp:3564,6120`: UAV barriers between World FX's passes over the same buffer.
-- The texture pack's textures (`src/pack/stream.cpp:1006`): committed, made in COMMON, written once on the streamer's
+- The texture pack's textures (`src/pack/stream.cpp:1007`): committed, made in COMMON, written once on the streamer's
   copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
   queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.
   **Nobody ever puts a barrier on a pack texture**: an explicit transition on the direct queue would stop it decaying,
@@ -147,7 +147,7 @@ Our own resources:
   character pass reads them as well (the colour map of a group whose texture's pack pair is ready,
   `src/chars/chardraw.cpp:1799`): the same promotion, no barrier; charinject_test draws the Mithra from them and turns
   them off and on 50 times between recording and running, 0 messages under GPU-based validation (WARP).
-- The streamer's ring (`src/pack/stream.cpp:552-564`): a CUSTOM heap buffer (CPU write-back, L0) made in COMMON; a
+- The streamer's ring (`src/pack/stream.cpp:553-565`): a CUSTOM heap buffer (CPU write-back, L0) made in COMMON; a
   buffer promotes to COPY_SOURCE on the copy queue and decays. Not an UPLOAD heap (GENERIC_READ for life, and
   write-combined: docs/d3d12/sync.md).
 - `src/d3d8/gpu.cpp:60`, `src/render/gpu_crash.cpp:204,211`, `src/render/worldfx_core.cpp:2384`: debug layer and GPU

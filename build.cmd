@@ -173,7 +173,7 @@ echo Built build\cloth_test.exe
 rem ... and drawn (WARP, debug layer): the banner's cloth as the oracle steps it, the overlay and cloak passes, the scene's
 rem copy at the see-through marker: build\actors_draw_test.exe build\test\cloth_oracle.bin
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /I src\render ^
-  tests\actors_draw_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp build\engine\worldfx_engine.lib ^
+  tests\actors_draw_test.cpp src\chars\chardraw.cpp src\chars\charinject.cpp src\chars\cache.cpp src\chars\charframe.cpp src\chars\os2.cpp src\chars\tex.cpp %PACK_CHARS% build\engine\worldfx_engine.lib ^
   /Fo"build\test\\" /Fe"build\actors_draw_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\actors_draw_test.exe
 

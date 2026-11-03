@@ -37,6 +37,9 @@
  *   - a forced low budget: over 85% the texture comes without its top level, over 95% it stays queued (pressure()),
  *     then comes once the budget is raised; the address-space floor the same way; eight asked in one window of a
  *     lagging usage sample (what was made since counts); pressure() the level at each set_limits;
+ *   - an 8 GB card (M6: [textures] budget_mb 7,450 as budget_cap under Windows' 11,226 MB): with the most video memory
+ *     Alex's logs show used (1,640 MB) every texture whole; nearly full, whole then without the top level, none missed;
+ *     at 96% held, then whole;
  *   - drop then destroy: 500 requests, the owner dropped mid-stream and its heap released at once; in_flight 0, every
  *     ticket dropped, everything the worker made released or handed to the retire list;
  *   - crash_section() from another thread while the test holds the streamer's mutex: within 10 ms, with its lines;
@@ -2206,6 +2209,98 @@ int main(int argc, char **argv)
 		const st::counts c = st::get_counts();
 		check(c.skipped_top >= 1 && c.requeued >= 1, "counted: " + std::to_string(c.skipped_top) + " made without the top level, " + std::to_string(c.requeued) + " put back");
 		messages_check("the budget");
+	}
+
+	// ---- An 8 GB card (M6), through [textures] budget_mb as the module passes it (limits::budget_cap): Windows' budget
+	// Alex's 12 GB card reports (11,226 MB) capped at 7,450 MB, what Windows leaves the game on an 8 GB card at the same
+	// share. First the most video memory Alex's logs show (1,640 MB: Windurst Waters, 11-03) and the made-up pack's 2,000
+	// textures (51 MB: more than a zone's, his took 9-26 MB, his characters 3 MB): all whole. Then the card nearly full
+	// (84.6% used, 30 MB below 85%): the first ones whole, then without their top level, none missed; at 96% held, then
+	// whole again
+	{
+		constexpr uint64_t kWindows = 11226 * kMB, kCap = 7450 * kMB;
+		const st::owner o = st::add_owner("8 GB card");
+		auto ask_mb = [&](size_t &from, uint64_t mb_wanted, std::vector<st::ticket> &ts) {
+			uint64_t total = 0;
+			for (; from < made.size() && total < mb_wanted * kMB; ++from)
+				if (made[from].tag.empty())
+				{
+					ts.push_back(st::request(o, want_of(made[from].k)));
+					total += made_idx->find(made[from].k)->map(pk::kColour)->bytes;
+				}
+			return total;
+		};
+		auto firsts = [&](const std::vector<st::ticket> &ts, uint32_t &whole, uint32_t &cut) {
+			whole = cut = 0;
+			for (const st::ticket &t : ts)
+				if (st::view v; st::get(t, v))
+					(v.first == 0 ? whole : cut)++;
+		};
+		st::limits l = nocap();
+		l.vram_budget = kWindows;
+		l.budget_cap = kCap;
+		l.vram_usage = 1640 * kMB;
+		st::set_limits(l);
+		const st::counts c0 = st::get_counts();
+		size_t next = 0;
+		std::vector<st::ticket> city;
+		const uint64_t city_bytes = ask_mb(next, 600, city); // (all of them: 51 MB)
+		const tally t1 = wait_all(city);
+		uint32_t whole = 0, cut = 0;
+		firsts(city, whole, cut);
+		const st::counts c1 = st::get_counts();
+		check(t1.ready == int(city.size()) && whole == city.size() && cut == 0 && !st::pressure() && c1.skipped_top == c0.skipped_top,
+			"an 8 GB card (budget_mb 7,450 under Windows' 11,226), 1,640 MB used: " + std::to_string(city.size()) + " textures (" + mb(city_bytes) + ") all ready, all whole");
+		st::drop_owner(o);
+		settle();
+		// (nearly full: 84.6% of the cap used; what the worker makes since the sample counts on top of it)
+		const st::owner o2 = st::add_owner("8 GB card, nearly full");
+		l.vram_usage = kCap * 846 / 1000;
+		st::set_limits(l);
+		std::vector<st::ticket> crowd;
+		next = 0;
+		auto ask2 = [&](uint64_t mb_wanted) {
+			uint64_t total = 0;
+			for (; next < made.size() && total < mb_wanted * kMB; ++next)
+				if (made[next].tag.empty())
+				{
+					crowd.push_back(st::request(o2, want_of(made[next].k)));
+					total += made_idx->find(made[next].k)->map(pk::kColour)->bytes;
+				}
+			return total;
+		};
+		const uint64_t crowd_bytes = ask2(600);
+		const tally t2 = wait_all(crowd);
+		firsts(crowd, whole, cut);
+		const st::counts c2 = st::get_counts();
+		char line[400];
+		std::snprintf(line, sizeof(line), "nearly full (84.6%% of 7,450 MB used): %d of %zu ready (%s asked), %u whole then %u without their top level past 85%%, %d missed",
+			t2.ready, crowd.size(), mb(crowd_bytes).c_str(), whole, cut, t2.missed);
+		check(t2.ready == int(crowd.size()) && t2.missed == 0 && whole != 0 && cut != 0 && c2.skipped_top - c1.skipped_top == cut, line);
+		// (96% used: new asks wait, pressure() for the characters' eviction; room again: they come whole. The crowd let go
+		// first, so the ten are made anew, not shared)
+		st::drop_owner(o2);
+		settle();
+		const st::owner o3 = st::add_owner("8 GB card, full");
+		l.vram_usage = kCap * 96 / 100;
+		st::set_limits(l);
+		std::vector<st::ticket> late;
+		for (size_t i = 0; i < made.size() && late.size() < 10; ++i)
+			if (made[i].tag.empty())
+				late.push_back(st::request(o3, want_of(made[i].k)));
+		Sleep(300);
+		const tally held = count_states(late);
+		const bool pressed = st::pressure();
+		l.vram_usage = 1640 * kMB;
+		st::set_limits(l);
+		const tally came = wait_all(late);
+		firsts(late, whole, cut);
+		check(late.size() == 10 && held.waiting == 10 && pressed && came.ready == 10 && whole == 10 && !st::pressure(),
+			"at 96% of the 8 GB card: 10 asked, all held (pressure() true); 1,640 MB used again: all 10 whole");
+		st::drop_owner(o3);
+		st::set_limits(nocap());
+		settle();
+		messages_check("an 8 GB card");
 	}
 
 	// ---- Drop then destroy: the owner gone mid-stream, its heap released at once

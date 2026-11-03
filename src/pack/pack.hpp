@@ -93,6 +93,8 @@ namespace hifi::pack
 	// most data files (pack-000.bin to pack-999.bin)
 	constexpr uint64_t kMaxFileBytes = 1ull << 30;
 	constexpr uint32_t kMaxFiles = 1000;
+	// index::client_differs
+	constexpr uint8_t kSameClient = 0, kClientDates = 1, kClientSizes = 2;
 	// The largest piece one ReadFile asks for (CancelIoEx then ends a read within milliseconds)
 	constexpr uint32_t kReadPiece = 4u << 20;
 
@@ -226,6 +228,11 @@ namespace hifi::pack
 		std::wstring folder;              // with its slash
 		// "" or a line for the status: the game's files differ from the ones the pack was made from
 		std::string status;
+		// How they differ (load's client given): kSameClient (or not known), kClientDates (VTABLE.DAT and FTABLE.DAT the
+		// same sizes, other times: another PC, or the game's files written again; most likely the same game), kClientSizes
+		// (other sizes: another version of the game, whose changed textures miss). Never a reason not to use the pack: a key
+		// is the texture's own bytes, so a texture the game changed simply isn't found
+		uint8_t client_differs = 0;
 		// (parse fills them, for the menu's "Found" line: the module reads three numbers, never the entries) Entries by
 		// source_kind (kSourceUnknown, kSourceZone, kSourceModel; a kind this build doesn't know counted as unknown), and
 		// the colour records' bytes

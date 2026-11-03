@@ -315,13 +315,15 @@ flag, 0.0f, 1.0f, kPackByDefault ? 1.0f : 0.0f, &pack::folder_exists }`.
   made on this PC from your own game files and kept on the graphics card. Anything the pack doesn't have is drawn as
   the game's own. Takes effect at the next area you enter. (/hifi textures)"
 - Section help: "Higher-resolution textures kept on the graphics card, made on your own PC from your game's files."
-- `pack::folder_exists()`: an atomic set by the module (`<pack folder>\pack.idx` exists) at its first update and at
+- `pack::folder_exists()`: an atomic set by the module (the pack folder exists, with or without `pack.idx`: M6, so a
+  folder copied only in part still shows the setting and the menu's "has no pack.idx" line) at its first update and at
   each on and reload; no file call in it.
 
 **Menu block** (`draw_game`, right after `draw_tab_settings`, only while `folder_exists()`), every line a string the
 module made in `update`:
 - "Found: 23,617 textures (scenery 4,755, the rest 18,862), 6.8 GB" / "Texture pack can't be used: <why>" /
-  "Opening the texture pack..." / "Off: turn it on above." (No pack: the section isn't shown at all.)
+  "Opening the texture pack..." / "Off: turn it on above." / "The texture pack folder has no pack.idx (copied only in
+  part?)..." (No pack folder: the section isn't shown at all.)
 - "This area: 812 of 840 scenery textures from the pack (28 not in it); 3 coming" / "This area was entered before
   the pack was on: its textures switch at the next area." / "Comparing: the game's own textures are drawn
   (/hifi textures compare again)."
@@ -453,7 +455,7 @@ region, `zonepack`, the streamer's decision 1, the FSR bias in the shader). Wher
   at a ratio of 1 or more, or unknown). Part B's glue sets `inject::set_texture_bias(fsr_bias_on() ?
   fsr_bias(ratio) : 0)` from `upscale::world_scale` each present and 0 in `clear_all`.
 - **The quiet window is the module's**: `pack::quiet_window(quiet_inputs)` (pure; `kQuietPresents` 3, `kQuietPercent`
-  85), fed each present by `follow_quiet` (`pack_module.cpp:397`) from `feed::zone()`, the new `feed::in()`
+  85), fed each present by `follow_quiet` (`pack_module.cpp:499`) from `feed::zone()`, the new `feed::in()`
   (`g_zone.in_game == 1`), native's slot 0 (the same ready gpu_zone counted over presents, from 0 at each zone change)
   and the last update's video memory. kQuiet is set or cleared only when it changes. No `zonepack::quiet`.
 - **`device(nullptr)` with the streamer started**: the owners cleared and `stream::set_device(nullptr)` (a device gone
@@ -485,7 +487,7 @@ region, `zonepack`, the streamer's decision 1, the FSR bias in the shader). Wher
 - **A streamer fix**: the worker dropped an open posted together with a device change (it took both at its loop's top
   and returned after the change). The module's device change while opening, and `set_device` then `open` within one
   update, hit it on the 4070 Ti (packmodule_test). Now an open or close waits for a pass of its own
-  (`stream.cpp:1354-1373`; streamer.md "As built", threads-pso.md, sync.md); packstream_test checks it.
+  (`stream.cpp:1355-1375`; streamer.md "As built", threads-pso.md, sync.md); packstream_test checks it.
 - **Build**: `PASSES_PACK` gains `stream.cpp pack.cpp validate.cpp hash.cpp` (zonepack.cpp: part B); new
   `packmodule_test` (links like menu_test, plus pack_write and bc2 for its made-up pack).
 - **Tests (part A)**: `packmodule_test` (new: the quiet window over made-up timelines; no folder, a folder found by

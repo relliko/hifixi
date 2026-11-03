@@ -80,11 +80,26 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
 ## Texture pack (optional)
 
-A texture pack is higher-resolution textures made on your own PC from your game's files, kept in `bootloader\hifixi-pack\` and streamed to the graphics card as you play. Nothing of it ships with HiFi XI. It sharpens scenery and characters (gear, NPCs and monsters), and as it is kept on the graphics card the game's own memory stays small. When that folder is there, the menu's **The game's own** tab shows **Use the texture pack** (off by default) with what it found; characters switch to the pack's textures at once, scenery, ships and furniture at the next area you enter, and anything the pack doesn't have is drawn as the game's own. The **Off** preset turns it off.
+A texture pack is a folder of sharper, higher-resolution copies of the game's textures, made from your own game's files. HiFi XI doesn't come with one and never downloads one: nothing of the game's data ships with it. If you don't have a pack, there is nothing to do and nothing changes: HiFi XI looks exactly as it does without this section, and the menu doesn't show the setting at all.
 
-If you installed the `hifi-textures` XIPivot overlay (the bigger game files the pack was made beside), remove it from XIPivot first: while it is listed the game loads its own bigger copies, which take the game's memory, and the characters keep them instead of the pack's. The menu says so while it's listed.
+**Getting one.** HiFi XI doesn't make texture packs. If you already have one, put it in `bootloader\hifixi-pack`.
 
-To remove it: turn it off (the setting, or `/hifi textures off`), then delete the `bootloader\hifixi-pack` folder. Turned off, HiFi XI has none of its files open, so the folder can be deleted while the game runs.
+**With a pack.** Put the `hifixi-pack` folder in your `bootloader` folder (`bootloader\hifixi-pack\pack.idx` and the `pack-000.bin`... files beside it). The menu's **The game's own** tab then shows **Use the texture pack** (off by default) and what it found. Turned on:
+
+- scenery, ships, furniture and plants get the pack's textures a moment after you enter an area; characters, gear, NPCs and monsters at once;
+- the pack's textures are kept on the graphics card, not in the game's own memory, so the game stays as light as without it;
+- anything the pack doesn't have is drawn as the game's own, so nothing goes missing;
+- `/hifi textures compare` shows the game's own textures again until you use it a second time, to compare.
+
+A pack copied from another PC works as long as it's whole and made for this version of HiFi XI. If it isn't (a file missing or cut short, or damaged), the menu says what's wrong and HiFi XI simply draws the game's own textures: copy the folder again, then `/hifi textures reload`. A pack made for an older or newer HiFi XI is refused the same way, and the menu says which: update HiFi XI, or get a pack made for this version. A pack made from another version of the game's files still works; only the textures the game changed since are drawn as the game's own, and the menu says so.
+
+If your graphics card stopped (crashed) last time, HiFi XI starts the next session with the pack paused, along with its other heavier effects, and the menu says so. `/hifi textures on` uses it anyway for that session.
+
+If you have the older `hifi-textures` XIPivot overlay installed (the big game files the pack replaces), remove it from XIPivot: while it's listed the game loads those big files into its own memory, and characters keep them instead of the pack's. The menu says so while it's listed.
+
+**Turning it off:** untick **Use the texture pack**, or `/hifi textures off`. The **Off** preset turns it off too. The game's own textures are back at once.
+
+**Removing it:** turn it off, then delete the `bootloader\hifixi-pack` folder. Once it's off HiFi XI has none of its files open, so you can delete it while the game runs. HiFi XI never writes into that folder.
 
 ## Commands
 
@@ -97,7 +112,7 @@ To remove it: turn it off (the setting, or `/hifi textures off`), then delete th
 - `/hifi enspell [auto|off|fire|ice|wind|earth|thunder|water|light|dark]`: the en-spell effect on your weapons. `auto` (the default) follows the en-spell on you; an element shows that one now, to see it. The same buttons are in the menu's Game tab.
 - `/hifi textures [on|off|compare|reload|status]`: the texture pack on or off (saved), the game's own textures drawn instead to compare (not saved), the pack looked for and opened again, or what it's doing.
 - `/hifi gamedraw zone|chars on|off`: the game's own drawing of the zone or the characters switched off, to compare (back on at every start).
-- `/hifi off`, `/hifi on`: its Direct3D 12 hooks out and back in.
+- `/hifi off`, `/hifi on`: HiFi XI's passes off (the game draws as without it) and back on.
 - `/hifi reset`: its counts started again.
 
 Settings are saved as you change them, in `config\hifixi\settings.ini`.
@@ -113,6 +128,14 @@ If the GPU hangs (`DXGI_ERROR_DEVICE_HUNG`):
 - Set the game's profile in your graphics driver back to its defaults (NVIDIA Control Panel or AMD Software), with anisotropic filtering, antialiasing and texture filtering left to the application.
 - Run your GPU at its stock clocks and voltage.
 - Send the crash report and the log when you ask for help.
+
+## Uninstall
+
+1. Take `/load hifixi` out of your boot script.
+2. Delete `plugins\hifixi.dll`, and in `bootloader`: `dxgi.dll` (HiFi XI's starter), `d3d8.dll` and `d3d8-shader-cache\` (put dgVoodoo's `d3d8.dll` back if you kept it, or switch your launcher back to its own wrapper).
+3. What HiFi XI made as you played, all in `bootloader`, safe to delete: the `worldfx-*` files and folders (grass, water, rain, lamps, shadows, its shader cache), `hifixi-shader-cache\`, `hifixi.log`, `hifixi.previous.log`, `d3d8.log`, `d3d8.ini` if you made one, and `worldfx-gpu-crash.txt` and `hifixi-hang.txt` if there are any.
+4. A texture pack, if you have one: the `bootloader\hifixi-pack` folder.
+5. Your settings: `config\hifixi\`, and `logs\hifixi-status.txt`.
 
 ## Licences
 

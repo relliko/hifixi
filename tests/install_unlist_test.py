@@ -60,8 +60,10 @@ def main():
     lines = ['root_path=' + os.path.join(work, 'DATs') if l.lower().startswith('root_path=') else l for l in lines]
     original = '\r\n'.join(lines).encode('ascii')
     if b'hifi-textures' not in original:
-        # (already unlisted on this PC: the test lists it itself, as install.py would have)
-        original = original.rstrip(b'\r\n') + b'\r\n9=hifi-textures\r\n'
+        # (already unlisted on this PC: the test lists it itself, as the overlay's install did: the next number after the
+        # last, since Pivot stops reading [overlays] at the first missing one and the gap checks below rely on none)
+        listed = [int(l.split(b'=', 1)[0]) for l in original.split(b'\r\n') if b'=' in l and l.split(b'=', 1)[0].strip().isdigit()]
+        original = original.rstrip(b'\r\n') + b'\r\n%d=hifi-textures\r\n' % (max(listed) + 1 if listed else 0)
     open(ini, 'wb').write(original)
     old_log = os.path.join(logs, 'old.txt')
     open(old_log, 'w').write('an old log')

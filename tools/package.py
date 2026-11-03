@@ -17,7 +17,9 @@ HiFi XI's release zip, laid out as Ashita's folder (unzipped there as it is):
 differs in its timestamps).
 
 Paths in the zip use forward slashes (Python's zipfile: PowerShell 5.1's Compress-Archive writes backslashes).
-Nothing of the game's own data goes in: the zone files are made on each player's PC.
+Nothing of the game's own data goes in: the zone files are made on each player's PC. A texture pack (hifixi-pack,
+pack.idx, pack-*.bin), the hifi-textures overlay and any DAT are Square Enix's data made on a player's PC: the zip is
+refused if any file meant for it looks like one (check_no_game_data), whatever --cache or another option points at.
 """
 
 import argparse
@@ -42,6 +44,28 @@ FILES = [
 ]
 
 
+# (lower-case pieces of a source or zip path that mean game data: never in the zip)
+GAME_DATA = ('hifixi-pack', 'hifi-textures', 'pack.idx', 'pack.src', '.dat', 'worldfx-grass', 'worldfx-water', 'worldfx-rain',
+             'worldfx-lamps', 'worldfx-sea', 'worldfx-wet', 'worldfx-shadow')
+
+
+def check_no_game_data(files):
+    bad = []
+    for src, dst in files:
+        # (a source under the repository by its path there: the worktree's own folder name may hold anything)
+        full = os.path.abspath(src)
+        inside = os.path.normcase(full).startswith(os.path.normcase(ROOT) + os.sep)
+        shown = os.path.relpath(full, ROOT) if inside else full
+        for path in (shown.replace('\\', '/').lower(), dst.lower()):
+            name = path.rsplit('/', 1)[-1]
+            if any(piece in path for piece in GAME_DATA if piece != '.dat') or name.endswith('.dat') or \
+                    (name.startswith('pack-') and name.endswith('.bin')):
+                bad.append(src)
+                break
+    if bad:
+        sys.exit('refused: game data (a texture pack, an overlay or a DAT) would go in the zip: ' + ', '.join(bad))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('version')
@@ -63,6 +87,7 @@ def main():
                 files.append((full, 'bootloader/d3d8-shader-cache/' + name))
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, 'hifixi-v%s.zip' % args.version.lstrip('v'))
+    check_no_game_data(files)
     missing = [src for src, _ in files if not os.path.isfile(src)]
     if missing:
         sys.exit('missing: ' + ', '.join(missing))

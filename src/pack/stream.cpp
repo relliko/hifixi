@@ -164,6 +164,7 @@ namespace hifi::pack::stream
 			int post = 0; // (1 open a folder, 2 open an index, 3 close: the worker does it)
 			uint64_t posted = 0, post_done = 0; // (the opens and closes asked; the last of them the worker has done)
 			std::wstring post_folder;
+			fingerprint post_client; // (all zeros: not compared)
 			std::shared_ptr<const index> post_index;
 			std::string open_status;
 			uint32_t epoch = 1;
@@ -1241,7 +1242,7 @@ namespace hifi::pack::stream
 
 		// ---- Opening, device change, stop
 
-		void do_open(int post, uint64_t number, const std::wstring &folder, std::shared_ptr<const index> given)
+		void do_open(int post, uint64_t number, const std::wstring &folder, const fingerprint &client, std::shared_ptr<const index> given)
 		{
 			crumb(sc::kOpening);
 			std::string why;
@@ -1249,7 +1250,7 @@ namespace hifi::pack::stream
 			if (post == 1)
 			{
 				// (stop() cancels it between pieces of pack.idx: stopping, nothing changes)
-				idx = pack::load(folder, nullptr, why, &g_cancel_open);
+				idx = pack::load(folder, client != fingerprint {} ? &client : nullptr, why, &g_cancel_open);
 				if (!idx && g_cancel_open.load())
 					return;
 			}
@@ -1347,6 +1348,7 @@ namespace hifi::pack::stream
 				int post = 0;
 				uint64_t number = 0;
 				std::wstring folder;
+				fingerprint client;
 				std::shared_ptr<const index> given;
 				bool change = false, lost = false;
 				ID3D12Device *device = nullptr;
@@ -1369,6 +1371,7 @@ namespace hifi::pack::stream
 						number = g.posted; // (the last asked: a later one overwrote any before it)
 						g.post = 0;
 						folder.swap(g.post_folder);
+						client = g.post_client;
 						given = std::move(g.post_index);
 					}
 				}
@@ -1384,7 +1387,7 @@ namespace hifi::pack::stream
 				}
 				if (post != 0)
 				{
-					do_open(post, number, folder, std::move(given));
+					do_open(post, number, folder, client, std::move(given));
 					continue;
 				}
 				if (!w.lost && !w.failed && w.queue == nullptr && device != nullptr)
@@ -1588,7 +1591,7 @@ namespace hifi::pack::stream
 		return g.started;
 	}
 
-	uint64_t open(const std::wstring &folder)
+	uint64_t open(const std::wstring &folder, const fingerprint *client)
 	{
 		std::shared_ptr<reader> rd;
 		uint64_t number = 0;
@@ -1597,6 +1600,7 @@ namespace hifi::pack::stream
 			g.post = 1;
 			number = ++g.posted;
 			g.post_folder = folder;
+			g.post_client = client != nullptr ? *client : fingerprint {};
 			g.post_index = nullptr;
 			rd = g.rd;
 		}

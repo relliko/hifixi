@@ -618,8 +618,14 @@ int main()
 			const bool short_one = refused(f, "cut short");
 			b.resize(100);
 			write_all(f + L"pack.idx", b);
-			const bool header_short = refused(f, "cut short");
-			check(short_one && header_short, "pack.idx a byte short, or shorter than a header: refused (" + why + ")");
+			const bool header_short = refused(f, "cut short") && why.find("copy the pack again") != std::string::npos;
+			check(short_one && header_short, "pack.idx a byte short, or shorter than a header: refused, the header's case saying to copy it again (" + why + ")");
+			// (a copy cut off while writing pack.idx: the file at its length, zeros where it wasn't written)
+			b = read_all(a + L"pack.idx");
+			std::fill(b.begin(), b.end(), uint8_t(0));
+			write_all(f + L"pack.idx", b);
+			const bool zeros = refused(f, "isn't a HiFi XI texture pack index") && why.find("copy the pack again") != std::string::npos;
+			check(zeros, "pack.idx all zeros (a copy cut off): refused, saying to copy it again (" + why + ")");
 		}
 		{
 			const std::wstring f = copy_pack(a, L"v2");
@@ -632,6 +638,12 @@ int main()
 			write_all(f + L"pack.idx", b);
 			const bool v2 = refused(f, "version 2");
 			check(v2, "a version 2 header (its CRC right): refused (" + why + ")");
+			// (a later version may checksum its header otherwise: the version is told, not a damaged header)
+			h.header_crc ^= 0x5A5A5A5A;
+			std::memcpy(b.data(), &h, sizeof(h));
+			write_all(f + L"pack.idx", b);
+			const bool v2_stale = refused(f, "made for a newer HiFi XI") && why.find("damaged") == std::string::npos;
+			check(v2_stale, "a version 2 header with a CRC this version doesn't make: told as a newer HiFi XI's, not as damaged (" + why + ")");
 			h.version = 1;
 			h.flags = 3;
 			h.header_crc = pk::crc32(0, &h, offsetof(pk::header, header_crc));

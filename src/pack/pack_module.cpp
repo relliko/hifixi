@@ -17,6 +17,11 @@
  *     space from memwatch, [textures] per_present_mb), its log lines into hifixi.log, the status and menu strings
  *     (status() and menu_lines() only hand them out). Each present: stream::on_present, the quiet window (kQuiet), then
  *     the consumers' frames, in the order they were added.
+ *   - The log (M6): what the first look found (none, a folder without pack.idx, found but off), a safe start's pause,
+ *     the open (or why the pack can't be used: another HiFi XI's version, damaged, copied only in part), the game's
+ *     files against the pack's (index::client_differs), the pack as each zone left had it, the streamer's lines at most
+ *     kLogLinesAnOpen an open, and once when the data files look damaged (kBadAtLeast, kBadPercent; the menu says it
+ *     too). A pack copied from another PC is never read partly: refused whole with a reason, or used with misses.
  *   - As in M1, the game's memory measured and reported: the address space and its largest free block (memwatch, on its
  *     own thread), the video memory, the characters' and the zone's bytes on the GPU, each zone's lowest free memory
  *     (logged once as the next zone comes), and whether a texture bake runs.
@@ -50,6 +55,14 @@ namespace hifi::pack
 		namespace mw = memwatch;
 		namespace opt = options;
 
+		// A pack whose data files look damaged (copied only in part, or bytes changed since): at least kBadAtLeast textures
+		// that couldn't be read since it opened, kBadPercent of those tried. One damaged record (a bad sector) says nothing
+		// in the menu; a data file cut short or overwritten says it at once
+		constexpr uint64_t kBadAtLeast = 8, kBadPercent = 5;
+		// The streamer's lines (a texture it couldn't make, each once) logged at most this many times an open: a damaged
+		// pack would otherwise write one for every texture an area asks for, session long
+		constexpr uint32_t kLogLinesAnOpen = 100;
+
 		enum class mode : uint8_t
 		{
 			off,
@@ -66,12 +79,24 @@ namespace hifi::pack
 			bool looked = false;          // (the folder looked for: at the first update)
 			std::wstring folder;          // (with its slash)
 			uint64_t folder_bytes = 0;    // (the files in it, at the last look)
+			bool folder_only = false;     // (the folder there but no pack.idx in it, at the last look)
+			bool folder_only_logged = false; // (that in the log, once until a look finds otherwise)
+			fingerprint client;           // (the game's VTABLE.DAT and FTABLE.DAT, at the last look; zeros: not found)
+			bool start_logged = false;    // (what the first look found, in the log once a session)
+			bool safe_logged = false;     // (a safe start holding the pack off, in the log once a session)
 			bool overlay_listed = false;  // (pivot.ini lists hifi-textures, at the last look)
 			bool stream_started = false;  // (once a session: kept till stop)
 			mode m = mode::off;
 			uint64_t asked = 0;           // (opening: the open's number, stream::open's; done once posts_done reaches it)
 			uint32_t epoch = 0;           // (on: the epoch owners ask in)
 			std::string why;              // (failed: what the open said)
+			uint8_t client_differs = kSameClient; // (on: the game's files against the pack's, index::client_differs)
+			std::string client_status;    // (on: index::status)
+			// (on: the textures that couldn't be read since the open (a CRC mismatch, a read failed or cut short), the
+			// streamer's counts at the open, the lines of them logged since and whether the damage was said)
+			uint64_t bad_base = 0, tries_base = 0;
+			uint32_t bad_lines = 0;
+			bool bad_said = false;
 			bool session_on = false;      // (/hifi textures on: a safe start doesn't keep it off this session)
 			bool lost_seen = false;
 			modes mode;                   // (the consumers' modes as last set)
@@ -92,7 +117,9 @@ namespace hifi::pack
 		};
 		state g;
 
-		// What owners and the menu read, any time (the game's thread; atomics so a mark moved to another thread stays right)
+		// What owners and the menu read, any time (the game's thread; atomics so a mark moved to another thread stays right).
+		// g_folder_exists: the pack folder there, whether or not pack.idx is (a copy cut off before pack.idx, which sorts
+		// after the data files, still shows the setting and the menu's line saying what's missing)
 		std::atomic<bool> g_folder_exists { false }, g_in_use { false }, g_compare { false }, g_quiet { false }, g_fsr { false };
 		std::atomic<uint32_t> g_epoch { 0 }, g_starts { 0 };
 		std::atomic<uint64_t> g_io { 0 };
@@ -175,6 +202,21 @@ namespace hifi::pack
 				g_fsr.store(false);
 		}
 
+		// Textures the streamer couldn't read from the pack: a CRC mismatch, a read failed or cut short (a damaged or
+		// partly copied data file), counted for every ticket that asked
+		uint64_t bad_reads(const stream::counts &c)
+		{
+			return c.refused[size_t(stream::miss::crc)] + c.refused[size_t(stream::miss::read)];
+		}
+
+		// The tickets those were among, counted the same way (per ticket): the textures made, the requests that joined one
+		// ready or on its way, and the bad reads. Counting made textures only would leave out every ticket that shared one,
+		// and one bad record asked by many owners would weigh more than it is
+		uint64_t tries_of(const stream::counts &c)
+		{
+			return bad_reads(c) + c.made + c.shared;
+		}
+
 		// The folder looked for (pack.idx in it), the bytes of its files, and whether pivot.ini still lists the
 		// hifi-textures overlay: at the first update, /hifi textures on and reload; never per frame
 		void look()
@@ -183,7 +225,10 @@ namespace hifi::pack
 			g.folder = folder_in(backend::folder());
 			const bool exists = GetFileAttributesW((g.folder + L"pack.idx").c_str()) != INVALID_FILE_ATTRIBUTES;
 			g.folder_bytes = 0;
-			if (exists)
+			g.folder_only = !exists && GetFileAttributesW(g.folder.substr(0, g.folder.size() - 1).c_str()) != INVALID_FILE_ATTRIBUTES;
+			// (two files' sizes and times: compared on the worker with the ones the pack was made from)
+			g.client = exists ? client_fingerprint(bake::ffxi_folder()) : fingerprint {};
+			if (exists || g.folder_only)
 			{
 				WIN32_FIND_DATAW f;
 				const HANDLE h = FindFirstFileW((g.folder + L"*").c_str(), &f);
@@ -200,20 +245,55 @@ namespace hifi::pack
 			for (const std::wstring &name : bake::overlays())
 				g.overlay_listed |= CompareStringOrdinal(name.c_str(), -1, L"hifi-textures", -1, TRUE) == CSTR_EQUAL;
 			g_overlay_listed.store(g.overlay_listed);
-			g_folder_exists.store(exists);
+			g_folder_exists.store(exists || g.folder_only);
 			std::lock_guard<std::mutex> lock(g_text_mutex);
 			g_folder_text = narrow(g.folder);
 		}
 
 		bool pack_option() { return game::option_on("textures", "pack", opt::kPackByDefault); }
 		bool safe_held() { return backend::safe_start() && !g.session_on; }
+		// (pack.idx in the folder, at the last look)
+		bool pack_there() { return g_folder_exists.load() && !g.folder_only; }
+
+		// The folder there without pack.idx, for the status, the menu and the commands' replies
+		std::string no_index_line()
+		{
+			return narrow(g.folder) + " has no pack.idx (copied only in part?): nothing of it is used. Copy the hifixi-pack folder again, then /hifi textures reload.";
+		}
 
 		// Whether the pack should be in use now, and if not why (for the log)
 		bool want(const char *&why)
 		{
-			why = !pack_option() ? "turned off" : !g_folder_exists.load() ? "no pack folder" : safe_held() ? "the graphics card stopped last session" :
+			why = !pack_option() ? "turned off" : !g_folder_exists.load() ? "no pack folder" : g.folder_only ? "no pack.idx in the pack folder" :
+				safe_held() ? "the graphics card stopped last session" :
 				g.device == nullptr ? "no graphics device" : gpu_crash::lost() ? "the graphics card stopped" : nullptr;
 			return why == nullptr;
+		}
+
+		// What the first look found, once a session (a pack in use logs its open instead), a folder without pack.idx each
+		// time a look finds it so (the first, or a reload's after a copy), and a safe start holding it off
+		void log_found()
+		{
+			if (g.folder_only && !g.folder_only_logged)
+				log(1, "texture pack: " + narrow(g.folder) + " has no pack.idx: not a whole texture pack (copied only in part?), nothing of it used");
+			g.folder_only_logged = g.folder_only;
+			if (!g.start_logged)
+			{
+				g.start_logged = true;
+				if (!g_folder_exists.load())
+					log(0, "texture pack: none on this PC (" + narrow(g.folder) + ")");
+				else if (!g.folder_only && !pack_option()) // (a folder without pack.idx: said above)
+				{
+					char line[300];
+					std::snprintf(line, sizeof(line), " (%.1f GB); off ([textures] pack=0: the menu's Game tab or /hifi textures on)", gigabytes(g.folder_bytes));
+					log(0, "texture pack: found " + narrow(g.folder) + line);
+				}
+			}
+			if (!g.safe_logged && pack_option() && pack_there() && safe_held())
+			{
+				g.safe_logged = true;
+				log(1, "texture pack: paused for this session, the graphics card stopped last session (/hifi textures on uses it anyway)");
+			}
 		}
 
 		// The consumers' modes from the hidden keys (while in use)
@@ -249,7 +329,8 @@ namespace hifi::pack
 			clear_all();
 			set_mode(modes {});
 			io();
-			g.asked = stream::open(g.folder);
+			g.asked = stream::open(g.folder, &g.client);
+			g.bad_lines = 0;
 			io();
 			stream::resume(stream::kOff);
 			if (g_quiet.load() && !g.quiet_set)
@@ -313,6 +394,16 @@ namespace hifi::pack
 				return;
 			}
 			g.epoch = e;
+			g.client_differs = idx->client_differs;
+			g.client_status = idx->status;
+			{
+				io();
+				const stream::counts c = stream::get_counts();
+				g.bad_base = bad_reads(c);
+				g.tries_base = tries_of(c);
+				g.bad_lines = 0;
+				g.bad_said = false;
+			}
 			g.entries = idx->entries.size();
 			g.scenery = idx->by_source[kSourceZone];
 			g.pack_bytes = 0;
@@ -449,6 +540,29 @@ namespace hifi::pack
 			}
 		}
 
+		// The pack as the zone just left had it, once as the next comes (the zone's own scenery line comes from zonepack
+		// as its textures settle): the characters' textures, the pack's video memory and what couldn't be read
+		void log_zone_left()
+		{
+			io();
+			const stream::counts c = stream::get_counts();
+			char line[400];
+			std::string chars_part;
+			if (g.mode.chars)
+			{
+				const chars::cache::counts k = chars::cache::get_counts();
+				std::snprintf(line, sizeof(line), "characters %u of %u textures from the pack (%u not in it, %u failed, %u back to the game's while the "
+					"graphics card was nearly full); ", k.pack_ready, k.textures_ready, k.pack_not_in, k.pack_failed, k.pack_evicted);
+				chars_part = line;
+			}
+			else
+				chars_part = "characters off; ";
+			std::snprintf(line, sizeof(line), "texture pack in zone %u as it was left: %s%llu MB of the pack on the graphics card (at most %llu textures at once); "
+				"%llu textures couldn't be read since it opened", g.zone, chars_part.c_str(), megabytes(c.resident_bytes),
+				static_cast<unsigned long long>(c.resident_peak), static_cast<unsigned long long>(bad_reads(c) - std::min(bad_reads(c), g.bad_base)));
+			log(0, line);
+		}
+
 		void present(double now, bool)
 		{
 			// A zone change: the last zone's lowest free memory into the log, once, then the marks started again
@@ -462,6 +576,8 @@ namespace hifi::pack
 						g.zone, megabytes(v.low_avail_virtual), megabytes(v.low_largest_free), megabytes(g.vram_peak), megabytes(v.vram_budget));
 					backend::log(0, line);
 				}
+				if (g.zone != 0 && g.m == mode::on)
+					log_zone_left();
 				g.zone = zone;
 				g.vram_peak = 0;
 				mw::reset_low_water();
@@ -538,6 +654,13 @@ namespace hifi::pack
 					status.push_back("textures: no texture pack on this PC (" + folder + ")");
 					break;
 				}
+				if (g.folder_only)
+				{
+					status.push_back("textures: " + no_index_line());
+					menu.push_back("The texture pack folder has no pack.idx (copied only in part?): nothing of it is used. Copy the hifixi-pack folder again, "
+						"then /hifi textures reload.");
+					break;
+				}
 				if (!pack_option())
 				{
 					status.push_back("textures: off (" + folder + "; /hifi textures on)");
@@ -561,6 +684,26 @@ namespace hifi::pack
 				{
 					status.push_back("textures: " + l);
 					menu.push_back(l);
+				}
+				if (g.client_differs == kClientSizes)
+					menu.push_back("Made from another version of the game's files: textures the game changed since are drawn as the game's own.");
+				if (!g.client_status.empty())
+					status.push_back("textures: " + g.client_status);
+				if (c.failure.empty())
+				{
+					const uint64_t bad = bad_reads(c) - std::min(bad_reads(c), g.bad_base), tries = tries_of(c) - std::min(tries_of(c), g.tries_base);
+					if (bad >= kBadAtLeast && bad * 100 >= tries * kBadPercent)
+					{
+						std::snprintf(line, sizeof(line), "%llu textures couldn't be read from the pack (its files damaged, or copied only in part?): they're drawn as "
+							"the game's own. Copy the hifixi-pack folder again, then /hifi textures reload.", static_cast<unsigned long long>(bad));
+						menu.push_back(line);
+						status.push_back(std::string("textures: ") + line);
+						if (!g.bad_said)
+						{
+							g.bad_said = true;
+							log(1, std::string("texture pack: ") + line);
+						}
+					}
 				}
 				if (g_compare.load())
 				{
@@ -664,6 +807,7 @@ namespace hifi::pack
 			}
 			g.delay = std::max(0.0, double(game::option_number("textures", "zone_delay_s", opt::kZoneDelayS)));
 			step();
+			log_found();
 			if (g.stream_started && g.m != mode::lost)
 			{
 				// (the streamer's limits: one input, made here; the worker never asks DXGI or memwatch itself)
@@ -681,7 +825,14 @@ namespace hifi::pack
 				io();
 				stream::take_log(lines);
 				for (const std::string &line : lines)
-					log(1, line);
+				{
+					if (g.bad_lines > kLogLinesAnOpen)
+						break;
+					if (++g.bad_lines > kLogLinesAnOpen)
+						log(1, "texture pack: more lines like these left out of the log until the pack is opened again (/hifi textures status counts them)");
+					else
+						log(1, line);
+				}
 			}
 			g_fsr.store(g.m == mode::on && game::option_on("textures", "fsr_bias", opt::kFsrBiasByDefault));
 			make_lines(v, chars, zone0, zone1);
@@ -734,6 +885,8 @@ namespace hifi::pack
 				step();
 				if (!g_folder_exists.load())
 					out.push_back("textures: no texture pack on this PC (" + narrow(g.folder) + ")");
+				else if (g.folder_only)
+					out.push_back("textures: on (saved), but " + no_index_line());
 				else
 				{
 					out.push_back(std::string("textures: on (saved)") + (lifted ? "; used this session despite the graphics card's stop last session" : "") +
@@ -761,6 +914,7 @@ namespace hifi::pack
 			{
 				reload();
 				out.push_back(g.m == mode::opening ? "textures: opening the pack again (the area in view keeps the game's own textures until the next)" :
+					g.folder_only ? "textures: " + no_index_line() :
 					g_folder_exists.load() ? "textures: looked for again (off: nothing opened)" : "textures: no texture pack on this PC (" + narrow(g.folder) + ")");
 				return true;
 			}

@@ -20,6 +20,14 @@
  *     off: cleared before the close, the pack closed, kOff, the streamer kept, the folder free to rename (held while
  *     on); on again: the same streamer;
  *   - a miss at the worker (a damaged record) logged from update, through the log;
+ *   - packs copied from another PC (M6): pack.idx of a newer and an older version, its tables damaged, cut short; a data
+ *     file missing, cut short, a few records damaged (7 alone, then 14 of 307: nothing in the menu; 21 of 314: said),
+ *     overwritten (the textures missed, the menu says the pack looks damaged, the log's lines capped); made from another
+ *     version of the game's files (said, the pack still used) or only dated otherwise (the status and the log); the
+ *     folder without pack.idx (the setting still shown; the menu, status, on and reload's replies and the log say so);
+ *     each a menu, status and log line, none a crash or a hang, the pack back in use once put right;
+ *   - the log: what the first look found (none; found with pack=0, loaded a third time), a safe start's pause (the
+ *     setting off and on again doesn't lift it), and the pack as each zone left had it;
  *   - a device change (none, then the device again): a new epoch, the pack in use again;
  *   - the plugin's unload with 1,000 queued and four copies in flight (held by a gate opened 5 ms into stop): the
  *     consumer cleared, then stop, retire::release_all: nothing leaked, the device's references back; loaded again:
@@ -35,9 +43,12 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include "../src/backend/backend.hpp"
+#include "../src/bake/dat.hpp"
+#include "../src/game/feed.hpp"
 #include "../src/game/game.hpp"
 #include "../src/host/passes.hpp"
 #include "../src/host/retire.hpp"
+#include "../src/pack/hash.hpp"
 #include "../src/pack/pack.hpp"
 #include "../src/pack/pack_module.hpp"
 #include "../src/pack/pack_write.hpp"
@@ -107,6 +118,29 @@ namespace
 			fwrite(text.data(), 1, text.size(), f);
 			fclose(f);
 		}
+	}
+
+	std::vector<uint8_t> read_all(const std::wstring &path)
+	{
+		std::vector<uint8_t> b;
+		if (FILE *f = nullptr; _wfopen_s(&f, path.c_str(), L"rb") == 0 && f != nullptr)
+		{
+			uint8_t chunk[65536];
+			for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) != 0;)
+				b.insert(b.end(), chunk, chunk + n);
+			fclose(f);
+		}
+		return b;
+	}
+
+	bool write_bytes(const std::wstring &path, const std::vector<uint8_t> &b)
+	{
+		FILE *f = nullptr;
+		if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || f == nullptr)
+			return false;
+		const bool ok = fwrite(b.data(), 1, b.size(), f) == b.size();
+		fclose(f);
+		return ok;
 	}
 
 	// ---- The device, the stand-in for the game's queue (as packstream_test's)
@@ -629,6 +663,7 @@ int main()
 		check(!pk::folder_exists() && !pk::in_use() && pk::test::stream_starts() == 0 && !st::running() &&
 			has(command("status"), "no texture pack on this PC"), "no pack folder (pack=1, a device): not shown, nothing started, the status says so");
 		check(pk::folder_text().find("packmodule\\hifixi-pack\\") != std::string::npos, "the Files line's folder: " + pk::folder_text());
+		check(logged("texture pack: none on this PC ("), "the log: what the first look found (none on this PC)");
 	}
 
 	// ---- The folder made; pack=0: found by a reload, the streamer not started
@@ -657,6 +692,15 @@ int main()
 		update();
 		check(!pk::in_use() && pk::test::stream_starts() == 0 && has(pk::menu_lines(), "Paused after a graphics-card stop") &&
 			has(command("status"), "paused after a graphics-card stop"), "pack=1 after a GPU stop: off for the session, said so");
+		check(logged("texture pack: paused for this session, the graphics card stopped last session"), "the safe start's pause in the log");
+		// (the menu's switch turned off and on again (the saved key): still paused; only /hifi textures on lifts it)
+		hifi::game::set_option_on("textures", "pack", false);
+		update();
+		hifi::game::set_option_on("textures", "pack", true);
+		for (int i = 0; i < 6; ++i)
+			update();
+		check(!pk::in_use() && pk::test::stream_starts() == 0 && has(pk::menu_lines(), "Paused after a graphics-card stop"),
+			"the setting turned off and on again in the session: still paused (only /hifi textures on lifts it)");
 		fake::calls.clear();
 		const std::vector<std::string> out = command("on");
 		const bool in = wait_in_use();
@@ -843,6 +887,240 @@ int main()
 		messages_check("on, off, compare, reload");
 	}
 
+	// ---- The pack as each zone left had it, in the log as the next comes
+	{
+		hifi::game::feed::test::set_zone(100, true);
+		present();
+		hifi::game::feed::test::set_zone(101, true);
+		present();
+		hifi::game::feed::test::set_zone(0, false);
+		present();
+		check(logged("texture pack in zone 100 as it was left: characters ") && logged("MB of the pack on the graphics card") &&
+				logged("texture pack in zone 101 as it was left") && logged("textures couldn't be read since it opened"),
+			"a zone change: the pack as the zone left had it in the log (characters, its video memory, what couldn't be read)");
+	}
+
+	// ---- Packs from another PC. Each case: off (the data files let go), the files changed, on; then the menu, the
+	// status and the log say what's wrong, or the pack is used. None may crash or hang: every wait below is bounded
+	{
+		const std::wstring idx_path = pack_folder + L"pack.idx", bin = pk::data_path(pack_folder, 0), kept = here + L"pack-000.kept";
+		const std::vector<uint8_t> idx_bytes = read_all(idx_path);
+		const double t_cases = now_ms();
+		double worst_settle = 0.0;
+		// (on again, then updates until in use or refused)
+		auto settle_open = [&] {
+			command("on");
+			const double t0 = now_ms();
+			while (now_ms() - t0 < 30000)
+			{
+				update();
+				if (pk::in_use() || has(pk::menu_lines(), "Texture pack can't be used"))
+					break;
+				Sleep(2);
+			}
+			worst_settle = std::max(worst_settle, now_ms() - t0);
+		};
+		auto off = [&] {
+			const uint32_t e0 = st::epoch();
+			command("off");
+			wait_epoch_past(e0);
+			Sleep(20); // (the worker closes the old reader's files just after the close is done)
+		};
+		// (a header changed and its CRC made again, so only the change is what's wrong)
+		auto with_header = [&](auto change) {
+			std::vector<uint8_t> b = idx_bytes;
+			pk::header h;
+			std::memcpy(&h, b.data(), sizeof(h));
+			change(h);
+			h.header_crc = pk::crc32(0, &h, offsetof(pk::header, header_crc));
+			std::memcpy(b.data(), &h, sizeof(h));
+			return b;
+		};
+		auto refused = [&](const char *says, const std::string &what) {
+			const std::vector<std::string> menu = pk::menu_lines(), status = command("status");
+			std::string first;
+			for (const std::string &l : menu)
+				if (l.find("can't be used") != std::string::npos)
+					first = l;
+			check(!pk::in_use() && pk::epoch_in_use() == 0 && has(menu, says) && has(status, says) && logged(says) && st::running(),
+				what + ": not used, the menu, the status and the log say so (\"" + first + "\")");
+		};
+
+		off();
+		write_bytes(idx_path, with_header([](pk::header &h) { h.version = 2; }));
+		settle_open();
+		refused("made for a newer HiFi XI: update HiFi XI", "pack.idx of a newer version (2)");
+		off();
+		write_bytes(idx_path, with_header([](pk::header &h) { h.version = 0; }));
+		settle_open();
+		refused("made for an older HiFi XI: get one made for this version", "pack.idx of an older version (0)");
+		off();
+		{
+			std::vector<uint8_t> b = idx_bytes;
+			b[b.size() - 100] ^= 0x5A;
+			write_bytes(idx_path, b);
+		}
+		settle_open();
+		refused("pack.idx's tables are damaged (CRC)", "pack.idx's tables damaged");
+		off();
+		write_bytes(idx_path, std::vector<uint8_t>(idx_bytes.begin(), idx_bytes.begin() + idx_bytes.size() / 2));
+		settle_open();
+		refused("pack.idx is cut short", "pack.idx cut short (half of it copied)");
+		off();
+		write_bytes(idx_path, idx_bytes);
+		const bool moved = MoveFileExW(bin.c_str(), kept.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+		settle_open();
+		refused("pack-000.bin is missing (the pack copied only in part?", std::string("pack-000.bin missing (moved away: ") + (moved ? "yes" : "NO") + ")");
+		off();
+		{
+			std::vector<uint8_t> part = read_all(kept);
+			part.resize(part.size() / 3);
+			write_bytes(bin, part);
+		}
+		settle_open();
+		refused("pack-000.bin is shorter than pack.idx says", "pack-000.bin a third of its size");
+		// (a few bad records, as a bad sector would leave: the first 7 entries' bytes changed. Too few, or too few of those
+		// tried, for the menu to call the pack damaged)
+		off();
+		{
+			std::vector<uint8_t> b = read_all(kept);
+			// (the index parsed, not loaded: pack-000.bin is still the short one here, which load refuses)
+			std::string why;
+			pk::index idx;
+			const bool parsed = pk::parse(idx_bytes.data(), idx_bytes.size(), idx, why);
+			uint32_t flipped = 0;
+			for (size_t i = 0; parsed && i < 7; ++i)
+				if (const pk::entry *e = idx.find(made[i].k))
+					if (const pk::record *r = e->map(pk::kColour); r != nullptr && r->file == 0 && r->offset + 16 < b.size())
+					{
+						b[r->offset + 16] ^= 0x5A;
+						flipped++;
+					}
+			write_bytes(bin, b);
+			settle_open();
+			fake::clear_all();
+			fake::ask(made, 0, 7);
+			wait_tickets();
+			update();
+			const bool seven_quiet = pk::in_use() && flipped == 7 && fake::count(st::state::missed) == 7 && !has(pk::menu_lines(), "couldn't be read from the pack");
+			fake::ask(made, 7, 293);
+			wait_tickets();
+			fake::ask(made, 0, 7);
+			wait_tickets();
+			update();
+			const bool few_quiet = fake::count(st::state::missed) == 14 && fake::count(st::state::ready) == 293 && !has(pk::menu_lines(), "couldn't be read from the pack") &&
+				!has(command("status"), "couldn't be read from the pack");
+			fake::ask(made, 0, 7);
+			wait_tickets();
+			update();
+			const bool then_said = fake::count(st::state::missed) == 21 && has(pk::menu_lines(), "couldn't be read from the pack");
+			check(seven_quiet && few_quiet && then_said,
+				"7 bad records: 7 asked, all missed, nothing in the menu (under 8); with 293 good, asked again: 14 of 307 missed (under 5%), the menu and status "
+				"quiet; asked a third time: 21 of 314, the menu says the pack looks damaged (" + std::to_string(flipped) + " changed, missed " + std::to_string(fake::count(st::state::missed)) +
+				", ready " + std::to_string(fake::count(st::state::ready)) + ")");
+			fake::clear_all();
+		}
+		// (the whole size, its first 8 MB overwritten: the first 300 small textures, written first, all fail their CRC)
+		off();
+		{
+			std::vector<uint8_t> b = read_all(kept);
+			std::fill(b.begin(), b.begin() + std::min<size_t>(b.size(), 8u << 20), uint8_t(0));
+			write_bytes(bin, b);
+		}
+		settle_open();
+		size_t lines_before;
+		{
+			std::lock_guard<std::mutex> lock(g_log_mutex);
+			lines_before = g_log.size();
+		}
+		const bool damaged_in = pk::in_use() && !has(pk::menu_lines(), "couldn't be read from the pack");
+		for (int batch = 0; batch < 5; ++batch)
+		{
+			fake::ask(made, size_t(batch) * 60, 60);
+			wait_tickets();
+			update();
+		}
+		size_t texture_lines = 0, more_lines = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_log_mutex);
+			for (size_t i = lines_before; i < g_log.size(); ++i)
+			{
+				texture_lines += g_log[i].find("left to the game") != std::string::npos;
+				more_lines += g_log[i].find("more lines like these left out of the log") != std::string::npos;
+			}
+		}
+		const std::vector<std::string> damaged_menu = pk::menu_lines();
+		check(damaged_in && fake::count(st::state::missed) == 300 && has(damaged_menu, "textures couldn't be read from the pack (its files damaged, or copied only in part?)") &&
+				has(command("status"), "Copy the hifixi-pack folder again") && logged("textures couldn't be read from the pack") && texture_lines == 100 &&
+				more_lines == 1,
+			"a data file overwritten (its size right): used, 300 asked all missed; the menu, status and log say the pack looks damaged; the log's lines for them "
+			"capped at 100 (" + std::to_string(texture_lines) + ") and one line says so (" + std::to_string(more_lines) + ")");
+		fake::clear_all();
+		off();
+		const bool back = DeleteFileW(bin.c_str()) && MoveFileExW(kept.c_str(), bin.c_str(), MOVEFILE_REPLACE_EXISTING);
+		// (made from other game files: VTABLE.DAT and FTABLE.DAT of the test's own "game folder")
+		const std::wstring game = here + L"ffxi\\";
+		CreateDirectoryW(game.c_str(), nullptr);
+		write_bytes(game + L"VTABLE.DAT", std::vector<uint8_t>(100, 1));
+		write_bytes(game + L"FTABLE.DAT", std::vector<uint8_t>(200, 2));
+		hifi::bake::set_ffxi_folder(game);
+		write_bytes(idx_path, with_header([](pk::header &h) {
+			h.vtable_size = 101;
+			h.ftable_size = 200;
+			h.vtable_mtime = h.ftable_mtime = 1;
+		}));
+		settle_open();
+		fake::ask(made, 0, 40);
+		const bool used = wait_tickets() && fake::count(st::state::ready) == 40;
+		update();
+		check(back && pk::in_use() && used && has(pk::menu_lines(), "Made from another version of the game's files") &&
+				has(command("status"), "made from another version of the game's files (VTABLE.DAT or FTABLE.DAT is another size)") &&
+				logged("made from another version of the game's files"),
+			"made from another version of the game's files (VTABLE.DAT's size): used (40 asked, 40 ready), the menu, the status and the log say so");
+		fake::clear_all();
+		off();
+		write_bytes(idx_path, with_header([](pk::header &h) {
+			h.vtable_size = 100;
+			h.ftable_size = 200;
+			h.vtable_mtime = h.ftable_mtime = 1;
+		}));
+		settle_open();
+		update();
+		check(pk::in_use() && !has(pk::menu_lines(), "Made from another version") && has(command("status"), "dated otherwise") && logged("dated otherwise") &&
+				!has(pk::menu_lines(), "couldn't be read from the pack"),
+			"the same files' sizes, other times (another PC): used, said in the status and the log, not the menu; the damage line gone with the new open");
+		off();
+		write_bytes(idx_path, idx_bytes);
+		settle_open();
+		fake::ask(made, 600, 50);
+		check(pk::in_use() && wait_tickets() && fake::count(st::state::ready) == 50 && !has(command("status"), "dated otherwise"),
+			"the pack as made again: in use, 50 asked, 50 ready (no fingerprint in it: nothing compared)");
+		// (the data files copied but not pack.idx, which sorts after them: a copy cut off near its end)
+		fake::clear_all();
+		off();
+		{
+			const std::wstring idx_kept = here + L"pack.idx.kept";
+			const bool idx_moved = MoveFileExW(idx_path.c_str(), idx_kept.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+			const std::vector<std::string> on_reply = command("on");
+			update();
+			const std::vector<std::string> menu = pk::menu_lines(), status = command("status"), reload_reply = command("reload");
+			update();
+			check(idx_moved && pk::folder_exists() && !pk::in_use() && has(menu, "has no pack.idx (copied only in part?)") && has(menu, "Copy the hifixi-pack folder again") &&
+					has(status, "has no pack.idx (copied only in part?)") && has(on_reply, "has no pack.idx") && has(reload_reply, "has no pack.idx") &&
+					logged("has no pack.idx: not a whole texture pack"),
+				"the folder without pack.idx: the setting still shown (folder_exists), not used; the menu, the status, /hifi textures on and reload and the "
+				"log say pack.idx is missing");
+			MoveFileExW(idx_kept.c_str(), idx_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+			settle_open();
+			check(pk::in_use() && !has(pk::menu_lines(), "has no pack.idx"), "pack.idx back: in use again, the line gone");
+		}
+		char line[200];
+		std::snprintf(line, sizeof(line), "every case settled in at most %.0f ms (the cases %.1f s in all): no hang", worst_settle, (now_ms() - t_cases) / 1000.0);
+		check(worst_settle < 10000.0, line);
+		settle();
+		messages_check("packs from another PC");
+	}
+
 	// ---- A device change: none, then the device again
 	{
 		const uint32_t e0 = pk::epoch_in_use();
@@ -922,6 +1200,11 @@ int main()
 	// ---- The menu's calls make no file, DXGI or streamer call; the worst present
 	{
 		M->device(G.device);
+		// (loaded a third time with pack=0: the first look's "found, off" line)
+		hifi::game::set_option_on("textures", "pack", false);
+		update();
+		check(!pk::in_use() && logged("GB); off ([textures] pack=0"), "loaded with pack=0: the log says the pack was found, and off");
+		hifi::game::set_option_on("textures", "pack", true);
 		wait_in_use();
 		const uint64_t io0 = pk::test::io_calls();
 		for (int i = 0; i < 100; ++i)

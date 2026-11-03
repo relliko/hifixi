@@ -147,7 +147,7 @@ The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md;
 src/pack/pack_module.cpp, docs/texture-pack/zones.md)
 
 - Started once a session by the "textures" module at the first enable with a device (`begin_open`,
-  src/pack/pack_module.cpp:231-247) and kept: turning the pack off closes it and pauses the streamer (`kOff`,
+  src/pack/pack_module.cpp:311-327) and kept: turning the pack off closes it and pauses the streamer (`kOff`,
   `turn_off` :267-284), never stops it (its ring's address space isn't given back). `stop()` only in the module's stop
   (:696-723), first in the plugin's Release (src/plugin/main.cpp:1029-1035), before `retire::release_all` (:1075).
 - Every `close`, `open` (on, reload) and `stop` the module makes is preceded in the same call by the owners'
@@ -156,7 +156,7 @@ src/pack/pack_module.cpp, docs/texture-pack/zones.md)
   holds a ticket of the epoch the call ends when the worker gets to it. A device change: the owners cleared, then
   `set_device` (`device`, :778-798), the epoch the owners ask in read again at once.
 - The zones' glue reads its tickets (`take_done`, src/zone/zonepack.cpp:329) and writes their views in the module's
-  present (src/pack/pack_module.cpp:478-481, each consumer's frame in turn), before `backend::present`'s
+  present (src/pack/pack_module.cpp:595-598, each consumer's frame in turn), before `backend::present`'s
   `retire::on_present` (src/backend/backend.cpp:766). That is safe because a gone ticket keeps its texture (below): a
   view's texture lives while its ticket is held, whatever the epoch does meanwhile.
 - The characters' glue (src/chars/charpack.cpp, docs/texture-pack/characters.md "When tickets are read") reads its
@@ -175,7 +175,7 @@ src/pack/pack_module.cpp, docs/texture-pack/zones.md)
   recording and its run: that frame as recorded, the next with the game's, 0 messages under GPU-based validation.
 
 - Its own copy queue, one fence and four allocators and lists (`kInFlight`), made on the worker thread
-  (src/pack/stream.cpp:536-542) and used by it alone. The fence is signalled only by the worker, after each
+  (src/pack/stream.cpp:537-543) and used by it alone. The fence is signalled only by the worker, after each
   `ExecuteCommandLists` (:1125-1126): one writer, values only going up. An allocator is reset only once the fence has
   passed the value after its last list (`list_value`, :1084, reset :1095); at most 4 copies are in flight
   (`pick_locked`, :1159).
@@ -281,7 +281,7 @@ AMD frame generation (src/framegen)
   the Mithra go between a frame's recording and its run and checks a new texture gets another pair.
 - Freed under a removed device's last copy (M3, 2026-11-02, packstream_test only). The streamer released its ring
   and textures at once on device loss, trusting "removed: nothing runs". On WARP the submitted copy went on running
-  and the test crashed in 4 of 6 runs. Now what a copy not yet seen done uses is left (src/pack/stream.cpp:670-677).
+  and the test crashed in 4 of 6 runs. Now what a copy not yet seen done uses is left (src/pack/stream.cpp:671-678).
   The M3 review found `switch_device` and `shut_down` still read `UINT64_MAX` as "done" when they ran before the
   worker handled the loss (stop() or set_device() right after device_lost()): a scratch run crashed 3 times in 22.
   Fixed in `wait_copies` (:652-653); the "lost-stop" and "lost-switch" children hold the copies on the GPU and check
@@ -295,7 +295,7 @@ AMD frame generation (src/framegen)
   (:1163); packstream_test makes the change on the worker in exactly that window (`test::before_pick`).
 - An open lost to a device change (M4, packmodule_test on the 4070 Ti). The streamer's worker took a pending open
   together with a pending `set_device` and returned after the device change, so the open was never done and the
-  module waited for its epoch for good. Now the open stays posted for the next pass (src/pack/stream.cpp:1363-1373).
+  module waited for its epoch for good. Now the open stays posted for the next pass (src/pack/stream.cpp:1365-1375).
 - Running on after the device was removed. Before 0.62 (a923d56) HiFi XI kept recording and submitting after a GPU
   hang and ended in "abnormal program termination". Now `gpu_crash::lost()` stops our passes, FSR and frame
   generation, and `retire::on_present` is no longer called.
