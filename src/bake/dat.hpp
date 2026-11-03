@@ -44,7 +44,9 @@ namespace hifi::bake
 
 	// The game's key tables (256 bytes each, in FFXiMain.dll: the first, the MZB's and the MMB's first, where its
 	// first bytes are; the second, the MMB's swaps, 0x328 bytes on), found in the game's image (hifi::game::set_image
-	// for the tests); false when the image isn't known or they aren't there
+	// for the tests); false when the image isn't known or they aren't there. (Defined in dat.cpp, the only part of
+	// this header that needs game:: code; everything else is dat_core.cpp. The 64-bit texpack links dat_core.cpp with
+	// its own key_tables, read from FFXiMain.dll's file: tools\texpack\keys.cpp.)
 	bool key_tables(const uint8_t *&first, const uint8_t *&second);
 
 	// Windows' XPRESS + Huffman (RtlCompressBuffer, format 4 | COMPRESSION_ENGINE_MAXIMUM, chunk 4096), as

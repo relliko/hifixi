@@ -6,8 +6,8 @@
  */
 
 #include "zonemesh.hpp"
-#include "bc2.hpp"
 #include "dat.hpp"
+#include "../pack/bc2.hpp"
 #include "mmb.hpp"
 #include <algorithm>
 #include <cmath>
@@ -20,6 +20,8 @@ namespace hifi::bake::zonemesh
 	{
 		using mmb::u16;
 		using mmb::u32;
+		// (the codec lives with the texture pack, which builds its mips with it)
+		namespace bc2 = hifi::pack::bc2;
 
 		// One piece as the MMB has it
 		struct raw_piece

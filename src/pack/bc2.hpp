@@ -1,14 +1,16 @@
 #pragma once
 
 // BC2 (DXT3) blocks to 8-bit RGBA texels and back, and the smaller mip levels a bigger texture from an XIPivot
-// overlay gets (zonemesh::texture::levels, made by the zone loader's thread, never the game's)
+// overlay gets (zonemesh::texture::levels, made by the zone loader's thread, never the game's). Header-only (inline),
+// so every build line that links zonemesh.cpp needs nothing more; the texture pack's coverage mips (full_chain, at the
+// end) are in bc2.cpp, linked only by what builds packs (texpack, pack_test).
 
 #include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <vector>
 
-namespace hifi::bake::bc2
+namespace hifi::pack::bc2
 {
 	// BC2 (DXT3) blocks to 8-bit RGBA texels and back, for the smaller levels below
 	inline void colour565(uint32_t c, int out[3])
@@ -124,4 +126,23 @@ namespace hifi::bake::bc2
 		}
 		return out;
 	}
+
+	// The texture pack's mip chains (bc2.cpp; docs/texture-pack/format.md "Mips"). How many levels a pack stores for
+	// a w x h texture: halved while both sides stay multiples of 4 (BC blocks whole), down to 4x4; 0 when w or h isn't a
+	// multiple of 4
+	uint32_t chain_levels(uint32_t w, uint32_t h);
+	// The alpha test a cut-out texture's mips keep: a texel passes when its 8-bit alpha (the BC2 4-bit value times 17)
+	// is above this. Zones: saturate(4*t.a*vcol.a) > 96/255 (zone draw.cpp's ps), so 96*255/(4*vcol.a) for the entry's
+	// typical vertex alpha (0 taken as 0x80, the commoner); characters: 2*a > 0x45 (chardraw.cpp), i.e. above 0x22
+	float zone_cut_threshold(uint8_t vcol_a);
+	constexpr float kCharsCutThreshold = 34.0f;
+	// The fraction of a w x h RGBA8 picture's texels whose alpha is above threshold
+	double coverage(const uint8_t *px, uint32_t w, uint32_t h, float threshold);
+	// Every level of a BC2 texture, level 0 (copied unchanged) first, chain_levels(w, h) of them: each next level the
+	// last one's colour and alpha averaged 2x2 (exactly smaller_levels' box), except for alpha_kind 1 (cut-out, the
+	// pack's kAlphaCut), whose alpha is rescaled in each level so the fraction of texels above cut_threshold matches
+	// level 0's (else the cut-outs thin out with distance: foliage, fences, hair). Empty when w or h isn't a multiple
+	// of 4. Blended, mask (characters' shine), mixed and none keep the plain box: rescaling would change their
+	// transparency at a distance or the shine's strength.
+	std::vector<std::vector<uint8_t>> full_chain(const uint8_t *level0, uint32_t w, uint32_t h, uint8_t alpha_kind, float cut_threshold);
 }

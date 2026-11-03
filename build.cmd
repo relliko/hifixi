@@ -46,7 +46,7 @@ rem The game side (src\game): what the worldfx Ashita addon did (FEED); what hif
 rem (MODULES); the zone files made on the player's PC (BAKE, src\bake). The plugin and the menu's test take them all.
 set "FEED=src\game\game.cpp src\game\feed.cpp src\game\glows.cpp src\game\gamewater.cpp src\game\gamerain.cpp"
 set "MODULES=src\game\jitter.cpp src\game\drawcull.cpp src\game\hifps\step.cpp src\game\hifps\sites.cpp src\game\hifps\exp.cpp src\game\gamedraw.cpp src\game\zoneslot.cpp"
-set "BAKE=src\bake\dat.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
+set "BAKE=src\bake\dat.cpp src\bake\dat_core.cpp src\bake\runner.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp src\bake\lamps.cpp src\bake\sea.cpp src\bake\zonemesh.cpp"
 set "GAME=%FEED% %MODULES% %BAKE%"
 rem The native zone renderer (src\zone): each zone's data on the GPU (the plugin alone)
 set "ZONE=src\zone\zone_gpu.cpp src\zone\native.cpp src\zone\frame.cpp src\zone\draw.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\game\zonedraw.cpp src\zone\actordata.cpp src\game\modelactor.cpp"
@@ -112,7 +112,7 @@ echo Built build\engine_check.exe
 rem The zone files the render tests read, made from this PC's game files with HiFi XI's own bakers when missing (not in
 rem the repo: they're made from the game's data): build\testdata (build\test_data.exe)
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\test_data.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\rain.cpp src\bake\sea.cpp src\bake\dat.cpp src\game\game.cpp ^
+  tests\test_data.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\rain.cpp src\bake\sea.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
   /Fo"build\test\\" /Fe"build\test_data.exe" /link /NOLOGO user32.lib || exit /b 1
 build\test_data.exe || exit /b 1
 
@@ -143,7 +143,7 @@ rem build\world_test.exe build\test\world_oracle.txt
 python tests\world_oracle.py build\test\world_oracle.txt || exit /b 1
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\world_test.cpp src\world\world_frames.cpp src\world\world_dome.cpp src\world\world_render.cpp src\world\world_font.cpp src\game\worldmark.cpp ^
-  src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp src\game\jitter.cpp src\chars\tex.cpp src\bake\dat.cpp src\game\game.cpp ^
+  src\game\skydraw.cpp src\game\namedraw.cpp src\game\griddraw.cpp src\game\jitter.cpp src\chars\tex.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
   build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\world_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\world_test.exe
 rem The world part's modules as the plugin and the backend drive them (the gates, the handlers into the world on WARP):
@@ -176,7 +176,7 @@ echo Built build\fx_geo_test.exe
 rem The game side on both dumps, the game's own walk and element draw run through our stubs (WARP for a texture's copy):
 rem build\fx_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\fx_test.cpp src\game\fxdraw.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxtextures.cpp src\chars\tex.cpp src\bake\dat.cpp src\game\game.cpp ^
+  tests\fx_test.cpp src\game\fxdraw.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxtextures.cpp src\chars\tex.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
   src\game\gamewater.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
   /Fo"build\test\\" /Fe"build\fx_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\fx_test.exe
@@ -189,7 +189,7 @@ if not exist build\test\fx_fastblade.bin python tests\fx_oracle.py play build\te
 if not exist build\test\fx_fountain.bin python tests\fx_oracle.py play build\test\fx_fountain.bin 120 --dat ROM/1/31 --gen fun1 fun2 fun3 awgd --size 480x270 || exit /b 1
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\fx_render_test.cpp src\fx\fxframe.cpp src\fx\fxgeo.cpp src\fx\fxinject.cpp src\fx\fxrender.cpp src\fx\fxtextures.cpp src\chars\tex.cpp ^
-  src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
   build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\fx_render_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\fx_render_test.exe
 rem The screen's 2D (src\game\uidraw, src\ui2d; docs\own-frame\2d.md): the loop tail's calls, the recorder on a stand-in
@@ -197,7 +197,7 @@ rem device and the gate on both dumps, the text fonts against tests\ui2d_fonts.p
 rem build\test\ui2d_fonts.txt); the recorder on dgVoodoo's own d3d8.dll (the game's, with
 rem its dgVoodoo.conf drawn by WARP: tests\ui2d_conf.py) against the 2D renderer on Direct3D 12 WARP at the pass markers,
 rem the d3dlog captures' interface replayed (build\dgv\ui2d_dgv.exe, run from build\dgv)
-set "UI2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\game\uidraw.cpp src\bake\dat.cpp src\game\game.cpp"
+set "UI2D=src\ui2d\frame2d.cpp src\ui2d\fonthigh.cpp src\ui2d\texfmt.cpp src\ui2d\render2d.cpp src\game\uidraw.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp"
 python tests\ui2d_fonts.py build\test\ui2d_fonts.txt || exit /b 1
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
   tests\uidraw_test.cpp %UI2D% build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\uidraw_test.exe" ^
@@ -268,42 +268,48 @@ rem The native zone renderer's zone data against tests\zonemesh_oracle.py: build
 rem picture of a zone through the GPU upload (needs the game closed, or --warp): build\zone_view.exe; the plugin's
 rem per-zone loading on WARP: build\zonenative_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zonemesh_test.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\zonemesh_test.exe" ^
+  tests\zonemesh_test.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\zonemesh_test.exe" ^
   /link /NOLOGO user32.lib || exit /b 1
 echo Built build\zonemesh_test.exe
 rem The texture pack's key (src\pack\pack.hpp) on the game's own DATs: build\packkey_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\packkey_test.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\packkey_test.exe" ^
+  tests\packkey_test.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\packkey_test.exe" ^
   /link /NOLOGO user32.lib || exit /b 1
 echo Built build\packkey_test.exe
+rem The texture pack's format, reader, writer and mips (src\pack; docs\texture-pack\format.md), with WARP's
+rem GetCopyableFootprints and tests\pack_oracle.py on the packs it writes: build\pack_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\pack_test.cpp src\pack\pack.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\pack\hash.cpp src\pack\validate.cpp ^
+  /Fo"build\test\\" /Fe"build\pack_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+echo Built build\pack_test.exe
 rem The texture pack's memory watch (src\pack\memwatch) and its section in the GPU crash report: build\memwatch_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\memwatch_test.cpp src\pack\memwatch.cpp src\render\gpu_crash.cpp /Fo"build\test\\" /Fe"build\memwatch_test.exe" ^
   /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\memwatch_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp src\pack\memwatch.cpp /Fo"build\test\\" ^
+  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\memwatch.cpp /Fo"build\test\\" ^
   /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zone_view.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zonenative_test.cpp src\zone\native.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  tests\zonenative_test.cpp src\zone\native.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
   /Fo"build\test\\" /Fe"build\zonenative_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zonenative_test.exe
 rem The zone's objects handed to the native renderer (17CBA8's stub run on both dumps, zone 100 on WARP): build\zonedraw_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zonedraw_test.cpp src\game\zonedraw.cpp src\game\jitter.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\game\game.cpp ^
+  tests\zonedraw_test.cpp src\game\zonedraw.cpp src\game\jitter.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp ^
   /Fo"build\test\\" /Fe"build\zonedraw_test.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zonedraw_test.exe
 rem The model actors handed to the zone renderer (0C4CC8's call on both dumps, a model DAT on WARP): build\modelactor_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\modelactor_test.cpp src\game\modelactor.cpp src\zone\actordata.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^
-  src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\modelactor_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\modelactor_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\modelactor_test.exe
 rem The native renderer drawing at the zone's end marker on a list recorded as dgVoodoo records (WARP, debug layer):
 rem build\zoneinject_test.exe [out.bmp]
 rem (no address-space randomisation: the FFXiMain dump goes at its own base, which a system mapping took at times)
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG /I src\render ^
-  tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp ^
+  tests\zoneinject_test.cpp src\zone\inject.cpp src\zone\zoneshadow.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp ^
   src\game\game.cpp build\engine\worldfx_engine.lib /Fo"build\test\\" /Fe"build\zoneinject_test.exe" /link /NOLOGO /DYNAMICBASE:NO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zoneinject_test.exe
 rem The world upscaled to the screen on a list recorded as dgVoodoo records its own (src\upscale): build\upscale_test.exe
@@ -337,15 +343,15 @@ rem The zone bakers against the Python bakers (tests\bake1_oracle.py, bake2_orac
 rem water, wet ground, rain), build\bake2_test.exe (lamps)
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\bake1_test.cpp src\bake\collision.cpp src\bake\grass.cpp src\bake\water.cpp src\bake\wet.cpp src\bake\rain.cpp ^
-  src\bake\sea.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\bake1_test.exe" /link /NOLOGO user32.lib || exit /b 1
+  src\bake\sea.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" /Fe"build\bake1_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\bake1_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\bake2_test.cpp src\bake\lamps.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
+  tests\bake2_test.cpp src\bake\lamps.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\bake2_test.exe" /link /NOLOGO user32.lib || exit /b 1
 echo Built build\bake2_test.exe
 rem The sea sheets against tools\bake_sea.py (tests\sea_oracle.py): build\sea_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\sea_test.cpp src\bake\sea.cpp src\bake\collision.cpp src\bake\dat.cpp src\game\game.cpp /Fo"build\test\\" ^
+  tests\sea_test.cpp src\bake\sea.cpp src\bake\collision.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp /Fo"build\test\\" ^
   /Fe"build\sea_test.exe" ^
   /link /NOLOGO user32.lib || exit /b 1
 echo Built build\sea_test.exe
@@ -356,3 +362,5 @@ for %%t in ("..\reshade-worldfx\tests\gamewater_cave.c" "tests\gamerain_cave.c")
     /Fo"build\test\%%~nt.obj" || exit /b 1
   echo Built build\test\%%~nt.exe
 )
+rem The texture pack's 64-bit tool and its test (tools\build_texpack.cmd: its own x64 environment, under setlocal)
+call "%~dp0tools\build_texpack.cmd" || exit /b 1
