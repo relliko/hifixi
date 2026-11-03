@@ -117,6 +117,14 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
 - 2D: `src/ui2d/render2d.cpp:667-671` its own SRV and sampler heaps, bound at `render2d.cpp:1066`.
 - Upscale: `upscale.cpp:304`, `temporal.cpp:309/348` own heaps; FSR 2 binds its own, so `upscale.cpp:459` and `562`
   put the list's heaps back (`upscale::on_heaps`, fed by `ev_heaps`, `backend.cpp:778-782`).
+- The texture pack's streamer (`src/pack/stream.cpp`) has **no shader-visible heap** and writes into nobody's.
+  An owner makes the view of a ready ticket itself with `stream::write_view(ticket, cpu_handle)` (`stream.cpp:1788`):
+  `CreateShaderResourceView` with the ticket's format, the levels uploaded, most detailed 0, on the owner's thread,
+  with none of the owner's locks held (a device call), into a slot the owner alone decides is free (the rule above:
+  no list in flight may read it). It holds the texture and the device for the call (AddRef'd with the ticket checked,
+  under the streamer's mutex), so another thread's epoch change can't free them under it; a view made just before an
+  epoch change is the owner's to drop. One texture shared by several owners gets one view in each owner's heap.
+  packstream_test samples through such views in its own heap.
 - Views made or copied by anyone are followed by the backend (`backend.cpp:808` `ev_view`, `814` `ev_copy`), so
   `port_resource_of_view` (`backend.cpp:223`) stays right after a slot is refilled.
 

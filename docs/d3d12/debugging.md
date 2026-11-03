@@ -116,6 +116,19 @@ Breadcrumbs:
   free block, the video memory and the characters' and zone's bytes as of the last half second, and whether a texture
   bake (bakeall.py, realesrgan-ncnn-vulkan) was running: a report from a session with a bake running is kept out of
   the hang analysis. It reads atomics only (no lock, no DXGI call). memwatch_test checks it.
+- The streamer's lines in that section (`src/pack/stream_crumbs.hpp`, read at `src/pack/memwatch.cpp:347-369`):
+  "streamer: not started" while nothing started it (M3: the plugin doesn't), else running or stopped, what the
+  worker is doing (reading, recording a copy, waiting for ring space, ...), the epoch and pause bits, how many are
+  queued, in flight and resident; the last record's key, data file, offset, bytes and levels; the copy fence's last
+  signal and the last completed value the worker read; the ring's size, head and tail; and how long since the worker
+  last moved. A hang with "reading" for seconds is the disk; "waiting for ring space" with signalled ahead of
+  completed is the copy queue. The fields are `std::atomic`s (the worker's state, last record, fence and ring written
+  by the worker; the counts, epoch and pause bits by any caller holding the streamer's mutex), in a header-only struct so
+  memwatch.cpp needs no link to the streamer. packstream_test calls `crash_section()` while it holds the streamer's
+  mutex: it returns at once.
+- The debug layer costs address space of its own per object: 1,000 pack textures took 16.5 MB of address space with
+  it on and 8.7 MB without on the 4070 Ti. packstream_test measures the streamer's address space in a child process
+  with the debug layer off.
 
 Hang report (the game thread, not the GPU):
 

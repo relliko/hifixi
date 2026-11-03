@@ -172,8 +172,16 @@ namespace hifi::pack
 		return true;
 	}
 
-	std::shared_ptr<const index> load(const std::wstring &folder_given, const fingerprint *client, std::string &why)
+	void (*load_test_window)() = nullptr;
+
+	std::shared_ptr<const index> load(const std::wstring &folder_given, const fingerprint *client, std::string &why, const std::atomic<bool> *cancel)
 	{
+		auto cancelled = [&] {
+			if (cancel == nullptr || !cancel->load())
+				return false;
+			why = "cancelled";
+			return true;
+		};
 		std::wstring folder = folder_given;
 		if (folder.empty() || (folder.back() != L'\\' && folder.back() != L'/'))
 			folder += L'\\';
@@ -194,8 +202,15 @@ namespace hifi::pack
 				bytes.resize(size_t(size.QuadPart));
 				for (size_t at = 0; ok && at < bytes.size();)
 				{
+					if (load_test_window != nullptr)
+						load_test_window();
+					if (cancelled())
+					{
+						CloseHandle(f);
+						return nullptr;
+					}
 					DWORD got = 0;
-					ok = ReadFile(f, bytes.data() + at, DWORD(std::min<size_t>(bytes.size() - at, kReadPiece)), &got, nullptr) != 0 && got != 0;
+					ok = ReadFile(f, bytes.data() + at, DWORD(std::min<size_t>(bytes.size() - at, kIndexPiece)), &got, nullptr) != 0 && got != 0;
 					at += got;
 				}
 			}
@@ -206,12 +221,16 @@ namespace hifi::pack
 				return nullptr;
 			}
 		}
+		if (cancelled())
+			return nullptr;
 		auto out = std::make_shared<index>();
 		if (!parse(bytes.data(), bytes.size(), *out, why))
 			return nullptr;
 		out->folder = folder;
 		for (uint32_t i = 0; i < out->head.file_count; ++i)
 		{
+			if (cancelled())
+				return nullptr;
 			uint64_t real = 0;
 			const std::wstring path = data_path(folder, i);
 			if (!size_of(path, real))
@@ -301,10 +320,16 @@ namespace hifi::pack
 			ov.OffsetHigh = DWORD((offset + at) >> 32);
 			ov.hEvent = event;
 			DWORD got = 0;
+			if (test_window != nullptr)
+				test_window(*this);
 			BOOL ok = ReadFile(h, out + size_t(at), piece, nullptr, &ov);
 			DWORD e = ok ? ERROR_SUCCESS : GetLastError();
 			if (ok || e == ERROR_IO_PENDING)
 			{
+				// (a cancel() between the check above and this ReadFile found no read to cancel: cancelled is stored before
+				// cancel()'s CancelIoEx, so either that CancelIoEx saw this read or this load sees the flag)
+				if (e == ERROR_IO_PENDING && cancelled)
+					CancelIoEx(h, &ov);
 				ok = GetOverlappedResult(h, &ov, &got, TRUE);
 				e = ok ? ERROR_SUCCESS : GetLastError();
 			}
@@ -362,6 +387,40 @@ namespace hifi::pack
 			why = "CRC mismatch";
 			return false;
 		}
+		return true;
+	}
+
+	uint64_t reader::levels_span(const record &r, uint32_t first, uint32_t count)
+	{
+		layout l;
+		if (check(r) != nullptr || count == 0 || first >= r.levels || count > r.levels - first || !footprint(r.format, r.w, r.h, r.levels, l))
+			return 0;
+		const uint32_t end = first + count;
+		return (end < l.levels ? l.level[end].offset : l.total) - l.level[first].offset;
+	}
+
+	bool reader::read_levels(const record &r, uint32_t first, uint32_t count, uint8_t *out, std::string &why)
+	{
+		layout l;
+		if (const char *bad = check(r))
+		{
+			why = bad;
+			return false;
+		}
+		const uint64_t span = levels_span(r, first, count);
+		if (span == 0 || !footprint(r.format, r.w, r.h, r.levels, l))
+		{
+			why = "no such levels";
+			return false;
+		}
+		if (!read(r.file, uint64_t(r.offset) + l.level[first].offset, out, span, why))
+			return false;
+		for (uint32_t i = first; i < first + count; ++i)
+			if (crc32(0, out + (l.level[i].offset - l.level[first].offset), size_t(l.level_span(i))) != idx->level_crc(r, i))
+			{
+				why = "CRC mismatch (level " + std::to_string(i) + ")";
+				return false;
+			}
 		return true;
 	}
 }

@@ -9,8 +9,8 @@
  *     (a 64-bit one, from this 32-bit one);
  *   - the thread: its first values (within 5 s, the suites running side by side), stop() within 200 ms;
  *   - a fall of the free address space between two walks walked at once (the low-water mark of the largest block);
- *   - gpu_crash: the section added once however often it's added, the report's sections with "Texture pack:" and the
- *     free address space; crash_section() read on another thread while the probes run, never waiting;
+ *   - gpu_crash: the section added once however often it's added, the report's sections with "Texture pack:", the
+ *     free address space and "streamer: not started" (stream_crumbs.hpp; nothing in this test starts the streamer); crash_section() read on another thread while the probes run, never waiting;
  *   - gpu_crash::video_memory: false with no device; on WARP, told, its budget the adapter's own (asked here), and
  *     memory_over saying it.
  *
@@ -268,8 +268,8 @@ int main()
 	const std::string sections = gpu_crash::sections_text();
 	check(count_of(sections, "Texture pack:") == 1, "added twice, in the report once");
 	check(sections.find("address space:") != std::string::npos && sections.find("largest free block:") != std::string::npos &&
-			sections.find("a texture bake running") != std::string::npos && sections.find("streamer: none yet") != std::string::npos,
-		"the report's sections: the free address space, the largest block, the bake, the streamer");
+			sections.find("a texture bake running") != std::string::npos && sections.find("streamer: not started") != std::string::npos,
+		"the report's sections: the free address space, the largest block, the bake, the streamer (not started: nothing here starts it)");
 	std::printf("%s", sections.c_str());
 	{
 		// (read on another thread over and over while the probes run on theirs and this one: never waiting)

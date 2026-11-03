@@ -239,8 +239,13 @@ namespace hifi::pack
 	bool parse(const uint8_t *bytes, size_t size, index &out, std::string &why);
 	// The pack in folder (with its slash): pack.idx read whole and closed at once, parsed, and every data file's real
 	// size at least the index's (else nothing of it is used: "pack can't be used: <why>"). client: the game's files'
-	// fingerprint, or nullptr; a mismatch only sets index::status. nullptr and why ("no pack.idx" when there's none)
-	std::shared_ptr<const index> load(const std::wstring &folder, const fingerprint *client, std::string &why);
+	// fingerprint, or nullptr; a mismatch only sets index::status. nullptr and why ("no pack.idx" when there's none).
+	// cancel (the streamer's stop): checked before each piece of pack.idx (kIndexPiece) and each data file's size, so
+	// it gives up within one piece's read ("cancelled")
+	std::shared_ptr<const index> load(const std::wstring &folder, const fingerprint *client, std::string &why, const std::atomic<bool> *cancel = nullptr);
+	constexpr uint32_t kIndexPiece = 256u << 10;
+	// (packstream_test only) Called before each piece of pack.idx load reads: a slow disk
+	extern void (*load_test_window)();
 
 	// Reads records of one index's data files. Data files are opened on first use with FILE_SHARE_READ |
 	// FILE_SHARE_WRITE | FILE_SHARE_DELETE (a writer may append, the folder's files may be deleted) and
@@ -259,13 +264,24 @@ namespace hifi::pack
 		// One level (layout::level_span bytes: its rows, and the zeros up to the next level) into out, its level CRC
 		// checked
 		bool read_level(const record &r, uint32_t level, uint8_t *out, std::string &why);
-		// Any thread: reads in flight are cancelled (CancelIoEx) and every read fails until resume()
+		// Levels first to first + count - 1 as one span (from level first's offset, the stored layout kept: each level's
+		// footprint offset is its own minus level first's) into out, in pieces of at most kReadPiece, each level's CRC
+		// checked: the streamer's read into its ring. false (why) as read_record, or "no such levels"
+		bool read_levels(const record &r, uint32_t first, uint32_t count, uint8_t *out, std::string &why);
+		// The span read_levels reads (0 when the record or the range breaks the rules)
+		static uint64_t levels_span(const record &r, uint32_t first, uint32_t count);
+		// Any thread: reads in flight are cancelled (CancelIoEx) and every read fails until resume(). A cancel that comes
+		// between a piece's check of the flag and its ReadFile is caught after the ReadFile (the reading thread checks the
+		// flag again and cancels its own read)
 		void cancel();
 		void resume();
 		// Every data file closed (on the reading thread, or once its read has returned): the folder can then be renamed
 		// or deleted. Reads open them again
 		void close();
 		const index &pack() const { return *idx; }
+		// (pack_test only) Called on the reading thread after a piece's cancel check, before its ReadFile: the window of
+		// the cancel race
+		void (*test_window)(reader &) = nullptr;
 
 	private:
 		bool read(uint32_t file, uint64_t offset, uint8_t *out, uint64_t n, std::string &why);

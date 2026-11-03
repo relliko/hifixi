@@ -17,7 +17,10 @@
  *   - resume: kept entries, pack.src's lines (only once committed; the overlay copy's size and time too; one forget()
  *     took out rewritten away), appending past what an interrupted run left;
  *     pack.idx replaced while a reader reads the old one; the folder renamed once nothing holds it;
- *   - cancel: a cancelled reader's reads fail until resume;
+ *   - cancel: a cancelled reader's reads fail until resume; the cancel race (a cancel just before a piece's ReadFile, on
+ *     a pipe that never answers) ends the read at once;
+ *   - read_levels: a level range as one span, the same bytes as read_record's from their offsets, each level's CRC (a
+ *     damaged level misses, the levels before it read);
  *   - the client fingerprint: a mismatch only a status line;
  *   - mips: cut-out coverage within 2% of level 0 in every level of 256 texels and more (zone vertex alpha 0x80 and 0xFF,
  *     characters' 0x22) where the plain box loses it; blended, mask, mixed and none exactly smaller_levels' box;
@@ -37,11 +40,14 @@
 #include "../src/pack/pack_write.hpp"
 #include "../src/pack/validate.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace pk = hifi::pack;
@@ -550,6 +556,24 @@ int main()
 			const bool refused = !r.read_record(*rec0, buf.data(), why) && why == "cancelled";
 			r.resume();
 			check(refused && r.read_record(*rec0, buf.data(), why), "cancel: reads fail (\"cancelled\") until resume, then read again");
+
+			// read_levels (the streamer's read into its ring): one span from level first's offset, each level's CRC
+			const pk::record *rr = x->find(made_a[0].e.the_key())->map(pk::kColour); // (256x256, 7 levels)
+			pk::layout l;
+			pk::footprint(rr->format, rr->w, rr->h, rr->levels, l);
+			std::vector<uint8_t> rl_whole(rr->bytes);
+			r.read_record(*rr, rl_whole.data(), why);
+			const uint64_t rl_tail_span = pk::reader::levels_span(*rr, 1, rr->levels - 1);
+			std::vector<uint8_t> rl_all(size_t(pk::reader::levels_span(*rr, 0, rr->levels))), rl_tail(static_cast<size_t>(rl_tail_span)), rl_mid(size_t(pk::reader::levels_span(*rr, 2, 2)));
+			const bool rl_all_ok = r.read_levels(*rr, 0, rr->levels, rl_all.data(), why) && rl_all == rl_whole;
+			const bool rl_tail_ok = rl_tail_span == rr->bytes - l.level[1].offset && r.read_levels(*rr, 1, rr->levels - 1, rl_tail.data(), why) &&
+				std::equal(rl_tail.begin(), rl_tail.end(), rl_whole.begin() + l.level[1].offset);
+			const bool rl_mid_ok = rl_mid.size() == l.level[4].offset - l.level[2].offset && r.read_levels(*rr, 2, 2, rl_mid.data(), why) &&
+				std::equal(rl_mid.begin(), rl_mid.end(), rl_whole.begin() + l.level[2].offset);
+			std::string past_why;
+			const bool past = !r.read_levels(*rr, 1, rr->levels, rl_tail.data(), past_why) && past_why == "no such levels" && pk::reader::levels_span(*rr, rr->levels, 1) == 0;
+			check(rr->levels == 7 && rl_all_ok && rl_tail_ok && rl_mid_ok && past,
+				"read_levels: all 7 levels are read_record's bytes; from level 1, and levels 2-3, the same bytes from their offsets; a range past the chain refused");
 		}
 		int code = 0;
 		const std::string out = run_oracle(a, code);
@@ -1016,6 +1040,86 @@ int main()
 		const bool renamed_closed = MoveFileW(folder.c_str(), moved.c_str());
 		check(renamed_loaded && renamed_closed, "the pack folder renamed with snapshots loaded and the readers closed (pack.idx isn't held), and again after a read and close()");
 		std::printf("--    while a reader held pack-000.bin open, renaming the folder %s\n", held ? "failed (close() is what frees it)" : "worked");
+	}
+
+	// ---- read_levels with a damaged level: the levels before it read, it and any range over it miss
+	{
+		const std::wstring d = copy_pack(a, L"a_level");
+		std::string why;
+		auto x = pk::load(d, nullptr, why);
+		const pk::record *rr = x ? x->find(made_a[0].e.the_key())->map(pk::kColour) : nullptr;
+		bool damaged = false;
+		if (rr != nullptr)
+		{
+			pk::layout l;
+			pk::footprint(rr->format, rr->w, rr->h, rr->levels, l);
+			std::vector<uint8_t> file = read_all(d + L"pack-000.bin");
+			const size_t at = size_t(rr->offset) + l.level[2].offset + 3;
+			if (at < file.size())
+			{
+				file[at] ^= 0x5A;
+				write_all(d + L"pack-000.bin", file);
+				damaged = true;
+			}
+		}
+		if (rr != nullptr && damaged)
+		{
+			pk::reader r(x);
+			std::vector<uint8_t> buf(rr->bytes);
+			std::string w1, w2, w3;
+			const bool before = r.read_levels(*rr, 0, 2, buf.data(), w1);
+			const bool level2 = r.read_levels(*rr, 2, 1, buf.data(), w2);
+			const bool over = r.read_levels(*rr, 1, 3, buf.data(), w3);
+			check(before && !level2 && w2 == "CRC mismatch (level 2)" && !over && w3 == "CRC mismatch (level 2)",
+				"read_levels with level 2 damaged: levels 0-1 read; level 2 alone, and 1-3, miss (\"" + w2 + "\")");
+		}
+		else
+			check(false, "read_levels with a damaged level: the copy couldn't be made " + why);
+	}
+
+	// ---- The cancel race (docs/texture-pack/streamer.md "Stop"): a cancel() that lands after a piece's check of the flag
+	// and before its ReadFile found no read to cancel, and a read that never ends then ran on (a 4 MB piece on a slow
+	// disk). The reading thread checks the flag again after its ReadFile. A pipe that never answers stands in for
+	// pack-000.bin (stall.cpp's trick); the test window cancels right before the ReadFile
+	{
+		wchar_t f[128];
+		std::swprintf(f, 128, L"\\\\.\\pipe\\hxp-race-%lu\\", GetCurrentProcessId());
+		auto idx = std::make_shared<pk::index>();
+		idx->head.file_count = 1;
+		idx->file_bytes = { 1ull << 30 };
+		idx->folder = f;
+		pk::record rr;
+		rr.kind = pk::kColour;
+		rr.levels = 1;
+		rr.w = rr.h = 1024;
+		rr.format = pk::kBC2;
+		pk::layout l;
+		pk::footprint(rr.format, rr.w, rr.h, 1, l);
+		rr.bytes = uint32_t(l.total);
+		HANDLE pipe = CreateNamedPipeW(pk::data_path(f, 0).c_str(), PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 1 << 20, 0, 0, nullptr);
+		std::thread server([&] { ConnectNamedPipe(pipe, nullptr); });
+		pk::reader rd(idx);
+		rd.test_window = [](pk::reader &me) { me.cancel(); };
+		std::vector<uint8_t> out(rr.bytes);
+		std::atomic<bool> back { false };
+		bool ok = true;
+		std::string why;
+		std::thread t([&] {
+			ok = rd.read_record(rr, out.data(), why);
+			back = true;
+		});
+		const DWORD t0 = GetTickCount();
+		while (!back && GetTickCount() - t0 < 3000)
+			Sleep(1);
+		const bool in_time = back;
+		if (!in_time)
+			CloseHandle(pipe), pipe = INVALID_HANDLE_VALUE; // (the read never ended: the pipe broken so it does, and the test fails)
+		t.join();
+		server.join();
+		if (pipe != INVALID_HANDLE_VALUE)
+			CloseHandle(pipe);
+		check(pipe != nullptr && in_time && !ok && why == "cancelled",
+			"the cancel race: a cancel() just before a piece's ReadFile on a pipe that never answers ends the read at once (\"" + why + "\")");
 	}
 
 	if (failures == 0)

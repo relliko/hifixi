@@ -1,8 +1,8 @@
 # Queues, fences and object lifetime
 
 HiFi XI runs work on several Direct3D 12 queues: the game's direct queue (made by our d3d8.dll), our own copy queues
-for zone, model-actor and character uploads, a direct queue for 2D uploads, and AMD frame generation's present and
-async compute queues. This page says what orders work between them, and when a GPU object may be released. Read it
+for zone, model-actor and character uploads and the texture pack's streamer, a direct queue for 2D uploads, and AMD
+frame generation's present and async compute queues. This page says what orders work between them, and when a GPU object may be released. Read it
 before adding a queue, a fence, an upload path or a `Release()` of anything a command list may still use.
 
 ## The rules
@@ -34,6 +34,10 @@ CPU side
   wanted (it is in retire.hpp, it is not in framegen.cpp).
 - `SetEventOnCompletion(v, event)` fires the event when the fence reaches `v`. With a null handle it blocks until
   then. It is safe from several threads at once. Our habit: test `GetCompletedValue()` first and skip the event.
+- A registration stays until the fence reaches its value, even after the wait that made it returned for another
+  handle (a stop or wake event, a timeout). One auto-reset event registered for several values is therefore set by
+  whichever value comes first: after waking on it, read `GetCompletedValue()` again and loop until the value you
+  need or the deadline (the streamer's `wait_copies`).
 - Never wait with `INFINITE` where a hung GPU or a lock held by another thread can stop the fence: give it a timeout
   and decide what to leak.
 
@@ -45,6 +49,13 @@ Object lifetime
 - A descriptor slot is the same: do not overwrite a shader-visible descriptor that a list in flight may still read.
 - An upload buffer lives until the copy that reads it is done, on the queue that ran the copy. Microsoft's ring
   buffer example (fence-based resource management) reuses upload memory only once a fence says the frame is done.
+- Never read an UPLOAD heap's mapping from the CPU. It is write-combined on the GPU: the 4070 Ti read it back at
+  57-59 MB/s against 2,400 MB/s for cached memory (2026-11-02). Memory the CPU writes and then reads (a CRC over what
+  was just read from disk) belongs in a CUSTOM heap with `CPU_PAGE_PROPERTY_WRITE_BACK` (on a discrete GPU, in L0).
+  WARP hides this: its UPLOAD memory is cached.
+- A mapped CPU-visible buffer's address space isn't given back on Release on the 4070 Ti: the driver keeps one
+  freed range and reuses it for the next of that size (a 32 MB ring made and released in a loop takes 32 MB once;
+  the streamer stopped and started again holds two rings' worth, then no more). Make such buffers once, keep them.
 
 Command allocators and lists
 
@@ -121,6 +132,54 @@ The characters' cache worker (src/chars/cache.cpp)
 - When the device goes, the queue and fence go through `retire::later` (src/chars/cache.cpp:1194-1199). That is safe
   because nothing is left running on the copy queue.
 
+The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md; M3: only packstream_test starts it)
+
+- Its own copy queue, one fence and four allocators and lists (`kInFlight`), made on the worker thread
+  (src/pack/stream.cpp:485-491) and used by it alone. The fence is signalled only by the worker, after each
+  `ExecuteCommandLists` (:1072-1073): one writer, values only going up. An allocator is reset only once the fence has
+  passed the value after its last list (`list_value`, :1042); at most 4 copies are in flight (`pick_locked`, :1101).
+- No GPU `Wait`: a ticket is stored ready (`memory_order_release`) only after the worker read the copy fence past its
+  copy (`complete`, :712, :745), so any list the game's thread records after it saw ready is submitted after the copy
+  finished. Same scheme as the zone's `ready()`. packstream_test holds copies on the GPU (below) and checks that no
+  ticket reads ready meanwhile.
+- Every wait on the copy fence is `SetEventOnCompletion` plus `WaitForMultipleObjects` with the stop event and a
+  timeout: 1 s while running (:782-785, :1350-1352), 1 s at a device change and 50 ms at stop (`wait_copies`, :590).
+  Never INFINITE, never under the streamer's mutex.
+- `wait_copies` loops on `GetCompletedValue()` until the last copy's value or the deadline, never trusting the event
+  alone (:590-610): the one auto-reset event is registered for the oldest copy by the idle wait and `wait_oldest`, and
+  when the stop event or a request ends that wait the registration stays and fires later, so a wait for the last
+  copy returned at the oldest one's. Before the M3 review that leaked the ring, queue, lists and four textures at
+  about half the stops with copies in flight. A spurious wake of the idle wait or `wait_oldest` only costs a pass.
+- What is released where: textures that were ready may be on the game's lists, so they go through `retire::later`
+  (:399-402), after the mutex is left. What only the copy queue saw (a texture never ready, the ring, queue, lists,
+  fence) is released by the worker once its own fence passed (:758, :817, `drop_parts` :452), never through retire
+  (wrong queue). At stop or a device change, if the copies don't finish within the wait, they are left (counted
+  `leaked`), not freed under the GPU.
+- An epoch change made on the worker (`do_open`, :1191: an open, close or reload) hands every resident texture to
+  `retire::later` (`end_epoch_locked`, :367) whenever the worker gets there, while owners may still hold views of
+  them (a gone ticket holds no reference). Retire's +2 rule covers lists recorded up to the next `retire::on_present`
+  (src/backend/backend.cpp:766), not the frame after it. So an owner reads its tickets (`poll`, `take_done`) after
+  the last present's `retire::on_present` and before it records, and records no view of one that isn't ready; a look
+  taken before that `on_present` in the same present can miss an epoch change landing in between and record the next
+  frame with a texture the fence passes too early. An owner that calls `open` or `close` itself stops recording its
+  views right then (docs/texture-pack/streamer.md "Notes for M4").
+- Device removed: the worker stops submitting and never waits again, and releases what the copy queue used only if it
+  had seen every copy done before the loss. All three paths decide the same way: `lose_parts` (:617-624), and
+  `wait_copies` (:599-600) for `switch_device` and `shut_down`, which can run first (stop() or set_device() right after
+  device_lost()). A fence reading `UINT64_MAX` there means "removed", not "done": only `w.completed`, the last real
+  value read, counts. A removed device needn't stop running what was submitted: WARP's `RemoveDevice` doesn't, and
+  packstream_test crashed when the worker released a ring and a texture a copy still used. Otherwise they are left: a
+  lost device ends the session anyway.
+- A device change stops new work at once: `pick_locked` starts nothing while `set_device`, an open or stop is pending
+  or the parts were made on another device (:1110), so no ticket of the new epoch is copied on the old device's queue
+  and ring, which `switch_device` (:1226) then lets go. Each job still in flight there leaves the residency map with
+  it (`let_flight_go_locked`, :563).
+- The ring is a CUSTOM heap buffer, CPU write-back in L0 (:499-511), because the reader reads the CPU's copy back for
+  its CRC.
+- Tests only: `stream::test::gate_copies` makes the copy queue `Wait` on a test fence before each copy (:1071), the one
+  GPU wait in the streamer. packstream_test holds copies there to see nothing ready and the ring not reused under a
+  copy, and to stop or remove the device with copies held; it signals the fence from the CPU.
+
 2D uploads (src/ui2d/render2d.cpp)
 
 - A separate direct queue (src/ui2d/render2d.cpp:702) that also waits for each upload's fence, 10 s at most
@@ -176,6 +235,20 @@ AMD frame generation (src/framegen)
   upload's views into it at once, while lists recorded with the old views could still run (the objects themselves
   already went through `retire::later`). Now the pair waits for the fence too (`retire::then`); charinject_test lets
   the Mithra go between a frame's recording and its run and checks a new texture gets another pair.
+- Freed under a removed device's last copy (M3, 2026-11-02, packstream_test only). The streamer released its ring
+  and textures at once on device loss, trusting "removed: nothing runs". On WARP the submitted copy went on running
+  and the test crashed in 4 of 6 runs. Now what a copy not yet seen done uses is left (src/pack/stream.cpp:617-624).
+  The M3 review found `switch_device` and `shut_down` still read `UINT64_MAX` as "done" when they ran before the
+  worker handled the loss (stop() or set_device() right after device_lost()): a scratch run crashed 3 times in 22.
+  Fixed in `wait_copies` (:599-600); the "lost-stop" and "lost-switch" children hold the copies on the GPU and check
+  nothing is released.
+- A stale fence event ended a wait early (M3 review, packstream_test only). `shut_down` and `switch_device` waited
+  once on the auto-reset event, which an older registration set at the oldest copy, so they saw the last copy not
+  done and leaked the ring, queue, lists and textures (9 of 20 probe stops). Now `wait_copies` loops on the value.
+- Work started on the old device during a device change (M3 review). `pick_locked` didn't look at a pending
+  `set_device`, so a ticket asked right after it could be copied on the old queue, and `switch_device` then left its
+  entry in the residency map pointing at a released texture, the ticket "copying" for good. Fixed in `pick_locked`
+  (:1110); packstream_test makes the change on the worker in exactly that window (`test::before_pick`).
 - Running on after the device was removed. Before 0.62 (a923d56) HiFi XI kept recording and submitting after a GPU
   hang and ended in "abnormal program termination". Now `gpu_crash::lost()` stops our passes, FSR and frame
   generation, and `retire::on_present` is no longer called.

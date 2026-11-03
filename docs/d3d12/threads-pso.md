@@ -90,12 +90,36 @@ The game-thread-only rule:
   `g.mutex`; the crash report, the status and `gpu_times` only try it. `tests/worldfx_core_test.cpp` pins this with a
   probe: a feed call made from another thread while the blades record completes.
 
+- The texture pack's streamer (`src/pack/stream.cpp`; M3: only packstream_test starts it): one worker thread
+  (`worker`, :1281), below normal (:1283), raised above normal in `stop()` before the join (:1501, memwatch's lesson).
+  Its mutex `g.mutex` (:146) is a leaf, held only for the ticket table, owners, the residency map, the snapshot
+  pointer, limits and pause bits: never across ReadFile, any D3D12 or DXGI call (`Create*`, `GetCompletedValue`,
+  `Signal`, `SetEventOnCompletion`, `ExecuteCommandLists`, `CreateShaderResourceView`, `Release`), a fence wait,
+  `pack::load` or a call into retire. One exception, `write_view` (:1788): it AddRefs the texture and the device under
+  the mutex (an interlocked count, no lock of the runtime's), so an epoch change on another thread can't free them
+  before its `CreateShaderResourceView`; their `Release` comes after the mutex is left. It calls back into nobody, so
+  an owner may call it with its own lock held (owner lock, then the streamer's), never the other way. `poll()` takes
+  no lock (:1700). `stop()` cancels the reader's read (CancelIoEx), and an open loading `pack.idx` at its next 256 KB
+  piece (`g_cancel_open`, :1493; `pack::load`'s cancel), sets the stop event and joins: 0.9-6 ms measured, also with a
+  read stalled on a pipe and with 1,000 queued; 18-21 ms with four copies in flight held until 5 ms in; 46-50 ms with
+  an open reading a slow `pack.idx` at 40 ms a piece (packstream_test, WARP and the 4070 Ti, also under GPU-based
+  validation).
+- What the worker reads at its loop's top (a device change, an open, stop) can change before it picks the next
+  texture: the mutex is let go in between (it makes its parts, sees copies done). So `pick_locked` checks them again
+  under the mutex and starts nothing while one is pending (:1110); packstream_test calls `set_device` and `request`
+  on the worker in that window (`test::before_pick`).
+- The reader's cancel race (`src/pack/pack.cpp:312`): `cancel()` sets the flag and then CancelIoEx's every handle;
+  a cancel landing between a piece's check of the flag and its ReadFile found nothing to cancel, and that piece (up
+  to 4 MB, or forever on a pipe) was read whole. The reading thread now checks the flag again after a pending
+  ReadFile and cancels its own read. pack_test's test window lands a cancel exactly there.
+
 Lists, allocators, queues:
 
 - `src/d3d8/gpu.hpp:12-27`: three frames in flight, each with its own allocator, upload pages and shader-visible
   descriptors. `src/d3d8/gpu.cpp:318-328` (`end_frame`) waits on the next set's fence before reusing its allocator.
 - Own copy queues for loaders: `src/chars/cache.cpp:265-287` (the characters' worker: queue, allocator, list, fence
-  of its own), `src/zone/native.cpp:172`, `src/zone/actordata.cpp:109`.
+  of its own), `src/zone/native.cpp:172`, `src/zone/actordata.cpp:109`, the texture pack's streamer
+  `src/pack/stream.cpp:485-491` (four allocators and lists, one per copy in flight).
 - `src/ui2d/render2d.cpp:702-704`: the 2D pass's own queue, allocator and list.
 
 Shader and PSO creation:

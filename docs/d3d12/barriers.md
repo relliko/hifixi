@@ -135,6 +135,16 @@ Our own resources:
 - `src/render/grass_render.cpp:4692,5295`, `src/fx/fxrender.cpp:596`: our private depths (floor map, blade depth, fx)
   are DENY_SHADER_RESOURCE on purpose: nothing samples them. Keep it that way, or drop the flag first.
 - `src/render/grass_render.cpp:3564,6120`: UAV barriers between World FX's passes over the same buffer.
+- The texture pack's textures (`src/pack/stream.cpp:953`): committed, made in COMMON, written once on the streamer's
+  copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
+  queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.
+  **Nobody ever puts a barrier on a pack texture**: an explicit transition on the direct queue would stop it decaying,
+  and the next list's promotion would no longer match. A key streamed again gets a new texture, never a second write.
+  packstream_test reads them back both ways with no barrier, 0 messages under GPU-based validation (WARP and the
+  4070 Ti).
+- The streamer's ring (`src/pack/stream.cpp:499-511`): a CUSTOM heap buffer (CPU write-back, L0) made in COMMON; a
+  buffer promotes to COPY_SOURCE on the copy queue and decays. Not an UPLOAD heap (GENERIC_READ for life, and
+  write-combined: docs/d3d12/sync.md).
 - `src/d3d8/gpu.cpp:60`, `src/render/gpu_crash.cpp:204,211`, `src/render/worldfx_core.cpp:2384`: debug layer and GPU
   validation switches.
 

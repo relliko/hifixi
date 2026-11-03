@@ -287,6 +287,13 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   tests\memwatch_test.cpp src\pack\memwatch.cpp src\render\gpu_crash.cpp /Fo"build\test\\" /Fe"build\memwatch_test.exe" ^
   /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\memwatch_test.exe
+rem The texture pack's streamer (src\pack\stream: worker, copy queue, ring, shared textures; docs\texture-pack\streamer.md)
+rem on WARP, and on the GPU with ZONE_GPU=1 (run_suites: packstream_gpu); the plugin doesn't link stream.cpp yet (M4):
+rem build\packstream_test.exe
+cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+  tests\packstream_test.cpp src\pack\stream.cpp src\pack\pack.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\pack\hash.cpp src\pack\validate.cpp ^
+  src\pack\memwatch.cpp /Fo"build\test\\" /Fe"build\packstream_test.exe" /link /NOLOGO /LARGEADDRESSAWARE user32.lib d3d12.lib dxgi.lib d3dcompiler.lib || exit /b 1
+echo Built build\packstream_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\memwatch.cpp /Fo"build\test\\" ^
   /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1

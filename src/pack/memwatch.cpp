@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include "memwatch.hpp"
+#include "stream_crumbs.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -343,8 +344,28 @@ namespace hifi::pack
 			v.bake == mw::kBakeUnknown ? "can't tell (a python.exe's command line couldn't be read)" : "not checked yet";
 		std::snprintf(line, sizeof(line), "  a texture bake running (bakeall.py, realesrgan-ncnn-vulkan): %s\n", bake);
 		out += line;
-		// (the streamer comes with M3: nothing of it yet)
-		out += "  streamer: none yet (no copies in flight, no upload ring, no fence of its own)\n";
+		// The streamer's crumbs (stream_crumbs.hpp: atomics the worker writes; no lock, no device or fence call)
+		namespace sc = stream_crumbs;
+		const sc::crumbs &c = sc::the;
+		const uint32_t state = c.state.load();
+		if (c.started.load() == 0 && state == sc::kNotStarted)
+		{
+			out += "  streamer: not started\n";
+			return out;
+		}
+		std::snprintf(line, sizeof(line), "  streamer: %s, %s; epoch %u, paused 0x%x; %u queued, %u copies in flight, %u textures resident (%llu MB), %u refused\n",
+			c.started.load() != 0 ? "running" : "stopped", sc::state_text(state), c.epoch.load(), c.pause.load(), c.queued.load(), c.in_flight.load(),
+			c.resident.load(), megabytes(c.resident_bytes.load()), c.refused.load());
+		out += line;
+		std::snprintf(line, sizeof(line), "  streamer's last record: key %016llx, pack-%03u.bin at %llu, %llu bytes, levels %u to %u\n",
+			static_cast<unsigned long long>(c.last_hash.load()), c.last_file.load(), static_cast<unsigned long long>(c.last_offset.load()),
+			static_cast<unsigned long long>(c.last_bytes.load()), c.last_first.load(), c.last_first.load() + (c.last_count.load() != 0 ? c.last_count.load() - 1 : 0));
+		out += line;
+		const uint64_t tick = c.progress_tick.load();
+		std::snprintf(line, sizeof(line), "  streamer's copy fence: signalled %llu, completed %llu (as the worker last read it); upload ring %llu MB, head %llu, tail %llu; last step %.1f s ago\n",
+			static_cast<unsigned long long>(c.signalled.load()), static_cast<unsigned long long>(c.completed.load()), megabytes(c.ring_size.load()),
+			static_cast<unsigned long long>(c.ring_head.load()), static_cast<unsigned long long>(c.ring_tail.load()), tick != 0 && now >= tick ? double(now - tick) / 1000.0 : 0.0);
+		out += line;
 		return out;
 	}
 }
