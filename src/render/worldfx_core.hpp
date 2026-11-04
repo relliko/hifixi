@@ -122,7 +122,7 @@ namespace worldfx
 	// The ground's colour map the host draws for the grass (grass::renderer::set_floor_source), likewise
 	void set_floor_source(grass::renderer::floor_fn fn, void *context);
 	// The light split the host draws (grass::renderer::set_light_source), likewise
-	void set_light_source(grass::renderer::light_fn fn, void *context);
+	void set_light_source(grass::renderer::light_fn fn, void *context, grass::renderer::light_marks_fn marks = nullptr);
 	// The camera of the frame being finished (VIEW and PROJECTION, row vectors), from the host: the zone pass's
 	// recorded on the game's thread, when it's fresh (false: the game's camera read now). Called with the core's lock
 	// held, on the game's thread: it mustn't call back into the core.

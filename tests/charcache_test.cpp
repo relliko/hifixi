@@ -722,6 +722,71 @@ int main()
 				" pack pairs in use, " + std::to_string(c.textures_ready) + " textures)");
 	}
 	{
+		// M9: a texture asked with a height whose colour settled ready while the height is still on its way (the streamer
+		// holds a height back while its pressure lasts) holds the colour in video memory with nothing drawing it:
+		// pack_evict lets it go first, its view bytes counted, both tickets with it, evicted until pack_unevict
+		pk::modes off;
+		cp::set_mode(off);
+		cache::set_pack_drop(&st::drop);
+		cache::set_pack_on(true);
+		const st::owner o = st::add_owner("charcache_test held");
+		const cache::key k = key_of();
+		const uint32_t id = cache::add_texture(k, named(64, 64, 150));
+		cache::settle(60000);
+		now += 0.01;
+		cache::frame_tick(device, now);
+		std::vector<cache::pack_ask> asks;
+		cache::take_pack_asks(200, asks);
+		st::ticket t, h;
+		for (const cache::pack_ask &a : asks)
+		{
+			if (a.id != id)
+				continue;
+			st::want w;
+			w.k = a.k;
+			w.down_to_w = a.down_to_w;
+			w.down_to_h = a.down_to_h;
+			w.epoch = st::epoch();
+			t = st::request(o, w);
+			// (the height's stand-in: another key's ticket, never settled, so the height stays on its way)
+			st::want hw = w;
+			hw.k = cache::test::pack_key_of(hits[8]);
+			h = st::request(o, hw);
+			if (!cache::pack_asked(a.id, a.serial, t, w.epoch, h))
+			{
+				st::drop(t);
+				st::drop(h);
+				t = h = st::ticket {};
+			}
+		}
+		for (int i = 0; i < 2000 && t.generation != 0 && st::poll(t) != st::state::ready; ++i)
+		{
+			st::on_present();
+			Sleep(1);
+		}
+		st::view v;
+		const bool got = t.generation != 0 && st::get(t, v) && v.bytes != 0;
+		cache::pack_writing w;
+		const cache::pack_step settled = got ? cache::pack_settle(t, true, cache::pack_miss::failed, 0.0f, w, v.bytes) : cache::pack_step::none;
+		const bool held = settled == cache::pack_step::wait && std::strcmp(cache::test::pack_state_of(id), "asked") == 0 && cache::get_counts().pack_heights_asked == 1;
+		uint64_t bytes = 0;
+		const uint32_t n = cache::pack_evict(1, bytes);
+		const bool evicted = n == 1 && bytes == v.bytes && std::strcmp(cache::test::pack_state_of(id), "evicted") == 0 &&
+			cache::test::pack_ticket_of(id).generation == 0 && cache::test::pack_height_ticket_of(id).generation == 0 &&
+			cache::get_counts().pack_heights_asked == 0 && cache::get_counts().pack_asked == 0;
+		uint32_t still = 0;
+		const uint32_t back = cache::pack_unevict(1, still);
+		const bool none_again = back == 1 && still == 0 && std::strcmp(cache::test::pack_state_of(id), "none") == 0;
+		check(got && held && evicted && none_again, "M9: a colour held ready while its height is on its way: let go first under pressure (" + std::to_string(n) +
+			" evicted, " + mb(bytes) + " against its view's " + mb(v.bytes) + "), both tickets with it, none again after pack_unevict");
+		cache::key moved = k;
+		moved.handle++;
+		cache::texture(moved); // (forgotten: the eviction test below has the 64 alone)
+		cache::forget_pack_textures();
+		st::drop_owner(o);
+		presents_until_back(queue);
+	}
+	{
 		// Eviction under the streamer's pressure (plan section 5, characters.md "Eviction under pressure"): the 64 drawn one
 		// after another and then the first three again, the video memory over 95% (set_limits): each half second the ones
 		// drawn longest ago back to the game's (not the first ready: those were drawn last), up to the round's bytes (three

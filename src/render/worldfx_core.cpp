@@ -112,6 +112,7 @@ namespace
 		void *floor_context = nullptr;
 		void *zone_casters_context = nullptr;
 		grass::renderer::light_fn light = nullptr;
+		grass::renderer::light_marks_fn light_marks = nullptr;
 		void *light_context = nullptr;
 		// The camera of the frame being finished, from the host (set_camera_source), else the game's camera read now
 		worldfx::camera_source_fn camera_source = nullptr;
@@ -2486,14 +2487,15 @@ namespace worldfx
 			g.renderer->set_floor_source(fn, context);
 	}
 
-	void set_light_source(grass::renderer::light_fn fn, void *context)
+	void set_light_source(grass::renderer::light_fn fn, void *context, grass::renderer::light_marks_fn marks)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.light = fn;
+		g.light_marks = marks;
 		g.light_context = context;
 		std::lock_guard<std::mutex> render(g_render_mutex);
 		if (g.renderer != nullptr)
-			g.renderer->set_light_source(fn, context);
+			g.renderer->set_light_source(fn, context, marks);
 	}
 
 	void attach(ID3D12Device *device)
@@ -2507,7 +2509,7 @@ namespace worldfx
 		g.renderer = std::make_unique<grass::renderer>();
 		g.renderer->set_casters(g.casters, g.casters_context);
 		g.renderer->set_zone_casters(g.zone_bounds, g.zone_draw, g.zone_casters_context);
-		g.renderer->set_light_source(g.light, g.light_context);
+		g.renderer->set_light_source(g.light, g.light_context, g.light_marks);
 		g.renderer->set_floor_source(g.floor, g.floor_context);
 		g.shader_stamp = 0; // (a new renderer starts from the built-in shaders: worldfx.hlsl is loaded again)
 		g.shader_status = "built in";

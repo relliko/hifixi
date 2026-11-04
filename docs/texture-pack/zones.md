@@ -659,3 +659,96 @@ M4 against the plan's steps, tests and in-game check, sections 4 and 6, streamer
   offline test (the module and the glue are tested apart: packmodule_test with a fake consumer, zonenative_test driving
   the glue as the module does); the model actors' priority against a zone's; the FSR bias in motion; everything in
   the in-game check.
+
+## Pack normals (M9 steps 2, 4 and 5, 2026-11-03: the zones' and model actors' relief, World FX's fade, the switch)
+
+The texture pack's height records (format.md "Height records") drawn as relief per pixel on the zone, its second map and
+the model actors (ships, furniture, plants: the same gpu_zone and glue, so they get relief for the first time). Only the
+light changes: the colour map, its alpha and the vertex colour are as before, nothing is multiplied into the colour.
+Characters (step 3, the detail slot's tilt): characters.md "Pack relief".
+
+- **The gpu_zone's heights' block** (`src/zone/zone_gpu.cpp/.hpp`): a pack-mode zone's pack region is `2 x textures`
+  slots, the colours' then the heights'; each height slot starts as the flat stand-in's view (red 0x80, a level height),
+  words of its own (`height_word`, `set_height_word`: none, asked, drawn, spent) under the same write-once rule:
+  `write_view` and the relief scale (`height_written`) before the word is stored drawn with release. `height_srv(i,
+  &relief)` names the slot only while the word reads drawn, heights are on (`set_heights`, every gpu_zone) and compare
+  is off; else a null handle. `pack_summary` counts the height words apart (`heights_asked`, `_drawn`, `_spent`); the
+  test log reports their events with `kHeightLog` in the texture's number, the same grammar (a, w, d, s).
+- **Asking** (`src/zone/zonepack.cpp` `frame`): while heights are on, after the colours and under the same cap, each
+  keyed texture in the same order whose entry has a height record in the pack (`stream::current()->find(key)`: a pack
+  without heights asks nothing more, logs and counts as before) is asked for it, `kind kHeight`, its **whole chain**
+  (no `down_to`: the relief is wanted mip-mapped at a distance so it doesn't sparkle, while the colour stops at the
+  game's size). Asked and settled apart from the colour: an entry with a height and no colour (a materials-only pack)
+  draws the game's texture with the pack's relief; a colour that missed doesn't stop its height.
+- **The relief scale** (`settle_height`): `4 x span x view.w / key.w` (`stream::view::param` carries the record's span):
+  the shader takes `s(u - e) - s(u + e)` one level-0 texel each way, and the game's Sobel on its own grid is 4 times
+  the central difference, times span (H = (s - 0.5) x span), times the map's texels a game texel. So a height made from
+  the game's bump map gives back the game's normals (zonenative_test's stripes and format.md's 0.61 degrees). A flat map
+  (span 0) or a scale that isn't a number is let go and its word spent.
+- **The shader** (`src/zone/draw.cpp`): a new piece flag `kPackRelief` (32) set when `height_srv` gives a view, per
+  pixel only, never for doors or a pass without bump (`no_bump`): then table 7 (t5) binds the height in the normal map's
+  place and the piece's fourth root constant (unused and 0 until now, b1 `relief`) holds the scale; no root signature,
+  pipeline or heap binding changed. `pack_tilt` makes the tilt as the game's normal maps have it (red the slope along v,
+  green along u) from four taps through the sampler (mip-mapped, anisotropic) and `GetDimensions`, then the same frame
+  from the UVs' derivatives as `kMapped`. `kMapped` prefers it where both are there; the highlight (`piece_spec`) still
+  follows `kMapped` only, so a piece that had no normal map gets the relief's light and no new shine (that's M10's).
+  `kBump` and the per-vertex path are unchanged (the pack's height is never bound there).
+- **Sobel in the shader or a stored BC5** (`shade_bench relief`, 3840x2160, 4070 Ti, 60 frames of 4 full-screen passes
+  each, a ground in perspective with a 512x512 BC2 colour, anisotropic x8 and the -0.5 bias; ms a full-screen pass,
+  median, and over no relief):
+
+  | relief | ms | over none |
+  |---|---|---|
+  | none | 0.085 | |
+  | the game's normal map, B8G8R8A8 256, 1 level (today's kMapped) | 0.107 | +0.022 |
+  | the pack's height, BC4 256 (half), Sobel in the shader | 0.170 | +0.085 |
+  | a stored normal, BC5 256 (half) | 0.101 | +0.016 |
+  | the pack's height, BC4 512 (full), Sobel in the shader | 0.195 | +0.109 |
+  | a stored normal, BC5 512 (full) | 0.097 | +0.012 |
+
+  **Taken: Sobel in the shader.** It costs about 0.07-0.1 ms more than BC5 for a whole 4K screen of relief (a zone
+  pass covers less, and only per pixel); BC5 would double the heights' bytes in the pack (16 bytes a block against 8),
+  or need a BC5 encoder on the GPU at upload, and would fix the relief's scale at build time. Revisit only if a 4K
+  frame budget ever finds the 0.1 ms.
+- **The light split's marks** (`src/zone/light_split.hpp` "Marks"): World FX turns every facing toward the camera when
+  it reads it, so the zone writes a pixel lit with the pack's relief with its facing turned away (`ps_light`); while
+  `light::marks()` is set (the pack in use with heights there and on: `pack::heights_in_use`, set each present by
+  `pack_wiring::follow_texture_bias`) the characters turn theirs toward the camera (camera.w 2 in chardraw's
+  constants) and World FX is told by zinfo.w bit 64 (`grass::renderer::set_light_source`'s new `marks` function,
+  through `worldfx::set_light_source`). With marks off every word is as before, bit for bit.
+- **World FX's relief fades there** (`src/render/grass.hlsl`): `light_at` gives `marked` (a facing turned away by more
+  than 0.02 of the view direction, past the 7-bit facing's error near edge on); the screen-space surface relief
+  (shade.z) is left out on those pixels, so the two don't double up. Everything else reads the facing as before.
+- **[textures] height** (`src/pack/packoptions.hpp`, on by default; the schema's `textures.height`, "Relief from the
+  texture pack", in the Texture pack section under "Use the texture pack", shown with the pack folder): read by the
+  module into `modes::heights`; off asks none and draws none from the next pass (heights already held stay for the
+  visit, so on again draws them at once). `/hifi textures status`: "...; relief on|off, N textures with heights)"; the
+  menu: "Relief: N textures have heights." once the pack has any; the zone's line "Relief from the pack on N of them";
+  the open's log line "N textures with heights (relief on)"; the zone's coverage log line " (N with the pack's
+  relief)" when any were asked.
+- **Unchanged without heights, measured**: against 198e154's own build (M7; a scratch worktree), zone_view of 100, 230
+  and 145 from the street (per vertex, per pixel, per pixel at night), zoneinject_test's picture (per vertex and per
+  pixel), charinject_test's and, with the installed pack (no heights, read only), zone_view per pixel of 235, 245 and
+  100 at 2560x1440: all byte for byte the same; grass_test prints the same numbers. With heights in the pack and
+  `[textures] height=0` (`ZONE_VIEW_HEIGHT=0`), the picture is the installed pack's byte for byte; per pixel off, the
+  same with heights or without.
+- **The pictures for question 11** (`C:\code\LSB\hifi-textures\m9-ab`: each zone without heights, at half and at full,
+  and crops of where they differ most, with the difference x16): from the m9-zones packs (the installed pack's colour,
+  heights 100 of 119 from the game's bump maps), per pixel, the street view: Bastok Markets (235) 53% of pixels change
+  at half (1.2 levels on average), 59% at full (1.6); Lower Jeuno (245) 46% / 58% (1.0 / 1.4); West Ronfaure (100) 61%
+  / 67% (1.0 / 1.4); the light on the whole within 0.15% everywhere. `game` is the same as `half` for these 2x zones.
+  Most of the zones' textures with game heights are the ones whose pieces already had the game's normal map, so the
+  change there is small (the pack gives back the game's own); the relief made from the colour (grass, walls without a
+  bump map) is where it shows.
+- **Tests**: zonenative_test's heights part (`zonenative_test heights`, run by the main run in a process of its own: its
+  streamer and loaders afresh; 14 checks): a made-up pack of 230's keyed textures, a third colour and height, a third a
+  height alone, a third a colour alone (BC4 stripes, 4 texels wide, span 1): heights off asks none; on, each asked once
+  and drawn (the colour-less ones too), the bytes counted, the menu's line; per pixel the picture changes (10% of
+  pixels on WARP) with the light on the whole within 3%; per pixel off byte for byte the one without; the light split's
+  words differ only on the relief's pixels, each with its depth and its facing turned away; off again byte for byte
+  (picture and light split), on again at once, compare without relief; `clear_all` spends every height; the slot-write
+  log valid for the heights' words; the debug layer silent. modelactor_test: the model DAT's heights drawn, each with
+  a relief scale. grass_test: the marks (the stripes' spread with relief 28.76, marked 18.03 = without relief 18.03,
+  facing away with marks off 28.76). shade_bench's `relief` mode.
+- **Not done**: the in-game look, and Alex's answer to question 11 (the pack's `--height-scale` default stays `half`).
+  Characters (step 3) since 2026-11-04: characters.md "Pack relief".

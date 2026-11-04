@@ -97,8 +97,11 @@ namespace hifi::chars::cache
 	bool mesh_ready(uint32_t id);
 	// A texture's pair once it's on the GPU: the texture pack's when it has one ready and allow_pack (the shadow casters
 	// refuse it: they keep the game's cut-outs) and /hifi textures compare is off, else the game's; is_pack says which
-	// (the game's thread: the time a pack pair is handed out is kept, its "last drawn")
-	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out, bool allow_pack = true, bool *is_pack = nullptr);
+	// (the game's thread: the time a pack pair is handed out is kept, its "last drawn"). is_pack: the pair's colour is the
+	// pack's (a pair written for a height alone holds a view of the game's texture: false). relief (M9, docs/texture-pack/
+	// characters.md "Pack relief"): above 0 when the pair handed out holds the pack's height in the detail map's place,
+	// its relief scale; 0 otherwise (the game's pair, or a pack pair with the detail view)
+	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out, bool allow_pack = true, bool *is_pack = nullptr, float *relief = nullptr);
 	ID3D12DescriptorHeap *heap();
 	// The renderer's own descriptors in that heap (k < kReserved: 0 the see-through target's view, 1 the scene's copy, 2
 	// the aura ring's 256 x 256 target); false before the heap. (The heap's last kReserved / 2 pairs.)
@@ -134,6 +137,9 @@ namespace hifi::chars::cache
 		// Textures evicted now (the streamer's pressure: the game's until it's gone a while), and evictions in all
 		uint32_t pack_evicted = 0;
 		uint64_t pack_evictions = 0;
+		// (M9) Ready pack pairs holding the pack's height (relief), of them the ones whose colour is the game's (a height
+		// alone: a materials-only entry, or a colour the pack hasn't); heights asked now (on their way)
+		uint32_t pack_relief = 0, pack_relief_only = 0, pack_heights_asked = 0;
 	};
 	counts get_counts();
 	std::vector<std::string> status();
@@ -181,28 +187,24 @@ namespace hifi::chars::cache
 	// fewer are free none is handed out (pack_waiting_slots: how many wait); over it, no more than the pairs over the
 	// floor less the textures already asked or being written (each ready ticket takes a pair)
 	void take_pack_asks(uint32_t max, std::vector<pack_ask> &out);
-	// The ticket a request gave: kept (asked, in epoch), or false when the texture went meanwhile (drop it)
-	bool pack_asked(uint32_t id, uint32_t serial, hifi::pack::stream::ticket t, uint32_t epoch);
+	// The ticket a request gave: kept (asked, in epoch), or false when the texture went meanwhile (drop both). height
+	// (M9): the same texture's height ticket, asked beside the colour while heights are on and the pack has one for its
+	// key (none: generation 0); the texture's pair is written only once both are settled (pack_settle)
+	bool pack_asked(uint32_t id, uint32_t serial, hifi::pack::stream::ticket t, uint32_t epoch, hifi::pack::stream::ticket height = {});
 	// A request that gave no ticket (the owner gone, the table full): spent, failed
 	void pack_refused(uint32_t id, uint32_t serial);
-	// A ticket take_done handed over ready: a pair taken (over kPackSlotFloor) and the texture marked as being written.
-	// false: not the cache's ticket any more, or no pair (the ticket let go, the texture asks again). The detail map is
-	// AddRef'd for write_pack_detail
+	// A texture's pair being written (pack_settle or pack_begin, then write_pack_detail and pack_end): t the colour's
+	// ticket (generation 0: the pack has no colour for it, and game_colour is AddRef'd: descriptor 2s a view of the game's
+	// texture), height the height's (generation 0: none, and detail_map is AddRef'd, or nullptr: descriptor 2s + 1 the
+	// detail map's view as before M9), relief its relief scale
 	struct pack_writing
 	{
 		uint32_t id = kNone, serial = 0, slot = 0;
-		hifi::pack::stream::ticket t;
+		hifi::pack::stream::ticket t, height;
+		float relief = 0.0f;
 		D3D12_CPU_DESCRIPTOR_HANDLE colour {}, detail {}; // (the pair's two descriptors)
-		ID3D12Resource *detail_map = nullptr;
+		ID3D12Resource *detail_map = nullptr, *game_colour = nullptr;
 	};
-	bool pack_begin(hifi::pack::stream::ticket t, pack_writing &out);
-	// (the mutex not held: a device call) The pair's second descriptor: a new view of the game texture's detail map (its
-	// levels from its desc), or the null view the game's pair has when it has none. Never a copy from the shader-visible
-	// heap. The detail map Released
-	void write_pack_detail(pack_writing &w);
-	// The colour view written (stream::write_view: ok) or not: ready with its view bytes, or the pair and the ticket let
-	// go and the texture spent (failed). Nothing when the texture's pack part was let go meanwhile
-	void pack_end(const pack_writing &w, bool ok, uint64_t bytes);
 	// A ticket take_done handed over missed or gone: let go, the texture spent (until its pack part is forgotten)
 	enum class pack_miss : uint8_t
 	{
@@ -210,10 +212,33 @@ namespace hifi::chars::cache
 		failed,
 		gone,
 	};
+	// (M9) A ticket take_done handed over, ready or not (why: a colour's miss), for a texture with or without a height:
+	// what's to be done now. none: not the cache's any more (or no pair to spare: let go, asked again); wait: the other
+	// of its two tickets isn't settled yet; write: a pair taken, out to be written (the caller writes the pack's views
+	// with the mutex left, then write_pack_detail, then pack_end); spent: neither had anything (the texture spent by the
+	// colour's why). relief: a height ticket's relief scale (ready only when above 0: the caller checked it). colour_bytes:
+	// a ready colour ticket's view bytes, kept while its height is on its way (pack_evict's pace for such a held colour)
+	enum class pack_step : uint8_t { none, wait, write, spent };
+	pack_step pack_settle(hifi::pack::stream::ticket t, bool ready, pack_miss why, float relief, pack_writing &out, uint64_t colour_bytes = 0);
+	// (M9) Whether t is a texture's height ticket, and that texture's key width (the game's texture: the relief's grid)
+	bool pack_height_of(hifi::pack::stream::ticket t, uint32_t &key_w);
+	// A colour ticket take_done handed over ready (no height asked): pack_settle's write. false: not the cache's ticket
+	// any more, no pair (the ticket let go, the texture asks again), or a height still on its way
+	bool pack_begin(hifi::pack::stream::ticket t, pack_writing &out);
+	// (the mutex not held: device calls) The pair's descriptors that aren't the pack's: the second a new view of the game
+	// texture's detail map (its levels from its desc), or the null view the game's pair has when it has none (nothing
+	// when the height is there); the first a view of the game's texture when the pack has no colour for it. Never a copy
+	// from the shader-visible heap. What was AddRef'd Released
+	void write_pack_detail(pack_writing &w);
+	// The pack's views written (stream::write_view: ok) or not: ready with their view bytes, or the pair and the tickets
+	// let go and the texture spent (failed). Nothing when the texture's pack part was let go meanwhile
+	void pack_end(const pack_writing &w, bool ok, uint64_t bytes);
+	// A colour ticket take_done handed over missed or gone (no height asked): pack_settle's spent
 	void pack_spent(hifi::pack::stream::ticket t, pack_miss why);
 	// The streamer's pressure (charpack, each half second while it holds: plan section 5): the ready textures whose pack
 	// pair was handed out longest ago let go (pair and ticket behind the GPU, as any), at least one, until their view bytes
-	// reach max_bytes; each evicted, not asked again until pack_unevict. How many (their view bytes in bytes)
+	// reach max_bytes; each evicted, not asked again until pack_unevict. How many (their view bytes in bytes). M9: first
+	// the asked ones holding a ready colour while their height is on its way (nothing draws them; their tickets let go)
 	uint32_t pack_evict(uint64_t max_bytes, uint64_t &bytes);
 	// The evicted textures a model drew last none again, and on the asks' list while pack parts are wanted (the pressure
 	// gone a while), at least one, until their view bytes reach max_bytes (charpack paces them a round each half second,
@@ -233,6 +258,7 @@ namespace hifi::chars::cache
 		hifi::pack::key pack_key_of(uint32_t id);
 		const char *pack_state_of(uint32_t id);
 		hifi::pack::stream::ticket pack_ticket_of(uint32_t id);
+		hifi::pack::stream::ticket pack_height_ticket_of(uint32_t id); // (M9: its height's ticket, while held)
 		uint32_t pack_slot_of(uint32_t id);
 		uint32_t game_slot_of(uint32_t id);
 		// (tests) Pairs taken out of free_slots till leave_free are left (the floor reached by hand), and given back

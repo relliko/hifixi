@@ -140,7 +140,7 @@ The characters' cache worker (src/chars/cache.cpp)
 - A batch is at most `kBatchBytes` of upload bytes (one entry bigger than that goes alone), and the worker holds at
   most one batch's textures decoded (`cache.hpp` `kBatchBytes`, `kEntryCap`): that bounds the upload buffer and the
   CPU copies in the game's 32-bit memory, not any GPU lifetime.
-- When the device goes, the queue and fence go through `retire::later` (`stop()`, src/chars/cache.cpp:1721-1726). That is safe
+- When the device goes, the queue and fence go through `retire::later` (`stop()`, src/chars/cache.cpp:1840-1845). That is safe
   because nothing is left running on the copy queue.
 
 The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md; started by the module
@@ -160,16 +160,19 @@ src/pack/pack_module.cpp, docs/texture-pack/zones.md)
   `retire::on_present` (src/backend/backend.cpp:766). That is safe because a gone ticket keeps its texture (below): a
   view's texture lives while its ticket is held, whatever the epoch does meanwhile.
 - The characters' glue (src/chars/charpack.cpp, docs/texture-pack/characters.md "When tickets are read") reads its
-  tickets there too (`take_done`, :244) and writes the pack pairs' views (:137-138) before the cache marks them ready.
+  tickets there too (`take_done`, :309) and writes the pack pairs' views (:173, :179) before the cache marks them ready.
+  Since M9 a texture may hold two tickets (its colour and its height, characters.md "Pack relief"): both kept by the
+  same entry and let go together (`release_pack`, src/chars/cache.cpp:283: each to the drop hook from `bury`), so the
+  rules below hold for each.
   The game's thread records a character with a pack pair only while its texture reads ready (`texture_view_of`,
-  src/chars/cache.cpp:1148), and nothing of the streamer's is read at record time. The ticket keeps its texture until
+  src/chars/cache.cpp:1166), and nothing of the streamer's is read at record time. The ticket keeps its texture until
   it's dropped; the drop (from `bury`, the game's thread or, for textures no list was recorded with since, the cache's
   worker) and the pair's `retire::then` both land at `signalled + 2`, behind every list recorded before. An epoch
   change is preceded by the characters' `clear_all` (`cache::forget_pack_textures`: every ticket dropped, every pair
   let go, the game's textures kept) as for the zones. charinject_test turns it off between a frame's recording and
   its run 50 times (with copies held on the GPU every fifth time): each frame as recorded, 0 messages under GPU-based
-  validation. Eviction under the streamer's pressure (`cache::pack_evict`, src/chars/cache.cpp:1513-1543, from the
-  glue's frame, src/chars/charpack.cpp:91) lets go the same way (`release_pack`: the pair to `retire::then`, the
+  validation. Eviction under the streamer's pressure (`cache::pack_evict`, src/chars/cache.cpp:1622-1657, from the
+  glue's frame, src/chars/charpack.cpp:94) lets go the same way (`release_pack`: the pair to `retire::then`, the
   ticket to the drop hook, both from `bury` once the mutex is left), so a list recorded with an evicted pair before
   the eviction still runs with its view and texture; charinject_test evicts every texture between a frame's
   recording and its run: that frame as recorded, the next with the game's, 0 messages under GPU-based validation.

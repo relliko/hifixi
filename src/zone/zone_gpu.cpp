@@ -92,7 +92,7 @@ namespace hifi::zone
 		}
 
 		// (the texture pack's: every gpu_zone's; the game's thread today, atomics in case a mark moves thread)
-		std::atomic<bool> g_compare { false };
+		std::atomic<bool> g_compare { false }, g_heights { true };
 		std::atomic<void (*)(gpu_zone &)> g_pack_drop { nullptr };
 		std::atomic<void (*)(const gpu_zone &, uint32_t, char)> g_test_log { nullptr };
 
@@ -141,6 +141,8 @@ namespace hifi::zone
 		_upload_ms = 0.0;
 		_pack_base = 0;
 		_pack_words.reset();
+		_height_words.reset();
+		_relief.reset();
 		_pack = pack_data {};
 		_z = zm::zone();
 	}
@@ -257,12 +259,13 @@ namespace hifi::zone
 
 		// The descriptors: the images', then (a zone read in the texture pack's mode with keys) a pack region of one slot a
 		// texture, each starting as the game texture's own view (zones.md: never read before its word says drawn, but a
-		// slot bound by mistake still reads a valid texture)
+		// slot bound by mistake still reads a valid texture), then (M9) the heights' block, each starting as the flat
+		// stand-in's view (its red 0x80: a level height)
 		const bool pack_region = _z.pack && !_z.overlaid && !_z.textures.empty();
 		const size_t pack_slots = pack_region ? _z.textures.size() : 0;
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		hd.NumDescriptors = UINT(images.size() + pack_slots);
+		hd.NumDescriptors = UINT(images.size() + 2 * pack_slots);
 		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap))))
 			return failed("the zone's descriptor heap couldn't be made");
@@ -294,6 +297,22 @@ namespace hifi::zone
 				h.ptr += _srv_step;
 			}
 			_pack.tickets.assign(pack_slots, hifi::pack::stream::ticket {});
+			_height_words = std::make_unique<std::atomic<uint8_t>[]>(pack_slots);
+			_relief = std::make_unique<float[]>(pack_slots);
+			const size_t flat = images.size() - 1;
+			for (size_t i = 0; i < pack_slots; ++i)
+			{
+				_height_words[i].store(kPackNone, std::memory_order_relaxed);
+				_relief[i] = 0.0f;
+				D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+				v.Format = images[flat].format;
+				v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				v.Texture2D.MipLevels = 1;
+				device->CreateShaderResourceView(_textures[flat], &v, h);
+				h.ptr += _srv_step;
+			}
+			_pack.height_tickets.assign(pack_slots, hifi::pack::stream::ticket {});
 		}
 
 		// What drawing doesn't need dropped (the sizes stay)
@@ -422,6 +441,63 @@ namespace hifi::zone
 		test_log(*this, texture, 'w');
 	}
 
+	uint8_t gpu_zone::height_word(uint32_t texture) const
+	{
+		return _height_words != nullptr && texture < _z.textures.size() ? _height_words[texture].load(std::memory_order_acquire) : uint8_t(kPackNone);
+	}
+
+	void gpu_zone::set_height_word(uint32_t texture, uint8_t word)
+	{
+		if (_height_words == nullptr || texture >= _z.textures.size() || _height_words[texture].load(std::memory_order_relaxed) == word)
+			return;
+		_height_words[texture].store(word, std::memory_order_release);
+		test_log(*this, texture | kHeightLog, word == kPackAsked ? 'a' : word == kPackDrawn ? 'd' : word == kPackSpent ? 's' : 'n');
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE gpu_zone::height_cpu(uint32_t texture) const
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE h = {};
+		if (_heap == nullptr || _height_words == nullptr || texture >= _z.textures.size())
+			return h;
+		h = _heap->GetCPUDescriptorHandleForHeapStart();
+		h.ptr += SIZE_T(_pack_base + _z.textures.size() + texture) * _srv_step;
+		return h;
+	}
+
+	void gpu_zone::height_written(uint32_t texture, float relief)
+	{
+		if (_relief == nullptr || texture >= _z.textures.size())
+			return;
+		// (read only once the word says drawn: its release store publishes this)
+		_relief[texture] = relief;
+		test_log(*this, texture | kHeightLog, 'w');
+	}
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_zone::height_srv(uint32_t texture, float *relief) const
+	{
+		D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+		if (relief != nullptr)
+			*relief = 0.0f;
+		if (_height_words == nullptr || texture >= _z.textures.size() || !g_heights.load(std::memory_order_relaxed) || g_compare.load(std::memory_order_relaxed) ||
+			_height_words[texture].load(std::memory_order_acquire) != kPackDrawn)
+			return h;
+		if (relief != nullptr)
+			*relief = _relief[texture];
+		h = _heap->GetGPUDescriptorHandleForHeapStart();
+		h.ptr += uint64_t(_pack_base + _z.textures.size() + texture) * _srv_step;
+		return h;
+	}
+
+	void gpu_zone::set_heights(bool on)
+	{
+		g_heights.store(on, std::memory_order_relaxed);
+	}
+
+	bool gpu_zone::heights()
+	{
+		return g_heights.load(std::memory_order_relaxed);
+	}
+
 	void gpu_zone::pack_let_go()
 	{
 		if (_pack.owner == 0)
@@ -452,6 +528,20 @@ namespace hifi::zone
 				break;
 			case kPackSpent:
 				c.spent++;
+				break;
+			default:
+				break;
+			}
+			switch (_height_words[i].load(std::memory_order_acquire))
+			{
+			case kPackAsked:
+				c.heights_asked++;
+				break;
+			case kPackDrawn:
+				c.heights_drawn++;
+				break;
+			case kPackSpent:
+				c.heights_spent++;
 				break;
 			default:
 				break;

@@ -5609,7 +5609,8 @@ namespace grass
 		if ((d24 || d32) && ds_desc.SampleDesc.Count == 1 && ds_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
 			if ((depth_pitch = copy_out(list, _depth, t.ds, t.ds_state, light, &light_copied)) != 0)
 			{
-				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u);
+				// (bit 64: the light split's facings marked, light_marks: asked with this frame's texture)
+				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u) | (light_copied && _light_marks != nullptr && _light_marks(_light_context) ? 64u : 0u);
 				stats.light_split = light_copied;
 				transition(list, t.ds, D3D12_RESOURCE_STATE_COPY_SOURCE, t.ds_state, 0);
 			}

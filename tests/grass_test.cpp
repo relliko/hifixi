@@ -1926,9 +1926,19 @@ int main(int argc, char **argv)
 		float weather_share = 1.0f;    // (the share of the sun's shadows the weather leaves)
 		float haze_end = 0.0f;         // (the game's fog, in the ground's own colour, from 0 to this many yalms: none while 0)
 		bool light_read = false;       // (the last frame read the host's light split: set_light_source)
+		float frame_relief = 0.0f;     // (the surface relief's strength: 0 off)
+		bool frame_stripes = false;    // (darker stripes across the ground in front of the box, as 1h's)
 		auto frame = [&](bool with_box, float shadows) {
 			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
+			if (frame_stripes)
+			{
+				const float stripe[4] = { 0.3f, 0.28f, 0.24f, 0.5f };
+				std::vector<D3D12_RECT> stripes;
+				for (LONG y = LONG(py) + 20; y < LONG(py) + 120; y += 6)
+					stripes.push_back({ LONG(px) - 120, y, LONG(px) + 120, y + 3 });
+				g.list->ClearRenderTargetView(world_rtv, stripe, UINT(stripes.size()), stripes.data());
+			}
 			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			ground_depth(cam);
 			if (with_box)
@@ -1955,7 +1965,7 @@ int main(int argc, char **argv)
 			look l2 = l;
 			l2.grass = false;
 			l2.ao_strength = 0.0f;
-			l2.relief = 0.0f;
+			l2.relief = frame_relief;
 			l2.sun[0] = to_sun.x;
 			l2.sun[1] = to_sun.y;
 			l2.sun[2] = to_sun.z;
@@ -2028,12 +2038,14 @@ int main(int argc, char **argv)
 			struct source
 			{
 				ID3D12Resource *texture;
-			} src_ctx = { nullptr };
+				bool marks;
+			} src_ctx = { nullptr, false };
 			r.set_light_source([](void *c) { return static_cast<source *>(c)->texture; }, &src_ctx);
 			const float lx = cam.proj[11] != 0.0f ? cam.proj[10] / cam.proj[11] : cam.proj[10], ly = cam.proj[14];
 			// (facing up, y down: octahedral (0, -1, 0) is (0, -1), each side 0..127)
 			const uint32_t up_bits = uint32_t(std::lround(0.5 * 127.0)) << 11 | uint32_t(std::lround(0.0)) << 18;
-			auto words = [&](float share) {
+			auto words = [&](float share, uint32_t facing_bits = 0xFFFFFFFFu) {
+				const uint32_t facing = facing_bits != 0xFFFFFFFFu ? facing_bits : up_bits;
 				uint32_t *w = nullptr;
 				sup->Map(0, nullptr, reinterpret_cast<void **>(&w));
 				for (UINT y = 0; y < H; ++y)
@@ -2046,7 +2058,7 @@ int main(int argc, char **argv)
 						{
 							const double vd = ly / (d24 / 16777215.0 - lx);
 							const uint32_t code = uint32_t(std::clamp(std::lround((std::log2(std::max(vd, 1e-3)) + 3.0) * 128.0), 1L, 2047L));
-							v = code | up_bits | uint32_t(std::lround(std::clamp(share, 0.0f, 1.0f) * 127.0f)) << 25;
+							v = code | facing | uint32_t(std::lround(std::clamp(share, 0.0f, 1.0f) * 127.0f)) << 25;
 						}
 						w[size_t(y) * (sfp.Footprint.RowPitch / 4) + x] = v;
 					}
@@ -2080,6 +2092,52 @@ int main(int argc, char **argv)
 			check(std::fabs(n0 - n_lit) < 1.0, "no shadow on ground the sun doesn't light (its share 0)");
 			check(n72 < n_lit * 0.9 && n36 < n_lit - 0.35 * (n_lit - n72) && n36 > n_lit - 0.65 * (n_lit - n72), "a shadow takes the sun's share: about half at half of it");
 			check(std::fabs(box_split - box_old) < 1.0, "where the word isn't what's drawn (the box), as without the split");
+
+			// The light split's marks (M9, HiFi XI's light_split.hpp "Marks": zinfo.w bit 64): a facing written turned away
+			// from the camera is a pixel the zone lit with the texture pack's relief, and the surface relief leaves it be (the
+			// two would double up). Striped ground with the relief on: words facing up (toward the camera), the stripes'
+			// spread as the relief makes it; facing down (marked) with marks on, as with the relief off; with marks off the
+			// facing is only turned back, the relief as it was
+			{
+				r.set_light_source([](void *c) { return static_cast<source *>(c)->texture; }, &src_ctx, [](void *c) { return static_cast<source *>(c)->marks; });
+				// (facing down, y down: octahedral (0, 1, 0) is (0, 1))
+				const uint32_t down_bits = uint32_t(std::lround(0.5 * 127.0)) << 11 | 127u << 18;
+				auto spread_of = [&](const std::vector<uint8_t> &img) {
+					double sum = 0.0, sum2 = 0.0;
+					uint32_t n = 0;
+					for (LONG y = LONG(py) + 30; y < std::min(LONG(H), LONG(py) + 100); ++y)
+						for (LONG x = std::max(0L, LONG(px) - 100); x < std::min(LONG(W), LONG(px) + 100); ++x)
+						{
+							const uint8_t *c = &img[(size_t(y) * W + x) * 4];
+							const double v = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+							sum += v;
+							sum2 += v * v;
+							n++;
+						}
+					const double m = n != 0 ? sum / n : 0.0;
+					return n != 0 ? std::sqrt(std::max(0.0, sum2 / n - m * m)) : 0.0;
+				};
+				frame_stripes = true;
+				src_ctx.marks = true;
+				words(0.72f);
+				frame_relief = 0.0f;
+				const double no_relief = spread_of(frame(false, 0.0f));
+				frame_relief = 1.0f;
+				const double unmarked = spread_of(frame(false, 0.0f));
+				words(0.72f, down_bits);
+				const double marked = spread_of(frame(false, 0.0f));
+				const bool read_marked = light_read;
+				src_ctx.marks = false;
+				const double marks_off = spread_of(frame(false, 0.0f));
+				std::printf("  the light split's marks: the stripes' spread %.2f without relief, %.2f with it (facing the camera), %.2f marked, %.2f facing away "
+					"with marks off\n", no_relief, unmarked, marked, marks_off);
+				check(read_marked && unmarked > no_relief * 1.15 && std::fabs(marked - no_relief) < 0.02 * no_relief + 0.05 && std::fabs(marks_off - unmarked) < 0.02 * unmarked + 0.05,
+					"the surface relief leaves a pixel marked as the texture pack's relief be, only while the marks are on");
+				frame_stripes = false;
+				frame_relief = 0.0f;
+				src_ctx.marks = false;
+				r.set_light_source(nullptr, nullptr);
+			}
 			release(sup);
 			release(split);
 		}

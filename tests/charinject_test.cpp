@@ -31,11 +31,15 @@
  *     times as far, the colours within 2 of brightness. The real pack (read only; skipped without): the original bytes'
  *     keys in it; the overlay's copies' (what the game holds while hifi-textures is listed) none, and the line says why.
  *     Per pixel too: the shine groups' highlight (by the texture's alpha) as bright with the pack as with the game's.
- *     CHARS_DETAIL=1: the pack's pairs' second view of each detail map too.
+ *     CHARS_DETAIL=1: the pack's pairs' second view of each detail map too. M9: a pack with heights (a third colour and
+ *     height, a third a height alone, a third a colour alone): off none asked or drawn; on each asked, its relief scale
+ *     in the pair, per vertex unchanged, per pixel changed with the light within 3%, compare none, off again byte for
+ *     byte, on again the same, clear_all lets every height go.
  *   ZONE_GPU=1 runs it on the first GPU in place of WARP. For a look, not the checks: CHARS_DATS="ROM\a\b.DAT;..." draws
  *   those DATs read as one (a race's base file, then its gear) in place of the Mithra (the pose: tests/chars_pose.py on
  *   the base file), and CHARS_PICTURES=<folder> writes game, pack and overlay BMPs there (whole and close up: the game's
- *   textures, the real pack's, the hifi-textures overlay's copies).
+ *   textures, the real pack's, the hifi-textures overlay's copies). M9's relief A/B: HIFIXI_PACK=<folder> another pack
+ *   for "the real pack", CHARS_PACK_HEIGHT=0/1 its heights off or on, CHARS_SUN="x y z" the sun toward there (y down).
  *
  *   build\charinject_test.exe <pose.bin> [out.bmp]
  */
@@ -56,6 +60,7 @@
 #include "../src/pack/pack.hpp"
 #include "../src/pack/pack_write.hpp"
 #include "../src/pack/stream.hpp"
+#include "../src/pack/validate.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -435,8 +440,26 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 	// so (the game's drawn). flat: level 0 green and every other level blue, alpha 0x88 (passing the alpha test
 	// everywhere); else the game's own picture 4x (each texel 4 x 4), its mips by bc2::full_chain (a cut-out's keeping
 	// level 0's coverage, as the converter makes them)
+	// A BC4 level (M9's heights) of stripes along u: block columns 0 and 255 in turn (4 texels each), down every row
+	std::vector<uint8_t> height_stripes(uint32_t w, uint32_t h)
+	{
+		const uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
+		std::vector<uint8_t> b(size_t(bw) * bh * 8, 0);
+		for (uint32_t y = 0; y < bh; ++y)
+			for (uint32_t x = 0; x < bw; ++x)
+			{
+				uint8_t *p = b.data() + (size_t(y) * bw + x) * 8;
+				p[0] = p[1] = (x & 1) != 0 ? 255 : 0; // (r0 == r1: every code 0 is r0)
+			}
+		return b;
+	}
+
+	// kinds (M9, not nullptr): heights too, each texture in turn (sides multiples of 4; else a colour alone) 0 a colour
+	// and a height, 1 a height alone (no colour record: the game's colour drawn with the pack's relief), 2 a colour alone;
+	// the heights stripes 2x the game's size (a model's half), span kHeightSpan; *kinds says which each texture got
+	constexpr float kHeightSpan = 0.25f;
 	bool make_mithra_pack(const std::wstring &folder, const std::vector<std::pair<hifi::pack::key, const std::vector<uint8_t> *>> &textures,
-		const hifi::pack::key &left_out, const hifi::pack::key &no_pack, bool flat, std::string &why)
+		const hifi::pack::key &left_out, const hifi::pack::key &no_pack, bool flat, std::string &why, std::vector<int> *kinds = nullptr)
 	{
 		namespace pk = hifi::pack;
 		remove_tree(folder);
@@ -446,8 +469,16 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 		o.source = "charinject_test";
 		if (!w.open(o, why))
 			return false;
+		if (kinds != nullptr)
+			kinds->clear();
+		uint32_t turn = 0;
 		for (const auto &[k, bytes] : textures)
 		{
+			int kind = 2;
+			if (kinds != nullptr && k.w % 4 == 0 && k.h % 4 == 0)
+				kind = int(turn++ % 3);
+			if (kinds != nullptr)
+				kinds->push_back(kind);
 			if (k == left_out)
 				continue;
 			pk::entry e;
@@ -498,7 +529,22 @@ float4 ps(o i) : SV_Target { return t.Sample(s, i.uv); }
 				const std::vector<uint8_t> top = pk::bc2::encode_bc2(px.data(), m.w, m.h);
 				m.levels = pk::bc2::full_chain(top.data(), m.w, m.h, e.alpha_kind, pk::bc2::kCharsCutThreshold);
 			}
-			if (w.add(e, { m }, why) != pk::add_result::ok)
+			std::vector<pk::map_in> maps;
+			if (kind != 1)
+				maps.push_back(std::move(m));
+			if (kind != 2)
+			{
+				pk::map_in hm;
+				hm.kind = pk::kHeight;
+				hm.format = pk::kBC4;
+				hm.w = 2 * k.w;
+				hm.h = 2 * k.h;
+				std::memcpy(&hm.param, &kHeightSpan, 4);
+				for (uint32_t l = 0, n = pk::full_levels(hm.w, hm.h); l < n; ++l)
+					hm.levels.push_back(height_stripes(std::max(1u, hm.w >> l), std::max(1u, hm.h >> l)));
+				maps.push_back(std::move(hm));
+			}
+			if (w.add(e, maps, why) != pk::add_result::ok)
 				return false;
 		}
 		const bool ok = w.commit(why);
@@ -644,7 +690,15 @@ int main(int argc, char **argv)
 	check(inj::prepare(device, why), "the renderer made" + (why.empty() ? "" : ": " + why));
 	inj::set_options(getenv("CHARS_PERPIXEL") != nullptr, getenv("CHARS_DETAIL") != nullptr); // (the per-pixel option: CHARS_PERPIXEL=1; the detail maps: CHARS_DETAIL=1)
 	// (with it the zone's sun, as the plugin passes it: the models' light 0 below is that sun, for its highlight)
-	const float sun_l = std::sqrt(0.31f * 0.31f + 0.951f * 0.951f), toward_sun[3] = { -0.31f / sun_l, -0.951f / sun_l, 0.0f };
+	// (CHARS_SUN="x y z": toward the sun from elsewhere, y down: e.g. a low sun for M9's relief pictures)
+	float toward_sun[3] = { -0.31f, -0.951f, 0.0f };
+	if (const char *s = getenv("CHARS_SUN"); s != nullptr)
+		std::sscanf(s, "%f %f %f", &toward_sun[0], &toward_sun[1], &toward_sun[2]);
+	{
+		const float sun_l = std::sqrt(toward_sun[0] * toward_sun[0] + toward_sun[1] * toward_sun[1] + toward_sun[2] * toward_sun[2]);
+		for (float &c : toward_sun)
+			c /= sun_l;
+	}
 	inj::set_sun(getenv("CHARS_PERPIXEL") != nullptr ? toward_sun : nullptr);
 
 	// The camera on the three of them
@@ -1918,10 +1972,135 @@ int main(int argc, char **argv)
 				quiet_check("  the Mithra's own pictures");
 			}
 
+			// M9 (docs/texture-pack/characters.md "Pack relief"): a pack of the Mithra's own pictures with heights, a third a
+			// colour and a height, a third a height alone (the game's colour, the pack's relief), a third a colour alone.
+			// Heights off: none asked, none drawn. On: each asked once, the pair's detail descriptor the height (flags 4, its
+			// relief scale); per vertex the picture as without; per pixel it changes, the light on the whole within 3%; compare
+			// shows none; off again byte for byte the picture without, on again the same as before
+			{
+				cp::clear_all();
+				std::vector<int> kinds;
+				const bool hmade = make_mithra_pack(here + L"heights\\", textures, pk::key {}, pk::key {}, false, pack_why, &kinds) && open(here + L"heights\\");
+				uint32_t with = 0, alone = 0, colour_only = 0;
+				for (int k : kinds)
+					(k == 0 ? with : k == 1 ? alone : colour_only)++;
+				check(hmade && kinds.size() == tids.size() && with != 0 && alone != 0, "M9: a made-up pack of the Mithra's own pictures with heights: " + std::to_string(with) +
+					" with a colour and a height, " + std::to_string(alone) + " a height alone, " + std::to_string(colour_only) + " a colour alone" +
+					(pack_why.empty() ? std::string() : ": " + pack_why));
+				const bool detail = getenv("CHARS_DETAIL") != nullptr;
+				inj::set_sun(sun_toward);
+				pk::modes hm;
+				hm.chars = true;
+				hm.heights = false;
+				cp::set_mode(hm);
+				const uint64_t asked_before = cp::get_counts().heights_asked;
+				const bool off_settled = pump_settled();
+				const ch::cache::counts off_counts = ch::cache::get_counts();
+				std::vector<uint8_t> h_off, v_off, c_off;
+				inj::set_options(true, detail);
+				render(vp, h_off);
+				cp::set_compare(true);
+				render(vp, c_off);
+				cp::set_compare(false);
+				inj::set_options(false, detail);
+				render(vp, v_off);
+				check(off_settled && cp::get_counts().heights_asked == asked_before && off_counts.pack_relief == 0 && off_counts.pack_heights_asked == 0 &&
+					off_counts.pack_ready == with + colour_only, "  heights off: none asked, none drawn, the colours ready (" + std::to_string(off_counts.pack_ready) + ")");
+				// (on: every pack part let go and asked again, the heights beside the colours)
+				hm.heights = true;
+				cp::set_mode(hm);
+				const bool on_settled = pump_settled();
+				const ch::cache::counts on_counts = ch::cache::get_counts();
+				bool relief_views = true;
+				std::string relief_text;
+				for (size_t i = 0; i < tids.size(); ++i)
+				{
+					D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+					bool is_pack = false;
+					float relief = -1.0f;
+					const bool got = ch::cache::texture_view_of(tids[i], h, true, &is_pack, &relief);
+					// (4 x span x the map's texels a game texel: 2x)
+					const float want = kinds[i] != 2 ? 4.0f * kHeightSpan * 2.0f : 0.0f;
+					const bool ok = got && is_pack == (kinds[i] != 1) && std::fabs(relief - want) < 1e-6f;
+					relief_views = relief_views && ok;
+					if (!ok && relief_text.empty())
+						relief_text = ": texture " + std::to_string(i) + " (kind " + std::to_string(kinds[i]) + ") is_pack " + std::to_string(is_pack) + ", relief " + std::to_string(relief);
+					float casters_relief = -1.0f;
+					bool casters_pack = true;
+					relief_views = relief_views && ch::cache::texture_view_of(tids[i], h, false, &casters_pack, &casters_relief) && !casters_pack && casters_relief == 0.0f;
+				}
+				std::snprintf(line, sizeof(line), "  heights on: %llu asked, %u pairs with the pack's relief (%u on the game's colour), %u colours from the pack",
+					static_cast<unsigned long long>(cp::get_counts().heights_asked - asked_before), on_counts.pack_relief, on_counts.pack_relief_only, on_counts.pack_ready);
+				check(on_settled && cp::get_counts().heights_asked - asked_before == with + alone && on_counts.pack_relief == with + alone && on_counts.pack_relief_only == alone &&
+					on_counts.pack_ready == with + colour_only && on_counts.pack_heights_asked == 0, line);
+				check(relief_views, "  texture_view_of: the relief scale (4 x span x 2) on exactly the textures with a height, the colour the pack's but for the heights alone; none with the pack refused (the casters)" + relief_text);
+				std::vector<uint8_t> v_on, h_on, c_on;
+				render(vp, v_on);
+				check(v_on == v_off, "  per vertex: the picture byte for byte as with heights off (no relief without per-pixel lighting)");
+				inj::set_options(true, detail);
+				const uint64_t draws_before = inj::get_counts().relief_draws;
+				render(vp, h_on);
+				const uint64_t relief_draws = inj::get_counts().relief_draws - draws_before;
+				{
+					uint32_t changed = 0, both = 0;
+					double l_off = 0.0, l_on = 0.0;
+					for (size_t i = 0; i < size_t(W) * H; ++i)
+					{
+						const uint8_t *a = h_off.data() + i * 4, *b = h_on.data() + i * 4;
+						if (!mithra(h_off, middle, i) || !mithra(h_on, middle, i))
+							continue;
+						both++;
+						changed += std::memcmp(a, b, 4) != 0;
+						l_off += 0.3 * a[0] + 0.59 * a[1] + 0.11 * a[2];
+						l_on += 0.3 * b[0] + 0.59 * b[1] + 0.11 * b[2];
+					}
+					const double ratio = l_off > 0.0 ? l_on / l_off : 0.0;
+					std::snprintf(line, sizeof(line), "  per pixel: %llu draws with relief, %u of the Mithra's %u pixels changed, the light on the whole %.2f%% of it (within 3%%)",
+						static_cast<unsigned long long>(relief_draws), changed, both, 100.0 * ratio);
+					check(relief_draws != 0 && changed > both / 50 && std::fabs(ratio - 1.0) <= 0.03, line);
+				}
+				cp::set_compare(true);
+				render(vp, c_on);
+				cp::set_compare(false);
+				check(c_on == c_off, "  compare: the game's pairs, no relief (byte for byte as with heights off)");
+				// (off again: every pair written again with the detail map's view, the picture as without heights)
+				hm.heights = false;
+				cp::set_mode(hm);
+				const bool off_again = pump_settled();
+				std::vector<uint8_t> h_off2, h_on2;
+				render(vp, h_off2);
+				check(off_again && h_off2 == h_off && ch::cache::get_counts().pack_relief == 0, "  off again: byte for byte the picture with heights off, no pair with relief");
+				hm.heights = true;
+				cp::set_mode(hm);
+				const bool on_again = pump_settled();
+				render(vp, h_on2);
+				std::string bad;
+				check(on_again && h_on2 == h_on && ch::cache::test::slots_consistent(bad), "  on again: the same picture with relief; no pair twice" + (bad.empty() ? std::string() : ": " + bad));
+				cp::clear_all();
+				const ch::cache::counts cleared = ch::cache::get_counts();
+				bool no_height_tickets = true;
+				for (uint32_t t : tids)
+					no_height_tickets = no_height_tickets && ch::cache::test::pack_height_ticket_of(t).generation == 0;
+				check(cleared.pack_relief == 0 && cleared.pack_heights_asked == 0 && no_height_tickets, "  clear_all: every height let go");
+				hm.heights = false;
+				cp::set_mode(hm);
+				inj::set_options(getenv("CHARS_PERPIXEL") != nullptr, detail);
+				inj::set_sun(getenv("CHARS_PERPIXEL") != nullptr ? toward_sun : nullptr);
+				quiet_check("  the heights");
+			}
+
 			// The real pack (read only; skipped without it): the Mithra's original bytes' keys in it; the overlay's copies'
 			// (the game's bytes while hifi-textures is listed) none, and the line says pack_why
 			{
 				cp::clear_all();
+				// (CHARS_PACK_HEIGHT=0/1: the pictures' pack with its heights off or on, M9's A/B; HIFIXI_PACK: another pack)
+				if (const char *ph = getenv("CHARS_PACK_HEIGHT"); ph != nullptr)
+				{
+					pk::modes rm;
+					rm.chars = true;
+					rm.heights = std::atoi(ph) != 0;
+					cp::set_mode(rm);
+				}
 				const std::wstring real = pk::folder_in(L"C:\\Games\\PhoenixXI\\bootloader");
 				const std::vector<dat_chunk> overlay = dats != nullptr ? read_dats(dats, true) : read_dat_at("C:\\Games\\PhoenixXI\\polplugins\\DATs\\hifi-textures\\ROM2\\0\\52.DAT");
 				// (CHARS_PICTURES=<folder>: the game's textures, the real pack's and the overlay's copies drawn whole and close

@@ -141,7 +141,15 @@ namespace hifi::pack
 		uint32_t bytes = 0;    // all levels in the copy layout (validate.hpp footprint's total)
 		uint32_t crc = 0;      // CRC-32 of those bytes
 		uint32_t level_crc = 0; // index of level 0's CRC in the index's level CRC table (level i's at level_crc + i)
-		uint32_t reserved = 0;
+		// (M9) a height record's span, float32 bits (height.hpp: H = (s - 0.5) * span; 0 a flat map); other kinds 0.
+		// Readers before M9 ignore it (it was reserved)
+		uint32_t param = 0;
+		float span() const
+		{
+			float f;
+			std::memcpy(&f, &param, 4);
+			return f;
+		}
 	};
 	static_assert(sizeof(record) == 32);
 

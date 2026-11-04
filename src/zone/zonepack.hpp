@@ -13,6 +13,10 @@
 //     written into the zone's pack slot (stream::write_view), then its word set drawn; a missed or gone one dropped
 //     and its word spent. Read before backend::present's retire::on_present: a ticket keeps its texture until it's
 //     dropped, gone or not (zones.md decision 1), so the view stays valid while the word says drawn.
+//   - (M9) While heights are on (set_mode's heights, [textures] height), after the colours: each keyed texture whose entry
+//     has a height record in the pack (stream::current) asked for that record, its whole chain, under the same cap; a
+//     ready one's view written into the zone's height block with its relief scale (gpu_zone::height_written), then its
+//     height word set drawn. Asked and settled apart from the colour, so an entry with no colour still gets its relief.
 //   - A gpu_zone let go (gpu_zone::pack_let_go before retire::later, or its destructor) runs the drop hook: its owner
 //     dropped (stream::drop_owner: no wait, it may go right after), every word spent, out of the list; its visit done.
 //   - clear_all (the module, before every close, open, stop, a device change or loss): every owner dropped, every word
@@ -40,7 +44,8 @@ namespace hifi::zone::zonepack
 	// The module's consumer (pack::add_consumer, main.cpp: the first; its set_mode takes the zones' and actors' modes)
 	pack::consumer consumer();
 	void clear_all();
-	void set_mode(bool zones, bool actors);
+	// (heights: M9's [textures] height: the pack's height records asked and drawn as relief, gpu_zone::set_heights)
+	void set_mode(bool zones, bool actors, bool heights = true);
 	void frame(double now, uint32_t epoch);
 	void set_compare(bool on);
 	void lines(std::vector<std::string> &out);
@@ -61,6 +66,7 @@ namespace hifi::zone::zonepack
 		uint64_t dropped = 0;                // (owners dropped: the hook and clear_all)
 		uint32_t most_in_a_present = 0;      // (requests in one present, at most)
 		uint32_t last_requests = 0, last_views = 0; // (the last present's)
+		uint64_t heights_asked = 0, heights_drawn = 0, heights_failed = 0; // (M9: of those, the height records')
 	};
 	counts get_counts();
 	// (tests) The order a zone's textures are asked in (empty until it has been ordered)

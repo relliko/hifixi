@@ -28,12 +28,16 @@
 //   - The game: checked before each batch and every --game-poll-s (3) seconds while the upscaler runs. When it starts,
 //     the upscaler is ended, its batch thrown away, and make waits (progress.txt: paused) until the game has been
 //     closed for --game-quiet-s (60) seconds, then does that batch again. --no-wait: stop with exit 4 instead.
+//   - --heights (M9; off by default until M9 is approved): each texture also gets its height record (heights.hpp, at
+//     --height-scale), made from its BC2 colour decoded, zones' from the bump DAT's map of their name where there is one
+//     (height_from_game): the same bytes make and then heights would write.
 
 #include "shared.hpp"
 #include "keys.hpp"
 #include "image_io.hpp"
 #include "keeptexels.hpp"
 #include "upscale.hpp"
+#include "heights.hpp"
 #include "../../src/pack/pack_write.hpp"
 #include "../../src/pack/bc2.hpp"
 #include "../../src/pack/hash.hpp"
@@ -44,6 +48,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -247,8 +252,23 @@ namespace hifi::texpack
 			pk::map_in map;
 			bool made = false, no_picture = false, soul_failed = false;
 			bool own = false; // (the pack's entry for the key is this DAT chunk's: replaced)
+			// (--heights: the zone's bump map of the texture's name, if any; the height record once made)
+			bool has_game = false;
+			hgt::game_map game;
+			hgt::made height;
 			std::string why;
 			soul_result s;
+		};
+
+		// (--heights) A key in the pack from before whose height was made from the colour, met again in a zone whose bump
+		// DAT has the game's map for it: its height made again from that map after the batch's adds
+		struct to_game_later
+		{
+			pk::key k;
+			std::string rel;
+			uint32_t chunk = 0;
+			std::vector<uint8_t> body; // the original chunk (the colour when the pack's can't be read)
+			hgt::game_map game;
 		};
 
 		struct batch_dat
@@ -262,6 +282,8 @@ namespace hifi::texpack
 		{
 			uint32_t dats = 0, refused = 0, made = 0, deduped = 0, skipped = 0, soul_failed = 0, no_picture = 0, unused = 0, untagged = 0, walk_failed = 0;
 			uint32_t same = 0, differs = 0, add_refused = 0, replaced = 0, batches = 0, pauses = 0;
+			uint32_t heights = 0, heights_game = 0, no_height = 0; // (--heights)
+			uint32_t heights_to_game = 0; // (--heights: shared with a zone before it that has no game map, made from the game's)
 			uint32_t by_kind[5] = {};
 			uint64_t texels_in = 0, texels_out = 0;
 			double upscaler_s = 0, cpu_s = 0, waited_s = 0;
@@ -305,6 +327,12 @@ namespace hifi::texpack
 		if (!o.kind.empty() && o.kind != "zone" && o.kind != "model")
 		{
 			say("--kind is zone or model.");
+			return kUsage;
+		}
+		pk::height::scale height_scale;
+		if (!pk::height::parse(o.height_scale, height_scale))
+		{
+			say("--height-scale is half, full or game.");
 			return kUsage;
 		}
 		// (Ashita's folder: given, above the game's folder (find_folders), or above this tool's)
@@ -561,7 +589,8 @@ namespace hifi::texpack
 		for (const dat_in *in : todo)
 		{
 			const uint64_t f = in->kind == pk::kSourceZone ? o.zone_factor : o.model_factor;
-			estimate += uint64_t(double(in->texels * f * f) * 4.0 / 3.0 * 1.05);
+			// (--heights: BC4 at the colour's size at most, half a byte a texel)
+			estimate += uint64_t(double(in->texels * f * f) * 4.0 / 3.0 * 1.05 * (o.heights ? 1.5 : 1.0));
 		}
 		ULARGE_INTEGER free_bytes = {};
 		std::wstring probe = no_slash(out);
@@ -653,6 +682,9 @@ namespace hifi::texpack
 			std::vector<batch_dat> dats;
 			std::vector<job> jobs;
 			std::set<pk::key> queued;
+			std::map<pk::key, size_t> job_of; // (--heights: a key's job in the batch)
+			std::vector<to_game_later> upgrades;
+			std::set<pk::key> upgrading;
 			uint64_t texels = 0, tsv_texels = 0;
 			phase = "reading DATs";
 			while (next < todo.size() && (dats.empty() || texels < budget))
@@ -672,6 +704,15 @@ namespace hifi::texpack
 				const std::vector<bk::chunk> cs = bk::chunks(dat);
 				const uint32_t factor = in.kind == pk::kSourceZone ? o.zone_factor : o.model_factor;
 				const bool failed_walk = in.kind == pk::kSourceZone && walk_failed.count(in.rel) != 0;
+				// (--heights: the zone's bump DAT's height maps, by name)
+				std::unordered_map<std::string, hgt::game_map> games;
+				if (o.heights && in.kind == pk::kSourceZone)
+				{
+					const uint32_t bump = hgt::bump_id_of(in.id);
+					std::vector<uint8_t> bump_bytes;
+					if (bump < ids.rel_of.size() && !ids.rel_of[bump].empty() && bk::read_file(o.ffxi + L"\\" + wide(ids.rel_of[bump]), bump_bytes))
+						games = hgt::game_maps(bump_bytes);
+				}
 				for (size_t i = 0; i < cs.size(); ++i)
 				{
 					const bk::chunk &c = cs[i];
@@ -693,13 +734,42 @@ namespace hifi::texpack
 					const pk::entry *had = w.find(k);
 					const bool own = had != nullptr && in.id != 0xFFFFFFFFu && had->file_id == in.id && had->chunk == uint32_t(i) &&
 						std::memcmp(had->name, c.body + 1, 16) == 0;
+					const auto game_here = games.find(hgt::bump_name(c.body + 1));
 					if ((had != nullptr && !own) || !queued.insert(k).second)
 					{
 						d.deduped++;
+						// (--heights, game heights first: a texture two zones share (one key) is made in the first; when only
+						// this one's bump DAT has the game's map for it, its height is the game's all the same. Still in the
+						// batch: the job takes the map; in the pack from before, made from the colour: made again from the
+						// map after the batch's adds)
+						if (game_here != games.end())
+						{
+							if (const auto q = job_of.find(k); q != job_of.end())
+							{
+								if (!jobs[q->second].has_game)
+								{
+									jobs[q->second].has_game = true, jobs[q->second].game = game_here->second;
+									n.heights_to_game++;
+								}
+							}
+							else if (had != nullptr && had->map(pk::kHeight) != nullptr && (had->flags & pk::kHeightFromGame) == 0 && upgrading.insert(k).second)
+							{
+								to_game_later u;
+								u.k = k;
+								u.rel = in.rel;
+								u.chunk = uint32_t(i);
+								u.body.assign(c.body, c.body + c.size);
+								u.game = game_here->second;
+								upgrades.push_back(std::move(u));
+							}
+						}
 						continue;
 					}
 					job j;
 					j.own = own;
+					if (game_here != games.end())
+						j.has_game = true, j.game = game_here->second;
+					job_of[k] = jobs.size();
 					j.dat = dats.size();
 					j.chunk = uint32_t(i);
 					j.body.assign(c.body, c.body + c.size);
@@ -865,6 +935,15 @@ namespace hifi::texpack
 						j.made = !j.map.levels.empty();
 						if (!j.made)
 							j.why = "no mips";
+						// (the height from the colour as stored, BC2 decoded: make --heights writes what make then heights would)
+						if (j.made && o.heights)
+						{
+							const std::vector<uint8_t> stored = pk::bc2::decode_bc2(blocks.data(), W, H);
+							j.height = hgt::make(stored.data(), W, H, j.w, j.h, j.e.alpha_kind, j.threshold, j.has_game ? &j.game : nullptr, height_scale);
+							if (j.height.ok && j.height.from_game)
+								j.e.flags |= pk::kHeightFromGame;
+						}
+						j.game.bytes.clear();
 						j.rgba.clear();
 						j.rgba.shrink_to_fit();
 					});
@@ -905,7 +984,16 @@ namespace hifi::texpack
 					continue;
 				}
 				std::string why2;
-				switch (w.add(j.e, { j.map }, why2, j.own))
+				std::vector<pk::map_in> maps { j.map };
+				if (j.height.ok)
+					maps.push_back(std::move(j.height.map));
+				else if (o.heights)
+				{
+					n.no_height++;
+					say("%s: chunk %u '%s': no height (%s)", rel.c_str(), j.chunk, name16(reinterpret_cast<const uint8_t *>(j.e.name)).c_str(), j.height.why.c_str());
+				}
+				n.heights += j.height.ok, n.heights_game += j.height.ok && j.height.from_game;
+				switch (w.add(j.e, maps, why2, j.own))
 				{
 				case pk::add_result::replaced:
 					n.replaced++;
@@ -929,6 +1017,39 @@ namespace hifi::texpack
 					break;
 				}
 				j.map.levels.clear();
+			}
+			// (--heights, game heights first: the keys from before whose height a zone in this batch has the game's map for)
+			if (!upgrades.empty() && !failed)
+			{
+				std::string why2;
+				const std::shared_ptr<const pk::index> idx = pk::load(out, nullptr, why2);
+				std::unique_ptr<pk::reader> rd = idx ? std::make_unique<pk::reader>(idx) : nullptr;
+				for (to_game_later &u : upgrades)
+				{
+					const pk::entry *pe = idx ? idx->find(u.k) : nullptr;
+					std::vector<uint8_t> rgba;
+					uint32_t cw = 0, ch = 0;
+					hgt::made m;
+					if (pe != nullptr && hgt::colour_of(*rd, *pe, u.body.data(), uint32_t(u.body.size()), rgba, cw, ch, why2))
+						m = hgt::make(rgba.data(), cw, ch, pe->w, pe->h, pe->alpha_kind, pk::bc2::zone_cut_threshold(pe->vcol_a), &u.game, height_scale);
+					else
+						m.why = pe == nullptr ? "not in the pack as loaded (" + why2 + ")" : why2;
+					if (!m.ok)
+					{
+						say("%s: chunk %u: its height not made again from the game's map (%s)", u.rel.c_str(), u.chunk, m.why.c_str());
+						continue;
+					}
+					const pk::add_result r = w.set_map(u.k, m.map, pk::kHeightFromGame, 0, why2);
+					if (r == pk::add_result::refused)
+					{
+						say("%s: chunk %u: its height from the game's map not added: %s", u.rel.c_str(), u.chunk, why2.c_str());
+						failed = failed || why2.find("writing") != std::string::npos || why2.find("can't open") != std::string::npos;
+						continue;
+					}
+					n.heights_to_game++;
+					say("%s: chunk %u: its bump DAT has the game's map for this texture, which a zone before it shares without one: its height made again "
+						"from the game's", u.rel.c_str(), u.chunk);
+				}
 			}
 			if (failed)
 			{
@@ -981,6 +1102,9 @@ namespace hifi::texpack
 		say("entries: made %u (none %u, cut-out %u, blended %u, mask %u, mixed %u; %u of them replacing what the DAT made before), the same key again %u, "
 			"differing %u, refused %u; %zu in the pack",
 			n.made, n.by_kind[0], n.by_kind[1], n.by_kind[2], n.by_kind[3], n.by_kind[4], n.replaced, n.same, n.differs, n.add_refused, w.entries().size());
+		if (o.heights)
+			say("heights (%s resolution): %u made, %u of them from the zones' bump DATs, %u without one; %u from the game's map of a zone after the "
+				"first that shares the texture", pk::height::name(height_scale), n.heights, n.heights_game, n.no_height, n.heights_to_game);
 		say("tags: zone textures no mesh uses %u, in zones whose meshes can't be read %u (blended); model textures no Os2 group names %u (none)", n.unused,
 			n.walk_failed, n.untagged);
 		say("time: upscaler %.1f s, keeping texels/BC2/mips %.1f s for %.2f M original texels (%.2f M made): %.2f us per original texel; written %.3f GB",

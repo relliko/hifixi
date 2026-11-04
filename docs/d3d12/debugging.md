@@ -109,7 +109,9 @@ Breadcrumbs:
 - Each piece's note says whose texture was bound (`piece_note::pack`, `src/zone/draw.hpp:102`, from
   `gpu_zone::texture_srv(texture, &pack)` at draw.cpp:959; printed by `note_text` :444 as "texture N (the texture
   pack's)" or "(the game's)"), so a zone-pass hang report tells a pack texture from the game's own
-  (docs/texture-pack/zones.md "Risks": run the same build with the pack off first).
+  (docs/texture-pack/zones.md "Risks": run the same build with the pack off first). Since M9 also whether the pack's
+  height was bound in the normal map's place (`piece_note::relief`, "normal map N (the texture pack's relief in its
+  place)", shader flag 0x20 kPackRelief).
 - World FX: `src/render/grass_render.cpp:2214-2322`. `crumb()` writes both IN and OUT at every section marker;
   the report names the section the GPU stopped in, or says the stop came outside World FX.
 - `draw.cpp` must not link `gpu_crash` (tests link draw without it): hence `add_section`. The sections are added at

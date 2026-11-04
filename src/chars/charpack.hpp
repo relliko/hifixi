@@ -19,6 +19,9 @@
 //     memory), each half second the textures a model drew longest ago go back to the game's (cache::pack_evict, through
 //     the retire list like any let go), held so till it's been gone the hold (kEvictHoldS, doubled while it keeps coming
 //     back just after), then asked again a round each half second (characters.md "Eviction under pressure").
+//   - M9 (characters.md "Pack relief"): with heights on (set_mode's modes::heights) a texture the pack has a height for
+//     is asked for it beside its colour; the cache writes its pair once both are settled (cache::pack_settle), the
+//     height in the detail map's place. Heights turned on or off let every pack part go, as chars off does.
 //   - clear_all (the module, before every close, open, reload, stop, device change and loss): every pack part let go
 //     (cache::forget_pack_textures: tickets to the drop hook, pairs behind the GPU), the owner dropped. The game's
 //     textures stay on the GPU: the characters keep being drawn by HiFi XI with them.
@@ -68,6 +71,7 @@ namespace hifi::chars::charpack
 		uint64_t not_in_pack = 0, failed = 0, gone = 0;    // (tickets missed as not in it or no_pack, missed otherwise, gone)
 		uint64_t refused = 0;                              // (requests that gave no ticket)
 		uint64_t evicted = 0, evict_rounds = 0;            // (textures back to the game's under the pressure; rounds that did)
+		uint64_t heights_asked = 0, heights = 0, heights_missed = 0; // (M9: heights requested; pairs written with one; missed or flat)
 		double hold_s = kEvictHoldS;                       // (the hold now: how long the pressure must be gone before they're asked again)
 		uint32_t last_requests = 0, last_views = 0;        // (the last frame's)
 		bool other_device = false;                         // (the cache's device isn't the module's: nothing asked)

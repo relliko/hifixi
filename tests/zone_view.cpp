@@ -21,7 +21,11 @@
  *     game's own file: zm::load's pack) and every keyed texture streamed from that pack (read only) as the plugin's
  *     glue asks for it (src/zone/zonepack: the colour record down to the game's size), its view written into the zone's
  *     pack slot and its word set drawn before the picture; it prints what came of them. A map another overlay serves
- *     (Zi'Tah's canopy) gets no pack region: the picture is the one without the pack
+ *     (Zi'Tah's canopy) gets no pack region: the picture is the one without the pack. With it (M9) every keyed texture
+ *     whose entry has a height record gets it too, its whole chain, as the glue asks it (zonepack: the view into the
+ *     zone's height block with its relief scale, gpu_zone::height_written), drawn as relief with --perpixel
+ *   ZONE_VIEW_HEIGHT=0: no height asked ([textures] height=0): the picture as before M9
+ *   ZONE_VIEW_SUN="x y z": the day's sun toward there (y down), e.g. "0.9 -0.15 0.4" a low sun for the relief A/B
  *   ZONE_VIEW_BIAS=<b>: the colour maps' extra mip bias (draw_options::texture_bias), for the FSR A/B: e.g. Quality's
  *     -0.585 at ZONE_VIEW_SIZE 2/3 of the full size
  *   HIFIXI_PIVOT_INI: the overlays (zonemesh's dat_core; unset: config\pivot\pivot.ini beside build\, none here)
@@ -43,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -172,6 +177,10 @@ namespace
 		gz.pack().owner = o;
 		gz.pack().epoch = epoch;
 		gz.pack().tickets.assign(d.textures.size(), st::ticket {});
+		gz.pack().height_tickets.assign(d.textures.size(), st::ticket {});
+		char hv[8] = "";
+		const bool heights = GetEnvironmentVariableA("ZONE_VIEW_HEIGHT", hv, sizeof(hv)) == 0 || hv[0] != '0';
+		hifi::zone::gpu_zone::set_heights(heights);
 
 		// (the order: the most used first, by the triangles naming each texture times its model's placements)
 		std::vector<uint64_t> placed(d.models.size(), 0), uses(d.textures.size(), 0);
@@ -210,6 +219,28 @@ namespace
 			by_slot.emplace_back(tk.slot, i);
 			gz.set_pack_word(i, hifi::zone::gpu_zone::kPackAsked);
 		}
+		// (M9: then the heights, as zonepack asks them: an entry with a height record, its whole chain)
+		uint32_t heights_asked = 0, heights_drawn = 0;
+		for (size_t rank = 0; heights && rank < order.size(); ++rank)
+		{
+			const uint32_t i = order[rank];
+			const zm::texture &t = d.textures[i];
+			const hifi::pack::entry *e = idx->find(t.key);
+			if (e == nullptr || e->map(hifi::pack::kHeight) == nullptr)
+				continue;
+			st::want w;
+			w.k = t.key;
+			w.kind = hifi::pack::kHeight;
+			w.priority = int32_t(order.size() - rank);
+			w.epoch = epoch;
+			const st::ticket tk = st::request(o, w);
+			if (tk.generation == 0)
+				continue;
+			gz.pack().height_tickets[i] = tk;
+			by_slot.emplace_back(tk.slot, i | hifi::zone::gpu_zone::kHeightLog);
+			gz.set_height_word(i, hifi::zone::gpu_zone::kPackAsked);
+			heights_asked++;
+		}
 
 		// The tickets as they come: views for the ready ones (the levels counted), the rest spent by why
 		uint32_t drawn = 0, levels[8] = {}, bigger = 0;
@@ -224,7 +255,33 @@ namespace
 			for (const auto &[tk, s] : done)
 			{
 				const auto at = std::find_if(by_slot.begin(), by_slot.end(), [&](const auto &e) { return e.first == tk.slot; });
-				if (at == by_slot.end() || !(gz.pack().tickets[at->second] == tk))
+				if (at == by_slot.end())
+					continue;
+				if ((at->second & hifi::zone::gpu_zone::kHeightLog) != 0)
+				{
+					// (a height: its relief scale as zonepack's settle_height makes it)
+					const uint32_t i = at->second & ~hifi::zone::gpu_zone::kHeightLog;
+					if (!(gz.pack().height_tickets[i] == tk))
+						continue;
+					outstanding--;
+					st::view v;
+					float span = 0.0f;
+					if (s == st::state::ready && st::get(tk, v))
+						std::memcpy(&span, &v.param, 4);
+					const float relief = d.textures[i].key.w != 0 ? 4.0f * span * float(v.w) / float(d.textures[i].key.w) : 0.0f;
+					if (std::isfinite(relief) && relief > 0.0f && st::write_view(tk, gz.height_cpu(i)))
+					{
+						gz.height_written(i, relief);
+						gz.pack().bytes += v.bytes;
+						gz.set_height_word(i, hifi::zone::gpu_zone::kPackDrawn);
+						heights_drawn++;
+						continue;
+					}
+					st::drop(tk);
+					gz.set_height_word(i, hifi::zone::gpu_zone::kPackSpent);
+					continue;
+				}
+				if (!(gz.pack().tickets[at->second] == tk))
 					continue;
 				const uint32_t i = at->second;
 				outstanding--;
@@ -255,9 +312,9 @@ namespace
 			if (reasons[m] != 0)
 				missed += std::string(missed.empty() ? "" : ", ") + std::to_string(reasons[m]) + " " + st::text(st::miss(m));
 		std::printf("map %u from the pack: %u of %zu textures (%zu keyed) drawn from it, %u of them bigger than the game's; views of 1/2/3/4+ levels %u/%u/%u/%u; missed: %s; "
-			"%llu gone, %zu not back; %.1f MB in %.0f ms\n", d.map, drawn, d.textures.size(), order.size(), bigger, levels[1], levels[2], levels[3],
+			"%llu gone, %zu not back; heights %u of %u asked drawn%s; %.1f MB in %.0f ms\n", d.map, drawn, d.textures.size(), order.size(), bigger, levels[1], levels[2], levels[3],
 			levels[4] + levels[5] + levels[6] + levels[7], missed.empty() ? "none" : missed.c_str(), static_cast<unsigned long long>(gone), outstanding,
-			double(gz.pack().bytes) / 1048576.0, ms);
+			heights_drawn, heights_asked, heights ? "" : " (ZONE_VIEW_HEIGHT=0)", double(gz.pack().bytes) / 1048576.0, ms);
 		for (const std::string &l : st::status())
 			std::printf("  %s\n", l.c_str());
 		return true;
@@ -497,6 +554,9 @@ int main(int argc, char **argv)
 	std::memcpy(f.view_proj, vp.m, sizeof(vp.m));
 	std::memcpy(f.camera, eye, sizeof(eye));
 	float sun_dir[3] = { 0.35f, night ? -0.25f : -0.85f, 0.4f };
+	// (ZONE_VIEW_SUN="x y z": the day's sun from elsewhere, toward it, y down: e.g. a low sun for M9's relief A/B)
+	if (const char *s = std::getenv("ZONE_VIEW_SUN"); s != nullptr)
+		std::sscanf(s, "%f %f %f", &sun_dir[0], &sun_dir[1], &sun_dir[2]);
 	norm3(sun_dir);
 	std::memcpy(f.sun_dir, sun_dir, sizeof(sun_dir));
 	float sun[3] = { 1.26f, 1.25f, 1.1f }, dusk[3] = { 0.35f, 0.38f, 0.55f };

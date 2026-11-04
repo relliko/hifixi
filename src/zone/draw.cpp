@@ -4,7 +4,8 @@
  *   1  4 constants b1: the object, the piece's first index, its flags
  *   2  SRV t0      the zone's vertices (48 bytes)        3  SRV t1  its indices (32-bit) (the second map's for its objects)
  *   4  SRV t2      the frame's objects (80 bytes)        5  SRV t3  its lamps (32 bytes)
- *   6  table t4    the piece's texture                   7  table t5  its normal map
+ *   6  table t4    the piece's texture                   7  table t5  its normal map, or (kPackRelief) the texture pack's
+ *                                                                     height (BC4) from the pack region's height block
  *   s0             anisotropic x8, wrapping, mip bias -0.5 (the zone pass draws without mips: MIPFILTER NONE; the
  *                  game's textures have one level, an overlay's bigger copies step down to the game's size:
  *                  zm::texture::levels, as do the texture pack's); the colour map sampled with draw_options'
@@ -54,8 +55,8 @@ cbuffer draw_constants : register(b1)
 {
 	uint object_index;
 	uint first_index;
-	uint piece;          // kBump, kTested, kDoorEnv, kMapped (a normal map: used per pixel), kBlended
-	uint unused;
+	uint piece;          // kBump, kTested, kDoorEnv, kMapped (a normal map: used per pixel), kBlended, kPackRelief
+	uint relief;         // kPackRelief: the height's relief scale (float bits: gpu_zone::height_written); else 0
 };
 struct vertex { float3 pos; float3 normal; uint colour; float2 uv; float3 sway; };
 // (env: its own | a door's << 8; lamp: x the game's 4 lamps, a byte each, then yzw the frame's lamps whose range
@@ -67,10 +68,10 @@ StructuredBuffer<uint> indices : register(t1);
 StructuredBuffer<object> objects : register(t2);
 StructuredBuffer<lamp_t> lamps : register(t3);
 Texture2D colour_map : register(t4);
-Texture2D normal_map : register(t5);
+Texture2D normal_map : register(t5); // (kPackRelief: the texture pack's height, BC4: its red)
 SamplerState wrap : register(s0);
 
-static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
+static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kPackRelief = 32, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
 // HiFi XI's own look per pixel (hemi_spec.hpp). The ambient from a sky: x kSkyAbove on what faces up, x kSkyBelow on
 // what faces down, tinted kSkyTint toward the fog's hue from above and the sun's (its light off the ground) from below;
 // a town's street seen from it comes out as bright as the game's on the whole (the ground's a little brighter, walls a
@@ -139,6 +140,22 @@ float3 near_lamp_light(object o, float3 world, float3 n)
 			sum += one_lamp((word >> (8 * k)) & 255, world, n);
 	}
 	return sum;
+}
+
+// (per pixel, kPackRelief: M9, docs/texture-pack/zones.md "Pack normals") The tilt from the texture pack's height at uv,
+// as the game's own normal maps have it (zonemesh::sobel): red the slope along v, green along u, both in the game's
+// units (relief: 4 x span x the map's texels a game texel), so a height made from the game's bump map gives back its
+// normals. The differences one level-0 texel each way through the mip-mapped, filtered height: at a distance the
+// smaller levels' smoother slope, so the relief doesn't sparkle. Only the light it gives changes, never the colour.
+float3 pack_tilt(float2 uv)
+{
+	float w, h;
+	normal_map.GetDimensions(w, h);
+	const float2 e = 1.0 / max(float2(w, h), 1.0);
+	const float l = normal_map.Sample(wrap, uv - float2(e.x, 0)).r, r = normal_map.Sample(wrap, uv + float2(e.x, 0)).r;
+	const float u = normal_map.Sample(wrap, uv - float2(0, e.y)).r, d = normal_map.Sample(wrap, uv + float2(0, e.y)).r;
+	const float k = asfloat(relief);
+	return normalize(float3(k * (u - d), k * (l - r), 1));
 }
 
 // (per pixel) The env's ambient a from its sky, at the facing n (world, its length the object's scale)
@@ -245,10 +262,15 @@ float4 shade(v2p i, out float share)
 		// (the normal's length kept: the object's scale in its light, as per vertex)
 		const float scale = length(i.normal);
 		float3 n = i.normal / max(scale, 1e-6);
-		// (every piece with a normal map uses it here, not only the bump shader's models: this is HiFi XI's own look)
-		if ((piece & kMapped) != 0)
+		// (every piece with a normal map uses it here, not only the bump shader's models: this is HiFi XI's own look; the
+		// texture pack's height in its place where it has one, and on pieces with none: kPackRelief)
+		if ((piece & (kMapped | kPackRelief)) != 0)
 		{
-			const float3 m = normal_map.Sample(wrap, i.uv).rgb * 2 - 1;
+			float3 m;
+			[branch] if ((piece & kPackRelief) != 0)
+				m = pack_tilt(i.uv);
+			else
+				m = normal_map.Sample(wrap, i.uv).rgb * 2 - 1;
 			const float3 dp1 = ddx(i.world), dp2 = ddy(i.world);
 			const float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
 			const float3 p1 = cross(dp2, n), p2 = cross(n, dp1);
@@ -315,12 +337,15 @@ light_out ps_light(v2p i)
 	float share;
 	o.colour = shade(i, share);
 	const float3 n = i.normal;
-	o.light = light_word(i.depth, dot(n, options.yzw - i.world) < 0 ? -n : n, share);
+	// (the facing turned toward the camera; on a pixel lit with the texture pack's relief turned away instead: the light
+	// split's mark, light_split.hpp "Marks", so World FX's own relief fades there. World FX turns it back either way)
+	const float3 toward = dot(n, options.yzw - i.world) < 0 ? -n : n;
+	o.light = light_word(i.depth, (piece & kPackRelief) != 0 ? -toward : toward, share);
 	return o;
 }
 )";
 
-		constexpr uint32_t kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16;
+		constexpr uint32_t kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kPackRelief = 32;
 		constexpr UINT64 kConstantsBytes = 1024;
 		// Blended pieces' depth bias: the game sends ZBIAS 8 for them (notes-zone, "Blended pieces"), which dgVoodoo 2.87
 		// makes DepthBias trunc(-2.5 ZBIAS) and SlopeScaledDepthBias -0.5 ZBIAS, no clamp (measured: dgvprobe ZBIAS_TEST)
@@ -449,9 +474,10 @@ light_out ps_light(v2p i)
 			for (int i = 15; i >= 0 && (name[i] == ' ' || name[i] == 0); --i)
 				name[i] = 0;
 			std::snprintf(line, sizeof(line), "  %s: draw %u: object %u (model %u \"%s\", at %.1f %.1f %.1f, flags 0x%X, %s), its piece %u (index %u, %u triangles, "
-				"texture %d (%s), normal map %d, shader flags 0x%X); its game lamps (bytes, 255 none): %u %u %u %u\n",
+				"texture %d (%s), normal map %d%s, shader flags 0x%X); its game lamps (bytes, 255 none): %u %u %u %u\n",
 				what, draw, n.object, n.model, name, n.at[0], n.at[1], n.at[2], n.object_flags, n.zone == 0 ? "the zone's" : "the second map's", n.piece,
-				n.first_index, n.triangles, int(n.texture), n.pack ? "the texture pack's" : "the game's", int(n.normal_map), n.flags, n.lamps & 255, (n.lamps >> 8) & 255,
+				n.first_index, n.triangles, int(n.texture), n.pack ? "the texture pack's" : "the game's", int(n.normal_map),
+				n.relief ? " (the texture pack's relief in its place)" : "", n.flags, n.lamps & 255, (n.lamps >> 8) & 255,
 				(n.lamps >> 16) & 255, n.lamps >> 24);
 			return line;
 		}
@@ -949,15 +975,24 @@ light_out ps_light(v2p i)
 						step(kStepPipeline);
 				}
 				// (doors take the fixed-function path, never the bump shader; their bit-28 pieces the door's environment)
+				// (M9: the texture pack's height for the piece's texture, per pixel only and where a normal map would be used:
+				// gpu_zone::height_srv, a null handle when there's none, heights are off or compare is on. kMapped stays as
+				// it is (the highlight follows it); kBump too)
+				float relief = 0.0f;
+				const D3D12_GPU_DESCRIPTOR_HANDLE height = o.per_pixel && !door && !p.no_bump ? z->height_srv(pc.texture, &relief) : D3D12_GPU_DESCRIPTOR_HANDLE {};
+				const bool pack_relief = height.ptr != 0;
 				const uint32_t flags = (pc.normal_map != zm::kNone && mo.bump && !door && !p.no_bump ? kBump : 0) | ((fo.flags & zm::kAlphaTested) != 0 ? kTested : 0) |
 					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !p.no_bump ? kMapped : 0) |
-					(blended ? kBlended : 0);
-				const uint32_t dc[4] = { i, pc.first_index, flags, 0 };
+					(blended ? kBlended : 0) | (pack_relief ? kPackRelief : 0);
+				uint32_t relief_bits = 0;
+				if (pack_relief)
+					std::memcpy(&relief_bits, &relief, 4);
+				const uint32_t dc[4] = { i, pc.first_index, flags, relief_bits };
 				list->SetGraphicsRoot32BitConstants(1, 4, dc, 0);
 				// (the texture pack's view once its word says drawn: gpu_zone::texture_srv; whether it was, for the breadcrumbs)
 				bool pack = false;
 				list->SetGraphicsRootDescriptorTable(6, z->texture_srv(pc.texture, &pack));
-				list->SetGraphicsRootDescriptorTable(7, z->normal_srv(pc.normal_map));
+				list->SetGraphicsRootDescriptorTable(7, pack_relief ? height : z->normal_srv(pc.normal_map));
 				// (the breadcrumbs: begun before draw n, then draw n finished)
 				const uint32_t crumb = tag | (st.draws & 0xFFFFu);
 				D3D12_WRITEBUFFERIMMEDIATE_PARAMETER wb = { crumb_va, crumb };
@@ -981,6 +1016,7 @@ light_out ps_light(v2p i)
 					n.texture = pc.texture;
 					n.normal_map = pc.normal_map;
 					n.pack = pack;
+					n.relief = pack_relief;
 					n.lamps = go[i].lamps[0];
 					n.zone = fo.zone;
 					std::memcpy(n.name, mo.name, sizeof(n.name));

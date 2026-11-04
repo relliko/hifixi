@@ -735,11 +735,16 @@ namespace grass
 		// frame, by the pass that shades (not the blades' at the zone's end), before the depth is copied: the texture written
 		// since the last call, in NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE (left so), or nullptr. It's copied after
 		// the depth (grass.hlsl light_at). nullptr: none.
+		// marks (nullptr: none): whether the facings in it are marked (HiFi XI's light_split.hpp "Marks": a facing written
+		// turned away from the camera is a pixel lit with the texture pack's relief), asked with the texture each frame;
+		// zinfo.w bit 64 then, and grass.hlsl's own relief fades on the marked pixels
 		using light_fn = ID3D12Resource *(*)(void *context);
-		void set_light_source(light_fn fn, void *context)
+		using light_marks_fn = bool (*)(void *context);
+		void set_light_source(light_fn fn, void *context, light_marks_fn marks = nullptr)
 		{
 			_light = fn;
 			_light_context = context;
+			_light_marks = marks;
 		}
 		// The ground's own colour the host draws (HiFi XI: the native zone data, docs/own-frame/grass-colour.md): from above,
 		// world_to_clip taking world x, z to the map and the height (world y) to its depth, into rtv (R16G16B16A16_FLOAT,
@@ -962,6 +967,7 @@ namespace grass
 		void *_zone_casters_context = nullptr;
 		// The host's light split (set_light_source)
 		light_fn _light = nullptr;
+		light_marks_fn _light_marks = nullptr;
 		void *_light_context = nullptr;
 		// The ground's colour map: drawn by the host (_floor), its texture and depth and their views; copied to the start of
 		// the blades' memory (u0: a header of kFloorHeader bytes, its middle x, z (floats), texels a yalm, its size, a row's

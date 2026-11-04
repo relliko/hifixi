@@ -323,6 +323,84 @@ namespace hifi::pack
 		return true;
 	}
 
+	const char *writer::lay_out(const map_in &in, laid &o, std::string &why)
+	{
+		o = laid {};
+		layout l;
+		if (in.w % 4 != 0 || in.h % 4 != 0 || !footprint(in.format, in.w, in.h, uint32_t(in.levels.size()), l))
+			return (why = "a map's format, size or level count breaks the rules").c_str();
+		o.bytes.assign(size_t(l.total), 0);
+		for (uint32_t i = 0; i < l.levels; ++i)
+		{
+			const level_layout &lv = l.level[i];
+			if (in.levels[i].size() != size_t(lv.row_bytes) * lv.rows)
+				return (why = "level " + std::to_string(i) + "'s bytes aren't its blocks'").c_str();
+			for (uint32_t row = 0; row < lv.rows; ++row)
+				std::memcpy(o.bytes.data() + lv.offset + size_t(row) * lv.row_pitch, in.levels[i].data() + size_t(row) * lv.row_bytes, lv.row_bytes);
+			o.level_crcs.push_back(crc32(0, o.bytes.data() + lv.offset, size_t(l.level_span(i))));
+		}
+		o.r.kind = in.kind;
+		o.r.levels = uint8_t(l.levels);
+		o.r.w = uint16_t(in.w);
+		o.r.h = uint16_t(in.h);
+		o.r.format = in.format;
+		o.r.bytes = uint32_t(l.total);
+		o.r.crc = crc32(0, o.bytes.data(), o.bytes.size());
+		o.r.param = in.param;
+		if (const char *bad = check(o.r))
+			return (why = bad).c_str();
+		return nullptr;
+	}
+
+	add_result writer::set_map(const key &k, const map_in &map, uint16_t flags_set, uint16_t flags_clear, std::string &why)
+	{
+		auto refuse = [&](const std::string &w) {
+			why = w;
+			counts.refused++;
+			return add_result::refused;
+		};
+		if (!opened)
+			return refuse("the writer isn't open");
+		auto it = where.find(k);
+		if (it == where.end())
+			return refuse("no entry with that key");
+		laid o;
+		std::string bad;
+		if (lay_out(map, o, bad) != nullptr)
+			return refuse(bad);
+		entry &e = list[it->second];
+		record *slot = nullptr;
+		for (record &r : e.maps)
+			if (r.kind == map.kind)
+				slot = &r;
+		if (slot != nullptr && slot->format == o.r.format && slot->w == o.r.w && slot->h == o.r.h && slot->levels == o.r.levels && slot->bytes == o.r.bytes &&
+			slot->crc == o.r.crc && slot->param == o.r.param)
+		{
+			e.flags = uint16_t((e.flags | flags_set) & ~flags_clear);
+			counts.same++;
+			return add_result::same;
+		}
+		const bool replacing = slot != nullptr;
+		if (slot == nullptr)
+			for (record &r : e.maps)
+				if (r.kind == kUnused && slot == nullptr)
+					slot = &r;
+		if (slot == nullptr)
+			return refuse("the entry has no free map slot");
+		if (!append(o.bytes.data(), o.bytes.size(), o.r.offset, o.r.file, why))
+		{
+			counts.refused++;
+			return add_result::refused;
+		}
+		o.r.level_crc = uint32_t(crcs.size());
+		crcs.insert(crcs.end(), o.level_crcs.begin(), o.level_crcs.end());
+		*slot = o.r;
+		e.flags = uint16_t((e.flags | flags_set) & ~flags_clear);
+		counts.bytes += o.bytes.size();
+		(replacing ? counts.maps_replaced : counts.maps_added)++;
+		return replacing ? add_result::replaced : add_result::ok;
+	}
+
 	add_result writer::add(const entry &e, const std::vector<map_in> &maps, std::string &why, bool replace)
 	{
 		const key k = e.the_key();
@@ -338,41 +416,14 @@ namespace hifi::pack
 		if (maps.empty() || maps.size() > 3)
 			return refuse("an entry has 1 to 3 maps");
 		// (each map laid out in the copy layout, its CRCs made, before anything is written or compared)
-		struct laid
-		{
-			record r;
-			std::vector<uint8_t> bytes;
-			std::vector<uint32_t> level_crcs;
-		};
 		std::vector<laid> out(maps.size());
 		for (size_t m = 0; m < maps.size(); ++m)
 		{
-			const map_in &in = maps[m];
 			for (size_t n = 0; n < m; ++n)
-				if (maps[n].kind == in.kind)
+				if (maps[n].kind == maps[m].kind)
 					return refuse("two maps of one kind");
-			layout l;
-			if (in.w % 4 != 0 || in.h % 4 != 0 || !footprint(in.format, in.w, in.h, uint32_t(in.levels.size()), l))
-				return refuse("a map's format, size or level count breaks the rules");
-			laid &o = out[m];
-			o.bytes.assign(size_t(l.total), 0);
-			for (uint32_t i = 0; i < l.levels; ++i)
-			{
-				const level_layout &lv = l.level[i];
-				if (in.levels[i].size() != size_t(lv.row_bytes) * lv.rows)
-					return refuse("level " + std::to_string(i) + "'s bytes aren't its blocks'");
-				for (uint32_t row = 0; row < lv.rows; ++row)
-					std::memcpy(o.bytes.data() + lv.offset + size_t(row) * lv.row_pitch, in.levels[i].data() + size_t(row) * lv.row_bytes, lv.row_bytes);
-				o.level_crcs.push_back(crc32(0, o.bytes.data() + lv.offset, size_t(l.level_span(i))));
-			}
-			o.r.kind = in.kind;
-			o.r.levels = uint8_t(l.levels);
-			o.r.w = uint16_t(in.w);
-			o.r.h = uint16_t(in.h);
-			o.r.format = in.format;
-			o.r.bytes = uint32_t(l.total);
-			o.r.crc = crc32(0, o.bytes.data(), o.bytes.size());
-			if (const char *bad = check(o.r))
+			std::string bad;
+			if (lay_out(maps[m], out[m], bad) != nullptr)
 				return refuse(bad);
 		}
 		size_t old = list.size();
@@ -384,7 +435,7 @@ namespace hifi::pack
 			{
 				const record *r = have.map(o.r.kind);
 				same = same && r != nullptr && r->format == o.r.format && r->w == o.r.w && r->h == o.r.h && r->levels == o.r.levels &&
-					r->bytes == o.r.bytes && r->crc == o.r.crc;
+					r->bytes == o.r.bytes && r->crc == o.r.crc && r->param == o.r.param;
 			}
 			if (same || !replace)
 			{

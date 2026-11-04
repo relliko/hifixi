@@ -36,16 +36,19 @@ cbuffer frame_constants : register(b0)
 	float4 options;      // x: per-pixel lighting; y: the frame's models; z: the detail maps ([chars] detail, per pixel only);
 	                     // w: the texture pack's mip bias (FSR, the pack's textures only: flags 2)
 	float4 sun_dir;      // toward the zone's sun (world), w: 1 when it's known (the light split's share: which light is it)
-	float4 camera;       // the camera (world), w: 1 when it's known (the sun's highlight)
+	float4 camera;       // the camera (world), w: 1 when it's known (the sun's highlight); 2: known, and the light split's
+	                     // marks on (light_split.hpp "Marks": the facing written turned toward the camera)
 };
 cbuffer draw_constants : register(b1)
 {
 	uint model_index;
 	float light_scale;   // the material's dword 4
-	uint flags;          // 1: shine (the alpha always passes); 2: the texture is the pack's (sampled with options.w's bias)
+	uint flags;          // 1: shine (the alpha always passes); 2: the texture is the pack's (sampled with options.w's bias);
+	                     // 4 (M9): t6 is the texture pack's height (BC4: its red), not a detail map; composite its relief
 	uint vertex_count;
 	uint bone_count;
-	uint composite;      // the actor colour (0xAARRGGBB) for the composite
+	uint composite;      // the actor colour (0xAARRGGBB) for the composite; a model's draw with flags 4: the height's relief
+	                     // scale (float bits: cache::texture_view_of's relief); else 0
 	uint first_corner;   // the group's first corner (SV_VertexID starts at 0 for each draw, whatever its start)
 	uint corner_count;   // the mesh's corners (every read clamped below it)
 	uint has_last;       // 1: last_palette is this instance's in the last frame (its motion); 0: it moved nowhere of its own
@@ -73,7 +76,8 @@ struct model_t
 StructuredBuffer<vertex_t> vertices : register(t0);
 StructuredBuffer<corner_t> corners : register(t1);
 Texture2D colour_map : register(t2);
-Texture2D detail_map : register(t6); // (tex::make_detail: rg the tilt, b metal, a cavity; the descriptor after the texture's)
+Texture2D detail_map : register(t6); // (tex::make_detail: rg the tilt, b metal, a cavity; the descriptor after the texture's.
+                                     // flags 4: the texture pack's height there instead)
 StructuredBuffer<bone_t> palette : register(t3);
 StructuredBuffer<model_t> models : register(t4);
 StructuredBuffer<bone_t> last_palette : register(t5);
@@ -95,12 +99,45 @@ static const float kMetalSpec = 0.6, kMetalSharp = 45, kMetalSky = 0.35, kCavity
 // mirrored halves and any UV layout need nothing stored), metal, cavity. Called in uniform control flow (options.z is
 // the frame's), before any discard.
 struct detail_t { float3 n; float metal; float cavity; };
+// (per pixel, flags 4: M9, docs/texture-pack/characters.md "Pack relief") The normal tilted by the texture pack's height
+// at uv, as the zones' pack_tilt (draw.cpp): the slopes one level-0 texel each way through the mip-mapped height (so at a
+// distance the smaller levels' smoother slope, no sparkle), in the game's units (composite: 4 x span x the map's texels
+// a game texel), green along u, red along v, in the same frame from the screen derivatives as the detail map's below.
+// Only the light changes: no metal, no cavity, nothing into the colour.
+float3 pack_relief(float3 n, float3 world, float2 uv)
+{
+	float w, h;
+	detail_map.GetDimensions(w, h);
+	const float2 e = 1.0 / max(float2(w, h), 1.0);
+	const float l = detail_map.Sample(clamp_linear, uv - float2(e.x, 0)).r, r = detail_map.Sample(clamp_linear, uv + float2(e.x, 0)).r;
+	const float u = detail_map.Sample(clamp_linear, uv - float2(0, e.y)).r, d = detail_map.Sample(clamp_linear, uv + float2(0, e.y)).r;
+	const float k = asfloat(composite);
+	const float3 m = normalize(float3(k * (u - d), k * (l - r), 1));
+	const float3 dp1 = ddx(world), dp2 = ddy(world);
+	const float2 duv1 = ddx(uv), duv2 = ddy(uv);
+	const float3 p2 = cross(dp2, n), p1 = cross(n, dp1);
+	const float3 tu = p2 * duv1.x + p1 * duv2.x, tv = p2 * duv1.y + p1 * duv2.y;
+	const float s2 = max(dot(tu, tu), dot(tv, tv));
+	if (s2 <= 1e-20)
+		return n;
+	const float s = rsqrt(s2);
+	const float3 b = m.g * tu * s + m.r * tv * s + m.b * n;
+	return dot(b, b) > 1e-12 ? normalize(b) : n;
+}
 detail_t detail_at(float3 n, float3 world, float2 uv)
 {
 	detail_t d;
 	d.n = n;
 	d.metal = 0;
 	d.cavity = 0;
+	// (the texture pack's height in the detail map's place: its relief per pixel, whatever [chars] detail says; never read
+	// as a detail map. A constant, the same for every pixel of the draw)
+	[branch] if ((flags & 4) != 0)
+	{
+		if (options.x > 0)
+			d.n = pack_relief(n, world, uv);
+		return d;
+	}
 	if (options.z <= 0 || options.x <= 0)
 		return d;
 	const float3 dp1 = ddx(world), dp2 = ddy(world);
@@ -314,12 +351,22 @@ struct light_out
 	float4 colour : SV_Target0;
 	uint light : SV_Target1;
 };
+// (the light split's facing: as drawn, or with its marks on (camera.w 2) turned toward the camera, so World FX doesn't
+// read a facing turned away as the mark for the texture pack's relief; a pixel lit with the pack's relief (flags 4, per
+// pixel: M9) turned away instead, the same mark as the zone's, so World FX's own relief fades there too)
+float3 light_facing(v2p i)
+{
+	if (camera.w <= 1.5)
+		return i.normal;
+	const float3 toward = dot(i.normal, camera.xyz - i.world) < 0 ? -i.normal : i.normal;
+	return (flags & 4) != 0 && options.x > 0 ? -toward : toward;
+}
 light_out ps_light(v2p i)
 {
 	light_out o;
 	float share;
 	o.colour = shade(i, share);
-	o.light = light_word(i.motion.w, i.normal, share);
+	o.light = light_word(i.motion.w, light_facing(i), share);
 	return o;
 }
 struct light_motion_out
@@ -333,7 +380,7 @@ light_motion_out ps_light_motion(v2p i)
 	light_motion_out o;
 	float share;
 	o.colour = shade(i, share);
-	o.light = light_word(i.motion.w, i.normal, share);
+	o.light = light_word(i.motion.w, light_facing(i), share);
 	o.motion = i.motion;
 	return o;
 }
@@ -1688,8 +1735,9 @@ float4 pps(p2p i) : SV_Target
 			c.sun_dir[3] = 1.0f;
 		}
 		// (the frame's own camera, whatever view_proj the draw's seen through)
+		// (2: the light split's marks on, light_split.hpp)
 		if (f.camera && camera_of(f.view_proj, c.camera))
-			c.camera[3] = 1.0f;
+			c.camera[3] = light::marks() ? 2.0f : 1.0f;
 		std::memcpy(_mapped + slot, &c, sizeof(c));
 		gpu_model *gm = reinterpret_cast<gpu_model *>(_mapped + slot + kModelsAt);
 		for (uint32_t i = 0; i < std::min(f.models, kMaxModels); ++i)
@@ -1780,6 +1828,7 @@ float4 pps(p2p i) : SV_Target
 				D3D12_GPU_DESCRIPTOR_HANDLE bound = {};
 				int32_t bound_texture = -2;
 				bool bound_pack = false; // (the bound texture is the pack's: flags 2, its mip bias)
+				float bound_relief = 0.0f; // (M9: the bound pair holds the pack's height, its relief scale: flags 4)
 				for (const os2::group &gr : mv.groups)
 				{
 					if (gr.count == 0 || gr.first + gr.count > mv.corners)
@@ -1796,10 +1845,12 @@ float4 pps(p2p i) : SV_Target
 						const uint32_t tid = gr.texture >= 0 && size_t(gr.texture) < mv.textures.size() ? mv.textures[gr.texture] : cache::kNone;
 						// (the texture pack's pair once it's ready, unless refused: the shadow casters keep the game's cut-outs)
 						bool pack = false;
-						if (tid != cache::kNone && cache::texture_view_of(tid, h, allow_pack, &pack))
+						float relief = 0.0f;
+						if (tid != cache::kNone && cache::texture_view_of(tid, h, allow_pack, &pack, &relief))
 						{
 							bound = h;
 							bound_pack = pack;
+							bound_relief = relief;
 							if (pass == 0)
 								list->SetGraphicsRootDescriptorTable(5, h);
 						}
@@ -1818,13 +1869,19 @@ float4 pps(p2p i) : SV_Target
 					std::memcpy(&env, &gr.material[10], 4);
 					const uint32_t shine = gr.has_material && env != 0.0f ? 1u : 0u;
 					// (the pack's flag only in the model's own pass: the extra passes bind their own texture)
-					const uint32_t flags = shine | (pass == 0 && bound_pack ? 2u : 0u);
+					// (M9: flags 4 whenever the pair holds the pack's height, so it's never read as a detail map; its relief
+					// scale in the composite's word, 0 in a model's draw till now)
+					const bool relief = pass == 0 && bound_relief > 0.0f;
+					const uint32_t flags = shine | (pass == 0 && bound_pack ? 2u : 0u) | (relief ? 4u : 0u);
 					uint32_t dc[9] = { mi, 0, flags, mv.vertices, ie.bones, 0, gr.first, mv.corners, has_last };
 					std::memcpy(&dc[1], &scale, 4);
+					if (relief)
+						std::memcpy(&dc[5], &bound_relief, 4);
 					list->SetGraphicsRoot32BitConstants(1, 9, dc, 0);
 					list->DrawInstanced(gr.count, 1, 0, 0);
 					st.draws++;
 					st.pack_draws += bound_pack;
+					st.relief_draws += relief;
 					if (pass == 0)
 						st.triangles += gr.count / 3;
 				}

@@ -24,7 +24,15 @@
  * convert's, verify --soul, dedupe, resume after a kill, the stop file, the fake game started mid-upscale (paused, the
  * child ended, goes on after it closes), --no-wait, a hung and a failing upscaler.
  *
- *   build\texpack_test.exe [make]   (64-bit, built by tools\build_texpack.cmd; needs build\hifixi-texpack.exe,
+ * heights (M9, heights_tests): BC4's round trip within its bound on noise, bands, gradients, 0/255 and flat blocks; the
+ * height sizes per --height-scale; coverage (a cut-out's holes change nothing it shows); a flat colour's span 0; on a pack
+ * of ROM\0\100 at 2x and ROM\310\0 at 4x made here: every entry gets a BC4 height in the rules, colour and fields kept,
+ * height_from_game on exactly the textures ROM\92\51 has bump maps for, verify and the oracle read it, pack.src and the
+ * source pack untouched; resume (--limit 1, then the rest: the same records), a rerun makes nothing; the stop file, the
+ * game (--no-wait), no pack, a bad --height-scale; full and game sizes; the stored game-size heights made back into
+ * normals against the game's own (angle bounds); make --heights equal to make then heights (in make_tests).
+ *
+ *   build\texpack_test.exe [make|heights]   (64-bit, built by tools\build_texpack.cmd; needs build\hifixi-texpack.exe,
  *                               build\fake_esrgan.exe, python, the game's files in C:\Games\PhoenixXI and the overlay;
  *                               work folder build\test\texpack. "make": only make's tests)
  *
@@ -35,12 +43,17 @@
 #include "../src/pack/pack.hpp"
 #include "../src/pack/pack_write.hpp"
 #include "../src/pack/bc2.hpp"
+#include "../src/pack/bc4.hpp"
+#include "../src/pack/height.hpp"
 #include "../src/pack/validate.hpp"
 #include "../src/bake/dat.hpp"
 #include "../tools/texpack/keeptexels.hpp"
 #include "../tools/texpack/upscale.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <random>
+#include <tuple>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -654,6 +667,401 @@ namespace
 		return CopyFileW(from.c_str(), to.c_str(), FALSE) != 0;
 	}
 
+	// A pack folder's files copied into a fresh folder (not its lock or work folder)
+	bool copy_pack(const std::wstring &from, const std::wstring &to)
+	{
+		remove_tree(to);
+		make_folders(to);
+		bool ok = true;
+		for (const wchar_t *n : { L"pack.idx", L"pack.src", L"pack-000.bin", L"pack-001.bin", L"dats.tsv" })
+			if (is_there(from + L"\\" + n))
+				ok = ok && copy_into(from + L"\\" + n, to + L"\\" + n);
+		return ok;
+	}
+
+	// A record's level 0 as BC4 decoded to 8-bit texels
+	std::vector<uint8_t> height_level0(const std::shared_ptr<const pk::index> &idx, const pk::record &r)
+	{
+		const std::vector<std::vector<uint8_t>> lv = levels_of(idx, r);
+		return lv.empty() ? std::vector<uint8_t> {} : pk::bc4::decode(lv[0].data(), r.w, r.h);
+	}
+
+	// ---- (M9) Height records: BC4, the height maker, texpack heights, make --heights
+	void heights_unit_tests()
+	{
+		// BC4 round trip: every texel within max_error of its block's range, on noise of several ranges, gradients,
+		// blocks touching 0 and 255, flat blocks
+		{
+			std::mt19937 rng(20261103);
+			uint32_t blocks = 0, over = 0, flat_bad = 0;
+			double sum = 0;
+			uint64_t n = 0;
+			for (int pic = 0; pic < 24; ++pic)
+			{
+				const uint32_t w = 64, h = 32;
+				std::vector<uint8_t> t(size_t(w) * h);
+				const int kind = pic % 6;
+				for (uint32_t y = 0; y < h; ++y)
+					for (uint32_t x = 0; x < w; ++x)
+					{
+						int v = 0;
+						switch (kind)
+						{
+						case 0: v = int(rng() % 256); break;                                       // noise, the whole range
+						case 1: v = 120 + int(rng() % 16); break;                                   // a narrow band
+						case 2: v = int((x * 4 + y * 2) % 256); break;                               // a gradient
+						case 3: v = (rng() % 5 == 0) ? (rng() % 2 ? 0 : 255) : 100 + int(rng() % 40); break; // 0 and 255 among the rest
+						case 4: v = 77; break;                                                       // flat
+						default: v = 128 + int(60 * std::sin(x * 0.3) * std::cos(y * 0.2)); break;   // smooth
+						}
+						t[size_t(y) * w + x] = uint8_t(std::clamp(v, 0, 255));
+					}
+				const std::vector<uint8_t> enc = pk::bc4::encode(t.data(), w, h);
+				const std::vector<uint8_t> dec = pk::bc4::decode(enc.data(), w, h);
+				for (uint32_t by = 0; by < h / 4; ++by)
+					for (uint32_t bx = 0; bx < w / 4; ++bx)
+					{
+						int lo = 255, hi = 0;
+						for (int k = 0; k < 16; ++k)
+						{
+							const int v = t[(size_t(by) * 4 + k / 4) * w + bx * 4 + k % 4];
+							lo = std::min(lo, v), hi = std::max(hi, v);
+						}
+						blocks++;
+						for (int k = 0; k < 16; ++k)
+						{
+							const size_t i = (size_t(by) * 4 + k / 4) * w + bx * 4 + k % 4;
+							const int d = std::abs(int(dec[i]) - int(t[i]));
+							over += d > pk::bc4::max_error(lo, hi);
+							flat_bad += lo == hi && d != 0;
+							sum += d, n++;
+						}
+					}
+			}
+			check(over == 0 && flat_bad == 0 && pk::bc4::encode(nullptr, 6, 4).empty(),
+				"BC4 round trip: " + std::to_string(blocks) + " blocks (noise, bands, gradients, 0/255, flat, smooth), every texel within (range+13)/14+1 levels, "
+				"flat blocks exact; mean error " + std::to_string(sum / double(n)).substr(0, 5) + " levels");
+		}
+		// The maker's sizes (open question 11)
+		{
+			namespace ht = pk::height;
+			uint32_t w = 0, h = 0;
+			bool ok = ht::size_for(ht::scale::half, 128, 64, 64, 32, w, h) && w == 64 && h == 32;
+			ok = ok && ht::size_for(ht::scale::half, 256, 128, 64, 32, w, h) && w == 128 && h == 64;
+			ok = ok && ht::size_for(ht::scale::full, 256, 128, 64, 32, w, h) && w == 256 && h == 128;
+			ok = ok && ht::size_for(ht::scale::game, 256, 128, 64, 32, w, h) && w == 64 && h == 32;
+			ok = ok && ht::size_for(ht::scale::half, 64, 32, 64, 32, w, h) && w == 64 && h == 32; // (no pack colour: the original's size)
+			ok = ok && !ht::size_for(ht::scale::game, 12, 8, 6, 4, w, h);                           // (6x4: no BC4 of that)
+			check(ok, "height sizes: half = half the colour (never under the original), full = the colour, game = the original; none for sides not multiples of 4");
+		}
+		// Coverage: what's in a cut-out's holes changes nothing where the game shows the texture; flat: span 0
+		{
+			namespace ht = pk::height;
+			const uint32_t w = 64, h = 64;
+			std::vector<uint8_t> a(size_t(w) * h * 4), b;
+			std::mt19937 rng(7);
+			for (uint32_t i = 0; i < w * h; ++i)
+			{
+				const uint8_t v = uint8_t(100 + rng() % 60);
+				a[i * 4] = a[i * 4 + 1] = a[i * 4 + 2] = v;
+				a[i * 4 + 3] = (i % w) < 40 ? 0x80 : 0; // (the right part a hole)
+			}
+			b = a;
+			for (uint32_t i = 0; i < w * h; ++i)
+				if (b[i * 4 + 3] == 0)
+					b[i * 4] = b[i * 4 + 1] = b[i * 4 + 2] = uint8_t(rng() % 2 ? 0 : 255);
+			ht::field fa, fb;
+			std::string why;
+			const float cut = pk::bc2::zone_cut_threshold(0x80);
+			const bool made = ht::from_colour(a.data(), w, h, w, w, h, pk::kAlphaCut, cut, fa, why) && ht::from_colour(b.data(), w, h, w, w, h, pk::kAlphaCut, cut, fb, why);
+			float worst = 0, range = 0;
+			for (uint32_t i = 0; made && i < w * h; ++i)
+				if (fa.wt[i] > 0)
+					worst = std::max(worst, std::fabs(fa.v[i] - fb.v[i])), range = std::max(range, std::fabs(fa.v[i]));
+			// (and the plain blur would have let the holes in: the same with every texel counted)
+			ht::field pa, pb;
+			ht::from_colour(a.data(), w, h, w, w, h, pk::kAlphaNone, cut, pa, why);
+			ht::from_colour(b.data(), w, h, w, w, h, pk::kAlphaNone, cut, pb, why);
+			float plain = 0;
+			for (uint32_t i = 0; i < w * h; ++i)
+				if (fa.wt[i] > 0)
+					plain = std::max(plain, std::fabs(pa.v[i] - pb.v[i]));
+			std::vector<uint8_t> flat(size_t(w) * h * 4, 0x60);
+			ht::field ff;
+			ht::from_colour(flat.data(), w, h, w, w, h, pk::kAlphaNone, 0, ff, why);
+			const ht::made fm = ht::encode(ff);
+			const std::vector<uint8_t> f0 = fm.levels.empty() ? std::vector<uint8_t> {} : pk::bc4::decode(fm.levels[0].data(), w, h);
+			check(made && worst < 1e-4f * std::max(range, 1e-3f) + 1e-6f && plain > 100 * worst && fm.span == 0 && !f0.empty() &&
+					std::all_of(f0.begin(), f0.end(), [](uint8_t v) { return v == 128; }) && fm.levels.size() == pk::bc2::chain_levels(w, h),
+				"heights are coverage-aware: a cut-out's holes painted black and white change the shown texels by " + std::to_string(worst) +
+					" (counting every texel: " + std::to_string(plain) + "); a flat colour gives span 0, every texel 0.5, the whole chain");
+		}
+	}
+
+	// The pack heights is tried on: ROM\0\100 (zone 150: twelve of its textures have bump maps in ROM\92\51) at 2x and
+	// ROM\310\0 (a model DAT) at 4x, nearest-upscaled originals as the colour, made here with the writer
+	bool write_height_test_pack(const std::wstring &folder, size_t &entries)
+	{
+		remove_tree(folder);
+		pk::writer w;
+		pk::writer_options wo;
+		wo.folder = folder;
+		wo.maker_version = 2;
+		wo.source = "texpack_test heights";
+		std::string why;
+		if (!w.open(wo, why))
+			return false;
+		for (const auto &[rel, f, kind] : { std::tuple{ kZone, 2u, pk::kSourceZone }, std::tuple{ kModel, 4u, pk::kSourceModel } })
+		{
+			const std::vector<uint8_t> dat = read(kFFXI + L"\\" + wide(rel));
+			const std::vector<bk::chunk> cs = bk::chunks(dat);
+			for (size_t i = 0; i < cs.size(); ++i)
+			{
+				const bk::chunk &c = cs[i];
+				if (c.type != 0x20 || c.size < 69 || c.body[0] != 0xA1 || std::memcmp(c.body + 57, "3TXD", 4) != 0)
+					continue;
+				const int32_t ow = i32(c.body + 21), oh = i32(c.body + 25);
+				if (ow <= 0 || oh <= 0 || ow % 4 || oh % 4 || 69 + size_t(ow / 4) * (oh / 4) * 16 > c.size)
+					continue;
+				const std::vector<uint8_t> px = pk::bc2::decode_bc2(c.body + 69, uint32_t(ow), uint32_t(oh));
+				const uint32_t W = uint32_t(ow) * f, H = uint32_t(oh) * f;
+				std::vector<uint8_t> up(size_t(W) * H * 4);
+				for (uint32_t y = 0; y < H; ++y)
+					for (uint32_t x = 0; x < W; ++x)
+						std::memcpy(&up[(size_t(y) * W + x) * 4], &px[(size_t(y / f) * uint32_t(ow) + x / f) * 4], 4);
+				const std::vector<uint8_t> blocks = pk::bc2::encode_bc2(up.data(), W, H);
+				pk::entry e;
+				const pk::key k = pk::key_of(c.body, c.size);
+				e.hash = k.hash, e.bytes = k.bytes, e.w = k.w, e.h = k.h;
+				e.orig_format = 0xA1;
+				std::memcpy(&e.orig_fourcc, c.body + 57, 4);
+				e.alpha_kind = pk::kAlphaNone;
+				e.source_kind = kind;
+				e.file_id = 0xFFFFFFFFu;
+				e.chunk = uint32_t(i);
+				std::memcpy(e.name, c.body + 1, 16);
+				pk::map_in m;
+				m.w = W, m.h = H;
+				m.levels = pk::bc2::full_chain(blocks.data(), W, H, pk::kAlphaNone, 0);
+				w.add(e, { m }, why);
+			}
+			WIN32_FILE_ATTRIBUTE_DATA a = {};
+			GetFileAttributesExW((kFFXI + L"\\" + wide(rel)).c_str(), GetFileExInfoStandard, &a);
+			w.finished(rel, (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow, (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime);
+		}
+		entries = w.entries().size();
+		const bool ok = w.commit(why);
+		w.close();
+		return ok;
+	}
+
+	void heights_tests()
+	{
+		heights_unit_tests();
+		const std::wstring hw = work + L"\\heights", T0 = hw + L"\\T0";
+		size_t n0 = 0;
+		const bool written = write_height_test_pack(T0, n0);
+		std::shared_ptr<const pk::index> t0 = load(T0);
+		check(written && t0 != nullptr && n0 > 10, "a test pack of ROM\\0\\100 (2x) and ROM\\310\\0 (4x): " + std::to_string(n0) + " entries");
+		if (!t0)
+			return;
+		const std::vector<uint8_t> t0_idx = read(T0 + L"\\pack.idx");
+		// (the zone's textures the game has height maps for, read here independently: ROM\92\51's 0x5D chunks)
+		std::map<std::string, std::tuple<uint32_t, uint32_t, std::vector<uint8_t>>> bumps;
+		{
+			const std::vector<uint8_t> b = read(kFFXI + L"\\ROM\\92\\51.DAT");
+			for (const bk::chunk &c : bk::chunks(b))
+				if (c.type == 0x5D && c.size >= 0x20 && c.body[0] == 'b' && c.body[1] == 'p')
+				{
+					const uint32_t w = c.body[4] | (c.body[5] << 8), h = c.body[6] | (c.body[7] << 8);
+					const std::string nm(reinterpret_cast<const char *>(c.body) + 0x18, 8);
+					if (w && h && 0x20 + size_t(w) * h <= c.size && bumps.count(nm) == 0)
+						bumps[nm] = { w, h, std::vector<uint8_t>(c.body + 0x20, c.body + 0x20 + size_t(w) * h) };
+				}
+		}
+		size_t want_game = 0;
+		for (const pk::entry &e : t0->entries)
+			want_game += e.source_kind == pk::kSourceZone && bumps.count(std::string(e.name + 8, 8)) != 0;
+		auto heights_args = [&](const std::wstring &pack, const std::string &more) {
+			return "heights --pack " + q(pack) + " --ffxi " + q(kFFXI) + " --threads 4 --reserve-gb 0 --ignore-game " + more;
+		};
+
+		// T1: heights at the default (half)
+		const std::wstring T1 = hw + L"\\T1";
+		copy_pack(T0, T1);
+		int code = 0;
+		std::string out = run(heights_args(T1, ""), code);
+		std::shared_ptr<const pk::index> t1 = load(T1);
+		check(code == 0 && t1 && t1->entries.size() == n0, "heights: exit 0, the pack loads (" + line_with(out, "heights: ") + ")");
+		if (!t1)
+		{
+			std::printf("%s", out.c_str());
+			return;
+		}
+		{
+			bool all = true, colour_same = true, fields_same = true, rules = true;
+			size_t flagged = 0, flagged_right = 0;
+			for (const pk::entry &e : t1->entries)
+			{
+				const pk::entry *b = t0->find(e.the_key());
+				const pk::record *h = e.map(pk::kHeight), *c = e.map(pk::kColour);
+				const uint32_t f = e.source_kind == pk::kSourceZone ? 2 : 4;
+				all = all && h != nullptr && h->format == pk::kBC4 && h->w == e.w * f / 2 && h->h == e.h * f / 2 && h->levels == pk::bc2::chain_levels(h->w, h->h) &&
+					std::isfinite(h->span()) && h->span() >= 0;
+				rules = rules && h != nullptr && pk::check(*h) == nullptr;
+				colour_same = colour_same && b && c && std::memcmp(c, b->map(pk::kColour), sizeof(pk::record)) == 0;
+				// (every field but the flags as they were)
+				pk::entry x = e;
+				if (b)
+					x.flags = b->flags;
+				fields_same = fields_same && b && std::memcmp(&x, b, 64) == 0;
+				if (e.flags & pk::kHeightFromGame)
+				{
+					flagged++;
+					flagged_right += e.source_kind == pk::kSourceZone && bumps.count(std::string(e.name + 8, 8)) != 0;
+				}
+			}
+			check(all && rules, "every entry has a BC4 height record at half the colour (zones 1x, models 2x), the whole chain, a span 0 or above, within the rules");
+			check(colour_same && fields_same, "colour records unchanged byte for byte (file, offset, CRC), and every entry field but the flags");
+			check(flagged == want_game && flagged_right == flagged && want_game >= 10,
+				"height_from_game on exactly the zone's textures with a bump map of their name: " + std::to_string(flagged) + " of " + std::to_string(want_game));
+			int vc = 0;
+			const std::string v = run("verify --pack " + q(T1) + " --ffxi " + q(kFFXI), vc);
+			check(vc == 0, "verify reads every record back, heights too (" + last_line(v) + ")");
+			const std::string o = oracle(T1, vc);
+			check(vc == 0, "pack_oracle.py reads it: " + last_line(o));
+			const std::string progress = text_of(T1 + L"\\progress.txt");
+			check(progress.find("state: finished") != std::string::npos && progress.find("heights_from_game: " + std::to_string(want_game)) != std::string::npos &&
+					!is_there(T1 + L"\\pack.lock") && pack_src(T1) == pack_src(T0),
+				"progress.txt finished, pack.lock gone, pack.src untouched");
+		}
+		// The pack it was copied from: no heights, its index as written (packs without heights read as before)
+		{
+			bool none = true;
+			for (const pk::entry &e : t0->entries)
+				none = none && e.map(pk::kHeight) == nullptr && (e.flags & pk::kHeightFromGame) == 0;
+			check(none && read(T0 + L"\\pack.idx") == t0_idx, "a pack without heights: none in it, its pack.idx unchanged");
+		}
+		// Resume: --limit 1 (the zone first), then the rest; the same records as in one run
+		{
+			const std::wstring T2 = hw + L"\\T2";
+			copy_pack(T0, T2);
+			int c1 = 0, c2 = 0;
+			const std::string o1 = run(heights_args(T2, "--limit 1"), c1);
+			std::shared_ptr<const pk::index> mid = load(T2);
+			size_t zone_h = 0, model_h = 0, zones = 0;
+			if (mid)
+				for (const pk::entry &e : mid->entries)
+				{
+					zones += e.source_kind == pk::kSourceZone;
+					(e.source_kind == pk::kSourceZone ? zone_h : model_h) += e.map(pk::kHeight) != nullptr;
+				}
+			const std::string o2 = run(heights_args(T2, ""), c2);
+			std::shared_ptr<const pk::index> t2 = load(T2);
+			bool same = t2 && t2->entries.size() == t1->entries.size();
+			for (size_t i = 0; same && i < t2->entries.size(); ++i)
+			{
+				const pk::record *a = t2->entries[i].map(pk::kHeight), *b = t1->entries[i].map(pk::kHeight);
+				same = a && b && a->crc == b->crc && a->param == b->param && a->bytes == b->bytes && t2->entries[i].flags == t1->entries[i].flags;
+			}
+			check(c1 == 0 && c2 == 0 && zone_h == zones && model_h == 0 && o2.find(std::to_string(zones) + " there already") != std::string::npos && same,
+				"resume: --limit 1 does the zone (" + std::to_string(zone_h) + " heights, the models none), the next run the rest (" + line_with(o2, "there already") +
+					"); the same records as one run");
+			int c3 = 0;
+			const std::string o3 = run(heights_args(T2, ""), c3);
+			check(c3 == 0 && o3.find(": 0 made") != std::string::npos && o3.find(std::to_string(n0) + " there already") != std::string::npos,
+				"a rerun makes nothing (" + line_with(o3, "there already") + ")");
+		}
+		// The stop file, the game, a missing pack
+		{
+			const std::wstring T3 = hw + L"\\T3";
+			copy_pack(T0, T3);
+			write_text(T3 + L"\\stop", "");
+			int c = 0;
+			std::string o = run("heights --pack " + q(T3) + " --ffxi " + q(kFFXI) + " --reserve-gb 0 --ignore-game", c);
+			check(c == 3 && read(T3 + L"\\pack.idx") == t0_idx && !is_there(T3 + L"\\pack.lock"), "the stop file: exit 3, nothing written (" + line_with(o, "Stopped") + ")");
+			DeleteFileW((T3 + L"\\stop").c_str());
+			o = run("heights --pack " + q(T3) + " --ffxi " + q(kFFXI) + " --reserve-gb 0 --no-wait --game-names texpack_test.exe", c);
+			check(c == 4 && read(T3 + L"\\pack.idx") == t0_idx, "the game running (--no-wait): exit 4, nothing written (" + line_with(o, "Stopped") + ")");
+			o = run("heights --pack " + q(hw + L"\\nowhere") + " --ffxi " + q(kFFXI) + " --ignore-game", c);
+			check(c == 1 && o.find("can't be used") != std::string::npos, "no pack there: exit 1 (" + last_line(o) + ")");
+			o = run(heights_args(T3, "--height-scale quarter"), c);
+			check(c == 2, "--height-scale quarter: a usage error");
+		}
+		// Full and game resolution; the game-height path against the game's own normals
+		{
+			const std::wstring T4 = hw + L"\\T4", T5 = hw + L"\\T5";
+			copy_pack(T0, T4);
+			copy_pack(T0, T5);
+			int c4 = 0, c5 = 0;
+			run(heights_args(T4, "--height-scale full"), c4);
+			run(heights_args(T5, "--height-scale game --kind zone"), c5);
+			std::shared_ptr<const pk::index> t4 = load(T4), t5 = load(T5);
+			bool full = t4 != nullptr, game = t5 != nullptr, kind = true;
+			uint64_t bytes[3] = {}, texels[3] = {};
+			for (size_t i = 0; full && i < t4->entries.size(); ++i)
+			{
+				const pk::record *h = t4->entries[i].map(pk::kHeight), *c = t4->entries[i].map(pk::kColour);
+				full = full && h && h->w == c->w && h->h == c->h;
+				if (h)
+					bytes[0] += h->bytes, texels[0] += uint64_t(h->w) * h->h;
+			}
+			for (const pk::entry &e : t1->entries)
+				if (const pk::record *h = e.map(pk::kHeight))
+					bytes[1] += h->bytes, texels[1] += uint64_t(h->w) * h->h;
+			for (size_t i = 0; game && i < t5->entries.size(); ++i)
+			{
+				const pk::entry &e = t5->entries[i];
+				const pk::record *h = e.map(pk::kHeight);
+				kind = kind && (e.source_kind == pk::kSourceZone) == (h != nullptr);
+				game = game && (!h || (h->w == e.w && h->h == e.h));
+				if (h)
+					bytes[2] += h->bytes, texels[2] += uint64_t(h->w) * h->h;
+			}
+			char sizes[256];
+			std::snprintf(sizes, sizeof(sizes), "bytes a map texel with mips and pitch: full %.3f, half %.3f, game %.3f", double(bytes[0]) / double(texels[0] ? texels[0] : 1),
+				double(bytes[1]) / double(texels[1] ? texels[1] : 1), double(bytes[2]) / double(texels[2] ? texels[2] : 1));
+			check(c4 == 0 && c5 == 0 && full && game && kind, std::string("--height-scale full: the colour's size; game: the original's; --kind zone: the zone's only (") + sizes + ")");
+
+			// (the stored map, at the game's size, made back into normals as the game makes them, against the game's own from
+			// the bump bytes: the angle between them)
+			double sum = 0, worst_mean = 0;
+			std::vector<double> all;
+			uint32_t compared = 0;
+			for (const pk::entry &e : t5 ? t5->entries : std::vector<pk::entry> {})
+			{
+				const pk::record *h = e.map(pk::kHeight);
+				auto b = bumps.find(std::string(e.name + 8, 8));
+				if (!h || !(e.flags & pk::kHeightFromGame) || b == bumps.end() || std::get<0>(b->second) != h->w || std::get<1>(b->second) != h->h)
+					continue;
+				const std::vector<uint8_t> s = height_level0(t5, *h);
+				const uint32_t w = h->w, hh = h->h;
+				std::vector<float> ours(size_t(w) * hh), theirs(size_t(w) * hh);
+				for (size_t i = 0; i < ours.size(); ++i)
+					ours[i] = (float(s[i]) / 255.0f - 0.5f) * h->span(), theirs[i] = float(std::get<2>(b->second)[i]) / 255.0f;
+				std::vector<float> na, nb;
+				pk::height::normals(ours.data(), w, hh, 1.0f, na);
+				pk::height::normals(theirs.data(), w, hh, 1.0f, nb);
+				double m = 0;
+				for (size_t i = 0; i < ours.size(); ++i)
+				{
+					const double d = std::clamp(double(na[i * 3] * nb[i * 3] + na[i * 3 + 1] * nb[i * 3 + 1] + na[i * 3 + 2] * nb[i * 3 + 2]), -1.0, 1.0);
+					const double deg = std::acos(d) * 180.0 / 3.14159265358979;
+					all.push_back(deg), m += deg;
+				}
+				m /= double(ours.size());
+				sum += m, worst_mean = std::max(worst_mean, m);
+				compared++;
+			}
+			std::sort(all.begin(), all.end());
+			const double p99 = all.empty() ? 0 : all[size_t(double(all.size() - 1) * 0.99)];
+			char msg[256];
+			std::snprintf(msg, sizeof(msg), "the game-height path: %u of ROM\\0\\100's bump-mapped textures, their normals from the stored map against the game's: "
+				"mean %.2f deg (worst texture %.2f), p99 %.2f deg", compared, compared ? sum / compared : 0.0, worst_mean, p99);
+			check(compared >= 8 && sum / std::max(compared, 1u) < 2.0 && worst_mean < 4.0 && p99 < 10.0, msg);
+		}
+	}
+
 	void make_tests(const std::shared_ptr<const pk::index> &convert_pack)
 	{
 		ported_steps();
@@ -832,6 +1240,30 @@ namespace
 			const std::string v = run("verify --pack " + q(P1) + " --soul --ffxi " + q(ffxi) + " --threads 4", vc);
 			check(vc == 0 && v.find(", 0 bad") != std::string::npos && v.find("0 over the limits") != std::string::npos,
 				"verify --soul passes it (" + line_with(v, "soul: ") + ")");
+			// (M9) make without --heights writes none; make --heights writes what make and then heights write
+			{
+				bool none = true;
+				for (const pk::entry &e : p1->entries)
+					none = none && e.map(pk::kHeight) == nullptr && (e.flags & pk::kHeightFromGame) == 0;
+				check(none, "make without --heights: no height records (off until M9 is approved)");
+				const std::wstring PH = mw + L"\\PH", PC = mw + L"\\PC";
+				copy_pack(P1, PC);
+				int hc = 0;
+				const std::string ho = run("heights --pack " + q(PC) + " --ffxi " + q(ffxi) + " --threads 4 --reserve-gb 0 --ignore-game", hc);
+				std::string mo;
+				const int mc = make_run(PH, "--heights", mo);
+				std::shared_ptr<const pk::index> pc = load(PC), ph = load(PH);
+				bool same = pc && ph && pc->entries.size() == ph->entries.size() && pc->entries.size() == p1->entries.size();
+				for (size_t i = 0; same && i < pc->entries.size(); ++i)
+				{
+					const pk::entry &x = pc->entries[i], &y = ph->entries[i];
+					const pk::record *hx = x.map(pk::kHeight), *hy = y.map(pk::kHeight);
+					same = hx && hy && hx->crc == hy->crc && hx->param == hy->param && hx->bytes == hy->bytes && x.flags == y.flags &&
+						x.map(pk::kColour)->crc == y.map(pk::kColour)->crc;
+				}
+				check(hc == 0 && mc == 0 && same, "make --heights: every entry's height record the same bytes and span as make, then heights, give (" +
+						line_with(mo, "heights (") + ")");
+			}
 			const std::string progress = text_of(P1 + L"\\progress.txt");
 			check(progress.find("state: finished") != std::string::npos && progress.find("dats_done: 5") != std::string::npos &&
 					progress.find("dats_total: 5") != std::string::npos && progress.find("summary: 5 of 5 DATs done") != std::string::npos,
@@ -1013,6 +1445,14 @@ int main(int argc, char **argv)
 	{
 		make_folders(work);
 		make_tests(nullptr);
+		std::printf("texpack_test: %d passed, %d failed\n", passes, failures);
+		return failures;
+	}
+	// (texpack_test heights: only M9's height tests)
+	if (argc > 1 && std::string(argv[1]) == "heights")
+	{
+		make_folders(work);
+		heights_tests();
 		std::printf("texpack_test: %d passed, %d failed\n", passes, failures);
 		return failures;
 	}
@@ -1550,6 +1990,9 @@ int main(int argc, char **argv)
 
 	// ---- make (M7)
 	make_tests(a);
+
+	// ---- heights (M9)
+	heights_tests();
 
 	std::printf("texpack_test: %d passed, %d failed\n", passes, failures);
 	return failures;

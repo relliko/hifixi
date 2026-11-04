@@ -11,6 +11,7 @@
 //   - follow_texture_bias: each present on the game's thread, after the loaders' frames: the pack's textures sampled with
 //     more detail under FSR while the pack is in use (log2 of the world's width over the screen's, at least -1; 0 else),
 //     into both injects (the zone's and the characters'); each present is also counted for game_drawn_models.
+//     Also (M9) the light split's marks (light_split.hpp "Marks"): on while the pack's heights are in use.
 
 #include <cstdint>
 

@@ -102,18 +102,23 @@ The game-thread-only rule:
 - The texture pack's zones' glue (`src/zone/zonepack.cpp`, the module's consumer) makes its streamer calls on the
   game's thread too, with no lock of ours held (it has none): `add_owner`, `request` (at most 128 a present, :303),
   `take_done` (:329), `get` and `write_view` (:183: `CreateShaderResourceView` into the zone heap's pack slot), `drop`,
-  `drop_owner` (the drop hook, :89). The hook also runs from `gpu_zone::release()` when retire's `on_present` frees a
+  `drop_owner` (the drop hook, :89); since M9 also `current()` (:394, the pack's index, to ask only for heights it has:
+  the leaf mutex for a pointer copy) and the heights' `request` (:405) and `write_view` (:203). The hook also runs from `gpu_zone::release()` when retire's `on_present` frees a
   zone (retire's mutex isn't held then: src/host/retire.hpp, `then`'s rule) and from native's and actordata's
   `forget_device`; it only takes the streamer's leaf mutex and hands what it lets go to `retire::later` after leaving
   it. zonenative_test measures the worst of those presents with copies in flight.
 - The texture pack's characters' glue (`src/chars/charpack.cpp`, the module's second consumer) makes its streamer calls
-  on the game's thread with no lock of ours held: `add_owner`, `request` (at most 64 a present, :198), `take_done`
-  (:213), `get` and `write_view` (:106: into the characters' heap, the pack pair's first descriptor), `drop_owner` (:52).
-  The cache (`src/chars/cache.cpp`) keeps every texture's pack part under its own mutex and makes no streamer call: its
-  calls (`take_pack_asks`, `pack_asked`, `pack_begin`, `pack_end`, `pack_spent`, `pack_evict`, `pack_unevict`) take the mutex and leave it before
-  they return, so `write_view` and the detail view (`write_pack_detail`, :1434-1451, a device call) run with it left.
-  `pack_begin` AddRefs the detail map under the mutex (an interlocked count, :1426), released after its view is made.
-  The tickets the cache lets go go to its drop hook (`stream::drop`) from `bury` (:218-220), after the mutex is left,
+  on the game's thread with no lock of ours held: `add_owner` (:252), `request` (at most 64 textures a present, :280;
+  since M9 a height beside each that has one, :303, after `current()` once a present while heights are on and asks
+  wait, :268: the leaf mutex for a pointer copy), `take_done` (:317), `get` (:144, a height's span; :167, a ready
+  colour's view bytes) and `write_view` (:181 and :187: into the characters' heap, the pack pair's first descriptor and, for a height, its second),
+  `drop_owner` (:59). The cache (`src/chars/cache.cpp`) keeps every texture's pack part under its own mutex and makes
+  no streamer call: its calls (`take_pack_asks`, `pack_asked`, `pack_settle`, `pack_height_of`, `pack_begin`,
+  `pack_end`, `pack_spent`, `pack_evict`, `pack_unevict`) take the mutex and leave it before they return, so
+  `write_view` and the game's views (`write_pack_detail`, :1549-1584, device calls) run with it left. `pack_settle`
+  AddRefs the detail map, or for a height alone the game's texture, under the mutex (an interlocked count, :1518,
+  :1524), released after its view is made.
+  The tickets the cache lets go go to its drop hook (`stream::drop`) from `bury` (:227-229), after the mutex is left,
   on the game's thread or the cache's worker (its idle `bury`): `drop` takes only the streamer's leaf mutex and never
   blocks. `texture_view_of`'s new stores (the pack pair's last drawn) are made under the cache's mutex, no device
   call.

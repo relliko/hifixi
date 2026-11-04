@@ -25,6 +25,14 @@
 // one writes. A word: none (no key, or not asked yet), asked, drawn (texture_srv names the pack slot), spent (missed,
 // gone, cleared, the pack off in this visit: never asked again). The glue's stream calls live in zonepack; this file
 // keeps only the data (the owner, the tickets: plain numbers) and calls the glue's drop hook when it's let go.
+//
+// The pack's heights (M9, zones.md "Pack normals"): a second block of the pack region, one slot a texture after the
+// colour's, by the same write-once rule and with words of their own. Each starts as the flat stand-in's view and takes a
+// ready height record's (BC4) view; with it its relief scale (4 x span x the map's width over the game texture's: the
+// shader's Sobel in the game's own units). height_srv names it while its word says drawn, heights are on and compare is
+// off; the zone shader then binds it at t5 in place of the normal map (draw.cpp kPackRelief). An entry's colour and its
+// height are asked and settled apart: an entry with a height and no colour (a materials-only pack) draws the game's
+// texture with the pack's relief.
 
 #include <d3d12.h>
 #include "../bake/zonemesh.hpp"
@@ -88,6 +96,7 @@ namespace hifi::zone
 			hifi::pack::stream::owner owner = 0;
 			uint32_t epoch = 0;
 			std::vector<hifi::pack::stream::ticket> tickets;
+			std::vector<hifi::pack::stream::ticket> height_tickets; // (M9: a texture's height record's)
 			uint64_t bytes = 0;
 			bool done = false;
 		};
@@ -102,6 +111,21 @@ namespace hifi::zone
 		D3D12_CPU_DESCRIPTOR_HANDLE pack_cpu(uint32_t texture) const;
 		// The glue says it wrote a slot (the test log's 'w')
 		void pack_written(uint32_t texture) const;
+		// ---- The pack's heights (M9): the same words, a block of their own (the test log's events for them carry
+		// kHeightLog in the texture's number)
+		static constexpr uint32_t kHeightLog = 0x80000000u;
+		uint8_t height_word(uint32_t texture) const;
+		void set_height_word(uint32_t texture, uint8_t word);
+		D3D12_CPU_DESCRIPTOR_HANDLE height_cpu(uint32_t texture) const;
+		// (before its word says drawn) The relief scale the shader multiplies its Sobel by, and the slot's write logged
+		void height_written(uint32_t texture, float relief);
+		// The texture's height view when its word says drawn, heights are on and compare is off (relief: its scale), else
+		// a null handle (ptr 0) and relief 0
+		D3D12_GPU_DESCRIPTOR_HANDLE height_srv(uint32_t texture, float *relief) const;
+		// Pack normals drawn at all ([textures] height, every gpu_zone; on by default: no zone has a height until the glue
+		// asks one)
+		static void set_heights(bool on);
+		static bool heights();
 		// Its pack textures let go now (the drop hook, when it has an owner): before a hand-over to retire::later, so the
 		// textures and the zone are freed at the same fence. release() and the destructor call it too
 		void pack_let_go();
@@ -109,6 +133,7 @@ namespace hifi::zone
 		struct pack_counts
 		{
 			uint32_t textures = 0, keyed = 0, asked = 0, drawn = 0, spent = 0;
+			uint32_t heights_asked = 0, heights_drawn = 0, heights_spent = 0; // (M9: the height words')
 		};
 		pack_counts pack_summary() const;
 		// /hifi textures compare: the game's own textures drawn where the pack's are ready (every gpu_zone; nothing freed)
@@ -141,6 +166,9 @@ namespace hifi::zone
 		// The texture pack's region: its first slot (the images' count), a word a texture (nullptr: no region)
 		uint32_t _pack_base = 0;
 		std::unique_ptr<std::atomic<uint8_t>[]> _pack_words;
+		// (M9: the height block's words and relief scales; its slots follow the colour's: _pack_base + textures + i)
+		std::unique_ptr<std::atomic<uint8_t>[]> _height_words;
+		std::unique_ptr<float[]> _relief;
 		pack_data _pack;
 	};
 }

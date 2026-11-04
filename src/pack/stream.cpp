@@ -1838,6 +1838,7 @@ namespace hifi::pack::stream
 			out.levels = r.levels;
 			out.first = r.first;
 			out.bytes = r.bytes;
+			out.param = d.rec.param;
 			return true;
 		}
 	}

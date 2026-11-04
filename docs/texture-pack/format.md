@@ -87,7 +87,7 @@ One texture of the game's.
 | 27 | u8 | source_kind | 0 unknown, 1 zone, 2 model (`dats.tsv`'s kind; diagnostics) |
 | 28 | u8 | alpha_lo | the original texels' lowest alpha (raw) |
 | 29 | u8 | alpha_hi | and highest |
-| 30 | u16 | flags | 1 `no_pack` (a hit the game's texture is drawn for), 2 `height_from_game` (M9) |
+| 30 | u16 | flags | 1 `no_pack` (a hit the game's texture is drawn for), 2 `height_from_game` (M9: its height record was made from the zone's bump DAT, not guessed from the colour) |
 | 32 | u32 | file_id | diagnostics: the source DAT's file id (VTABLE/FTABLE); 0xFFFFFFFF when no table names the DAT (a few model DATs, e.g. `ROM4\10\1.DAT`) |
 | 36 | u32 | chunk | diagnostics: the texture chunk's ordinal in that DAT (`bake::chunks` order) |
 | 40 | char[16] | name | diagnostics: the chunk's 16-byte name (body+1..17) |
@@ -115,7 +115,7 @@ binary search; it hits only when all four are equal.
 | 16 | u32 | bytes | all its levels in the copy layout: GetCopyableFootprints' total |
 | 20 | u32 | crc | CRC-32 of those bytes |
 | 24 | u32 | level_crc | index of level 0's CRC in the level CRC table; level i's is at level_crc + i |
-| 28 | u32 | reserved | 0 |
+| 28 | u32 | param | height (kind 2): its span, a float32 0 or above ("Height records"); colour: 0. Was `reserved`: readers before M9 ignore it |
 
 A record's levels have CRCs of their own so that a reader that uploads only some levels (the zones' levels down to the
 game's size; the top level skipped under memory pressure, §3 of the plan) still checks every byte it uses.
@@ -176,6 +176,46 @@ texels averaged 2x2 and encoded again (`bc2::full_chain`), with alpha by the ent
   24 at 0xFF; `vcol_a` 0 is taken as 0x80). Characters pass above 0x22 (`2*a > 0x45`, `chardraw.cpp`).
 - **blended (2), mask (3), mixed (4), none (0)**: the plain 2x2 box. Rescaling would change transparency at a distance
   or the shine's strength (`kSpec*saturate(2*t.a)`).
+
+### Height records (M9)
+
+An entry may have a height record (kind 2) beside its colour (`src/pack/height.hpp`, `bc4.hpp`; plan §8 "Per-pixel
+relief"). The zones and model actors draw it as relief per pixel since M9 step 2 (docs/texture-pack/zones.md "Pack
+normals"); a pack whose entries have none is exactly a v1 pack as before, and a reader
+that doesn't use heights skips the record (the streamer streams any record kind it's asked for).
+
+- **Format:** `BC4_UNORM`, 8 bytes a 4x4 block (r0, r1, then 16 3-bit codes; r0 > r1: 8 values, else 6 and explicit 0
+  and 255), in the same copy layout as colour. `bc4::encode` keeps every texel within `(range + 13) / 14 + 1` 8-bit levels
+  of its block's range (texpack_test holds it).
+- **What a texel means:** `H = (s - 0.5) * span`, s the texel (0..1, 0.5 the map's mean over the texels the game shows),
+  `span` the record's `param` as a float (0: a flat map, every texel 0.5). H is in the game's bump units on the
+  **original** texture's grid: the game's zone normals are `normalize(sobel(bytes / 255), 1)` (`zonemesh::sobel`,
+  01E0A0), so a map the original's size gives the game's tilt with `normalize(sobel(H), 1)`, and a map n times as wide
+  takes its own Sobel times n (level i of it: times n / 2^i). span is twice the 99.9th percentile of |H|; the rare texels
+  past it are clamped.
+- **Size** (`--height-scale`, open question 11; `half` until Alex picks): `full` the size of the colour the texture is
+  drawn with (the colour record, else the original), `half` half that but never under the original (zones at 2x: the
+  game's own size; models at 4x: 2x), `game` the original's. Levels as colour's: halved while both sides stay multiples
+  of 4, down to 4x4 (`bc2::chain_levels`).
+- **Mips are coverage-aware:** each level's texel is the 2x2 mean weighted by how much of each the game shows (cut-out
+  and mixed: alpha past the test as in "Mips", blended: alpha / 0x80, the others: all), carried down the chain; a 2x2
+  the game shows none of takes the plain mean. The same weights count in the high-pass and the detail blurs, so a
+  cut-out's holes give nothing to the leaf beside them.
+- **Where H comes from** (game heights first, so painted shading isn't taken for relief):
+  - a zone texture whose name's last 8 characters (name+8) name a height map (chunk 0x5D, `bp`, w and h u16 at +4 and +6,
+    bytes from +0x20, matched by +0x18) in the zone's bump DAT (map + 0x9B97, + 0x14817 from 600: the map's DAT's file id
+    100 + map, + 0x144F7 from 600): that map's bytes / 255, resampled bilinearly (wrapping) onto the record's size, then
+    high-passed (its Gaussian blur at 6 original texels taken out, weighted). The entry's flag 2 `height_from_game` is
+    set. On ROM\0\100's 12 bump-mapped textures at game size, the normals made back from the stored record are 0.61
+    degrees from the game's own on average (p99 2.6);
+  - else a port of `research\ffxi-re\tools\nmmockup.py` `nmap_multi` on the colour (the colour record's BC2 level 0
+    decoded, else the original decoded), box-filtered (weighted) onto the record's size: brightness (0.30, 0.59, 0.11),
+    less its weighted Gaussian blur at 6 original texels; then the weighted blurs at 0.6, 1.2 and 2.5 map texels summed
+    with weights 1, 0.7 and 0.4, times 2.2 (nmap_multi's k), divided by the map texels an original texel (its slopes
+    are a map texel's).
+- **Sizes** (measured 2026-11-03): with mips and row padding, 0.68 to 0.73 bytes a map texel (small textures pay most
+  for the 256-byte row pitch); per texel of a 2x zone colour, about 0.68 bytes at `full`, 0.18 at `half` and `game`;
+  per texel of a 4x model colour, 0.68, 0.18 and 0.045.
 
 ## Rules
 
@@ -247,7 +287,22 @@ has the details):
   (`--redo`, say with another factor, or a `convert` pack's line) made that entry: then it is made again and replaces it, as
   `convert` does. `source` is `texpack make 2`, the
   maker version 2, so `convert` and `make` each redo the other's `pack.src` lines. Resumable, stopped by `stop`; while
-  the game runs it waits (progress.txt `state: paused`).
+  the game runs it waits (progress.txt `state: paused`). With `--heights` (off by default until M9 is approved) each
+  entry also gets its height record (`--height-scale`), made from its colour's BC2 decoded, so it writes the same bytes
+  as `make` followed by `heights`. A key two zones share is made in the first, but its height comes from the game's map
+  when any zone met has one (game heights first): a later zone in the batch hands its map to the job; one in a later
+  batch makes the committed entry's colour-made height again from its map (`writer::set_map`).
+- `heights --pack <pack>` (M9): height records added to the pack's entries, their other records and fields kept
+  (`writer::set_map`; the flag `height_from_game` set or cleared), the header's maker version, source and fingerprint
+  kept, `pack.src` untouched. Goes through `pack.src`'s DATs (zones, by file id, first; `--kind`, `--only`, `--limit`),
+  the first DAT with a key doing it, in batches of `--batch-mtexels` colour texels, one commit a batch; except that a
+  key whose height the first made from the colour is made again from the game's map by a later zone whose bump DAT
+  has one for it (game heights first: a texture two zones share, only one of them bump-mapped; logged and counted
+  "made again from the game's map"). An entry with a height is skipped (that is the resume; `--redo` makes them
+  again), unless it was made from the colour and the zone at hand has the game's map; `no_pack` entries get none. `pack.lock`, `stop`,
+  `progress.txt` (`state`, `phase`, `paused`, `dats_done`, `dats_total`, `heights_made`, `heights_from_game`,
+  `heights_there_already`, `heights_failed`, `entries`, `written_gb`, `elapsed_s`, `waited_s`, `last`), the game
+  check (waits; `--no-wait` exit 4) and the free-space check as `make`'s. CPU only.
 - `verify [--soul]`: every record and level CRC read back; the soul test against the originals.
 - `stats [--scan]`; `prune` (drops entries no DAT of `pack.src` has any more, takes out the lines of DATs gone or
   changed; stops when a DAT can't be read or more than 1% are gone); `compact` (holds the old pack's `pack.lock`,
@@ -266,6 +321,9 @@ has the details):
   size, levels, bytes and CRC equal) or as differing (two bake runs made it differently). Only the writer's caller
   can ask for a replace (convert: the entry the same DAT's chunk made before): the new bytes are appended and take
   the key, the old ones are left for `compact`.
+- **One map into an entry (M9, `set_map`).** An entry already there gets one record appended and put in place of its
+  record of that kind (the old bytes left for `compact`) or in its first unused slot; its other records and fields stay,
+  and the flags given are set or cleared. The same bytes and `param` again: counted as the same, nothing written.
 - **Commit.** The data file is flushed; `pack.src` rewritten if lines were taken out (above); `pack.idx.new` written
   whole and flushed, then moved over `pack.idx` with `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`
   (retried for a second while a reader has the old one open); and only then the sources finished since the last commit

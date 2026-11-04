@@ -11,6 +11,7 @@
 #include "../pack/pack_module.hpp"
 #include "../upscale/upscale.hpp"
 #include "../zone/inject.hpp"
+#include "../zone/light_split.hpp"
 #include "../zone/zonepack.hpp"
 #include <algorithm>
 #include <atomic>
@@ -53,6 +54,8 @@ namespace hifi::pack_wiring
 		g_bias.store(bias, std::memory_order_relaxed);
 		zone::inject::set_texture_bias(bias);
 		chars::inject::set_texture_bias(bias);
+		// (M9: the light split's marks while the pack's heights are drawn: light_split.hpp "Marks")
+		light::set_marks(pack::heights_in_use());
 	}
 
 	float texture_bias()

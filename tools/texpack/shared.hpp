@@ -88,6 +88,11 @@ namespace hifi::texpack
 		double batch_mtexels = 24.0, game_quiet_s = 60.0, game_poll_s = 3.0, stall_s = 900.0;
 		std::vector<std::wstring> game_names;
 		bool no_wait = false, rescan = false, keep_work = false;
+		// (M9) heights (heights.cpp) and make --heights: the height maps' resolution (height.hpp scale: half, full,
+		// game; half until Alex picks, open question 11); make carries them only with --heights (off until M9 is
+		// approved)
+		std::string height_scale = "half";
+		bool heights = false;
 		// get-upscaler (fetch.cpp): --yes (no question), --dir (where; default <exe folder>\upscaler), --url (tests: a
 		// file:// URL in place of the official one; the size and SHA-256 checked are always the official file's)
 		bool yes = false;
@@ -200,8 +205,12 @@ namespace hifi::texpack
 	// Whether a soul test's errors pass the limits (verify reports such an entry; convert and make leave it out)
 	bool over_limits(const options &o, const soul_result &s);
 
+	// A record's levels as tight BC blocks (the copy layout's row padding taken out)
+	bool untile(const pk::record &r, const std::vector<uint8_t> &bytes, std::vector<std::vector<uint8_t>> &levels);
+
 	// ---- The other files' commands
 
 	int make(options &o);         // make.cpp
 	int get_upscaler(options &o); // fetch.cpp
+	int heights(options &o);      // heights.cpp
 }

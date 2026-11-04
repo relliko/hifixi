@@ -57,6 +57,9 @@
  * over it, 8 degrees down), the water's cost alone (no AO, no
  * sun shadows): what the far water costs, out to the horizon. Bibiki Bay (4): water=... sea=... at=-380,3.3,-360
  * horizon=227 level=0.3, the camera on its baked water looking out to sea. "picture=sea.ppm": the last frame written there.
+ * "relief" (M9): the zone shader's ways to light a pixel with relief timed alone (relief_bench below: none, the game's
+ * normal map, the texture pack's BC4 height with the shader's Sobel, a stored BC5 normal; half and full size), at
+ * width x height, frames a variant; nothing else is drawn.
  */
 
 #include "grass_render.hpp" // (HiFi XI's render engine: ..\hifixi\src\render)
@@ -177,6 +180,375 @@ float ps_main(float4 pos : SV_Position) : SV_Depth
 	return saturate(c.z / c.w);
 }
 )";
+
+	// "relief" (M9, docs/texture-pack/zones.md "Pack normals: Sobel or BC5"): the zone shader's ways to light a pixel with
+	// relief, timed alone at width x height. A ground in perspective fills the screen (near, magnified; toward the top,
+	// minified down the mips, anisotropic x8 and the zone sampler's -0.5 bias): its colour a 512x512 BC2 with every
+	// level, repeating every half of a screen's width near the bottom; its relief one of: none, the game's normal map
+	// (B8G8R8A8 256x256, one level: today's kMapped), the pack's height (BC4, every level) with the shader's Sobel (four
+	// taps and its size: draw.cpp pack_tilt) at 256 (half: a 2x zone's game size) and 512 (full), or a stored normal (BC5,
+	// every level: one tap, z rebuilt) at 256 and 512. Each frame 4 passes between timestamps, waited for; the median and
+	// the tenth percentile of a pass printed, and each one's cost over "none".
+	const char kReliefShader[] = R"(
+cbuffer c : register(b0) { float4 info; }; // xy: the target's size; z: the relief scale
+Texture2D colour_map : register(t0);
+Texture2D relief_map : register(t1);
+SamplerState wrap : register(s0);
+float4 vs_main(uint id : SV_VertexID) : SV_Position
+{
+	float2 uv = float2((id << 1) & 2, id & 2);
+	return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+float4 ps_main(float4 pos : SV_Position) : SV_Target
+{
+	const float v = (pos.y + 6.0) / info.y;
+	const float d = 0.08 / v;
+	const float2 uv = float2((pos.x / info.x - 0.5) * 2.0 * d, d) * 4.0;
+	const float4 t = colour_map.Sample(wrap, uv);
+	float3 n = float3(0, 0, 1);
+#if VARIANT == 1
+	n = relief_map.Sample(wrap, uv).rgb * 2 - 1;
+#elif VARIANT == 2
+	float w, h;
+	relief_map.GetDimensions(w, h);
+	const float2 e = 1.0 / max(float2(w, h), 1.0);
+	const float l = relief_map.Sample(wrap, uv - float2(e.x, 0)).r, r = relief_map.Sample(wrap, uv + float2(e.x, 0)).r;
+	const float u = relief_map.Sample(wrap, uv - float2(0, e.y)).r, dn = relief_map.Sample(wrap, uv + float2(0, e.y)).r;
+	n = normalize(float3(info.z * (u - dn), info.z * (l - r), 1));
+#elif VARIANT == 3
+	const float2 xy = relief_map.Sample(wrap, uv).rg * 2 - 1;
+	n = float3(xy, sqrt(saturate(1 - dot(xy, xy))));
+#endif
+	n = normalize(n);
+	const float lit = saturate(dot(n, normalize(float3(0.3, 0.5, 0.8))));
+	return float4(2 * t.rgb * (0.3 + lit), 1);
+}
+)";
+
+	int relief_bench(ID3D12Device *device, ID3D12CommandQueue *queue, pD3DCompile compile_fn, UINT W, UINT H, int frames)
+	{
+		struct variant
+		{
+			const char *name;
+			int kind;           // (the shader's VARIANT)
+			DXGI_FORMAT format; // (the relief map's; UNKNOWN: none)
+			UINT size, levels;  // (levels 0: all)
+		};
+		const variant variants[] = {
+			{ "none (no relief)", 0, DXGI_FORMAT_UNKNOWN, 0, 0 },
+			{ "game normal map B8G8R8A8 256, 1 level (today's kMapped)", 1, DXGI_FORMAT_B8G8R8A8_UNORM, 256, 1 },
+			{ "pack height BC4 256 (half), Sobel in the shader", 2, DXGI_FORMAT_BC4_UNORM, 256, 0 },
+			{ "stored normal BC5 256 (half)", 3, DXGI_FORMAT_BC5_UNORM, 256, 0 },
+			{ "pack height BC4 512 (full), Sobel in the shader", 2, DXGI_FORMAT_BC4_UNORM, 512, 0 },
+			{ "stored normal BC5 512 (full)", 3, DXGI_FORMAT_BC5_UNORM, 512, 0 },
+		};
+		constexpr UINT kPasses = 4;
+		auto levels_of = [](UINT size) {
+			UINT n = 1;
+			while (size > 4)
+				size >>= 1, ++n;
+			return n;
+		};
+		ID3D12CommandAllocator *allocator = nullptr;
+		ID3D12GraphicsCommandList *list = nullptr;
+		ID3D12Fence *fence = nullptr;
+		UINT64 fence_value = 0;
+		device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+		device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list));
+		device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+		HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		auto run = [&]() {
+			list->Close();
+			ID3D12CommandList *lists[] = { list };
+			queue->ExecuteCommandLists(1, lists);
+			queue->Signal(fence, ++fence_value);
+			fence->SetEventOnCompletion(fence_value, event);
+			if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
+				return false;
+			allocator->Reset();
+			list->Reset(allocator, nullptr);
+			return true;
+		};
+
+		// The textures, every level filled with noise through one upload buffer (a texture's contents don't change what
+		// sampling a block-compressed one costs)
+		struct tex_spec
+		{
+			DXGI_FORMAT format;
+			UINT size, levels;
+		};
+		std::vector<tex_spec> specs = { { DXGI_FORMAT_BC2_UNORM, 512, levels_of(512) } };
+		for (const variant &v : variants)
+			specs.push_back({ v.format, v.size, v.levels != 0 ? v.levels : levels_of(v.size) });
+		std::vector<ID3D12Resource *> textures(specs.size(), nullptr);
+		std::vector<std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>> spots(specs.size());
+		UINT64 at = 0;
+		for (size_t i = 0; i < specs.size(); ++i)
+		{
+			if (specs[i].format == DXGI_FORMAT_UNKNOWN)
+				continue;
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = d.Height = specs[i].size;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = UINT16(specs[i].levels);
+			d.Format = specs[i].format;
+			d.SampleDesc.Count = 1;
+			const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+			if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&textures[i]))))
+			{
+				std::printf("relief: a texture couldn't be made\n");
+				return 1;
+			}
+			spots[i].resize(specs[i].levels);
+			UINT64 size = 0;
+			device->GetCopyableFootprints(&d, 0, specs[i].levels, at, spots[i].data(), nullptr, nullptr, &size);
+			at = (at + size + 511) & ~UINT64(511);
+		}
+		ID3D12Resource *upload = nullptr;
+		{
+			const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			d.Width = at;
+			d.Height = 1;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.SampleDesc.Count = 1;
+			d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			uint8_t *mapped = nullptr;
+			if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))) ||
+				FAILED(upload->Map(0, nullptr, reinterpret_cast<void **>(&mapped))))
+			{
+				std::printf("relief: the upload buffer couldn't be made\n");
+				return 1;
+			}
+			uint32_t x = 0x12345678u;
+			for (UINT64 k = 0; k < at; ++k)
+			{
+				x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+				mapped[k] = uint8_t(x);
+			}
+			upload->Unmap(0, nullptr);
+		}
+		for (size_t i = 0; i < specs.size(); ++i)
+		{
+			if (textures[i] == nullptr)
+				continue;
+			for (UINT l = 0; l < specs[i].levels; ++l)
+			{
+				D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+				dst.pResource = textures[i];
+				dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				dst.SubresourceIndex = l;
+				src.pResource = upload;
+				src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				src.PlacedFootprint = spots[i][l];
+				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			}
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = textures[i];
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			list->ResourceBarrier(1, &b);
+		}
+
+		// The target (the world's RGBA16F), a heap of SRVs (colour, then each variant's relief; a variant without one reads
+		// the colour), the root signature, timestamps
+		ID3D12Resource *target = nullptr;
+		{
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			d.Width = W;
+			d.Height = H;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			d.SampleDesc.Count = 1;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+			if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&target))))
+			{
+				std::printf("relief: the target couldn't be made\n");
+				return 1;
+			}
+		}
+		ID3D12DescriptorHeap *rtv_heap = nullptr, *srv_heap = nullptr;
+		const D3D12_DESCRIPTOR_HEAP_DESC rhd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+		const D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, UINT(2 * std::size(variants)), D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+		device->CreateDescriptorHeap(&rhd, IID_PPV_ARGS(&rtv_heap));
+		device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&srv_heap));
+		const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+		device->CreateRenderTargetView(target, nullptr, rtv);
+		const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		for (size_t v = 0; v < std::size(variants); ++v)
+			for (int k = 0; k < 2; ++k)
+			{
+				const size_t i = k == 0 || textures[1 + v] == nullptr ? 0 : 1 + v;
+				D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+				sd.Format = specs[i].format;
+				sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				sd.Texture2D.MipLevels = specs[i].levels;
+				D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap->GetCPUDescriptorHandleForHeapStart();
+				h.ptr += (2 * v + k) * step;
+				device->CreateShaderResourceView(textures[i], &sd, h);
+			}
+		ID3D12RootSignature *root = nullptr;
+		{
+			const D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0 };
+			D3D12_ROOT_PARAMETER p[2] = {};
+			p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+			p[0].Constants.Num32BitValues = 4;
+			p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+			p[1].DescriptorTable.NumDescriptorRanges = 1;
+			p[1].DescriptorTable.pDescriptorRanges = &range;
+			p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+			D3D12_STATIC_SAMPLER_DESC s = {};
+			s.Filter = D3D12_FILTER_ANISOTROPIC;
+			s.MaxAnisotropy = 8;
+			s.MipLODBias = -0.5f;
+			s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+			s.MaxLOD = D3D12_FLOAT32_MAX;
+			s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+			const D3D12_ROOT_SIGNATURE_DESC rd = { 2, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+			ID3DBlob *blob = nullptr, *errors = nullptr;
+			const auto serialize = reinterpret_cast<PFN_D3D12_SERIALIZE_ROOT_SIGNATURE>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
+			if (serialize == nullptr || FAILED(serialize(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
+				FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root))))
+			{
+				std::printf("relief: the root signature couldn't be made\n");
+				return 1;
+			}
+			blob->Release();
+		}
+		std::vector<ID3D12PipelineState *> psos(std::size(variants), nullptr);
+		ID3DBlob *vs = nullptr, *errors = nullptr;
+		if (FAILED(compile_fn(kReliefShader, sizeof(kReliefShader) - 1, "relief", nullptr, nullptr, "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &errors)))
+		{
+			std::printf("relief: %s\n", errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "the vertex shader didn't compile");
+			return 1;
+		}
+		for (size_t v = 0; v < std::size(variants); ++v)
+		{
+			char value[4];
+			std::snprintf(value, sizeof(value), "%d", variants[v].kind);
+			const D3D_SHADER_MACRO defines[] = { { "VARIANT", value }, { nullptr, nullptr } };
+			ID3DBlob *ps = nullptr;
+			if (FAILED(compile_fn(kReliefShader, sizeof(kReliefShader) - 1, "relief", defines, nullptr, "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &errors)))
+			{
+				std::printf("relief: %s\n", errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "the pixel shader didn't compile");
+				return 1;
+			}
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+			d.pRootSignature = root;
+			d.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+			d.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+			d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			d.NumRenderTargets = 1;
+			d.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			d.SampleDesc.Count = 1;
+			d.SampleMask = UINT_MAX;
+			d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&psos[v]));
+			ps->Release();
+			if (psos[v] == nullptr)
+			{
+				std::printf("relief: a pipeline couldn't be made\n");
+				return 1;
+			}
+		}
+		ID3D12QueryHeap *queries = nullptr;
+		ID3D12Resource *readback = nullptr;
+		{
+			const D3D12_QUERY_HEAP_DESC qd = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2 };
+			device->CreateQueryHeap(&qd, IID_PPV_ARGS(&queries));
+			const D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK };
+			D3D12_RESOURCE_DESC d = {};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			d.Width = 16;
+			d.Height = 1;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.SampleDesc.Count = 1;
+			d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+		}
+		if (!run())
+		{
+			std::printf("relief: the uploads didn't finish\n");
+			return 1;
+		}
+		UINT64 ticks = 1;
+		queue->GetTimestampFrequency(&ticks);
+
+		std::printf("relief: %ux%u, %u passes a frame, %d frames a variant (ms a full-screen pass: median, tenth percentile; over none)\n", W, H, kPasses, frames);
+		double none = 0.0;
+		for (size_t v = 0; v < std::size(variants); ++v)
+		{
+			std::vector<double> ms;
+			for (int f = -4; f < frames; ++f)
+			{
+				const D3D12_VIEWPORT vp = { 0, 0, float(W), float(H), 0, 1 };
+				const D3D12_RECT sc = { 0, 0, LONG(W), LONG(H) };
+				list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+				list->RSSetViewports(1, &vp);
+				list->RSSetScissorRects(1, &sc);
+				list->SetGraphicsRootSignature(root);
+				list->SetDescriptorHeaps(1, &srv_heap);
+				const float c[4] = { float(W), float(H), variants[v].size == 512 ? 8.0f : 4.0f, 0.0f };
+				list->SetGraphicsRoot32BitConstants(0, 4, c, 0);
+				D3D12_GPU_DESCRIPTOR_HANDLE h = srv_heap->GetGPUDescriptorHandleForHeapStart();
+				h.ptr += 2 * v * step;
+				list->SetGraphicsRootDescriptorTable(1, h);
+				list->SetPipelineState(psos[v]);
+				list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+				list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+				for (UINT k = 0; k < kPasses; ++k)
+					list->DrawInstanced(3, 1, 0, 0);
+				list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+				list->ResolveQueryData(queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
+				if (!run())
+				{
+					std::printf("relief: the GPU didn't finish a frame in 5 s\n");
+					return 1;
+				}
+				UINT64 *t = nullptr;
+				const D3D12_RANGE r = { 0, 16 };
+				readback->Map(0, &r, reinterpret_cast<void **>(&t));
+				if (f >= 0)
+					ms.push_back(double(t[1] - t[0]) * 1000.0 / double(ticks) / kPasses);
+				const D3D12_RANGE none_written = { 0, 0 };
+				readback->Unmap(0, &none_written);
+			}
+			std::sort(ms.begin(), ms.end());
+			const double median = ms[ms.size() / 2], low = ms[ms.size() / 10];
+			if (v == 0)
+				none = median;
+			std::printf("  %-58s %.3f  %.3f  %+.3f\n", variants[v].name, median, low, median - none);
+		}
+		for (ID3D12PipelineState *p : psos)
+			release(p);
+		for (ID3D12Resource *&t : textures)
+			release(t);
+		release(vs);
+		release(root);
+		release(queries);
+		release(readback);
+		release(target);
+		release(upload);
+		release(rtv_heap);
+		release(srv_heap);
+		release(list);
+		release(allocator);
+		release(fence);
+		CloseHandle(event);
+		return 0;
+	}
 }
 
 int main(int argc, char **argv)
@@ -190,7 +562,7 @@ int main(int argc, char **argv)
 	int sky = -1; // (-1: the usual camera; 0: the sky's camera, the sky off; 1: on)
 	float rain = 0.0f, snow = 0.0f;
 	const char *grass_file = nullptr;
-	bool wear = false, fade = false, warp = false, flash = false;
+	bool wear = false, fade = false, warp = false, flash = false, relief = false;
 	const char *weather_name_given = nullptr;
 	const char *water_file = nullptr, *sea_file = nullptr;
 	bool sea_synthetic = false, sea_off = false;
@@ -234,6 +606,8 @@ int main(int argc, char **argv)
 			fade = true;
 		else if (std::strcmp(argv[i], "warp") == 0)
 			warp = true;
+		else if (std::strcmp(argv[i], "relief") == 0)
+			relief = true;
 		else if (std::strcmp(argv[i], "flash") == 0)
 			flash = true;
 		else if (std::strncmp(argv[i], "weather=", 8) == 0 && std::strlen(argv[i]) == 12)
@@ -333,6 +707,8 @@ int main(int argc, char **argv)
 	device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list));
 	device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
 	HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	if (relief)
+		return relief_bench(device, queue, compile_fn, W, H, frames);
 	// (continuous: submit, then take the next of the queued allocators once the GPU is done with its last frame)
 	UINT slot = 0;
 	auto submit_queued = [&]() {

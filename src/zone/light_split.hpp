@@ -11,11 +11,19 @@
 //   bits 25-31  the sun's share of the light drawn there, 0..127: how much of it a full shadow takes away (the sun's
 //               term as the game lights it, against everything else: the ambient, the lamps; after the 0..1 clamp)
 //
+// Marks (M9, docs/texture-pack/zones.md "Pack normals"): World FX turns the facing toward the camera when it reads it, so
+// which way it was written is free to say one thing. The zone turns it away from the camera on a pixel it lit with the
+// texture pack's relief (draw.cpp kPackRelief), every other pixel toward. While marks() is set (the pack in use with its
+// heights: set_marks, from the texture pack's wiring each present) the characters turn theirs toward the camera too, and
+// World FX is told (zinfo.w bit 64) to read a facing written away as "the pack's relief is here" (its own screen-space
+// relief fades there, so the two don't double up). With marks off every word is as before M9, bit for bit.
+//
 // Cleared to 0 by the first native pass after World FX last took it (take): one frame's at a time, as dgVoodoo
 // records one frame after another on its one thread. Written only while World FX asks for it (take in the last second)
 // and the world has one sample. Header only: the zone's and the characters' injections and main.cpp share it.
 #include <windows.h>
 #include <d3d12.h>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <utility>
@@ -198,6 +206,12 @@ float light_share(float3 lit, float3 without_sun)
 		g.taken++;
 		return g.texture;
 	}
+
+	// Marks (above): set each present by the texture pack's wiring (pack::heights_in_use); read by the characters' draw
+	// (their facing turned toward the camera) and World FX's light source (zinfo.w bit 64)
+	inline std::atomic<bool> g_marks { false };
+	inline void set_marks(bool on) { g_marks.store(on, std::memory_order_relaxed); }
+	inline bool marks() { return g_marks.load(std::memory_order_relaxed); }
 
 	// (status: how many frames World FX took it, how many it was cleared)
 	inline void counts(uint64_t &taken, uint64_t &cleared)

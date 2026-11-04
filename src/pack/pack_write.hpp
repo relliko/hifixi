@@ -35,6 +35,7 @@ namespace hifi::pack
 		uint32_t format = kBC2;
 		uint32_t w = 0, h = 0;
 		std::vector<std::vector<uint8_t>> levels;
+		uint32_t param = 0; // (record::param: a height record's span)
 	};
 
 	struct writer_options
@@ -55,6 +56,7 @@ namespace hifi::pack
 		uint32_t replaced = 0; // a key already there, with other bytes, replaced as add() was told
 		uint32_t refused = 0;
 		uint32_t dropped = 0;
+		uint32_t maps_added = 0, maps_replaced = 0; // (set_map: a map put in a free slot, or over one of its kind)
 		uint64_t bytes = 0;    // record bytes written by this writer
 		uint32_t commits = 0;
 	};
@@ -112,6 +114,12 @@ namespace hifi::pack
 		// differ: then the new entry takes the key and the old one's bytes are left for compact (replaced); refused (why)
 		// when a map breaks the rules or a level's size isn't its blocks'
 		add_result add(const entry &e, const std::vector<map_in> &maps, std::string &why, bool replace = false);
+		// (M9: texpack heights) One map put into the entry that has key k, its other maps kept: in place of its record of
+		// that kind (whose bytes are then left for compact), else in its first unused slot. flags_set is or'ed into the
+		// entry's flags and flags_clear taken out (kHeightFromGame). same when the entry's record of that kind already
+		// has these bytes (the flags still set); refused (why) when there's no such entry, no free slot, or the map breaks
+		// the rules
+		add_result set_map(const key &k, const map_in &map, uint16_t flags_set, uint16_t flags_clear, std::string &why);
 		// rel finished (all its entries added): its pack.src line goes out with the next commit
 		void finished(const std::string &rel, uint64_t size, uint64_t mtime, uint64_t overlay_size = 0, uint64_t overlay_mtime = 0);
 		// rel's pack.src line taken out at the next commit (prune: its DAT changed or is gone), so it's converted again
@@ -133,6 +141,14 @@ namespace hifi::pack
 		bool open_file(uint32_t file, std::string &why);
 		void close_file();
 		bool append(const uint8_t *data, uint64_t size, uint32_t &offset, uint16_t &file, std::string &why);
+		// A map in the copy layout, its record (all but offset, file and level_crc) and level CRCs; nullptr or why not
+		struct laid
+		{
+			record r;
+			std::vector<uint8_t> bytes;
+			std::vector<uint32_t> level_crcs;
+		};
+		static const char *lay_out(const map_in &in, laid &o, std::string &why);
 		struct key_hash
 		{
 			size_t operator()(const key &k) const { return size_t(k.hash ^ (k.hash >> 32)); }

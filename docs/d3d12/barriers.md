@@ -146,7 +146,12 @@ Our own resources:
   zonenative_test draws a zone from them, 0 messages under GPU-based validation (WARP and the 4070 Ti). Since M5 the
   character pass reads them as well (the colour map of a group whose texture's pack pair is ready,
   `src/chars/chardraw.cpp:1799`): the same promotion, no barrier; charinject_test draws the Mithra from them and turns
-  them off and on 50 times between recording and running, 0 messages under GPU-based validation (WARP).
+  them off and on 50 times between recording and running, 0 messages under GPU-based validation (WARP). Since M9 the
+  zone pass reads the pack's height textures too (BC4, bound at t5 for a piece with a drawn height, `draw.cpp:995`): the
+  same promotion, no barrier; zonenative_test's heights part draws them with the debug layer, 0 messages. And the
+  character pass reads them (BC4 at t6, the pack pair's second descriptor, for a group drawn with flags 4,
+  `src/chars/chardraw.cpp:1849-1879`): the same promotion, no barrier; charinject_test's heights part, 0 messages under
+  GPU-based validation (WARP and the 4070 Ti).
 - The streamer's ring (`src/pack/stream.cpp:553-565`): a CUSTOM heap buffer (CPU write-back, L0) made in COMMON; a
   buffer promotes to COPY_SOURCE on the copy queue and decays. Not an UPLOAD heap (GENERIC_READ for life, and
   write-combined: docs/d3d12/sync.md).

@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <unordered_map>
 
 namespace hifi::zone::zonepack
@@ -34,14 +36,17 @@ namespace hifi::zone::zonepack
 			bool ordered = false;
 			std::vector<uint32_t> order; // (its keyed textures, most used first, then nearest)
 			size_t next = 0;             // (the next of them to ask for)
-			std::unordered_map<uint32_t, uint32_t> by_slot; // (outstanding tickets: slot -> texture)
+			size_t next_height = 0;      // (M9: the next of them whose height to ask for, while heights are on)
+			// (outstanding tickets: slot -> texture, kHeightLog set for a height's)
+			std::unordered_map<uint32_t, uint32_t> by_slot;
 			uint32_t drawn = 0, not_in_pack = 0, failed = 0, gone = 0;
+			uint32_t heights_drawn = 0, heights_failed = 0; // (M9)
 			bool logged = false;
 		};
 
 		struct state
 		{
-			bool zones = false, actors = false;
+			bool zones = false, actors = false, heights = true;
 			camera_fn camera = nullptr;
 			log_fn log = nullptr;
 			double now = 0.0; // (the last frame's)
@@ -69,9 +74,14 @@ namespace hifi::zone::zonepack
 			if (e.logged || e.base == kActorPriority)
 				return;
 			e.logged = true;
-			char line[300];
-			std::snprintf(line, sizeof(line), "texture pack in %s %u: %u of %zu textures from the pack, %u not in it, %u failed, %u gone; %.0f MB; %s %.1f s after it was ready",
-				e.what, e.map, e.drawn, z.data().textures.size(), e.not_in_pack, e.failed, e.gone, double(z.pack().bytes) / 1048576.0, how, now - e.since);
+			char line[360];
+			// (M9: the heights only when any were asked, so a pack without them logs as before)
+			char heights[80] = "";
+			if (e.heights_drawn + e.heights_failed != 0)
+				std::snprintf(heights, sizeof(heights), " (%u with the pack's relief%s)", e.heights_drawn,
+					e.heights_failed != 0 ? (", " + std::to_string(e.heights_failed) + " heights not had").c_str() : "");
+			std::snprintf(line, sizeof(line), "texture pack in %s %u: %u of %zu textures from the pack%s, %u not in it, %u failed, %u gone; %.0f MB; %s %.1f s after it was ready",
+				e.what, e.map, e.drawn, z.data().textures.size(), heights, e.not_in_pack, e.failed, e.gone, double(z.pack().bytes) / 1048576.0, how, now - e.since);
 			log(0, line);
 		}
 
@@ -90,8 +100,14 @@ namespace hifi::zone::zonepack
 				g.n.dropped++;
 			}
 			for (uint32_t i = 0; i < z.data().textures.size(); ++i)
+			{
 				if (z.pack_word(i) != gpu_zone::kPackSpent)
 					z.set_pack_word(i, gpu_zone::kPackSpent);
+				// (a height never asked stays none: the visit is done, nothing asks it again; so a pack without heights
+				// logs as before)
+				if (z.height_word(i) == gpu_zone::kPackAsked || z.height_word(i) == gpu_zone::kPackDrawn)
+					z.set_height_word(i, gpu_zone::kPackSpent);
+			}
 			p.owner = 0;
 			p.done = true;
 			p.bytes = 0;
@@ -166,12 +182,53 @@ namespace hifi::zone::zonepack
 			g.n.zones = uint32_t(entries().size());
 		}
 
+		// (M9) A height's ticket handed over by take_done: a ready one's view written into the height block with its relief
+		// scale, then drawn; else dropped and spent. The relief scale: the shader takes s(u - e) - s(u + e) over one level-0
+		// texel e each way, and the game's Sobel on its own grid is 4 x that x span (H = (s - 0.5) x span) x the map's
+		// texels a game texel (format.md "Height records")
+		void settle_height(gpu_zone &z, entry &e, st::ticket t, st::state s, uint32_t i, uint32_t &views)
+		{
+			if (i >= z.pack().height_tickets.size() || !(z.pack().height_tickets[i] == t))
+				return;
+			e.by_slot.erase(t.slot);
+			if (s == st::state::ready && z.height_word(i) == gpu_zone::kPackAsked)
+			{
+				st::view v;
+				const zm::texture &tx = z.data().textures[i];
+				float span = 0.0f;
+				if (st::get(t, v))
+					std::memcpy(&span, &v.param, 4);
+				const float relief = tx.key.w != 0 ? 4.0f * span * float(v.w) / float(tx.key.w) : 0.0f;
+				// (a flat map, or a span that isn't a number, gives nothing to draw: let go)
+				if (std::isfinite(relief) && relief > 0.0f && st::write_view(t, z.height_cpu(i)))
+				{
+					z.height_written(i, relief);
+					z.pack().bytes += v.bytes;
+					z.set_height_word(i, gpu_zone::kPackDrawn);
+					e.heights_drawn++;
+					g.n.heights_drawn++;
+					views++;
+					return;
+				}
+			}
+			st::drop(t);
+			z.pack().height_tickets[i] = st::ticket {};
+			z.set_height_word(i, gpu_zone::kPackSpent);
+			e.heights_failed++;
+			g.n.heights_failed++;
+		}
+
 		// A ticket handed over by take_done: a ready one's view written, then drawn; else dropped and spent
 		void settle(gpu_zone &z, entry &e, st::ticket t, st::state s, uint32_t &views)
 		{
 			const auto at = e.by_slot.find(t.slot);
 			if (at == e.by_slot.end())
 				return;
+			if ((at->second & gpu_zone::kHeightLog) != 0)
+			{
+				settle_height(z, e, t, s, at->second & ~gpu_zone::kHeightLog, views);
+				return;
+			}
 			const uint32_t i = at->second;
 			if (i >= z.pack().tickets.size() || !(z.pack().tickets[i] == t))
 				return;
@@ -209,7 +266,7 @@ namespace hifi::zone::zonepack
 	{
 		pack::consumer c;
 		c.clear_all = &clear_all;
-		c.set_mode = [](const pack::modes &m) { set_mode(m.zones, m.actors); };
+		c.set_mode = [](const pack::modes &m) { set_mode(m.zones, m.actors, m.heights); };
 		c.frame = &frame;
 		c.set_compare = &set_compare;
 		c.lines = &lines;
@@ -225,10 +282,14 @@ namespace hifi::zone::zonepack
 			drop_zone(*z);
 	}
 
-	void set_mode(bool zones, bool actors)
+	void set_mode(bool zones, bool actors, bool heights)
 	{
 		g.zones = zones;
 		g.actors = actors;
+		// (heights off: none drawn from the next pass, none asked; those held stay till the zone is let go, so turning
+		// them on again in the same area draws them at once)
+		g.heights = heights;
+		gpu_zone::set_heights(heights);
 		native::set_pack_mode(zones);
 		actordata::set_pack_mode(actors);
 	}
@@ -315,6 +376,49 @@ namespace hifi::zone::zonepack
 				z->set_pack_word(i, gpu_zone::kPackAsked);
 			}
 		}
+		// (M9) Then the heights, in the same order, while they're on: only an entry the pack has a height record for (a
+		// pack without heights asks nothing more), whatever came of its colour (a materials-only entry has none), its
+		// whole chain (the relief is wanted mip-mapped at a distance, unlike the colour: zones.md "Pack normals")
+		if (g.heights)
+		{
+			std::shared_ptr<const hifi::pack::index> idx;
+			for (auto &[z, e] : list)
+			{
+				const size_t n = e->order.size();
+				while (e->ordered && e->next_height < n && asked < cap)
+				{
+					const size_t rank = e->next_height++;
+					const uint32_t i = e->order[rank];
+					if (z->height_word(i) != gpu_zone::kPackNone)
+						continue;
+					if (idx == nullptr && (idx = st::current()) == nullptr)
+						break;
+					const zm::texture &t = z->data().textures[i];
+					const hifi::pack::entry *pe = idx->find(t.key);
+					if (pe == nullptr || pe->map(hifi::pack::kHeight) == nullptr)
+						continue;
+					st::want w;
+					w.k = t.key;
+					w.kind = hifi::pack::kHeight;
+					w.priority = e->base + int32_t(n - rank);
+					w.epoch = epoch;
+					const st::ticket tk = st::request(z->pack().owner, w);
+					asked++;
+					g.n.asked++;
+					g.n.heights_asked++;
+					if (tk.generation == 0)
+					{
+						z->set_height_word(i, gpu_zone::kPackSpent);
+						e->heights_failed++;
+						g.n.heights_failed++;
+						continue;
+					}
+					z->pack().height_tickets[i] = tk;
+					e->by_slot[tk.slot] = i | gpu_zone::kHeightLog;
+					z->set_height_word(i, gpu_zone::kPackAsked);
+				}
+			}
+		}
 		g.n.last_requests = asked;
 		g.n.most_in_a_present = std::max(g.n.most_in_a_present, asked);
 
@@ -329,7 +433,7 @@ namespace hifi::zone::zonepack
 			st::take_done(z->pack().owner, done);
 			for (const auto &[t, s] : done)
 				settle(*z, *e, t, s, views);
-			if (e->next >= e->order.size() && e->by_slot.empty() && e->ordered)
+			if (e->next >= e->order.size() && (!g.heights || e->next_height >= e->order.size()) && e->by_slot.empty() && e->ordered)
 				log_entry(*z, *e, now, "settled");
 		}
 		g.n.last_views = views;
@@ -361,6 +465,13 @@ namespace hifi::zone::zonepack
 				std::snprintf(line, sizeof(line), "This area: %u of %u scenery textures from the pack (%u not in it%s); %u coming", c.drawn, c.textures,
 					not_in + (c.textures - c.keyed), failed != 0 ? (", " + std::to_string(failed) + " failed").c_str() : "", coming);
 				out.push_back(line);
+				// (M9: only once the pack has given this area any relief)
+				if (c.heights_drawn + c.heights_asked != 0)
+				{
+					std::snprintf(line, sizeof(line), "Relief from the pack on %u of them%s%s", c.heights_drawn, c.heights_asked != 0 ? (", " + std::to_string(c.heights_asked) + " coming").c_str() : "",
+						gpu_zone::heights() ? "." : " (off: [textures] height).");
+					out.push_back(line);
+				}
 			}
 		}
 		uint32_t files = 0, textures = 0, drawn = 0;

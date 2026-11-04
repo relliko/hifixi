@@ -98,6 +98,7 @@ namespace hifi::pack::stream
 		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		uint32_t w = 0, h = 0, levels = 0, first = 0; // (w x h: level `first` of the record's, the texture's level 0)
 		uint64_t bytes = 0;                           // (its allocation: GetResourceAllocationInfo)
+		uint32_t param = 0;                           // (the record's param: a height record's span, float bits; M9)
 	};
 	struct limits
 	{

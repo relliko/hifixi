@@ -104,17 +104,27 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   (`chardraw.cpp:2160`).
 - The characters' texture pack pairs (docs/texture-pack/characters.md): a texture on the GPU may hold a second pair
   from the same `free_slots`, the pack's view of it. Taken only for a ticket `take_done` handed over ready
-  (`pack_begin`, `cache.cpp:1408`, :1427), and only while more than `kPackSlotFloor` 1,024 pairs are free (:1416; asks
-  are held then too, :1330, and never more are asked than the pairs over it less those on their way, :1337-1350): the meshes and the game's own textures always find one. Written once, on the game's
-  thread, with the cache's mutex left (`src/chars/charpack.cpp:137-138`): descriptor `2s` is `stream::write_view` of the
+  (`pack_settle`, `cache.cpp:1448`, :1500), and only while more than `kPackSlotFloor` 1,024 pairs are free (:1489; asks
+  are held then too, :1363, and never more are asked than the pairs over it less those on their way, :1370-1383): the meshes and the game's own textures always find one. Written once, on the game's
+  thread, with the cache's mutex left (`src/chars/charpack.cpp:178-190`): descriptor `2s` is `stream::write_view` of the
   ticket (BC2, its levels), `2s + 1` a **new view** of the game texture's detail map (`write_pack_detail`,
-  `cache.cpp:1448-1465`, its `MipLevels` from the resource's desc) or the null view the game's pair has. Never a
+  `cache.cpp:1549-1584`, its `MipLevels` from the resource's desc) or the null view the game's pair has. Never a
   `CopyDescriptors` from the game's pair: the cache's heap is shader visible, so it can't be a copy's source (the rule
-  above). Only then does the state say ready (`pack_end`, :1472), and only a ready pair is handed out
-  (`texture_view_of`, :1148; the shadow casters ask with the pack refused, `chardraw.cpp:1942`; counted, `char_stats::pack_draws`: charinject_test checks the casters draw none). Let go like a game
-  pair (`release_pack`, `cache.cpp:261`): behind the fence, never into a heap made since. charcache_test lets 1,000
+  above). Since M9 (characters.md "Pack relief") a texture asked with a height has two tickets, and its pair is taken
+  only once both are settled (`pack_settle`, `cache.cpp:1448`; `pack_begin` is its colour-only case): `2s + 1` is then
+  `stream::write_view` of the height ticket (BC4, its whole chain; `src/chars/charpack.cpp:187`) in the detail map's
+  place, and when the pack has no colour for it (a height alone) `2s` is a new view of the game's own texture
+  (`write_pack_detail` again, its `MipLevels` from the resource's desc; the texture AddRef'd under the mutex,
+  `cache.cpp:1524`), never a copy either. Still one pair, written once; the draw says which it holds by flags 4 (below).
+  Only then does the state say ready (`pack_end`, :1586), and only a ready pair is handed out
+  (`texture_view_of`, :1166; the shadow casters ask with the pack refused, `chardraw.cpp:1999`; counted, `char_stats::pack_draws`: charinject_test checks the casters draw none). Let go like a game
+  pair (`release_pack`, `cache.cpp:283`, both tickets with it): behind the fence, never into a heap made since. charcache_test lets 1,000
   textures go while upgrading, between `pack_begin` and `pack_end` too, and finds no pair twice and none free before
-  the fence.
+  the fence. Table 5's layout and root signature 1 are unchanged by M9: a pair whose `2s + 1` is the height is drawn
+  with draw-constant flags 4 and the relief scale in the composite's word (dc[5], unused and 0 in a model's draw until
+  then; `chardraw.cpp:1879`), so the shader never reads a height as a detail map; charinject_test's heights part
+  (a height alone, a colour and a height, a colour alone) is silent under the debug layer and GPU-based validation
+  (WARP and the 4070 Ti).
 - Zone: `src/zone/zone_gpu.cpp:258-299` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:922-933`
   switches heap only when the next object's zone differs (the second map), and binds that zone's vertex and index
   buffers as root SRVs with it; the breadcrumb
@@ -131,6 +141,15 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   shadow cut-outs (`zoneshadow.cpp:508`, :523) use it. zonenative_test's slot-write log checks the order per gpu_zone.
   `tests/zone_view.cpp:232` (`ZONE_VIEW_PACK`) writes the slots the same way, each before its word, all before its one
   list is recorded.
+- Its heights' block (M9, docs/texture-pack/zones.md "Pack normals"): the pack region is `2 x textures.size()` slots
+  (`zone_gpu.cpp:268`), the colours' and then the heights', each height slot written at upload with the flat stand-in's
+  view (:300-313: red 0x80, a level height). The same write-once rule with words of its own: the glue's `write_view`
+  of a ready height ticket (`zonepack.cpp:203`) and the relief scale (`height_written`, `zone_gpu.cpp:467`) before the
+  height word is stored drawn with release (`set_height_word`, :449); `height_srv` (:476) names the slot only once it
+  reads drawn (acquire), heights are on and compare is off, else a null handle. The zone pass then binds it at table 7
+  (t5) in place of the normal map (`draw.cpp:995`) and puts the relief scale in the piece's fourth root constant (b1,
+  `draw.cpp:991`: it was unused and 0, so no root signature changed); per pixel only, never with the bump shader's path.
+  zonenative_test's slot-write log checks the heights' words and writes as the colours'.
 - Effects: `src/fx/fxtextures.cpp:285-287` one heap of `kReserved` 8 + `kMax` 4096. `src/fx/fxrender.cpp:777-783`
   switches between its heap and a zone's heap for MMB meshes and **sets table 6 again right after**;
   `fxrender.cpp:846-847` ends on its own heap. Root signature with 3 static samplers (`fxrender.cpp:402`).

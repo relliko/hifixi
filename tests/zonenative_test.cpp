@@ -29,6 +29,20 @@
  *     before the glue's clear_all spends the words; stop() fast, no crash;
  *   - the debug layer says nothing.
  *
+ * Then the texture pack's heights (M9, zones.md "Pack normals"): a made-up pack under build\test\zonenative-heights of
+ * 230's keyed textures, a third with a colour and a height (BC4 stripes, 4 texels wide), a third a height alone (a
+ * materials-only entry: the game's colour), a third a colour alone, drawn per pixel with the light split, in a process
+ * of its own ("zonenative_test heights" runs it alone; the main run starts it so after the rest, its checks counted):
+ *   - heights off ([textures] height=0): none asked; then on: each height asked once and drawn (the colour-less ones
+ *     too, their colour words spent as not in the pack), the zone's bytes take them in, the menu's relief line;
+ *   - the picture per pixel changes on the relief's pixels and stays within 3% of the light on the whole; per pixel off
+ *     it is byte for byte the one without heights; the light split's words differ only where the relief lit them, each
+ *     with its depth as it was and its facing turned away from the camera (the mark), and nowhere else;
+ *   - heights off again: the picture and the light split byte for byte the ones without heights; on again: the relief's
+ *     picture at once; compare: the game's look, relief and all;
+ *   - clear_all: every height spent; the slot-write log valid for the heights' words as for the colours'; the debug
+ *     layer says nothing.
+ *
  *   build\zonenative_test.exe      (ZONE_GPU=1: the GPU instead of WARP for the texture pack's part; HIFIXI_GBV=1:
  *                                   GPU-based validation too)
  */
@@ -450,8 +464,53 @@ namespace
 		Sleep(1);
 	}
 
-	// The zone drawn from the street (every placement), read back
-	std::vector<uint32_t> picture(rig &r, gpu_zone *z, float bias = 0.0f)
+	// The light split's target and readback (made at its first use): R32_UINT, the picture's size
+	ID3D12Resource *g_light_rt = nullptr, *g_light_back = nullptr;
+	ID3D12DescriptorHeap *g_light_heap = nullptr;
+	bool light_target(rig &r)
+	{
+		if (g_light_rt != nullptr)
+			return true;
+		D3D12_HEAP_PROPERTIES def = { D3D12_HEAP_TYPE_DEFAULT }, rb = { D3D12_HEAP_TYPE_READBACK };
+		D3D12_RESOURCE_DESC td = {};
+		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		td.Width = W;
+		td.Height = H;
+		td.DepthOrArraySize = 1;
+		td.MipLevels = 1;
+		td.SampleDesc.Count = 1;
+		td.Format = DXGI_FORMAT_R32_UINT;
+		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		D3D12_CLEAR_VALUE cv = {};
+		cv.Format = td.Format;
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = uint64_t(W) * 4 * H;
+		bd.Height = 1;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+		if (FAILED(r.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&g_light_rt))) ||
+			FAILED(r.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_light_back))) ||
+			FAILED(r.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_light_heap))))
+			return false;
+		r.device->CreateRenderTargetView(g_light_rt, nullptr, g_light_heap->GetCPUDescriptorHandleForHeapStart());
+		return true;
+	}
+	void drop_light_target()
+	{
+		for (IUnknown *p : { static_cast<IUnknown *>(g_light_rt), static_cast<IUnknown *>(g_light_back), static_cast<IUnknown *>(g_light_heap) })
+			if (p != nullptr)
+				p->Release();
+		g_light_rt = g_light_back = nullptr;
+		g_light_heap = nullptr;
+	}
+
+	// The zone drawn from the street (every placement), read back; per_pixel: draw_options' (M9's heights are drawn only
+	// so); light: the light split as well, read back into it
+	std::vector<uint32_t> picture(rig &r, gpu_zone *z, float bias = 0.0f, bool per_pixel = false, std::vector<uint32_t> *light = nullptr)
 	{
 		std::vector<uint32_t> px;
 		if (z == nullptr || !z->ready())
@@ -507,9 +566,36 @@ namespace
 		t.dsv_format = DXGI_FORMAT_D32_FLOAT;
 		t.width = float(W);
 		t.height = float(H);
+		const bool with_light = light != nullptr && light_target(r);
+		if (with_light)
+		{
+			t.light_rtv = g_light_heap->GetCPUDescriptorHandleForHeapStart();
+			const UINT none[4] = {};
+			r.list->ClearRenderTargetView(t.light_rtv, reinterpret_cast<const float *>(none), 0, nullptr);
+		}
 		hifi::zone::draw_options o;
 		o.texture_bias = bias;
+		o.per_pixel = per_pixel;
 		r.renderer.record(r.list, t, f, o, ++r.frame_number);
+		if (with_light)
+		{
+			D3D12_RESOURCE_BARRIER lb = {};
+			lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			lb.Transition.pResource = g_light_rt;
+			lb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			lb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			lb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			r.list->ResourceBarrier(1, &lb);
+			D3D12_TEXTURE_COPY_LOCATION ldst = {}, lsrc = {};
+			ldst.pResource = g_light_back;
+			ldst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			ldst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
+			lsrc.pResource = g_light_rt;
+			lsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			r.list->CopyTextureRegion(&ldst, 0, 0, 0, &lsrc, nullptr);
+			std::swap(lb.Transition.StateBefore, lb.Transition.StateAfter);
+			r.list->ResourceBarrier(1, &lb);
+		}
 		D3D12_RESOURCE_BARRIER b = {};
 		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		b.Transition.pResource = r.rt;
@@ -537,6 +623,12 @@ namespace
 			px.assign(static_cast<const uint32_t *>(p), static_cast<const uint32_t *>(p) + size_t(W) * H);
 			const D3D12_RANGE none = { 0, 0 };
 			r.back->Unmap(0, &none);
+		}
+		if (with_light && SUCCEEDED(g_light_back->Map(0, &all, &p)))
+		{
+			light->assign(static_cast<const uint32_t *>(p), static_cast<const uint32_t *>(p) + size_t(W) * H);
+			const D3D12_RANGE none = { 0, 0 };
+			g_light_back->Unmap(0, &none);
 		}
 		return px;
 	}
@@ -593,12 +685,12 @@ namespace
 
 	// The module's open as it does it: every owner dropped first, the loaders out of pack mode, the open posted; then
 	// (later in the module: its next update) the epoch seen raised, the loaders in pack mode again
-	bool open_pack(rig &r)
+	bool open_pack(rig &r, const wchar_t *folder = kFolder)
 	{
 		zp::clear_all();
 		zp::set_mode(false, false);
 		const uint32_t before = st::epoch();
-		st::open(std::wstring(kFolder));
+		st::open(std::wstring(folder));
 		st::resume(st::kOff);
 		for (int i = 0; i < 5000 && st::epoch() == before; ++i)
 			Sleep(1);
@@ -693,6 +785,8 @@ namespace
 		// (the removed device's objects left for the process's end)
 		ExitProcess(ok ? 0 : 1);
 	}
+
+	DWORD run_child(const char *arg, std::string &out);
 
 	void pack_part(bool on_gpu, bool gbv)
 	{
@@ -1083,9 +1177,21 @@ namespace
 
 		// The device removed mid-copy: a child process
 		{
+			std::string out;
+			const DWORD code = run_child("lost", out);
+			while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+				out.pop_back();
+			check(code == 0 && out.find("lost: ok") != std::string::npos, "the device removed mid-copy (a child): " + out);
+		}
+	}
+
+	// This exe again with one argument, its output and exit code (99: not started)
+	DWORD run_child(const char *arg, std::string &out)
+	{
+		{
 			char exe[MAX_PATH] = "";
 			GetModuleFileNameA(nullptr, exe, MAX_PATH);
-			std::string cmd = std::string("\"") + exe + "\" lost";
+			std::string cmd = std::string("\"") + exe + "\" " + arg;
 			SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
 			HANDLE rd = nullptr, wr = nullptr;
 			CreatePipe(&rd, &wr, &sa, 0);
@@ -1095,7 +1201,6 @@ namespace
 			si.hStdOutput = wr;
 			si.hStdError = wr;
 			PROCESS_INFORMATION pi = {};
-			std::string out;
 			DWORD code = 99;
 			if (CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
 			{
@@ -1112,10 +1217,272 @@ namespace
 			else
 				CloseHandle(wr);
 			CloseHandle(rd);
-			while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-				out.pop_back();
-			check(code == 0 && out.find("lost: ok") != std::string::npos, "the device removed mid-copy (a child): " + out);
+			return code;
 		}
+	}
+}
+
+namespace
+{
+	// ---- The texture pack's heights (M9)
+	const wchar_t *const kHeightsFolder = L"build\\test\\zonenative-heights\\";
+
+	// A BC4 level of stripes along u: blocks a column 0 and 255 in turn (4 texels each), down every row
+	std::vector<uint8_t> stripes(uint32_t w, uint32_t h)
+	{
+		const uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
+		std::vector<uint8_t> b(size_t(bw) * bh * 8, 0);
+		for (uint32_t y = 0; y < bh; ++y)
+			for (uint32_t x = 0; x < bw; ++x)
+			{
+				uint8_t *p = b.data() + (size_t(y) * bw + x) * 8;
+				p[0] = p[1] = (x & 1) != 0 ? 255 : 0; // (r0 == r1: every code 0 is r0)
+			}
+		return b;
+	}
+
+	// The made-up pack of 230's keyed textures (sides multiples of 4), in turn: a colour and a height, a height alone (a
+	// materials-only entry), a colour alone. The colours as make_pack's; the heights the textures' own size (a 2x zone's
+	// half), stripes, span 1
+	bool make_height_pack(const zm::zone &z, uint32_t &with_height, uint32_t &height_only, uint32_t &colour_only)
+	{
+		remove_tree(kHeightsFolder);
+		pk::writer w;
+		pk::writer_options o;
+		o.folder = kHeightsFolder;
+		o.source = "zonenative_test heights";
+		std::string why;
+		if (!w.open(o, why))
+		{
+			note("the made-up heights pack couldn't be opened: " + why);
+			return false;
+		}
+		with_height = height_only = colour_only = 0;
+		uint32_t n = 0;
+		for (const zm::texture &t : z.textures)
+		{
+			if (t.key.bytes == 0 || t.key.w % 4 != 0 || t.key.h % 4 != 0)
+				continue;
+			const uint32_t kind = n++ % 3;
+			pk::entry e;
+			e.hash = t.key.hash;
+			e.bytes = t.key.bytes;
+			e.w = t.key.w;
+			e.h = t.key.h;
+			e.orig_format = t.format == zm::kBC2 ? 0xA1 : 0xB1;
+			e.source_kind = pk::kSourceZone;
+			e.file_id = z.map;
+			std::memcpy(e.name, t.name, 16);
+			std::vector<pk::map_in> maps;
+			if (kind != 1)
+			{
+				pk::map_in m;
+				m.format = pk::kBC2;
+				m.w = t.key.w * 2;
+				m.h = t.key.h * 2;
+				const uint32_t levels = pk::full_levels(m.w, m.h);
+				for (uint32_t l = 0; l < levels; ++l)
+					m.levels.push_back(solid(std::max(1u, m.w >> l), std::max(1u, m.h >> l), l == 0 ? 0xF800 : 0x001F));
+				maps.push_back(std::move(m));
+			}
+			if (kind != 2)
+			{
+				pk::map_in m;
+				m.kind = pk::kHeight;
+				m.format = pk::kBC4;
+				m.w = t.key.w;
+				m.h = t.key.h;
+				const float span = 1.0f;
+				std::memcpy(&m.param, &span, 4);
+				const uint32_t levels = pk::full_levels(m.w, m.h);
+				for (uint32_t l = 0; l < levels; ++l)
+					m.levels.push_back(stripes(std::max(1u, m.w >> l), std::max(1u, m.h >> l)));
+				maps.push_back(std::move(m));
+			}
+			if (w.add(e, maps, why) != pk::add_result::ok)
+			{
+				note("a made-up entry refused: " + why);
+				return false;
+			}
+			(kind == 0 ? with_height : kind == 1 ? height_only : colour_only)++;
+		}
+		const bool ok = w.commit(why);
+		w.close();
+		if (!ok)
+			note("the made-up heights pack couldn't be written: " + why);
+		return ok;
+	}
+
+	// A light split word's facing (light_split.hpp, as grass.hlsl light_at decodes it)
+	void facing_of(uint32_t v, float n[3])
+	{
+		float ox = float((v >> 11) & 127) / 127.0f * 2.0f - 1.0f, oy = float((v >> 18) & 127) / 127.0f * 2.0f - 1.0f;
+		float z = 1.0f - std::fabs(ox) - std::fabs(oy);
+		const float t = std::clamp(-z, 0.0f, 1.0f);
+		ox += ox >= 0.0f ? -t : t;
+		oy += oy >= 0.0f ? -t : t;
+		const float l = std::sqrt(ox * ox + oy * oy + z * z);
+		n[0] = ox / l;
+		n[1] = oy / l;
+		n[2] = z / l;
+	}
+
+	double light_mean(const std::vector<uint32_t> &a)
+	{
+		double s = 0.0;
+		for (uint32_t p : a)
+			s += 0.2126 * double(p & 0xFF) + 0.7152 * double((p >> 8) & 0xFF) + 0.0722 * double((p >> 16) & 0xFF);
+		return s / double(std::max<size_t>(a.size(), 1));
+	}
+
+	void heights_part(bool on_gpu, bool gbv)
+	{
+		std::printf("\nThe texture pack's heights (%s%s)\n", on_gpu ? "the GPU" : "WARP", gbv ? ", GPU-based validation" : "");
+		SetEnvironmentVariableW(L"HIFIXI_PIVOT_INI", L"build\\test\\zonenative\\no-pivot.ini");
+		zm::zone z230;
+		hifi::bake::result res;
+		const bool read = zm::load(230, z230, res, true);
+		uint32_t with_height = 0, height_only = 0, colour_only = 0;
+		const bool made = read && make_height_pack(z230, with_height, height_only, colour_only);
+		const uint32_t heights = with_height + height_only;
+		check(made && with_height > 0 && height_only > 0 && colour_only > 0, "the made-up heights pack under build\\test\\zonenative-heights: " +
+			std::to_string(with_height) + " with a colour and a height, " + std::to_string(height_only) + " a height alone, " + std::to_string(colour_only) +
+			" a colour alone");
+		if (!made)
+			return;
+
+		IDXGIFactory4 *factory = nullptr;
+		IDXGIAdapter *warp = nullptr;
+		CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+		factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
+		rig r;
+		if (FAILED(D3D12CreateDevice(on_gpu ? nullptr : warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&r.device))))
+		{
+			check(false, "a device for the heights' part");
+			return;
+		}
+		r.device->QueryInterface(IID_PPV_ARGS(&r.info));
+		if (r.info != nullptr)
+			r.info->SetMuteDebugOutput(TRUE);
+		check(make_rig(r), "the zone renderer, a target and the game's queue on the device");
+		std::string first;
+		g_log.clear();
+		gpu_zone::set_test_log(on_log);
+		zp::set_camera_source(camera_source);
+		zp::set_log(on_glue_log);
+		g_camera_map = 230;
+		st::start(r.device, 32);
+		const bool opened = open_pack(r, kHeightsFolder);
+		check(opened, "the heights pack opened");
+
+		// [textures] height=0 first: no height asked
+		zp::set_mode(true, false, false);
+		gpu_zone *const z = zone_up(r, 230);
+		const bool settled = z != nullptr && settle(r, z);
+		for (int i = 0; i < 20; ++i)
+			present(r);
+		const gpu_zone::pack_counts c0 = words(z);
+		const uint64_t bytes0 = z != nullptr ? z->bytes() : 0;
+		check(settled && c0.drawn == with_height + colour_only && c0.spent == c0.keyed - c0.drawn && c0.heights_asked + c0.heights_drawn + c0.heights_spent == 0 &&
+				zp::get_counts().heights_asked == 0,
+			"heights off: 230's colours settled (" + std::to_string(c0.drawn) + " from the pack, " + std::to_string(c0.spent) + " spent), no height asked");
+		std::vector<uint32_t> light_none, light_h, light_off;
+		const std::vector<uint32_t> pp_none = picture(r, z, 0.0f, true, &light_none), flat_none = picture(r, z, 0.0f, false);
+
+		// On: each height asked once and drawn, the colour-less ones too
+		zp::set_mode(true, false, true);
+		gpu_zone::pack_counts c1;
+		for (int i = 0; i < 4000; ++i)
+		{
+			c1 = words(z);
+			if (c1.heights_drawn + c1.heights_spent == heights && c1.heights_asked == 0)
+				break;
+			present(r);
+		}
+		const zp::counts n1 = zp::get_counts();
+		check(c1.heights_drawn == heights && c1.heights_spent == 0 && n1.heights_asked == heights && n1.heights_drawn == heights && c1.drawn == c0.drawn &&
+				z->bytes() > bytes0,
+			"heights on: " + std::to_string(c1.heights_drawn) + " of " + std::to_string(heights) + " drawn (" + std::to_string(height_only) +
+				" without a colour of their own), each asked once (" + std::to_string(n1.heights_asked) + "); the zone's bytes " + std::to_string(bytes0) + " -> " +
+				std::to_string(z->bytes()));
+		std::vector<std::string> area;
+		zp::lines(area);
+		bool relief_line = false;
+		for (const std::string &l : area)
+			relief_line = relief_line || l == "Relief from the pack on " + std::to_string(heights) + " of them.";
+		check(relief_line, "  the menu's relief line" + (area.size() > 1 ? ": " + area[1] : std::string()));
+
+		const std::vector<uint32_t> pp_h = picture(r, z, 0.0f, true, &light_h), flat_h = picture(r, z, 0.0f, false);
+		const size_t changed = differ(pp_h, pp_none);
+		const double m0 = light_mean(pp_none), m1 = light_mean(pp_h);
+		check(changed != SIZE_MAX && changed > pp_h.size() / 50 && std::fabs(m1 - m0) <= 0.03 * m0,
+			"per pixel: the relief changes " + std::to_string(changed) + " of " + std::to_string(pp_h.size()) + " pixels, the light on the whole " +
+				std::to_string(m0) + " -> " + std::to_string(m1) + " (within 3%)");
+		check(differ(flat_h, flat_none) == 0, "per pixel off: byte for byte the picture without heights");
+		// The light split: words differ only where the relief lit them, each with its depth, its facing turned away
+		size_t words_changed = 0, marked = 0, bad = 0;
+		for (size_t i = 0; i < light_h.size() && i < light_none.size(); ++i)
+		{
+			if (light_h[i] == light_none[i])
+				continue;
+			words_changed++;
+			float a[3], b[3];
+			facing_of(light_h[i], a);
+			facing_of(light_none[i], b);
+			const bool same_depth = (light_h[i] & 0x7FF) == (light_none[i] & 0x7FF);
+			const bool turned = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] < -0.9f;
+			if (same_depth && turned)
+				marked++;
+			else if (((light_h[i] >> 11) & 0x3FFF) != ((light_none[i] >> 11) & 0x3FFF) || !same_depth)
+				bad++;
+		}
+		check(light_h.size() == size_t(W) * H && marked > 0 && bad == 0 && marked == words_changed,
+			"  the light split: " + std::to_string(words_changed) + " words differ, every one the relief's: its depth as it was, its facing turned away (" +
+				std::to_string(marked) + " marked, " + std::to_string(bad) + " otherwise)");
+
+		// Off again: byte for byte the pictures without heights; on again: the relief at once
+		zp::set_mode(true, false, false);
+		const std::vector<uint32_t> pp_off = picture(r, z, 0.0f, true, &light_off);
+		check(differ(pp_off, pp_none) == 0 && light_off == light_none && words(z).heights_drawn == heights,
+			"heights off again: the picture and the light split byte for byte the ones without heights (the heights kept for the visit)");
+		zp::set_mode(true, false, true);
+		check(differ(picture(r, z, 0.0f, true), pp_h) == 0, "  on again: the relief at once");
+		zp::set_compare(true);
+		const std::vector<uint32_t> cmp_h = picture(r, z, 0.0f, true);
+		zp::set_mode(true, false, false);
+		const std::vector<uint32_t> cmp_off = picture(r, z, 0.0f, true);
+		zp::set_mode(true, false, true);
+		zp::set_compare(false);
+		check(differ(cmp_h, cmp_off) == 0 && differ(cmp_h, pp_h) != 0, "  compare: the game's look, without the relief");
+
+		// clear_all: every height spent; the log valid for the heights' words too
+		zp::clear_all();
+		const gpu_zone::pack_counts c2 = words(z);
+		std::string why_bad;
+		const bool valid = log_valid(why_bad);
+		size_t height_events = 0;
+		for (const auto &[o, ts] : g_log)
+			for (const auto &[t, ev] : ts)
+				height_events += (t & gpu_zone::kHeightLog) != 0 ? 1 : 0;
+		check(c2.heights_drawn == 0 && c2.heights_spent == heights && valid && height_events == heights,
+			"clear_all: every height spent; the slot-write log valid (" + std::to_string(height_events) + " heights' words: a, w, d, s)" +
+				(valid ? std::string() : ": " + why_bad));
+		check(debug_messages(r.info, first) == 0, "  the debug layer said nothing" + (first.empty() ? "" : ": " + first));
+
+		// Let go as the plugin would
+		close_pack(r);
+		st::stop();
+		native::stop();
+		for (int i = 0; i < 3; ++i)
+		{
+			wait_gpu(r);
+			hifi::retire::on_present(r.direct);
+		}
+		wait_gpu(r);
+		hifi::retire::release_all();
+		gpu_zone::set_test_log(nullptr);
+		drop_light_target();
+		g_camera_map = 0;
 	}
 }
 
@@ -1141,6 +1508,20 @@ int main(int argc, char **argv)
 			debug1->Release();
 		}
 		debug->Release();
+	}
+	// ("heights": the heights' part alone, in a process of its own: the main run starts it so, after the rest)
+	if (argc > 1 && std::strcmp(argv[1], "heights") == 0)
+	{
+		uintptr_t base = 0;
+		if (dump::map(dump::kDumps[0], base) == 0)
+		{
+			check(false, "the FFXiMain dump mapped");
+			return 1;
+		}
+		heights_part(GetEnvironmentVariableA("ZONE_GPU", nullptr, 0) != 0, GetEnvironmentVariableA("HIFIXI_GBV", nullptr, 0) != 0);
+		dump::unmap(base);
+		std::printf("\n%s (%d)\n", failures == 0 ? "all passed" : "failed", failures == 0 ? passes : failures);
+		return failures;
 	}
 	uintptr_t base = 0;
 	if (dump::map(dump::kDumps[0], base) == 0)
@@ -1227,6 +1608,25 @@ int main(int argc, char **argv)
 	hifi::retire::release_all();
 
 	pack_part(GetEnvironmentVariableA("ZONE_GPU", nullptr, 0) != 0, gbv);
+	{
+		// (the heights' part in a process of its own, as "zonenative_test heights" runs it: its streamer and loaders started
+		// afresh; its lines passed on, each check of it counted here)
+		std::string out;
+		const DWORD code = run_child("heights", out);
+		std::printf("%s", out.c_str());
+		size_t at = 0;
+		int child_ok = 0, child_failed = 0;
+		while ((at = out.find('\n', at)) != std::string::npos)
+		{
+			++at;
+			child_ok += out.compare(at, 4, "ok  ") == 0;
+			child_failed += out.compare(at, 4, "FAIL") == 0;
+		}
+		child_ok += out.compare(0, 4, "ok  ") == 0;
+		passes += child_ok;
+		failures += child_failed;
+		check(code == 0 && child_failed == 0 && child_ok > 0, "the heights' part (a child): exit " + std::to_string(code));
+	}
 	dump::unmap(base);
 	if (failures == 0)
 		std::printf("\nall passed (%d)\n", passes);

@@ -56,11 +56,15 @@ namespace hifi::pack
 	bool overlay_listed();
 
 	// Who asks for the pack's textures, as the hidden [textures] keys say: the zone and its second map (zone), the model
-	// actors (actors), the characters (chars); all false while the pack isn't in use
+	// actors (actors), the characters (chars); and (M9) whether the pack's heights are drawn as relief ([textures] height,
+	// the menu's "Relief from the texture pack"); all false while the pack isn't in use
 	struct modes
 	{
-		bool zones = false, actors = false, chars = false;
+		bool zones = false, actors = false, chars = false, heights = false;
 	};
+	// (M9) The pack in use with its heights on ([textures] height): the light split marks the pixels lit with a pack normal
+	// (light_split.hpp "Marks"), so World FX's relief fades there
+	bool heights_in_use();
 
 	// What an owner gives the module (any of them nullptr: nothing to call)
 	struct consumer

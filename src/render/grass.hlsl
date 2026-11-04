@@ -132,6 +132,8 @@ float drawn_depth(int2 p)
 // depth, at the next 512 bytes, in the same rows): what the native zone and characters know of a pixel's light. A uint
 // a pixel: bits 0-10 its view depth, round((log2(depth) + 3) x 128), 0 for none; 11-24 its facing (world, octahedral, 7
 // bits a side); 25-31 the sun's share of the light drawn there (how much of it a full shadow takes away), 0..127.
+// zinfo.w bit 64: the facings are marked (HiFi XI's light_split.hpp "Marks"): one written turned away from the camera
+// is a pixel the zone lit with the texture pack's relief (light_at's marked; the facing is turned back either way).
 // light_at: the facing (view space, toward the camera) and the share at p, where the word is this frame's and still
 // what's drawn there (its depth the depth's own within 2.5 codes, about 1.4%: what the game drew over it later, an
 // effect's mesh, a model left to the game, a blade, isn't it); false elsewhere, and the old ways stand.
@@ -142,10 +144,12 @@ float3 view_dir(float3 d)
 	float4 c = mul(float4(d, 0.0), view_proj);
 	return float3(c.x / lin.z, c.y / lin.w, c.w / up_row.w); // (the projection's _11, _22 and _34 undone, as body_in_view)
 }
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share)
+bool light_marks() { return (zinfo.w & 64) != 0; }
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked)
 {
 	n = float3(0.0, 0.0, 1.0);
 	share = 0.0;
+	marked = false;
 	if (!light_split() || any(zinfo.yz != ground.yz) || z > 1e8)
 		return false;
 	p = clamp(p, int2(0, 0), int2(zinfo.yz) - 1);
@@ -159,9 +163,16 @@ bool light_at(int2 p, float z, float3 P, out float3 n, out float share)
 	float t = saturate(-w.z);
 	w.xy += float2(w.x >= 0.0 ? -t : t, w.y >= 0.0 ? -t : t);
 	n = normalize(view_dir(normalize(w)));
+	// (a mark: turned away from the camera by more than the 7-bit facing's error near edge on)
+	marked = light_marks() && dot(n, -P) < -0.02 * length(P);
 	n = dot(n, -P) < 0.0 ? -n : n;
 	share = float(v >> 25) / 127.0;
 	return true;
+}
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share)
+{
+	bool marked;
+	return light_at(p, z, P, n, share, marked);
 }
 
 // The ground's colour under p on screen: the zone's own texture, lighting, fog and time of day, from
@@ -2035,7 +2046,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	// what it was made for)
 	float3 n_known;
 	float known_share;
-	const bool known = light_at(p, z, P, n_known, known_share);
+	bool pack_relief; // (the texture pack's relief lit this pixel: the light split's mark)
+	const bool known = light_at(p, z, P, n_known, known_share, pack_relief);
 	if (shade.x > 0.0 || (!known && (shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)))
 		n = surface_normal(p, P, steep);
 	const float3 n_depth = n;
@@ -2069,10 +2081,11 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 
 	// Surface relief: at about 0.12 yalms, a point darker than the ground around it (a joint between stones,
 	// a crack) gets darker and a lighter one lighter, with a little light from above; only from taps on the
-	// same surface (a similar depth), and fading out where that's under a few pixels
+	// same surface (a similar depth), and fading out where that's under a few pixels. None where the texture pack's
+	// relief lit the pixel already (the light split's mark): the two would double up
 	float relief = 1.0;
 	float rr = min(0.12 * px_per_yalm, 40.0);
-	if (shade.z > 0.0 && rr >= 1.5)
+	if (shade.z > 0.0 && rr >= 1.5 && !pack_relief)
 	{
 		static const int2 ring[8] = { int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2), int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
 		float sum = 0.0, n = 0.0;

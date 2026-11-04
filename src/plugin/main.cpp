@@ -826,7 +826,7 @@ class hifixi final : public IPlugin
 			worldfx::set_floor_source(hifi::zone::inject::floor_hook(), nullptr);
 			worldfx::set_camera_source(frame_camera, nullptr);
 			// (and the light split the zone and characters draw: World FX takes it in its shading pass)
-			worldfx::set_light_source([](void *) { return hifi::light::take(); }, nullptr);
+			worldfx::set_light_source([](void *) { return hifi::light::take(); }, nullptr, [](void *) { return hifi::light::marks(); });
 			m_zone_casters_set = true;
 			// (and the zone's moving layer, with the characters, into World FX's casters' map each frame)
 			if (!m_casters_set)

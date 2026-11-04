@@ -118,7 +118,7 @@ def main():
         last_key = k
         for m in range(3):
             raw = idx[base + 64 + 32 * m: base + 96 + 32 * m]
-            kind, levels, file, w, hh, fmt, offset, nbytes, crc, level_crc, _r = RECORD.unpack(raw)
+            kind, levels, file, w, hh, fmt, offset, nbytes, crc, level_crc, param = RECORD.unpack(raw)
             if kind == 0:
                 if raw != bytes(32):
                     fail('entry %d map %d: unused but not zero' % (n, m))
@@ -142,6 +142,12 @@ def main():
             if fmt not in BLOCK:
                 fail(where + ': format %d' % fmt)
                 continue
+            # (M9: a height record's param is its span, a float32 0 or above; the others' is 0)
+            span = struct.unpack('<f', struct.pack('<I', param))[0]
+            if kind == 2 and not (span >= 0 and span < float('inf')):
+                fail(where + ': height span %r' % span)
+            if kind == 1 and param != 0:
+                fail(where + ': colour record param %d' % param)
             if w == 0 or hh == 0 or w % 4 or hh % 4 or w > 16384 or hh > 16384:
                 fail(where + ': size %dx%d' % (w, hh))
                 continue

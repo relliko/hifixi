@@ -11,7 +11,9 @@
 #include "cache.hpp"
 #include "../pack/stream.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 
 namespace hifi::chars::charpack
@@ -23,6 +25,7 @@ namespace hifi::chars::charpack
 		struct state
 		{
 			bool chars = false;   // (set_mode's: the characters ask while the pack is in use)
+			bool heights = false; // (set_mode's, M9: the heights asked beside the colours, [textures] height)
 			st::owner owner = 0;  // (made at the first frame in use, dropped by clear_all)
 			sources src;
 			counts n;
@@ -123,38 +126,77 @@ namespace hifi::chars::charpack
 			}
 		}
 
-		// A ticket take_done handed over: a ready one's pair taken and written, then ready; else spent
+		// A ticket take_done handed over (a texture's colour, or its height: M9): settled in the cache; once both of a
+		// texture's are, its pair taken and written, then ready; or spent when neither had anything
 		void settle(st::ticket t, st::state s)
 		{
-			if (s == st::state::ready)
-			{
-				cache::pack_writing w;
-				if (!cache::pack_begin(t, w))
-					return; // (not the cache's any more, or no pair to spare: let go there)
-				// (the pair written once, the cache's mutex left: the colour from the ticket (BC2, the levels it got), the
-				// detail a view of the game texture's own map)
-				st::view v;
-				const bool ok = st::get(t, v) && st::write_view(t, w.colour);
-				cache::write_pack_detail(w);
-				cache::pack_end(w, ok, v.bytes);
-				if (ok)
-				{
-					g.n.views++;
-					g.n.last_views++;
-				}
-				else
-					g.n.gone++; // (gone between take_done and here)
-				return;
-			}
-			const st::miss why = s == st::state::missed ? st::reason(t) : st::miss::none;
+			uint32_t key_w = 0;
+			const bool height = cache::pack_height_of(t, key_w);
+			bool ready = s == st::state::ready;
+			float relief = 0.0f;
 			cache::pack_miss m = cache::pack_miss::gone;
-			if (s == st::state::missed && (why == st::miss::not_in_pack || why == st::miss::no_pack_flag))
-				m = cache::pack_miss::not_in_pack, g.n.not_in_pack++;
-			else if (s == st::state::missed)
-				m = cache::pack_miss::failed, g.n.failed++;
+			if (height)
+			{
+				// (the relief scale as the zones': 4 x span x the map's texels a game texel, zones.md "Pack normals". A flat
+				// map, or a scale that isn't a number, gives nothing to draw: let go as missed)
+				st::view v;
+				float span = 0.0f;
+				if (ready && st::get(t, v))
+					std::memcpy(&span, &v.param, 4);
+				relief = key_w != 0 ? 4.0f * span * float(v.w) / float(key_w) : 0.0f;
+				if (ready && !(std::isfinite(relief) && relief > 0.0f))
+					ready = false;
+				if (!ready)
+					g.n.heights_missed++;
+			}
+			else if (!ready)
+			{
+				const st::miss why = s == st::state::missed ? st::reason(t) : st::miss::none;
+				if (s == st::state::missed && (why == st::miss::not_in_pack || why == st::miss::no_pack_flag))
+					m = cache::pack_miss::not_in_pack, g.n.not_in_pack++;
+				else if (s == st::state::missed)
+					m = cache::pack_miss::failed, g.n.failed++;
+				else
+					g.n.gone++;
+			}
+			// (a ready colour's view bytes: kept while its height is still on its way, the pace pack_evict lets it go at)
+			uint64_t colour_bytes = 0;
+			if (!height && ready)
+			{
+				st::view cv;
+				if (st::get(t, cv))
+					colour_bytes = cv.bytes;
+			}
+			cache::pack_writing w;
+			if (cache::pack_settle(t, ready, m, relief, w, colour_bytes) != cache::pack_step::write)
+				return; // (the other on its way, spent, not the cache's any more, or no pair to spare: let go there)
+			// (the pair written once, the cache's mutex left: the colour from its ticket (BC2, the levels it got) or a view
+			// of the game's texture; the detail the height from its ticket (BC4, its whole chain) or a view of the game
+			// texture's own detail map)
+			bool ok = true;
+			uint64_t bytes = 0;
+			if (w.t.generation != 0)
+			{
+				st::view v;
+				ok = st::get(w.t, v) && st::write_view(w.t, w.colour);
+				bytes += v.bytes;
+			}
+			if (ok && w.height.generation != 0)
+			{
+				st::view v;
+				ok = st::get(w.height, v) && st::write_view(w.height, w.detail);
+				bytes += v.bytes;
+			}
+			cache::write_pack_detail(w);
+			cache::pack_end(w, ok, bytes);
+			if (ok)
+			{
+				g.n.views++;
+				g.n.last_views++;
+				g.n.heights += w.height.generation != 0;
+			}
 			else
-				g.n.gone++;
-			cache::pack_spent(t, m);
+				g.n.gone++; // (gone between take_done and here)
 		}
 
 		std::string number(uint64_t n)
@@ -181,8 +223,12 @@ namespace hifi::chars::charpack
 
 	void set_mode(const pack::modes &m)
 	{
+		// (M9: heights turned on or off let every pack part go too, so each pair is written again in the new mode at once:
+		// with them off, the detail map's view again in every pair, as before M9; characters switch at once both ways)
+		const bool heights_changed = m.heights != g.heights;
 		g.chars = m.chars;
-		if (!m.chars)
+		g.heights = m.heights;
+		if (!m.chars || (heights_changed && g.owner != 0))
 			let_go(); // (at once: the game's textures are handed out again from now)
 	}
 
@@ -215,6 +261,11 @@ namespace hifi::chars::charpack
 		{
 			g_asks.clear();
 			cache::take_pack_asks(kRequestsPerPresent, g_asks);
+			// (M9: the pack's index, only while heights are on and there are asks: a height is asked only for an entry
+			// that has one, so a pack without heights asks nothing more)
+			std::shared_ptr<const hifi::pack::index> idx;
+			if (g.heights && !g_asks.empty())
+				idx = st::current();
 			for (const cache::pack_ask &a : g_asks)
 			{
 				st::want w;
@@ -233,9 +284,31 @@ namespace hifi::chars::charpack
 				{
 					cache::pack_refused(a.id, a.serial); // (no owner any more, or the table full)
 					g.n.refused++;
+					continue;
 				}
-				else if (!cache::pack_asked(a.id, a.serial, t, epoch))
+				// (M9) Its height beside it, whatever comes of the colour (a materials-only entry has none: the game's
+				// texture is drawn with the pack's relief), the whole chain (mip-mapped at a distance, so it doesn't
+				// sparkle), at the same priority. Refused: the colour alone
+				st::ticket h;
+				const hifi::pack::entry *pe = idx ? idx->find(a.k) : nullptr;
+				if (pe != nullptr && pe->map(hifi::pack::kHeight) != nullptr)
+				{
+					st::want hw;
+					hw.k = a.k;
+					hw.kind = hifi::pack::kHeight;
+					hw.first = 0;
+					hw.count = 0;
+					hw.priority = kPriority;
+					hw.epoch = epoch;
+					h = st::request(g.owner, hw);
+					g.n.heights_asked += h.generation != 0;
+				}
+				if (!cache::pack_asked(a.id, a.serial, t, epoch, h))
+				{
 					st::drop(t); // (the texture went meanwhile)
+					if (h.generation != 0)
+						st::drop(h);
+				}
 			}
 		}
 
@@ -283,6 +356,9 @@ namespace hifi::chars::charpack
 		if (c.pack_evicted != 0)
 			line += ", " + number(c.pack_evicted) + " back to the game's while the graphics card is nearly full";
 		line += ", " + number(c.pack_asked) + " coming)";
+		// (M9: only once any has the pack's relief, so a pack without heights reads as before)
+		if (c.pack_relief != 0)
+			line += "; relief from the pack on " + number(c.pack_relief) + (c.pack_relief_only != 0 ? " (" + number(c.pack_relief_only) + " of them on the game's own colour)" : std::string());
 		if (c.pack_waiting_slots != 0)
 			line += "; " + number(c.pack_waiting_slots) + " skipped (the characters' descriptors are nearly all in use)";
 		if (g.src.game_drawn != nullptr)

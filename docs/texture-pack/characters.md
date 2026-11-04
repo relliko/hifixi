@@ -270,7 +270,70 @@ The pack pair's two descriptors are what table 5 reads (t2, then t6 "the descrip
   (`CreateShaderResourceView(nullptr, R8G8B8A8, 1 level)`, as cache.cpp:718-719). Decision 6.
 
 The detail map stays the game's size; `detail_at` reads it with the same `uv` and its tangent frame from the screen
-derivatives (chardraw.cpp:97-123), so the 4x colour and the 1x detail line up. M9 puts the pack's own relief there.
+derivatives (chardraw.cpp:97-123), so the 4x colour and the 1x detail line up. M9 puts the pack's own relief there
+for a texture the pack has a height for, while heights are on (next section); otherwise the pair is as above.
+
+## Pack relief (M9 step 3, 2026-11-04: the characters' relief from the pack's heights; not committed, not seen in game)
+
+The pack's height records (format.md "Height records") drawn as relief per pixel on characters, gear, NPCs and
+monsters, through the detail map's descriptor in the pack pair, as the plan's step 3 has it. Only the light changes:
+nothing is multiplied into the colour (no cavity, no metal from a height), the colour map and its alpha as before.
+
+- **Asking** (`src/chars/charpack.cpp` `frame`): while `[textures] height` is on (`modes::heights`), each texture asked
+  for its colour whose entry has a height record (`stream::current()->find(key)`: a pack without heights asks nothing
+  more) is asked for its height beside it: `kind kHeight`, its whole chain (no `down_to`, as the zones'), the same
+  priority. Refused: the colour alone. Both tickets go to `cache::pack_asked`, which keeps them on the entry (both in
+  `pack_by_ticket`).
+- **Settling** (`cache::pack_settle`): each ticket `take_done` hands over is settled on its entry (a ready one kept, a
+  missed one let go at once); the pair is taken only once both are settled, and written once, so no descriptor is
+  ever rewritten after a list may have read it. The colour ready: `2s` its view as before; else, with a height ready
+  (a materials-only entry, or a colour the pack hasn't), `2s` a new view of the game's own texture (`e.t`, its
+  levels from the resource; AddRef'd under the mutex). The height ready: `2s + 1` its view (BC4) in place of the
+  detail map's; else the detail map's view as before. Neither: spent by the colour's why, as before M9. A height
+  ticket for a texture that already settled its colour waits with the colour's ticket held (a ready ticket keeps its
+  texture, zones.md decision 1), its view bytes kept on the entry (`pack_settle`'s `colour_bytes`): the streamer may
+  hold the height back while its pressure lasts, so `pack_evict` lets such a held colour go first (below).
+  `pack_begin` and `pack_spent` stay, as `pack_settle`'s colour-only cases.
+- **The relief scale** (charpack `settle`, when the height ticket is ready): `4 x span x view.w / key.w`, the zones'
+  formula (zones.md "Pack normals"): the height on the original texture's grid in the game's bump units. A flat map
+  (span 0) or one that isn't a number is settled as missed (counted `heights_missed`), so the pair keeps the detail
+  map. Kept on the entry (`relief`) with `colour_from_pack`; `texture_view_of(id, h, allow_pack, &is_pack, &relief)`
+  hands both out: `is_pack` only when the colour is the pack's (flag 2's FSR bias stays on the pack's colour alone),
+  `relief` above 0 when the pair holds a height. The shadow casters (pack refused) get neither.
+- **The shader** (`src/chars/chardraw.cpp`): draw-constant flags 4 "t6 is the pack's height", set in the model's own
+  pass (pass 0) whenever the bound pair holds one, per vertex too (so a height is never read as a detail map), the
+  relief scale in the composite's word (dc[5], 0 in a model's draw until now; the composite's own draw unchanged). No
+  root signature, table or pipeline changed. `detail_at` takes a `[branch]` on it to `pack_relief`: four taps one
+  level-0 texel each way through `clamp_linear` (the colour's sampler, mip-mapped), the tilt as the zones' `pack_tilt`
+  (green the slope along u, red along v), in the same frame from the screen derivatives as the detail map's, per pixel
+  only (`options.x`), whatever `[chars] detail` says; no metal, no cavity. So on a texture with a height the detail
+  map's metal highlight and cavity give way to the pack's relief (M10's material record brings gloss and metal back).
+- **The light split** (`light_facing`): with marks on (light_split.hpp "Marks"), a pixel lit with the pack's relief
+  (flags 4, per pixel) writes its facing turned away from the camera, the zones' mark, so World FX's own relief fades
+  there too; every other character pixel turned toward, as before. With marks off, as before M9.
+- **`[textures] height` off and on** (charpack `set_mode`): a change lets every pack part go (`let_go`, as `chars`
+  off does) and asks again from the next frame, so every pair is written again in the new mode: with heights off the
+  detail map's view in every pair, the picture as before M9 byte for byte. Unlike the zones (whose heights held stay
+  for the visit) the characters re-stream their pack textures on a toggle, a second or two of the game's textures:
+  decision 3, characters switch at once both ways.
+- **Counts:** `cache::counts` `pack_relief` (ready pairs holding a height), `pack_relief_only` (of them on the game's
+  colour), `pack_heights_asked`; `pack_ready` now counts pairs whose colour is the pack's. The cache's status gains a
+  line "N with the pack's relief (M of them on the game's colour), K heights asked" once any was had or asked; the
+  menu's characters' line "; relief from the pack on N" once any; charpack's `heights_asked`, `heights`,
+  `heights_missed`; `char_stats::relief_draws`, `inject::counts::relief_draws`. Without heights every line reads as before.
+- **Unchanged without heights, measured:** charinject_test's own picture (out.bmp) from the build before this step
+  (steps 2, 4 and 5, itself byte for byte 198e154's) and from this one, byte for byte the same per vertex, per pixel
+  and per pixel with `[chars] detail`; inside the test, heights off and on again the picture byte for byte the one
+  without, per vertex with heights the same as without.
+- **Tests** (charinject_test's heights part, 11 checks, in the main run): a made-up pack of the Mithra's six textures,
+  in turn a colour and a height, a height alone, a colour alone (BC4 stripes 4 texels wide, 2x the game's size, span
+  0.25: relief 2): heights off none asked and none drawn, the colours ready; on, each height asked once, the relief
+  scale (2.0) on exactly the four with a height, `is_pack` false on the two heights alone, none for the casters; per
+  vertex byte for byte as off; per pixel 22 draws with relief, a quarter of the Mithra's pixels changed (1,659 of 6,551
+  on WARP, 1,633 on the 4070 Ti) with the light on the whole 99.8% of it; compare byte for byte as off; off again byte
+  for byte as off; on again the same picture; `clear_all` lets every height ticket go; no pair twice; the debug layer
+  silent, with GPU-based validation too, on WARP and the 4070 Ti (and with `CHARS_DETAIL=1`: 4,427 pixels change, the
+  detail maps' metal and cavity giving way on the textures with heights).
 
 ## The FSR bias in chardraw
 
@@ -524,7 +587,9 @@ kVersion and the join test. Where part A differs from the design above:
 Where part B differs from the design above, or adds to it:
 
 - **Eviction** is `cache::pack_evict(max_bytes, bytes)` (the ready textures by `pack_drawn`, oldest first, each let go
-  through `release_pack` and marked `evicted`) and `cache::pack_unevict()` (all of them `none` and asked again), called
+  through `release_pack` and marked `evicted`; since M9 before them the asked ones holding a ready colour while their
+  height is still on its way, which nothing draws and which would otherwise keep their colour in video memory while
+  the pressure holds the height back) and `cache::pack_unevict()` (all of them `none` and asked again), called
   from `charpack`'s `follow_pressure` each frame: a round each `kEvictEveryS` 0.5 s while `pressure()` holds, up to
   `kEvictBytes` 64 MB, logged; asked again once the pressure has been gone `kEvictHoldS` 10 s. `clear_all` ends a hold
   with the rest (the evicted textures are `none` again in the next epoch). The line says "N back to the game's while the

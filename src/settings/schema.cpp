@@ -237,6 +237,12 @@ namespace hifi::settings
 				"graphics card, so the game's own memory stays small. Anything the pack doesn't have is drawn as the game's own. "
 				"Characters switch at once; scenery switches at the next area you enter. (/hifi textures)", nullptr, nullptr, false, { 0.0f, _, _, _ },
 				flag, 0.0f, 1.0f, pack::options::kPackByDefault ? 1.0f : 0.0f, &pack::folder_exists },
+			// (M9: the pack's heights as relief; a pack without heights draws the same either way. Per-pixel lighting only)
+			{ "textures.height", tab::game, "Texture pack", "Relief from the texture pack",
+				"Stones, bricks and bark catch the light by their own bumps and joints, from the heights in the texture pack "
+				"(the game's own bump maps where it has them). Only the light changes, never the textures' colours. Needs the "
+				"scenery lit per pixel; packs made without heights look the same either way. (/hifi textures)", nullptr, "textures.pack", false,
+				{ _, _, _, _ }, flag, 0.0f, 1.0f, pack::options::kHeightByDefault ? 1.0f : 0.0f, &pack::folder_exists },
 			// (the upscale: src/upscale)
 			{ "upscale.fsr", tab::upscaling, "AMD FSR", "Upscale the world with AMD FSR",
 				"When the game's background resolution is below the screen's, the world is stretched to the screen with AMD "

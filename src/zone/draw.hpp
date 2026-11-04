@@ -100,6 +100,7 @@ namespace hifi::zone
 			uint32_t object = 0, model = 0, piece = 0, first_index = 0, triangles = 0, flags = 0, object_flags = 0;
 			uint32_t texture = 0, normal_map = 0, lamps = 0, zone = 0;
 			bool pack = false; // (the texture bound was the texture pack's: gpu_zone::texture_srv)
+			bool relief = false; // (M9: the texture pack's height bound at t5: gpu_zone::height_srv)
 			char name[16] = {};
 			float at[3] = {};
 		};

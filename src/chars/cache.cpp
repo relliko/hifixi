@@ -130,6 +130,14 @@ namespace hifi::chars::cache
 			uint64_t pack_bytes = 0;
 			double pack_drawn = 0.0;
 			pack_miss spent_why = pack_miss::not_in_pack;
+			// (M9, characters.md "Pack relief") Its height's ticket (generation 0: none asked, or let go once missed); while
+			// asked, how each of the two settled (colour: 0 on its way, 1 ready, 2 missed; height: 0 none asked or missed, 1 on
+			// its way, 2 ready) and the height's relief scale; once ready, whether the pair's colour is the pack's and the
+			// relief it holds (0: the detail map's view, as before M9)
+			hifi::pack::stream::ticket height_ticket;
+			uint8_t colour_settled = 0, height_settled = 0;
+			bool colour_from_pack = true;
+			float relief = 0.0f;
 			bool with_detail = false; // (whether its decode makes a detail map: [chars] detail when it was picked)
 			tex::texture decoded; // (dropped once uploaded)
 			tex::texture detail;  // its detail map (tex::make_detail; dropped once uploaded)
@@ -258,20 +266,30 @@ namespace hifi::chars::cache
 		// (under the lock) A texture's pack part let go: its pair behind the GPU, its ticket to the drop hook (both once the
 		// mutex is left), none again. Whatever its state: an asked ticket is dropped wherever the streamer has it (drop never
 		// blocks; what only the copy queue saw the worker lets go behind its own fence)
+		// (under the lock) One of a texture's tickets let go (to the drop hook once the mutex is left), its entry in the map
+		// with it
+		void release_ticket(texture_entry &e, hifi::pack::stream::ticket &t)
+		{
+			if (t.generation != 0)
+			{
+				const auto it = g.pack_by_ticket.find(t.slot);
+				if (it != g.pack_by_ticket.end() && it->second == e.id)
+					g.pack_by_ticket.erase(it);
+				g.tickets_dead.push_back(t);
+				g.n.pack_dropped++;
+			}
+			t = hifi::pack::stream::ticket {};
+		}
 		void release_pack(texture_entry &e)
 		{
 			if (e.pack_slot != kNoSlot)
 				g.n.pack_pairs -= std::min(g.n.pack_pairs, 1u);
 			release_slot(e.pack_slot);
-			if (e.ticket.generation != 0)
-			{
-				const auto it = g.pack_by_ticket.find(e.ticket.slot);
-				if (it != g.pack_by_ticket.end() && it->second == e.id)
-					g.pack_by_ticket.erase(it);
-				g.tickets_dead.push_back(e.ticket);
-				g.n.pack_dropped++;
-			}
-			e.ticket = hifi::pack::stream::ticket {};
+			release_ticket(e, e.ticket);
+			release_ticket(e, e.height_ticket);
+			e.colour_settled = e.height_settled = 0;
+			e.colour_from_pack = true;
+			e.relief = 0.0f;
 			e.ps = pack_state::none;
 			e.pack_bytes = 0;
 		}
@@ -295,7 +313,7 @@ namespace hifi::chars::cache
 			if (it == g.pack_by_ticket.end() || it->second >= g.textures.size() || !g.textures[it->second])
 				return nullptr;
 			texture_entry &e = *g.textures[it->second];
-			return e.ticket == t ? &e : nullptr;
+			return e.ticket == t || e.height_ticket == t ? &e : nullptr;
 		}
 		// (under the lock) A texture's decoded bytes no longer held (on the GPU, failed or let go)
 		void drop_decoded(texture_entry &e)
@@ -1145,11 +1163,13 @@ namespace hifi::chars::cache
 		return true;
 	}
 
-	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out, bool allow_pack, bool *is_pack)
+	bool texture_view_of(uint32_t id, D3D12_GPU_DESCRIPTOR_HANDLE &out, bool allow_pack, bool *is_pack, float *relief)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		if (is_pack != nullptr)
 			*is_pack = false;
+		if (relief != nullptr)
+			*relief = 0.0f;
 		if (id >= g.textures.size() || !g.textures[id] || g.textures[id]->s != state::ready)
 			return false;
 		texture_entry &e = *g.textures[id];
@@ -1161,7 +1181,9 @@ namespace hifi::chars::cache
 		{
 			e.pack_drawn = g.pack_now;
 			if (is_pack != nullptr)
-				*is_pack = true;
+				*is_pack = e.colour_from_pack;
+			if (relief != nullptr)
+				*relief = e.relief;
 		}
 		return true;
 	}
@@ -1221,7 +1243,11 @@ namespace hifi::chars::cache
 					continue;
 				// (the pack's part: a texture with no key counts as not in it)
 				c.pack_keyed += e->pack.bytes != 0;
-				c.pack_ready += e->ps == pack_state::ready;
+				// (pack_ready: the colour from the pack; a pair for a height alone is counted in pack_relief_only)
+				c.pack_ready += e->ps == pack_state::ready && e->colour_from_pack;
+				c.pack_relief += e->ps == pack_state::ready && e->relief > 0.0f;
+				c.pack_relief_only += e->ps == pack_state::ready && e->relief > 0.0f && !e->colour_from_pack;
+				c.pack_heights_asked += e->ps == pack_state::asked && e->height_settled == 1;
 				c.pack_bytes += e->ps == pack_state::ready ? e->pack_bytes : 0;
 				c.pack_asked += e->ps == pack_state::asked || e->ps == pack_state::writing;
 				c.pack_not_in += e->pack.bytes == 0 || (e->ps == pack_state::spent && e->spent_why == pack_miss::not_in_pack);
@@ -1258,6 +1284,13 @@ namespace hifi::chars::cache
 			static_cast<unsigned long long>(c.pack_evictions), static_cast<unsigned long long>(c.pack_skipped_slots), c.pack_waiting_slots, c.pack_pairs,
 			static_cast<unsigned long long>(c.pack_dropped));
 		out.push_back(line);
+		// (M9: only once any height was had or asked, so a pack without heights reads as before)
+		if (c.pack_relief != 0 || c.pack_heights_asked != 0)
+		{
+			std::snprintf(line, sizeof(line), "character data: texture pack: %u with the pack's relief (%u of them on the game's colour), %u heights asked",
+				c.pack_relief, c.pack_relief_only, c.pack_heights_asked);
+			out.push_back(line);
+		}
 		return out;
 	}
 
@@ -1297,7 +1330,7 @@ namespace hifi::chars::cache
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.pack_asks.clear();
 		for (const auto &e : g.textures)
-			if (e && (e->ps != pack_state::none || e->ticket.generation != 0 || e->pack_slot != kNoSlot))
+			if (e && (e->ps != pack_state::none || e->ticket.generation != 0 || e->height_ticket.generation != 0 || e->pack_slot != kNoSlot))
 				release_pack(*e);
 		// (none again: asked again in the next epoch while wanted)
 		for (const auto &e : g.textures)
@@ -1377,7 +1410,7 @@ namespace hifi::chars::cache
 		g.pack_asks.erase(g.pack_asks.begin(), g.pack_asks.begin() + ptrdiff_t(k));
 	}
 
-	bool pack_asked(uint32_t id, uint32_t serial, hifi::pack::stream::ticket t, uint32_t epoch)
+	bool pack_asked(uint32_t id, uint32_t serial, hifi::pack::stream::ticket t, uint32_t epoch, hifi::pack::stream::ticket height)
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		if (t.generation == 0 || id >= g.textures.size() || !g.textures[id])
@@ -1388,7 +1421,14 @@ namespace hifi::chars::cache
 		e.ps = pack_state::asked;
 		e.ticket = t;
 		e.pack_epoch = epoch;
+		e.colour_settled = 0;
 		g.pack_by_ticket[t.slot] = id;
+		if (height.generation != 0)
+		{
+			e.height_ticket = height;
+			e.height_settled = 1;
+			g.pack_by_ticket[height.slot] = id;
+		}
 		return true;
 	}
 
@@ -1405,17 +1445,50 @@ namespace hifi::chars::cache
 		}
 	}
 
-	bool pack_begin(hifi::pack::stream::ticket t, pack_writing &out)
+	pack_step pack_settle(hifi::pack::stream::ticket t, bool ready, pack_miss why, float relief, pack_writing &out, uint64_t colour_bytes)
 	{
 		pack_graves dead;
 		std::lock_guard<std::mutex> lock(g.mutex);
-		bool ok = false;
+		pack_step step = pack_step::none;
 		texture_entry *const e = pack_holder(t);
-		if (e != nullptr && e->ps == pack_state::asked && e->s == state::ready && g.heap != nullptr)
+		if (e != nullptr && e->ps == pack_state::asked)
 		{
-			if (g.free_slots.size() <= kPackSlotFloor)
+			// (each of its tickets settles once: a ready one is kept for the views, a missed one let go at once. A ready
+			// colour's view bytes kept while its height is on its way: pack_evict lets such a held colour go under pressure)
+			if (e->ticket == t && e->colour_settled == 0)
 			{
-				// (no pair to spare: the ticket let go, the texture none again, asked again once there are)
+				e->colour_settled = ready ? 1 : 2;
+				e->pack_bytes = ready ? colour_bytes : 0;
+				if (!ready)
+				{
+					e->spent_why = why;
+					release_ticket(*e, e->ticket);
+				}
+			}
+			else if (e->height_ticket == t && e->height_settled == 1)
+			{
+				const bool had = ready && relief > 0.0f;
+				e->height_settled = had ? 2 : 0;
+				e->relief = had ? relief : 0.0f;
+				if (!had)
+					release_ticket(*e, e->height_ticket);
+			}
+			if (e->colour_settled == 0 || e->height_settled == 1)
+				step = pack_step::wait;
+			else if (e->colour_settled != 1 && e->height_settled != 2)
+			{
+				// (neither had anything: spent by the colour's why, as before M9)
+				const pack_miss w = e->spent_why;
+				release_pack(*e);
+				e->ps = pack_state::spent;
+				e->spent_why = w;
+				step = pack_step::spent;
+			}
+			else if (e->s != state::ready || g.heap == nullptr)
+				release_pack(*e); // (nothing to write it into: none again)
+			else if (g.free_slots.size() <= kPackSlotFloor)
+			{
+				// (no pair to spare: the tickets let go, the texture none again, asked again once there are)
 				release_pack(*e);
 				g.n.pack_skipped_slots++;
 				pack_ask_later(*e);
@@ -1432,17 +1505,45 @@ namespace hifi::chars::cache
 				out.id = e->id;
 				out.serial = e->serial;
 				out.slot = e->pack_slot;
-				out.t = t;
+				out.t = e->colour_settled == 1 ? e->ticket : hifi::pack::stream::ticket {};
+				out.height = e->height_settled == 2 ? e->height_ticket : hifi::pack::stream::ticket {};
+				out.relief = out.height.generation != 0 ? e->relief : 0.0f;
 				out.colour = cpu_descriptor(2 * e->pack_slot);
 				out.detail = cpu_descriptor(2 * e->pack_slot + 1);
-				out.detail_map = e->d;
-				if (out.detail_map != nullptr)
-					out.detail_map->AddRef(); // (an interlocked count, no lock of the runtime's: the view is made after the mutex is left)
-				ok = true;
+				// (an interlocked count, no lock of the runtime's: the views are made after the mutex is left)
+				if (out.height.generation == 0)
+				{
+					out.detail_map = e->d;
+					if (out.detail_map != nullptr)
+						out.detail_map->AddRef();
+				}
+				if (out.t.generation == 0)
+				{
+					out.game_colour = e->t;
+					if (out.game_colour != nullptr)
+						out.game_colour->AddRef();
+				}
+				step = pack_step::write;
 			}
 		}
 		dead.d = take_dead();
-		return ok;
+		return step;
+	}
+
+	bool pack_height_of(hifi::pack::stream::ticket t, uint32_t &key_w)
+	{
+		std::lock_guard<std::mutex> lock(g.mutex);
+		key_w = 0;
+		const texture_entry *const e = pack_holder(t);
+		if (e == nullptr || t.generation == 0 || !(e->height_ticket == t))
+			return false;
+		key_w = e->pack.w;
+		return true;
+	}
+
+	bool pack_begin(hifi::pack::stream::ticket t, pack_writing &out)
+	{
+		return pack_settle(t, true, pack_miss::failed, 0.0f, out) == pack_step::write;
 	}
 
 	void write_pack_detail(pack_writing &w)
@@ -1456,17 +1557,30 @@ namespace hifi::chars::cache
 		{
 			// (a second view of the game texture's own detail map, its levels from the resource (the decoded ones are freed
 			// after the upload); or the null view the game's pair has. Never CopyDescriptors: the heap is shader visible,
-			// and a copy's source must be a CPU-only heap)
+			// and a copy's source must be a CPU-only heap. With the pack's height there (M9) the caller wrote it instead)
 			D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
 			v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 			v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-			v.Texture2D.MipLevels = w.detail_map != nullptr ? UINT(w.detail_map->GetDesc().MipLevels) : 1;
-			device->CreateShaderResourceView(w.detail_map, &v, w.detail);
+			if (w.height.generation == 0)
+			{
+				v.Texture2D.MipLevels = w.detail_map != nullptr ? UINT(w.detail_map->GetDesc().MipLevels) : 1;
+				device->CreateShaderResourceView(w.detail_map, &v, w.detail);
+			}
+			// (M9: a height with no colour of the pack's: a view of the game's own texture, as its own pair's, its levels
+			// from the resource)
+			if (w.t.generation == 0)
+			{
+				v.Texture2D.MipLevels = w.game_colour != nullptr ? UINT(w.game_colour->GetDesc().MipLevels) : 1;
+				device->CreateShaderResourceView(w.game_colour, &v, w.colour);
+			}
 		}
 		if (w.detail_map != nullptr)
 			w.detail_map->Release();
 		w.detail_map = nullptr;
+		if (w.game_colour != nullptr)
+			w.game_colour->Release();
+		w.game_colour = nullptr;
 	}
 
 	void pack_end(const pack_writing &w, bool ok, uint64_t bytes)
@@ -1476,11 +1590,13 @@ namespace hifi::chars::cache
 		if (w.id < g.textures.size() && g.textures[w.id])
 		{
 			texture_entry &e = *g.textures[w.id];
-			if (e.serial == w.serial && e.ps == pack_state::writing && e.ticket == w.t && e.pack_slot == w.slot)
+			if (e.serial == w.serial && e.ps == pack_state::writing && e.ticket == w.t && e.height_ticket == w.height && e.pack_slot == w.slot)
 			{
 				if (ok)
 				{
 					e.ps = pack_state::ready;
+					e.colour_from_pack = w.t.generation != 0;
+					e.relief = w.height.generation != 0 ? w.relief : 0.0f;
 					e.pack_bytes = bytes;
 					e.pack_drawn = g.pack_now;
 				}
@@ -1497,17 +1613,10 @@ namespace hifi::chars::cache
 
 	void pack_spent(hifi::pack::stream::ticket t, pack_miss why)
 	{
-		pack_graves dead;
-		std::lock_guard<std::mutex> lock(g.mutex);
 		// (only one still on its way: a ready texture's ticket turned gone keeps its texture till it's let go, zones.md
 		// decision 1, and the module forgets every pack part before it ends an epoch)
-		if (texture_entry *const e = pack_holder(t); e != nullptr && e->ps == pack_state::asked)
-		{
-			release_pack(*e);
-			e->ps = pack_state::spent;
-			e->spent_why = why;
-		}
-		dead.d = take_dead();
+		pack_writing unused;
+		pack_settle(t, false, why, 0.0f, unused);
 	}
 
 	uint32_t pack_evict(uint64_t max_bytes, uint64_t &bytes)
@@ -1516,11 +1625,15 @@ namespace hifi::chars::cache
 		std::lock_guard<std::mutex> lock(g.mutex);
 		bytes = 0;
 		// (the ready ones, the longest since a model drew them first: texture_view_of stamps pack_drawn as it hands the
-		// pair out. A walk every half second while the card is nearly full: a few thousand entries at most)
+		// pair out. A walk every half second while the card is nearly full: a few thousand entries at most. M9: before
+		// them, the asked ones holding a ready colour while their height is still on its way (the streamer may hold the
+		// height back while the pressure lasts): nothing draws those, and their colour is in video memory all the same)
 		std::vector<std::pair<double, uint32_t>> ready;
 		for (const auto &e : g.textures)
 			if (e && e->ps == pack_state::ready)
 				ready.emplace_back(e->pack_drawn, e->id);
+			else if (e && e->ps == pack_state::asked && e->colour_settled == 1 && e->height_settled == 1)
+				ready.emplace_back(-1.0, e->id);
 		std::sort(ready.begin(), ready.end());
 		uint32_t n = 0;
 		for (const auto &[drawn, id] : ready)
@@ -1593,6 +1706,12 @@ namespace hifi::chars::cache
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			return id < g.textures.size() && g.textures[id] ? g.textures[id]->ticket : hifi::pack::stream::ticket {};
+		}
+
+		hifi::pack::stream::ticket pack_height_ticket_of(uint32_t id)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			return id < g.textures.size() && g.textures[id] ? g.textures[id]->height_ticket : hifi::pack::stream::ticket {};
 		}
 
 		uint32_t pack_slot_of(uint32_t id)

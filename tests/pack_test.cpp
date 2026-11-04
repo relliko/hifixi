@@ -25,6 +25,9 @@
  *   - the client fingerprint: a mismatch only a status line;
  *   - mips: cut-out coverage within 2% of level 0 in every level of 256 texels and more (zone vertex alpha 0x80 and 0xFF,
  *     characters' 0x22) where the plain box loses it; blended, mask, mixed and none exactly smaller_levels' box;
+ *   - (M9) height records: set_map puts a BC4 kind-2 record (its span in param) beside an entry's colour, kept byte for
+ *     byte, sets or clears height_from_game, says same for the same bytes, replaces a height, refuses no such key and a
+ *     short level; check refuses a BC4 record of the wrong size or BC4_SNORM; the oracle reads it;
  *   - tests\pack_oracle.py (python -I) reading a written pack, and refusing a damaged one.
  *
  *   build\pack_test.exe     (built by build.cmd; needs python on PATH for the oracle)
@@ -1105,6 +1108,107 @@ int main()
 		}
 		else
 			check(false, "read_levels with a damaged level: the copy couldn't be made " + why);
+	}
+
+	// ---- (M9) Height records: set_map puts a BC4 kind-2 record into an entry, its colour kept; the span in param; the
+	// same again is same; a height over one replaces it; no such key, a bad map and no free slot refused; the rules and the
+	// oracle accept it; a pack without heights reads as before
+	{
+		const std::wstring f = base + L"heights\\";
+		remove_tree(f);
+		pk::writer w;
+		std::string why;
+		w.open(options(f), why);
+		made m = make(64, 32, 900), plain = make(32, 32, 901);
+		w.add(m.e, { m.map }, why);
+		w.add(plain.e, { plain.map }, why);
+		w.commit(why);
+		w.close();
+		auto before = pk::load(f, nullptr, why);
+		const pk::record colour_before = before ? *before->find(m.e.the_key())->map(pk::kColour) : pk::record {};
+		auto bc4_map = [](uint32_t mw, uint32_t mh, uint32_t seed, float span) {
+			pk::map_in h;
+			h.kind = pk::kHeight;
+			h.format = pk::kBC4;
+			h.w = mw, h.h = mh;
+			std::mt19937 rng(seed);
+			for (uint32_t lw = mw, lh = mh; lw >= 4 && lh >= 4 && lw % 4 == 0 && lh % 4 == 0; lw /= 2, lh /= 2)
+			{
+				std::vector<uint8_t> b(size_t(lw / 4) * (lh / 4) * 8);
+				for (uint8_t &v : b)
+					v = uint8_t(rng());
+				h.levels.push_back(std::move(b));
+			}
+			std::memcpy(&h.param, &span, 4);
+			return h;
+		};
+		pk::writer hw;
+		const bool opened = hw.open(options(f), why);
+		const pk::map_in h1 = bc4_map(32, 16, 1, 0.125f), h2 = bc4_map(32, 16, 2, 0.25f);
+		const pk::add_result put = hw.set_map(m.e.the_key(), h1, pk::kHeightFromGame, 0, why);
+		const pk::add_result again = hw.set_map(m.e.the_key(), h1, pk::kHeightFromGame, 0, why);
+		std::string why_none, why_bad;
+		const pk::add_result none = hw.set_map(pk::key { 1, 2, 3, 4 }, h1, 0, 0, why_none);
+		pk::map_in bad = h1;
+		bad.levels[0].pop_back();
+		const pk::add_result refused = hw.set_map(m.e.the_key(), bad, 0, 0, why_bad);
+		const bool committed = hw.commit(why);
+		hw.close();
+		auto x = pk::load(f, nullptr, why);
+		const pk::entry *e = x ? x->find(m.e.the_key()) : nullptr;
+		const pk::record *hr = e ? e->map(pk::kHeight) : nullptr, *cr = e ? e->map(pk::kColour) : nullptr;
+		bool read_back = false;
+		if (hr != nullptr)
+		{
+			pk::reader r(x);
+			pk::layout l;
+			pk::footprint(hr->format, hr->w, hr->h, hr->levels, l);
+			std::vector<uint8_t> all(hr->bytes);
+			read_back = r.read_record(*hr, all.data(), why);
+			for (uint32_t i = 0; i < l.levels && read_back; ++i)
+			{
+				std::vector<uint8_t> one(size_t(l.level_span(i)));
+				read_back = r.read_level(*hr, i, one.data(), why) && level_matches(one, l, i, h1.levels[i]);
+			}
+		}
+		check(opened && put == pk::add_result::ok && again == pk::add_result::same && none == pk::add_result::refused && why_none == "no entry with that key" &&
+				refused == pk::add_result::refused && committed && hr != nullptr && hr->format == pk::kBC4 && hr->w == 32 && hr->h == 16 &&
+				hr->levels == h1.levels.size() && hr->span() == 0.125f && pk::check(*hr) == nullptr && read_back && cr != nullptr &&
+				std::memcmp(cr, &colour_before, sizeof(pk::record)) == 0 && (e->flags & pk::kHeightFromGame) != 0 && x->find(plain.e.the_key())->map(pk::kHeight) == nullptr,
+			"set_map: a BC4 height record put beside the colour (kept byte for byte), span 0.125 in param, height_from_game set, every level read back; the "
+			"same again is same; no such key and a short level refused (\"" + why_bad + "\")");
+
+		// (a height over it: replaced, the flag taken out; the old bytes left; a third and a fourth kind: no free slot)
+		pk::writer rw;
+		rw.open(options(f), why);
+		const pk::add_result over = rw.set_map(m.e.the_key(), h2, 0, pk::kHeightFromGame, why);
+		pk::map_in mat = bc4_map(32, 16, 3, 0.0f);
+		mat.kind = pk::kMaterial;
+		mat.param = 0;
+		const pk::add_result third = rw.set_map(m.e.the_key(), mat, 0, 0, why);
+		pk::map_in fourth = mat;
+		fourth.kind = 9;
+		std::string why_full;
+		const pk::add_result full = rw.set_map(m.e.the_key(), fourth, 0, 0, why_full);
+		const uint32_t replaced = rw.stats().maps_replaced, added = rw.stats().maps_added;
+		rw.commit(why);
+		rw.close();
+		auto y = pk::load(f, nullptr, why);
+		const pk::entry *ye = y ? y->find(m.e.the_key()) : nullptr;
+		check(over == pk::add_result::replaced && third == pk::add_result::ok && full == pk::add_result::refused && replaced == 1 && added == 1 && ye &&
+				ye->map(pk::kHeight)->span() == 0.25f && ye->map(pk::kHeight)->crc != hr->crc && (ye->flags & pk::kHeightFromGame) == 0 &&
+				ye->map(pk::kColour)->crc == colour_before.crc && ye->map(pk::kMaterial) != nullptr,
+			"set_map: a height over one replaces it (span 0.25, the flag cleared), a material takes the third slot, an unknown fourth kind refused (\"" + why_full + "\")");
+		int code = 0;
+		const std::string o = run_oracle(f, code);
+		check(code == 0, "pack_oracle.py reads the pack with height records: " + last_line(o));
+
+		// (the rules: a height record whose bytes aren't BC4's layout, or of another format, refused by check)
+		pk::record r = *ye->map(pk::kHeight);
+		r.bytes += 8;
+		pk::record r2 = *ye->map(pk::kHeight);
+		r2.format = 81; // (BC4_SNORM)
+		check(pk::check(r) != nullptr && pk::check(r2) != nullptr, "check: a height record with BC2's byte count or BC4_SNORM refused");
 	}
 
 	// ---- The cancel race (docs/texture-pack/streamer.md "Stop"): a cancel() that lands after a piece's check of the flag

@@ -802,6 +802,52 @@ hours; a fraction of the upscaled pack's size. A player with an upscaled pack ge
 - **Tests:** `zonedraw_test` (per-pixel off byte-identical); zone_view A/B (luminance within 3%); chartest; `charinject_test`; `shade_bench` at 4K; `grass_test`; GBV churn.
 - **Done when:** approved and the suites pass.
 - **Risks:** painted shading mistaken for relief (game heights first); pair with M10.
+- **Step 1, the pack side, built 2026-11-03 (on dev-pack 198e154, not committed):**
+  - **Format:** height records are kind 2, `BC4_UNORM` (`src\pack\bc4.cpp`), their span in the record's former
+    `reserved` dword (`record::param`, a float); `docs\texture-pack\format.md` "Height records" has the meaning (H in the
+    game's bump units on the original's grid, 0.5 the mean), the sources and the sizes. The reader, the rules and the
+    streamer already took kind 2 and BC4 (pack_test's WARP footprints, packstream_test's made-up BC4 records); nothing
+    in the plugin asks for a height yet, so plugin behaviour is unchanged and a pack without heights reads as before.
+  - **Maker** (`src\pack\height.cpp`): zones' textures from the bump DAT's height map of their name (flag
+    `height_from_game`), else the `nmap_multi` port on the colour the texture is drawn with; both high-passed at 6
+    original texels and coverage-aware (blurs, mean and mips weighted by what the game shows). On ROM\0\100's 12
+    bump-mapped textures the stored map's normals are 0.61 degrees from the game's own (p99 2.6).
+  - **Commands:** `hifixi-texpack heights --pack <folder> [--kind] [--only] [--height-scale half|full|game] [--redo]`
+    (pack.lock, stop, progress.txt, the game check, resume by "has a height"); `make --heights` (off by default until
+    this milestone is approved) writes the same bytes as make then heights. `--height-scale` defaults to `half`
+    (question 11 open): zones' half is the game's size, models' 2x.
+  - **Sizes:** 0.68-0.79 bytes a map texel with mips and pitch (0.89 when every map is small, at game size): the three
+    scratch zones from the installed pack (Bastok Markets ROM\1\35, Lower Jeuno ROM\1\41, West Ronfaure ROM\0\120;
+    119 entries, 100 with game heights): half/game 5.09 M map texels, 4.0 MB; full 20.35 M, 14.2 MB, against 27.5 MB
+    of colour. Per colour texel: full about 0.7 bytes, half 0.2 (2x zones) or 0.18 (4x models), game 0.2 / 0.05.
+  - **Tests:** pack_test +4 (set_map, the rules for BC4 heights, the oracle); texpack_test +22 (20 in `texpack_test heights`,
+    which runs them alone; 2 in make's: no heights without `--heights`, and `make --heights` equal to make then heights).
+  - **Scratch packs** (`C:\code\LSB\hifi-textures`): `m9-trial` (m7-trial plus heights, half), `m9-trial-full`,
+    `m9-trial-game`; `m9-zones` (the three zones' entries copied from the installed pack, read only, plus heights at
+    half), `m9-zones-full`, `m9-zones-game`. The game was running, so no make (GPU) run: the zones' colour is the
+    installed pack's.
+  - **Left:** steps 2-5 (the zone and character shaders, grass relief fade, `[textures] height=0`).
+- **Steps 2, 4 and 5, built 2026-11-03 (not committed; nothing installed):** `docs\texture-pack\zones.md` "Pack normals"
+  has it all. Zones and model actors draw a piece's pack height as relief per pixel (`kPackRelief`, the height at t5
+  from the pack region's heights' block, the relief scale in b1's spare constant; `kMapped` prefers it, `kBump`
+  unchanged), asked apart from the colour (a materials-only entry works), whole chains. **Sobel in the shader** taken
+  over a stored BC5 (`shade_bench relief` at 4K: +0.085 ms half / +0.109 ms full a whole screen, BC5 +0.016 / +0.012;
+  BC5 would double the heights' bytes). World FX's relief fades on pixels the light split marks (the facing written
+  turned away, zinfo.w bit 64 while `pack::heights_in_use`). `[textures] height` (default 1, the menu's "Relief from
+  the texture pack"; status and menu lines with the count of textures with heights). Without heights, and with
+  `height=0`, the pictures are 198e154's byte for byte (zone_view, zoneinject_test, charinject_test; the installed
+  pack's zones). A/B pictures for question 11 in `C:\code\LSB\hifi-textures\m9-ab`. Left: step 3 (characters), the
+  in-game look, question 11.
+- **Step 3, built 2026-11-04 (not committed; nothing installed):** `docs\texture-pack\characters.md` "Pack relief".
+  A character texture whose entry has a height is asked for it beside its colour (whole chain); the pair is written
+  once both are settled, its detail descriptor then the height (BC4), its colour the pack's or, for a height alone, a
+  view of the game's texture. Draw-constant flags 4 with the relief scale in dc[5] (the composite's word): `detail_at`
+  tilts the normal as the zones' `pack_tilt` does, per pixel only, no metal or cavity (those give way to the relief on
+  textures with heights until M10). No root signature or table change. Relief pixels write the light split's mark.
+  `[textures] height` toggled re-streams the characters' pack parts (they switch at once). Unflagged draws byte for
+  byte as before (charinject_test's picture per vertex, per pixel, per pixel with detail, against the step 2-5
+  build); charinject_test's heights part (11 checks) passes on WARP and the 4070 Ti, with GPU-based validation.
+  Left: the in-game look, question 11.
 
 ### M10 — Material and gloss (own install, kill switch)
 - **Steps:**

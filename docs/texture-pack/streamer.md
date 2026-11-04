@@ -186,7 +186,9 @@ COMMON), one per uploaded record.
   `gone`.
 - **Epoch.** One counter raised by `open`, `close`, a reload, a new device and device loss. A ticket of an older epoch
   reads `gone`; a request made against an older index snapshot (its epoch passed in `want`) is `gone` at once.
-- **What's asked:** `want { key, kind (colour; height and material from M9/M10), first (top levels never wanted),
+- **What's asked:** `want { key, kind (colour; height and material from M9/M10: any kind the entry has a record of
+  streams the same way, a height record as BC4_UNORM; the zones' glue asks for heights since M9 step 2, the whole
+  chain), first (top levels never wanted),
   count (0: all the rest), priority }`. Zones ask down to the game's own size, characters `6 + log2(scale)` levels
   (plan §3 "Uploaded levels"). `first > 0` is refused when level `first` isn't a multiple of 4 on both sides (a BC
   texture's top level must be).
@@ -350,6 +352,7 @@ namespace hifi::pack::stream
 		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		uint32_t w = 0, h = 0, levels = 0, first = 0;
 		uint64_t bytes = 0;
+		uint32_t param = 0; // (M9: the record's param, a height record's span as float bits)
 	};
 	struct limits
 	{

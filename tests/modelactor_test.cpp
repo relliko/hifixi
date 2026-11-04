@@ -292,7 +292,18 @@ int main(int argc, char **argv)
 				m.h = t.key.h * 2;
 				for (uint32_t l = 0; l < pk::full_levels(m.w, m.h); ++l)
 					m.levels.push_back(std::vector<uint8_t>(size_t((std::max(1u, m.w >> l) + 3) / 4) * ((std::max(1u, m.h >> l) + 3) / 4) * 16, uint8_t(0x40 + l)));
-				made = w.add(e, { m }, why) != pk::add_result::refused;
+				// (M9: and a height record, the texture's own size, span 1: model actors get relief from the pack too)
+				pk::map_in hm;
+				hm.kind = pk::kHeight;
+				hm.format = pk::kBC4;
+				hm.w = t.key.w;
+				hm.h = t.key.h;
+				const float span = 1.0f;
+				std::memcpy(&hm.param, &span, 4);
+				for (uint32_t l = 0; l < pk::full_levels(hm.w, hm.h); ++l)
+					hm.levels.push_back(std::vector<uint8_t>(size_t((std::max(1u, hm.w >> l) + 3) / 4) * ((std::max(1u, hm.h >> l) + 3) / 4) * 8, uint8_t(0x30 + 0x20 * (l & 1))));
+				// (replace: a pack left by a run before M9 has the key without its height)
+				made = w.add(e, { m, hm }, why, true) != pk::add_result::refused;
 			}
 			made = made && w.commit(why);
 			w.close();
@@ -338,7 +349,8 @@ int main(int argc, char **argv)
 			zn::gpu_zone *got = until_up(1);
 			// (up to 20 s, a ms apart: WARP's copies on a busy PC, the suites side by side; found each present, so it isn't
 			// let go as unused meanwhile)
-			for (int i = 0; i < 20000 && got != nullptr && got->pack_summary().drawn + got->pack_summary().spent < keys; ++i)
+			for (int i = 0; i < 20000 && got != nullptr &&
+				(got->pack_summary().drawn + got->pack_summary().spent < keys || got->pack_summary().heights_drawn + got->pack_summary().heights_spent < keys); ++i)
 			{
 				present(1);
 				got = zn::actordata::find(g_file);
@@ -347,6 +359,13 @@ int main(int argc, char **argv)
 			const zn::gpu_zone::pack_counts c0 = got != nullptr ? got->pack_summary() : zn::gpu_zone::pack_counts();
 			check(got != nullptr && got->data().pack && got->has_pack() && c0.drawn == keys, "the DAT's textures from the pack: " + std::to_string(c0.drawn) + " of " +
 				std::to_string(keys) + " drawn");
+			{
+				// (M9: their heights too, each with a relief scale, bound in place of a normal map per pixel)
+				float relief = 0.0f;
+				const bool bound = got != nullptr && got->height_srv(0, &relief).ptr != 0;
+				check(c0.heights_drawn == keys && bound && relief > 0.0f, "  and their heights: " + std::to_string(c0.heights_drawn) + " of " + std::to_string(keys) +
+					" drawn (the first's relief scale " + std::to_string(relief) + ")");
+			}
 			// (let go as unused mid-stream: a new visit held by the gate first)
 			zn::actordata::stop();
 			st::test::gate_copies(gate, gate_value);

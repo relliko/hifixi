@@ -611,6 +611,7 @@ namespace hifi::chars::inject
 		g.n.frames++;
 		g.n.models += g.last.models;
 		g.n.overlays += g.last.overlays;
+		g.n.relief_draws += g.last.relief_draws;
 	}
 
 	void set_sun(const float *toward, float fade)

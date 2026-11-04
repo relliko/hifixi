@@ -107,6 +107,7 @@ namespace hifi::pack
 			modes mode;                   // (the consumers' modes as last set)
 			// (on: the index's summary)
 			uint64_t entries = 0, scenery = 0, pack_bytes = 0;
+			uint64_t heights = 0; // (M9: entries with a height record)
 			// (the quiet window: the zone it's for, when the character came in, native's slot 0 and how long it's been ready)
 			uint32_t q_zone = UINT32_MAX;
 			double q_in_since = -1.0;
@@ -127,7 +128,8 @@ namespace hifi::pack
 		// What owners and the menu read, any time (the game's thread; atomics so a mark moved to another thread stays right).
 		// g_folder_exists: the pack folder there, whether or not pack.idx is (a copy cut off before pack.idx, which sorts
 		// after the data files, still shows the setting and the menu's line saying what's missing)
-		std::atomic<bool> g_folder_exists { false }, g_in_use { false }, g_compare { false }, g_quiet { false }, g_fsr { false };
+		std::atomic<bool> g_folder_exists { false }, g_in_use { false }, g_compare { false }, g_quiet { false }, g_fsr { false },
+			g_heights_in_use { false };
 		std::atomic<uint32_t> g_epoch { 0 }, g_starts { 0 };
 		std::atomic<uint64_t> g_io { 0 };
 		std::atomic<int> g_force_quiet { -1 };
@@ -206,7 +208,10 @@ namespace hifi::pack
 			g_in_use.store(g.m == mode::on);
 			g_device_in_use.store(g.m == mode::on ? g.device : nullptr);
 			if (g.m != mode::on)
+			{
 				g_fsr.store(false);
+				g_heights_in_use.store(false);
+			}
 		}
 
 		// Textures the streamer couldn't read from the pack: a CRC mismatch, a read failed or cut short (a damaged or
@@ -311,7 +316,8 @@ namespace hifi::pack
 			m.zones = game::option_on("textures", "zone", opt::kZoneByDefault);
 			m.actors = game::option_on("textures", "actors", opt::kActorsByDefault);
 			m.chars = game::option_on("textures", "chars", opt::kCharsByDefault);
-			if (m.zones != g.mode.zones || m.actors != g.mode.actors || m.chars != g.mode.chars)
+			m.heights = game::option_on("textures", "height", opt::kHeightByDefault);
+			if (m.zones != g.mode.zones || m.actors != g.mode.actors || m.chars != g.mode.chars || m.heights != g.mode.heights)
 				set_mode(m);
 		}
 
@@ -414,6 +420,10 @@ namespace hifi::pack
 			}
 			g.entries = idx->entries.size();
 			g.scenery = idx->by_source[kSourceZone];
+			// (M9: the entries with a height record, for the status and the menu)
+			g.heights = 0;
+			for (const entry &en : idx->entries)
+				g.heights += en.map(kHeight) != nullptr;
 			g.pack_bytes = 0;
 			for (uint64_t b : idx->file_bytes)
 				g.pack_bytes += b;
@@ -426,6 +436,8 @@ namespace hifi::pack
 				narrow(g.folder).c_str(), thousands(g.entries).c_str(), thousands(g.scenery).c_str(), thousands(g.entries - g.scenery).c_str(),
 				gigabytes(g.pack_bytes), g.epoch, g.mode.zones ? "on" : "off", g.mode.actors ? "on" : "off", g.mode.chars ? "on" : "off");
 			log(0, line);
+			if (g.heights != 0)
+				log(0, "texture pack: " + thousands(g.heights) + " textures with heights (relief " + (g.mode.heights ? "on" : "off: [textures] height") + ")");
 			if (!idx->status.empty())
 				log(1, "texture pack: " + idx->status);
 		}
@@ -641,8 +653,12 @@ namespace hifi::pack
 					break;
 				}
 				status.push_back("textures: on, " + folder + ": " + found.substr(7) + " (epoch " + std::to_string(g.epoch) + "; zones " +
-					(g.mode.zones ? "on" : "off") + ", model actors " + (g.mode.actors ? "on" : "off") + ", characters " + (g.mode.chars ? "on" : "off") + ")");
+					(g.mode.zones ? "on" : "off") + ", model actors " + (g.mode.actors ? "on" : "off") + ", characters " + (g.mode.chars ? "on" : "off") +
+					"; relief " + (g.mode.heights ? "on" : "off") + ", " + thousands(g.heights) + " textures with heights)");
 				menu.push_back(found);
+				// (M9: the relief line once the pack has heights)
+				if (g.heights != 0)
+					menu.push_back("Relief: " + thousands(g.heights) + " textures have heights" + (g.mode.heights ? "." : " (off)."));
 				break;
 			case mode::opening:
 				status.push_back("textures: opening " + folder + "...");
@@ -864,6 +880,7 @@ namespace hifi::pack
 				}
 			}
 			g_fsr.store(g.m == mode::on && game::option_on("textures", "fsr_bias", opt::kFsrBiasByDefault));
+			g_heights_in_use.store(g.m == mode::on && g.mode.heights && g.heights != 0);
 			{
 				// (M7: memwatch's last read of progress.txt; a copy, no file read here)
 				const mw::build_file b = mw::read_build();
@@ -1014,6 +1031,7 @@ namespace hifi::pack
 	bool comparing() { return g_compare.load(); }
 	bool quiet() { return g_quiet.load(); }
 	bool fsr_bias_on() { return g_fsr.load(); }
+	bool heights_in_use() { return g_heights_in_use.load(); }
 
 	float fsr_bias(float ratio)
 	{

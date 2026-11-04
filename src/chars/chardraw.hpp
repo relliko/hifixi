@@ -109,6 +109,7 @@ namespace hifi::chars
 		uint32_t not_ready = 0, hidden = 0, untextured = 0; // groups (or models, not ready) left out
 		uint32_t overlays = 0, cloaks = 0;                  // models drawn with their extra passes
 		uint32_t pack_draws = 0;                            // draws with the texture pack's view bound (record_casters: never)
+		uint32_t relief_draws = 0;                          // (M9) draws with the pack's height bound as relief (flags 4)
 	};
 
 	class char_renderer

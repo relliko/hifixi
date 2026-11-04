@@ -66,6 +66,7 @@ namespace hifi::chars::inject
 		uint64_t frames = 0, models = 0, see_through = 0, failed = 0;
 		uint64_t caster_frames = 0, caster_models = 0; // (drawn into the sun's casters' map)
 		uint64_t caster_pack_draws = 0; // (casters' draws with a pack view bound: always 0, they keep the game's cut-outs)
+		uint64_t relief_draws = 0; // (M9: the opaque passes' draws with the pack's height bound as relief)
 		uint64_t enspell_models = 0; // (models drawn with an en-spell effect)
 		uint64_t overlays = 0, cloaks = 0, cloak_failed = 0; // (models drawn with their extra passes; scene copies that couldn't be made)
 		uint64_t auras = 0, aura_failed = 0; // (see-through models drawn with their aura ring; ones whose ring couldn't be: a multisampled world)

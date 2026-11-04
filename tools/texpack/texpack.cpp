@@ -12,7 +12,11 @@
  *                          [--batch-mtexels N] [--threads N] [--redo] [--rescan] [--no-wait] [--ignore-game]
  *                          [--reserve-gb N] [--ffximain <file>] [--keep-work] [--soul-mean X] [--soul-p99 X]
  *                          [--alpha-mean X] [--alpha-p99 X]
+ *                          [--heights [--height-scale half|full|game]]
  *                          (tests: [--game-names a.exe,b.exe] [--game-poll-s X] [--game-quiet-s X] [--stall-s X])
+ *   hifixi-texpack heights --pack <pack folder> [--ffxi ...] [--ashita ...] [--kind zone|model] [--only <rel> ...]
+ *                          [--height-scale half|full|game] [--limit N] [--threads N] [--batch-mtexels N] [--redo]
+ *                          [--no-wait] [--ignore-game] [--reserve-gb N] (tests: --game-names, --game-poll-s, --game-quiet-s)
  *   hifixi-texpack get-upscaler [--yes] [--dir <folder>]          (tests: [--url file:///...])
  *   hifixi-texpack verify  --pack <folder> [--soul] [--ffxi ...] [--threads N] [--soul-mean X] [--soul-p99 X]
  *                          [--alpha-mean X] [--alpha-p99 X] [--worst N]
@@ -63,6 +67,14 @@
  *   is ended (a job object, which also ends it with the builder), the batch thrown away, and make waits until the game
  *   has been closed for a minute (--no-wait: exit 4, as convert). The upscaler: --upscaler, else <this tool's
  *   folder>\upscaler; missing, it says to run get-upscaler (exit 1).
+ *   --heights (M9; off until M9 is approved): each entry also gets a height record (heights below), made from the
+ *   colour just made (its BC2 decoded, so make --heights and make then heights write the same bytes).
+ * heights (heights.cpp, M9): height records (BC4, kind 2: src\pack\height.hpp) added to an existing pack's entries, their
+ *   other records kept: zones' textures from the zone's bump DAT where it has a height map of the texture's name
+ *   (flagged height_from_game), else from the colour the texture is drawn with (the pack's colour record, or the
+ *   original). Goes through pack.src's DATs (zones first, by path; --kind, --only), in batches; an entry that has a
+ *   height already is skipped (resume; --redo makes them again). pack.lock, the stop file, progress.txt, texpack.log,
+ *   the game check (waits, or --no-wait exit 4), below-normal priority and the free-space check as make's. CPU only.
  * get-upscaler (fetch.cpp): Real-ESRGAN's official Windows release zip downloaded on the player's yes (or --yes), refused
  *   unless its size and SHA-256 are the official file's, unpacked with Windows' tar.exe, only the program, vcomp140.dll,
  *   the x4plus model and the readme kept, with PROVENANCE.txt (docs\texture-pack\upscaler.md: why it isn't shipped).
@@ -326,6 +338,10 @@ namespace hifi::texpack
 			"  make    --out <pack> [--ffxi <FINAL FANTASY XI>] [--ashita <folder>] [--upscaler <folder>] [--kind zone|model]\n"
 			"          [--only <rel> ...] [--limit N] [--zone-factor 2|4] [--model-factor 2|4] [--batch-mtexels N] [--threads N]\n"
 			"          [--redo] [--rescan] [--no-wait] [--ignore-game] [--reserve-gb N] [--ffximain <file>] [--keep-work]\n"
+			"          [--heights [--height-scale half|full|game]]\n"
+			"  heights --pack <pack> [--ffxi <FINAL FANTASY XI>] [--ashita <folder>] [--kind zone|model] [--only <rel> ...]\n"
+			"          [--height-scale half|full|game] [--limit N] [--threads N] [--batch-mtexels N] [--redo] [--no-wait]\n"
+			"          [--ignore-game] [--reserve-gb N]\n"
 			"  get-upscaler [--yes] [--dir <folder>]\n"
 			"  verify  --pack <pack> [--soul] [--ffxi ...] [--threads N] [--soul-mean X] [--soul-p99 X] [--alpha-mean X]\n"
 			"          [--alpha-p99 X] [--worst N]\n"
@@ -457,6 +473,10 @@ namespace hifi::texpack
 				o.rescan = true;
 			else if (a == L"--keep-work")
 				o.keep_work = true;
+			else if (a == L"--heights")
+				o.heights = true;
+			else if (a == L"--height-scale" && next(s))
+				o.height_scale = narrow(s);
 			else if (a == L"--yes")
 				o.yes = true;
 			else
@@ -2266,6 +2286,8 @@ int wmain(int argc, wchar_t **argv)
 		code = make(o);
 	else if (o.command == "get-upscaler")
 		code = get_upscaler(o);
+	else if (o.command == "heights")
+		code = heights(o);
 	else
 		usage();
 	if (g_log != nullptr)
