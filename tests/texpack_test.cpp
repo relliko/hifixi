@@ -23,6 +23,15 @@
  * fake game folder with build\fake_esrgan.exe and no Python on PATH: keys, fields, factors, the models' kinds as
  * convert's, verify --soul, dedupe, resume after a kill, the stop file, the fake game started mid-upscale (paused, the
  * child ended, goes on after it closes), --no-wait, a hung and a failing upscaler.
+ * M8 (HDCube and BC7): texconv missing (BC2, a clear line, maker 310); a models-hdcube with another hash refused;
+ * get-upscaler from a copy of the tool laid out as its zip puts HDCube in (with HIFIXI_ESRGAN_ZIP); and with texconv.exe
+ * (HIFIXI_TEXCONV, else build\texconv.exe; skipped with a line when neither is there): the BC7 decoder against texconv's
+ * on random blocks of every mode, our mips kept by texconv, BC7 against BC2 PSNR on 10 of the game's textures, alpha
+ * range and cut-out coverage after BC7, make with HDCube and BC7 (header, pack.src, progress, verify --soul, levels),
+ * one BC7 entry streamed as 0.67 streams it (its reader is src\pack, unchanged since 0.67) with WARP's footprints, a
+ * rerun, then --colour bc2, --upscaler-model x4plus and back: the DATs made again, their entries replaced. M9 on M8:
+ * heights on that BC7 pack equal pk::height on its BC7 level 0 decoded (maker 311 and pack.src kept), and make --heights
+ * with BC7 writes the same height records.
  *
  * heights (M9, heights_tests): BC4's round trip within its bound on noise, bands, gradients, 0/255 and flat blocks; the
  * height sizes per --height-scale; coverage (a cut-out's holes change nothing it shows); a flat colour's span 0; on a pack
@@ -40,6 +49,8 @@
  */
 
 #include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 #include "../src/pack/pack.hpp"
 #include "../src/pack/pack_write.hpp"
 #include "../src/pack/bc2.hpp"
@@ -49,6 +60,9 @@
 #include "../src/bake/dat.hpp"
 #include "../tools/texpack/keeptexels.hpp"
 #include "../tools/texpack/upscale.hpp"
+#include "../tools/texpack/bc7.hpp"
+#include "../src/chars/tex.hpp"
+#include <cmath>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -389,6 +403,7 @@ namespace
 	namespace ktx = hifi::texpack::keeptexels;
 	namespace ups = hifi::texpack::upscale;
 
+	const wchar_t *kHdcubeResearch = L"C:\\code\\LSB\\research\\ffxi-re\\tools\\upscale\\hdcube";
 	const char *kMakeZones[] = { "ROM\\1\\66.DAT", "ROM\\1\\72.DAT" };
 	const char *kMakeModels[] = { "ROM\\310\\0.DAT", "ROM3\\5\\110.DAT", "ROM3\\5\\31.DAT" };
 	const wchar_t *kFakeGame = L"texpack-fakegame.exe";
@@ -1062,6 +1077,267 @@ namespace
 		}
 	}
 
+	// ---- M8: BC7 by texconv (tools\texpack\bc7.cpp)
+
+	namespace b7 = hifi::texpack::bc7;
+	namespace tx = hifi::chars::tex;
+
+	// The texconv.exe the tests use: HIFIXI_TEXCONV, else build\texconv.exe; "" when there's none
+	std::wstring find_texconv()
+	{
+		wchar_t p[MAX_PATH] = L"";
+		if (GetEnvironmentVariableW(L"HIFIXI_TEXCONV", p, MAX_PATH) != 0 && is_there(p))
+			return p;
+		if (is_there(root + L"\\build\\texconv.exe"))
+			return root + L"\\build\\texconv.exe";
+		return {};
+	}
+
+	// PSNR of two RGBA8 pictures over their first channels
+	double psnr(const uint8_t *a, const uint8_t *b, size_t texels, int channels = 3)
+	{
+		double se = 0;
+		for (size_t i = 0; i < texels; ++i)
+			for (int c = 0; c < channels; ++c)
+			{
+				const double d = double(a[i * 4 + c]) - double(b[i * 4 + c]);
+				se += d * d;
+			}
+		const double mse = se / double(texels * size_t(channels));
+		return mse <= 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
+	}
+
+	// A DDS of BC7 blocks (DX10 header, one level)
+	bool write_bc7_dds(const std::wstring &path, const std::vector<uint8_t> &blocks, uint32_t w, uint32_t h)
+	{
+		uint32_t head[37] = {};
+		head[0] = 0x20534444, head[1] = 124, head[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000, head[3] = h, head[4] = w, head[5] = uint32_t(blocks.size()), head[7] = 1;
+		head[19] = 32, head[20] = 4, head[21] = 0x30315844, head[27] = 0x1000;
+		head[32] = 98, head[33] = 3, head[35] = 1;
+		std::vector<uint8_t> b(sizeof(head));
+		std::memcpy(b.data(), head, sizeof(head));
+		b.insert(b.end(), blocks.begin(), blocks.end());
+		return write(path, b);
+	}
+
+	// texconv's R8G8B8A8 output's texels (all levels, back to back)
+	std::vector<uint8_t> dds_texels(const std::wstring &path)
+	{
+		const std::vector<uint8_t> d = read(path);
+		if (d.size() < 128)
+			return {};
+		const size_t at = std::memcmp(d.data() + 84, "DX10", 4) == 0 ? 148 : 128;
+		return std::vector<uint8_t>(d.begin() + ptrdiff_t(at), d.end());
+	}
+
+	int run_texconv(const std::wstring &texconv, const std::wstring &args, const std::wstring &log)
+	{
+		started s = start(texconv, args, log);
+		return finish(s, 120000);
+	}
+
+	void bc7_tests(const std::wstring &texconv, const std::wstring &dir)
+	{
+		remove_tree(dir);
+		make_folders(dir + L"\\out");
+
+		// The decoder against texconv's (Microsoft's) on 2048 random blocks, 256 of each mode
+		{
+			const uint32_t W = 512, H = 64;
+			std::vector<uint8_t> blocks(size_t(W / 4) * (H / 4) * 16);
+			uint64_t seed = 0x9E3779B97F4A7C15ull;
+			for (size_t i = 0; i < blocks.size(); ++i)
+			{
+				seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+				blocks[i] = uint8_t(seed >> 56);
+			}
+			for (size_t b = 0; b < blocks.size() / 16; ++b)
+			{
+				const uint32_t mode = uint32_t(b % 8);
+				blocks[b * 16] = uint8_t((blocks[b * 16] & ~((2u << mode) - 1)) | (1u << mode));
+			}
+			write_bc7_dds(dir + L"\\random.dds", blocks, W, H);
+			const int code = run_texconv(texconv, L"-nologo -y -f R8G8B8A8_UNORM -o \"" + dir + L"\\out\" \"" + dir + L"\\random.dds\"", dir + L"\\texconv-random.txt");
+			const std::vector<uint8_t> theirs = dds_texels(dir + L"\\out\\random.dds"), mine = b7::decode(blocks.data(), W, H);
+			size_t off[8] = {}, wrong = 0;
+			for (size_t i = 0; theirs.size() >= mine.size() && i < size_t(W) * H; ++i)
+				if (std::memcmp(&theirs[i * 4], &mine[i * 4], 4) != 0)
+				{
+					const size_t b = (i / W / 4) * (W / 4) + (i % W) / 4;
+					off[b % 8]++, wrong++;
+				}
+			char text[200];
+			std::snprintf(text, sizeof(text), "%zu wrong texels; by mode %zu %zu %zu %zu %zu %zu %zu %zu", wrong, off[0], off[1], off[2], off[3], off[4], off[5], off[6],
+				off[7]);
+			check(code == 0 && theirs.size() >= mine.size() && wrong == 0, "the BC7 decoder is texconv's, texel for texel, on 2048 random blocks of all 8 modes (" +
+					std::string(text) + ")");
+		}
+
+		// Our mips kept: a DDS whose levels are each a different flat colour comes back with each level its own colour
+		{
+			const uint32_t W = 128, H = 64;
+			const uint8_t colours[6][4] = { { 200, 10, 10, 128 }, { 10, 200, 10, 64 }, { 10, 10, 200, 32 }, { 200, 200, 10, 100 }, { 10, 200, 200, 0 },
+				{ 90, 90, 90, 128 } };
+			std::vector<std::vector<uint8_t>> levels;
+			for (uint32_t l = 0; l < pk::bc2::chain_levels(W, H); ++l)
+			{
+				std::vector<uint8_t> px(size_t(W >> l) * (H >> l) * 4);
+				for (size_t i = 0; i < px.size(); i += 4)
+					std::memcpy(&px[i], colours[l], 4);
+				levels.push_back(px);
+			}
+			std::string why;
+			const bool wrote = b7::write_rgba_dds(dir + L"\\flat.dds", levels, W, H, why);
+			write_text(dir + L"\\flat-list.txt", narrow(dir) + "\\flat.dds\r\n");
+			b7::compress_options co;
+			co.texconv = texconv, co.list = dir + L"\\flat-list.txt", co.out = dir + L"\\out", co.log = dir + L"\\texconv-flat.txt";
+			const bool done = wrote && b7::compress(co, why) == hifi::texpack::upscale::end::done;
+			std::vector<std::vector<uint8_t>> got;
+			const bool read_back = done && b7::read_bc_dds(dir + L"\\out\\flat.dds", pk::kBC7, W, H, uint32_t(levels.size()), got, why);
+			bool kept = read_back;
+			for (size_t l = 0; kept && l < got.size(); ++l)
+			{
+				const std::vector<uint8_t> px = b7::decode(got[l].data(), W >> l, H >> l);
+				kept = max_diff(px.data(), levels[l].data(), px.size()) <= 1;
+			}
+			check(kept, "texconv keeps our own mips: " + std::to_string(levels.size()) + " levels of different flat colours back as they were, BC7_UNORM (" + why + ")");
+			std::vector<std::vector<uint8_t>> wrong;
+			const bool refused = read_back && !b7::read_bc_dds(dir + L"\\out\\flat.dds", pk::kBC7, W, H, uint32_t(levels.size()) + 1, wrong, why) &&
+				why.find("levels") != std::string::npos;
+			check(refused, "a BC7 file with another level count is refused (" + why + ")");
+
+			// (a pack folder with a non-ASCII name: texconv reads its list without UTF-8, so make lists names relative to
+			// the batch's folder and runs texconv there)
+			const std::wstring jose = dir + L"\\Jos\u00e9-\u30c6\u30b9\u30c8";
+			CreateDirectoryW(jose.c_str(), nullptr);
+			CreateDirectoryW((jose + L"\\dds-in").c_str(), nullptr);
+			CreateDirectoryW((jose + L"\\dds-out").c_str(), nullptr);
+			const bool wrote2 = b7::write_rgba_dds(jose + L"\\dds-in\\0.dds", levels, W, H, why) && write_text(jose + L"\\dds-list.txt", "dds-in\\0.dds\r\n");
+			b7::compress_options cj = co;
+			cj.list = jose + L"\\dds-list.txt", cj.cwd = jose, cj.out = jose + L"\\dds-out", cj.log = jose + L"\\texconv.txt";
+			const bool done2 = wrote2 && b7::compress(cj, why) == hifi::texpack::upscale::end::done;
+			std::vector<std::vector<uint8_t>> got2;
+			check(done2 && b7::read_bc_dds(jose + L"\\dds-out\\0.dds", pk::kBC7, W, H, uint32_t(levels.size()), got2, why) && got2 == got,
+				"texconv in a folder named Jos\xc3\xa9-\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88 (make's relative list, cwd the batch's folder): the same BC7 file (" + why + ")");
+		}
+
+		// Ten of the game's textures, enlarged 4x (Lanczos, the upscaler's smooth kind of picture) as cut-outs: BC7 beats
+		// BC2's PSNR on each; every level is ours; the alpha stays in the original's range and coverage holds
+		{
+			struct one
+			{
+				std::string what;
+				uint32_t w = 0, h = 0;
+				uint8_t lo = 0, hi = 0;
+				std::vector<std::vector<uint8_t>> chain;
+			};
+			std::vector<one> picked;
+			const char *dats[] = { "ROM\\310\\0.DAT", "ROM3\\5\\110.DAT", "ROM3\\5\\31.DAT", "ROM\\1\\66.DAT", "ROM\\1\\72.DAT", "ROM\\6\\70.DAT" };
+			for (const char *rel : dats)
+			{
+				const std::vector<uint8_t> dat = read(kFFXI + L"\\" + wide(rel));
+				for (const bk::chunk &c : bk::chunks(dat))
+				{
+					if (picked.size() >= 10)
+						break;
+					if (c.type != 0x20 || c.size < 69 || c.body[0] != 0xA1)
+						continue;
+					tx::texture t;
+					std::string why;
+					if (!tx::decode(c.body, c.size, t, why) || t.levels.empty() || t.w < 32 || t.h < 32 || t.w % 4 || t.h % 4)
+						continue;
+					one o;
+					o.what = std::string(rel) + " '" + printed(reinterpret_cast<const char *>(c.body + 1)) + "'";
+					o.w = t.w * 4, o.h = t.h * 4;
+					o.lo = 255;
+					for (size_t i = 3; i < t.levels[0].rgba.size(); i += 4)
+						o.lo = std::min(o.lo, t.levels[0].rgba[i]), o.hi = std::max(o.hi, t.levels[0].rgba[i]);
+					std::vector<uint8_t> big = ups::lanczos(t.levels[0].rgba.data(), t.w, t.h, 4, o.w, o.h);
+					o.chain = b7::rgba_chain(std::move(big), o.w, o.h, pk::kAlphaCut, pk::bc2::kCharsCutThreshold, o.lo, o.hi);
+					picked.push_back(std::move(o));
+				}
+			}
+			std::string list;
+			for (size_t i = 0; i < picked.size(); ++i)
+			{
+				std::string why;
+				b7::write_rgba_dds(dir + L"\\t" + std::to_wstring(i) + L".dds", picked[i].chain, picked[i].w, picked[i].h, why);
+				list += narrow(dir) + "\\t" + std::to_string(i) + ".dds\r\n";
+			}
+			write_text(dir + L"\\ten-list.txt", list);
+			b7::compress_options co;
+			co.texconv = texconv, co.list = dir + L"\\ten-list.txt", co.out = dir + L"\\out", co.log = dir + L"\\texconv-ten.txt";
+			std::string why;
+			const bool done = picked.size() == 10 && b7::compress(co, why) == hifi::texpack::upscale::end::done;
+			uint32_t beats = 0, levels_ours = 0, in_range = 0, coverage_ok = 0;
+			double sum7 = 0, sum2 = 0, worst_cov = 0, worst_level = 99;
+			int alpha_out = 0;
+			std::string worst_what;
+			for (size_t i = 0; done && i < picked.size(); ++i)
+			{
+				const one &o = picked[i];
+				std::vector<std::vector<uint8_t>> got;
+				if (!b7::read_bc_dds(dir + L"\\out\\t" + std::to_wstring(i) + L".dds", pk::kBC7, o.w, o.h, uint32_t(o.chain.size()), got, why))
+					continue;
+				const std::vector<uint8_t> px7 = b7::decode(got[0].data(), o.w, o.h);
+				const std::vector<uint8_t> bc2 = pk::bc2::encode_bc2(o.chain[0].data(), o.w, o.h), px2 = pk::bc2::decode_bc2(bc2.data(), o.w, o.h);
+				const double p7 = psnr(px7.data(), o.chain[0].data(), size_t(o.w) * o.h), p2 = psnr(px2.data(), o.chain[0].data(), size_t(o.w) * o.h);
+				sum7 += p7, sum2 += p2;
+				if (p7 > p2)
+					beats++;
+				else
+					worst_what = o.what;
+				bool ours = true, range = true, cov = true;
+				const double want = pk::bc2::coverage(o.chain[0].data(), o.w, o.h, pk::bc2::kCharsCutThreshold);
+				for (size_t l = 0; l < got.size(); ++l)
+				{
+					const uint32_t lw = o.w >> l, lh = o.h >> l;
+					const std::vector<uint8_t> px = b7::decode(got[l].data(), lw, lh);
+					const double p = psnr(px.data(), o.chain[l].data(), size_t(lw) * lh, 4);
+					worst_level = std::min(worst_level, p);
+					ours = ours && p > 30.0;
+					for (size_t q = 3; q < px.size(); q += 4)
+					{
+						range = range && px[q] + 6 >= o.lo && px[q] <= o.hi + 6;
+						alpha_out = std::max(alpha_out, std::max(int(o.lo) - int(px[q]), int(px[q]) - int(o.hi)));
+					}
+					const double d = std::fabs(pk::bc2::coverage(px.data(), lw, lh, pk::bc2::kCharsCutThreshold) - want);
+					if (lw >= 16 && lh >= 16)
+					{
+						worst_cov = std::max(worst_cov, d);
+						cov = cov && d <= 0.03;
+					}
+				}
+				levels_ours += ours, in_range += range, coverage_ok += cov;
+			}
+			const size_t n = picked.size();
+			char text[240];
+			std::snprintf(text, sizeof(text), "mean PSNR BC7 %.2f dB, BC2 %.2f dB; %u of %zu", n ? sum7 / double(n) : 0.0, n ? sum2 / double(n) : 0.0, beats, n);
+			check(done && beats == 10, "BC7 beats BC2's PSNR on 10 of the game's textures enlarged 4x (" + std::string(text) + (worst_what.empty() ? "" : "; not: " + worst_what) + ")");
+			std::snprintf(text, sizeof(text), "worst level RGBA PSNR %.1f dB", worst_level);
+			check(done && levels_ours == 10, "every BC7 level is our level (RGBA PSNR over 30 dB against our chain: " + std::string(text) + ")");
+			check(done && in_range == 10, "the BC7 alpha stays in the original's range (raw values, within 6: texconv measured 4, BC2's 4-bit alpha is up to 8 off; furthest out " + std::to_string(alpha_out) + ")");
+			std::snprintf(text, sizeof(text), "worst %.4f", worst_cov);
+			check(done && coverage_ok == 10, "cut-out coverage after BC7: every level of 16x16 or more within 3% of level 0's (" + std::string(text) + ")");
+		}
+	}
+
+	// A WARP device (the 0.67 streamer's GetCopyableFootprints rules); nullptr when there's none
+	ID3D12Device *warp_device()
+	{
+		IDXGIFactory4 *factory = nullptr;
+		IDXGIAdapter *adapter = nullptr;
+		ID3D12Device *device = nullptr;
+		if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&factory))) &&
+			SUCCEEDED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void **>(&adapter))))
+			D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&device));
+		if (adapter)
+			adapter->Release();
+		if (factory)
+			factory->Release();
+		return device;
+	}
+
 	void make_tests(const std::shared_ptr<const pk::index> &convert_pack)
 	{
 		ported_steps();
@@ -1108,7 +1384,25 @@ namespace
 			{
 				std::wstring url = L"file:///";
 				url += zip;
+				// (from a copy of the tool laid out as its zip: models-hdcube beside it, when HIFIXI_HDCUBE_DIR or the research
+				// copy has the model)
+				wchar_t hd[MAX_PATH] = L"";
+				const std::wstring hd_from = GetEnvironmentVariableW(L"HIFIXI_HDCUBE_DIR", hd, MAX_PATH) != 0 ? std::wstring(hd) : kHdcubeResearch;
+				const std::wstring tool_copy = mw + L"\\tool\\hifixi-texpack.exe", saved_tool = tool;
+				const bool laid = copy_into(tool, tool_copy) && copy_into(hd_from + L"\\realesrgan-hdcube-x4.param", mw + L"\\tool\\models-hdcube\\realesrgan-hdcube-x4.param") &&
+					copy_into(hd_from + L"\\realesrgan-hdcube-x4.bin", mw + L"\\tool\\models-hdcube\\realesrgan-hdcube-x4.bin") &&
+					copy_into(hd_from + L"\\PROVENANCE.txt", mw + L"\\tool\\models-hdcube\\PROVENANCE.txt");
+				if (laid)
+					tool = tool_copy;
 				out = run("get-upscaler --yes --dir " + q(dir) + " --url \"" + narrow(url) + "\"", code);
+				tool = saved_tool;
+				if (laid)
+					check(code == 0 && is_there(dir + L"\\models\\realesrgan-hdcube-x4.param") && is_there(dir + L"\\models\\realesrgan-hdcube-x4.bin") &&
+							is_there(dir + L"\\models\\PROVENANCE-hdcube.txt") && out.find("The HDCube model (CC0-1.0") != std::string::npos,
+						"get-upscaler from the tool's zip layout: HDCube copied from models-hdcube into the upscaler's models, hashes checked (" +
+							line_with(out, "HDCube") + ")");
+				else
+					std::printf("      (HDCube beside the tool not tried: no model at %s)\n", narrow(hd_from).c_str());
 				check(code == 0 && is_there(dir + L"\\realesrgan-ncnn-vulkan.exe") && is_there(dir + L"\\vcomp140.dll") && !is_there(dir + L"\\vcomp140d.dll") &&
 						is_there(dir + L"\\models\\realesrgan-x4plus.bin") && is_there(dir + L"\\models\\realesrgan-x4plus.param") &&
 						!is_there(dir + L"\\models\\realesr-animevideov3-x2.bin") && !is_there(dir + L"\\input.jpg") && is_there(dir + L"\\PROVENANCE.txt") &&
@@ -1133,8 +1427,9 @@ namespace
 		for (const char *rel : kMakeModels)
 			copied = copied && copy_into(kFFXI + L"\\" + wide(rel), ffxi + L"\\" + wide(rel));
 		copied = copied && copy_into(fake, up + L"\\realesrgan-ncnn-vulkan.exe") && write_text(up + L"\\vcomp140.dll", "fake") &&
-			write_text(up + L"\\models\\realesrgan-x4plus.param", "fake") &&
-			write_text(up + L"\\models\\realesrgan-x4plus.bin", "fake") && copy_into(fake, game_exe);
+			write_text(up + L"\\models\\realesrgan-x4plus.param", "fake") && write_text(up + L"\\models\\realesrgan-x4plus.bin", "fake") &&
+			write_text(up + L"\\models\\realesrgan-hdcube-x4.param", "fake") && write_text(up + L"\\models\\realesrgan-hdcube-x4.bin", "fake") &&
+			copy_into(fake, game_exe);
 		check(copied, "a fake game folder (tables and five DATs) and the fake upscaler");
 
 		// What make should give: every A1 texture of the five DATs once (the first DAT's), zones 2x, models 4x
@@ -1163,7 +1458,7 @@ namespace
 		SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
 		auto args = [&](const std::wstring &pack, const std::string &more) {
 			return "make --out " + q(pack) + " --ffxi " + q(ffxi) + " --ffximain " + q(kFFXI + L"\\FFXiMain.dll") + " --upscaler " + q(up) +
-				" --threads 4 --reserve-gb 0 --game-names " + narrow(kFakeGame) + " --game-poll-s 0.2 --game-quiet-s 2 " + more;
+				" --threads 4 --reserve-gb 0 --game-names " + narrow(kFakeGame) + " --game-poll-s 0.2 --game-quiet-s 2 --upscaler-model x4plus --colour bc2 " + more;
 		};
 		auto make_run = [&](const std::wstring &pack, const std::string &more, std::string &out, DWORD ms = 300000) {
 			started s = start(tool, wide(args(pack, more)), mw + L"\\make.out");
@@ -1201,8 +1496,8 @@ namespace
 					tsv.find("ROM3\\5\\110.DAT\tmodel\t") != std::string::npos && count_lines(tsv) == 6,
 				"dats.tsv made in the pack's folder from the game's ROM folders: the zones by file id, the models by their Os2");
 			const std::string src = pack_src(P1);
-			check(count_lines(src) == 5 && src.find("\t2\t0\t0") != std::string::npos, "pack.src: the five DATs, maker version 2, no overlay");
-			check(std::string(p1->head.source).rfind("texpack make 2", 0) == 0 && p1->head.maker_version == 2, "the header says texpack make 2");
+			check(count_lines(src) == 5 && src.find("\t300\t0\t0") != std::string::npos, "pack.src: the five DATs, maker version 300 (make 3, x4plus, BC2), no overlay");
+			check(std::string(p1->head.source) == "texpack make 3 x4plus bc2" && p1->head.maker_version == 300, "the header says texpack make 3 x4plus bc2, maker 300");
 			bool keys = p1->entries.size() == want.size(), fields = true, sizes = true;
 			for (const auto &[k, tw] : want)
 			{
@@ -1426,6 +1721,238 @@ namespace
 			check(code == 1 && out.find("the upscaler failed") != std::string::npos && out.find("exited with code 3") != std::string::npos,
 				"a failing upscaler: exit 1, its exit code said (" + line_with(out, "upscaler failed") + ")");
 			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
+		}
+
+		// ---- M8: HDCube (the default model) and BC7 colour (the default) by texconv
+		const std::string m8 = "--upscaler-model hdcube --colour bc7 ";
+		{
+			// (no texconv: BC2, said, and recorded as BC2 so a later run with texconv makes the DAT again)
+			DeleteFileW(fake_log.c_str());
+			const std::wstring P10 = mw + L"\\P10";
+			code = make_run(P10, m8 + "--texconv " + q(mw + L"\\nowhere\\texconv.exe") + " --only ROM3\\5\\110.DAT", out);
+			std::shared_ptr<const pk::index> p10 = load(P10);
+			bool bc2 = p10 && !p10->entries.empty();
+			for (size_t i = 0; bc2 && i < p10->entries.size(); ++i)
+				bc2 = p10->entries[i].map(pk::kColour) != nullptr && p10->entries[i].map(pk::kColour)->format == pk::kBC2;
+			check(code == 0 && bc2 && out.find("texconv.exe isn't at") != std::string::npos && pack_src(P10).find("\t310\t") != std::string::npos &&
+					text_of(P10 + L"\\progress.txt").find("colour: bc2 (texconv.exe missing)") != std::string::npos &&
+					text_of(fake_log).find("model realesrgan-hdcube-x4") != std::string::npos,
+				"texconv missing: BC2 colour, a clear line, maker 310 in pack.src, the HDCube model asked of the upscaler (" + line_with(out, "texconv.exe isn't") + ")");
+
+			// (the upscaler without HDCube, and a models-hdcube beside the tool that isn't the shipped one: refused)
+			const std::wstring up2 = mw + L"\\upscaler2", tool2 = mw + L"\\tool2\\hifixi-texpack.exe", saved_tool = tool;
+			const bool laid = copy_into(fake, up2 + L"\\realesrgan-ncnn-vulkan.exe") && write_text(up2 + L"\\vcomp140.dll", "fake") &&
+				write_text(up2 + L"\\models\\realesrgan-x4plus.param", "fake") && write_text(up2 + L"\\models\\realesrgan-x4plus.bin", "fake") &&
+				copy_into(tool, tool2) && write_text(mw + L"\\tool2\\models-hdcube\\realesrgan-hdcube-x4.param", "not the model") &&
+				write_text(mw + L"\\tool2\\models-hdcube\\realesrgan-hdcube-x4.bin", "not the model");
+			tool = tool2;
+			code = make_run(mw + L"\\P11", m8 + "--upscaler " + q(up2) + " --only ROM3\\5\\110.DAT", out);
+			tool = saved_tool;
+			check(laid && code == 1 && out.find("isn't the file the tool shipped with") != std::string::npos && !is_there(up2 + L"\\models\\realesrgan-hdcube-x4.bin"),
+				"HDCube beside the tool with another hash: refused, nothing copied, exit 1 (" + line_with(out, "HDCube") + ")");
+		}
+		const std::wstring texconv = find_texconv();
+		if (texconv.empty())
+			std::printf("      (BC7 not tried: no texconv.exe; set HIFIXI_TEXCONV or put it in build\\)\n");
+		else
+		{
+			bc7_tests(texconv, mw + L"\\bc7");
+			const std::wstring P8 = mw + L"\\P8";
+			DeleteFileW(fake_log.c_str());
+			code = make_run(P8, m8 + "--texconv " + q(texconv), out);
+			// (load and reader: src\pack\pack.cpp and validate.cpp, unchanged since HiFi XI 0.67's 13d3879: what 0.67 reads)
+			std::shared_ptr<const pk::index> p8 = load(P8);
+			check(code == 0 && p8 != nullptr, "make with HDCube and BC7: exit 0, the pack loads with 0.67's reader (" + line_with(out, "DATs 5") + ")");
+			if (p8)
+			{
+				bool fmt = p8->entries.size() == p1->entries.size(), same_keys = fmt;
+				for (size_t i = 0; fmt && i < p8->entries.size(); ++i)
+				{
+					const pk::record *r = p8->entries[i].map(pk::kColour);
+					fmt = r != nullptr && r->format == pk::kBC7 && r->levels == pk::bc2::chain_levels(r->w, r->h);
+					same_keys = same_keys && p8->entries[i].the_key() == p1->entries[i].the_key() && p8->entries[i].alpha_kind == p1->entries[i].alpha_kind;
+				}
+				check(fmt && same_keys, "every entry BC7_UNORM with the whole chain of our mips; the same keys and alpha kinds as the BC2 pack");
+				check(std::string(p8->head.source) == "texpack make 3 hdcube bc7" && p8->head.maker_version == 311 && p8->head.version == pk::kVersion &&
+						p8->head.flags == pk::kSpanWholeBody && count_lines(pack_src(P8)) == 5 && count_of(pack_src(P8), "\t311\t") == 5,
+					"header: version 1, flags as 0.67 wants, source 'texpack make 3 hdcube bc7', maker 311; pack.src maker 311 for the five DATs");
+				const std::string progress = text_of(P8 + L"\\progress.txt");
+				check(progress.find("upscaler_model: hdcube") != std::string::npos && progress.find("colour: bc7") != std::string::npos &&
+						text_of(fake_log).find("model realesrgan-hdcube-x4") != std::string::npos && out.find("BC7 by texconv") != std::string::npos,
+					"progress.txt and texpack.log name the model and the colour; the upscaler was asked for HDCube");
+				int vc = 0;
+				const std::string v = run("verify --pack " + q(P8) + " --soul --ffxi " + q(ffxi) + " --threads 4", vc);
+				check(vc == 0 && v.find(", 0 bad") != std::string::npos && v.find("0 over the limits") != std::string::npos,
+					"verify --soul passes the BC7 pack (" + line_with(v, "soul: ") + ")");
+				// (level 0 against the BC2 pack's: the same picture from the same fake upscale; each next level's colour the
+				// last BC7 level's averaged 2x2, as our chain makes it: within BC7's error, so texconv kept our mips)
+				double worst = 0, worst_cov = 0;
+				std::string worst_where;
+				bool cut_ok = true;
+				uint32_t cuts = 0;
+				for (size_t i = 0; i < p8->entries.size() && i < p1->entries.size(); ++i)
+				{
+					const pk::entry &e = p8->entries[i];
+					const pk::record *r7 = e.map(pk::kColour), *r2 = p1->entries[i].map(pk::kColour);
+					if (r7 == nullptr || r2 == nullptr || r2->levels != r7->levels)
+					{
+						worst = 255;
+						continue;
+					}
+					const auto l7 = levels_of(p8, *r7), l2 = levels_of(p1, *r2);
+					const float threshold = e.source_kind == pk::kSourceZone ? pk::bc2::zone_cut_threshold(e.vcol_a) : pk::bc2::kCharsCutThreshold;
+					double cov0 = 0;
+					std::vector<uint8_t> box;
+					for (uint32_t l = 0; l < r7->levels && l < l7.size() && l < l2.size(); ++l)
+					{
+						const uint32_t lw = r7->w >> l, lh = r7->h >> l;
+						const std::vector<uint8_t> a = b7::decode(l7[l].data(), lw, lh);
+						const std::vector<uint8_t> b = l == 0 ? pk::bc2::decode_bc2(l2[0].data(), lw, lh) : box;
+						double sum = 0;
+						for (size_t q = 0; q < a.size() && q < b.size(); ++q)
+							if (q % 4 != 3)
+								sum += std::abs(int(a[q]) - int(b[q]));
+						box.assign(size_t(lw / 2) * (lh / 2) * 4, 0);
+						for (uint32_t y = 0; y < lh / 2; ++y)
+							for (uint32_t x = 0; x < lw / 2; ++x)
+								for (int c = 0; c < 4; ++c)
+								{
+									const uint8_t *s0 = a.data() + ((size_t(y) * 2) * lw + x * 2) * 4 + c;
+									box[(size_t(y) * (lw / 2) + x) * 4 + c] = uint8_t((s0[0] + s0[4] + s0[lw * 4] + s0[lw * 4 + 4] + 2) / 4);
+								}
+						if (sum / double(size_t(lw) * lh * 3) > worst)
+						{
+							worst = sum / double(size_t(lw) * lh * 3);
+							worst_where = printed(e.name) + " level " + std::to_string(l) + " " + std::to_string(lw) + "x" + std::to_string(lh);
+						}
+						if (e.alpha_kind == pk::kAlphaCut)
+						{
+							const double c = pk::bc2::coverage(a.data(), lw, lh, threshold);
+							if (l == 0)
+								cov0 = c, cuts++;
+							else if (lw >= 16 && lh >= 16)
+							{
+								worst_cov = std::max(worst_cov, std::fabs(c - cov0));
+								cut_ok = cut_ok && std::fabs(c - cov0) <= 0.03;
+							}
+						}
+					}
+				}
+				char text[160];
+				std::snprintf(text, sizeof(text), "worst level's mean colour difference %.2f of 255 (%s); %u cut-outs, worst coverage change %.4f", worst, worst_where.c_str(), cuts, worst_cov);
+				check(worst < 6.0 && cut_ok && cuts > 0, "level 0 the BC2 pack's picture, every next level the last one averaged 2x2 (our mips, within BC7's error); cut-out coverage within 3% of level 0's in every level of 16x16 or more (" +
+						std::string(text) + ")");
+
+				// (a BC7 entry streamed as the 0.67 streamer reads it: read_levels into one span, each level's CRC, the
+				// record's layout against a WARP device's GetCopyableFootprints)
+				const pk::record *big = nullptr;
+				for (const pk::entry &e : p8->entries)
+					if (const pk::record *r = e.map(pk::kColour); r != nullptr && (big == nullptr || r->bytes > big->bytes))
+						big = r;
+				ID3D12Device *device = warp_device();
+				bool streamed = big != nullptr;
+				const char *rule = big ? pk::check(*big, device) : "none";
+				if (streamed)
+				{
+					pk::reader rd(p8);
+					std::vector<uint8_t> span(size_t(pk::reader::levels_span(*big, 0, big->levels)));
+					std::string why;
+					streamed = !span.empty() && rd.read_levels(*big, 0, big->levels, span.data(), why);
+					const auto tight = levels_of(p8, *big);
+					pk::layout l;
+					streamed = streamed && pk::footprint(big->format, big->w, big->h, big->levels, l) && !tight.empty();
+					for (uint32_t row = 0; streamed && row < l.level[0].rows; ++row)
+						streamed = std::memcmp(span.data() + l.level[0].offset + size_t(row) * l.level[0].row_pitch, tight[0].data() + size_t(row) * l.level[0].row_bytes,
+									   l.level[0].row_bytes) == 0;
+				}
+				if (device)
+					device->Release();
+				check(streamed && rule == nullptr && device != nullptr, "a BC7 entry streamed as 0.67 does (read_levels, level CRCs) and its layout is WARP's GetCopyableFootprints'" +
+						std::string(rule ? std::string(" (") + rule + ")" : ""));
+
+				// (resume, then the colour and the model changed: the DATs made again, their entries replaced)
+				code = make_run(P8, m8 + "--texconv " + q(texconv), out);
+				check(code == 0 && out.find("0 DATs (0 zones, 0 models) to make, 5 done before") != std::string::npos, "a rerun with the same model and colour: nothing to make (" +
+						line_with(out, "to make") + ")");
+				const std::string n = std::to_string(p8->entries.size());
+				code = make_run(P8, "--upscaler-model hdcube --colour bc2", out);
+				std::shared_ptr<const pk::index> p8b = load(P8);
+				bool all2 = p8b != nullptr && p8b->entries.size() == p8->entries.size();
+				for (size_t i = 0; all2 && i < p8b->entries.size(); ++i)
+					all2 = p8b->entries[i].map(pk::kColour)->format == pk::kBC2;
+				check(code == 0 && all2 && out.find("5 DATs (2 zones, 3 models) to make, 0 done before") != std::string::npos &&
+						out.find(n + " of them replacing") != std::string::npos,
+					"--colour bc2 over a BC7 pack: the five DATs made again, all " + n + " entries replaced by BC2 (" + line_with(out, "of them replacing") + ")");
+				DeleteFileW(fake_log.c_str());
+				code = make_run(P8, "--upscaler-model x4plus --colour bc2", out);
+				check(code == 0 && out.find("5 DATs (2 zones, 3 models) to make") != std::string::npos && text_of(fake_log).find("model realesrgan-x4plus") != std::string::npos &&
+						count_of(pack_src(P8), "\t300\t") == 5,
+					"--upscaler-model x4plus: made again with x4plus (the fake's bytes the same: " + line_with(out, "the same key again") + ")");
+				code = make_run(P8, m8 + "--texconv " + q(texconv), out);
+				std::shared_ptr<const pk::index> p8c = load(P8);
+				bool all7 = p8c != nullptr && same_entries(*p8, *p8c);
+				check(code == 0 && all7 && out.find(n + " of them replacing") != std::string::npos,
+					"back to HDCube and BC7: made again, the same pack as the first BC7 run (" + line_with(out, "of them replacing") + ")");
+
+				// (M9 on M8: heights on the BC7 pack made from its BC7 colour decoded (bc7::decode_level), the same as
+				// pk::height on b7::decode of the stored level 0; make --heights with BC7 writes the same; the maker version
+				// and pack.src as make left them)
+				if (p8c)
+				{
+					const std::wstring P8H = mw + L"\\P8H", P8M = mw + L"\\P8M";
+					copy_pack(P8, P8H);
+					int hc = 0;
+					const std::string ho = run("heights --pack " + q(P8H) + " --ffxi " + q(ffxi) + " --threads 4 --reserve-gb 0 --ignore-game", hc);
+					std::shared_ptr<const pk::index> p8h = load(P8H);
+					bool all = p8h != nullptr && p8h->entries.size() == p8c->entries.size(), equal = all;
+					uint32_t compared = 0, from_game = 0;
+					for (size_t i = 0; all && i < p8h->entries.size(); ++i)
+					{
+						const pk::entry &e = p8h->entries[i];
+						const pk::record *c = e.map(pk::kColour), *h = e.map(pk::kHeight);
+						all = c != nullptr && c->format == pk::kBC7 && h != nullptr && h->format == pk::kBC4;
+						if (!all)
+							break;
+						if (e.flags & pk::kHeightFromGame)
+						{
+							from_game++;
+							continue;
+						}
+						const auto cl = levels_of(p8h, *c), hl = levels_of(p8h, *h);
+						const std::vector<uint8_t> rgba = cl.empty() ? std::vector<uint8_t> {} : b7::decode(cl[0].data(), c->w, c->h);
+						const float threshold = e.source_kind == pk::kSourceZone ? pk::bc2::zone_cut_threshold(e.vcol_a) : pk::bc2::kCharsCutThreshold;
+						uint32_t mw2 = 0, mh2 = 0;
+						pk::height::field f;
+						std::string why;
+						bool same = !rgba.empty() && pk::height::size_for(pk::height::scale::half, c->w, c->h, e.w, e.h, mw2, mh2) &&
+							pk::height::from_colour(rgba.data(), c->w, c->h, e.w, mw2, mh2, e.alpha_kind, threshold, f, why);
+						if (same)
+						{
+							const pk::height::made m = pk::height::encode(f);
+							float span = 0;
+							std::memcpy(&span, &h->param, 4);
+							same = m.w == h->w && m.h == h->h && m.span == span && m.levels == hl;
+						}
+						equal = equal && same;
+						compared++;
+					}
+					check(hc == 0 && all && equal && compared > 0 && p8h->head.maker_version == 311 && pack_src(P8H) == pack_src(P8),
+						"heights on a BC7 pack: every entry gets one; the " + std::to_string(compared) + " made from the colour equal pk::height on the BC7 level 0 decoded (" +
+							std::to_string(from_game) + " from the game's maps); maker 311 and pack.src kept (" + line_with(ho, "heights: ") + ")");
+					code = make_run(P8M, m8 + "--texconv " + q(texconv) + " --heights", out);
+					std::shared_ptr<const pk::index> p8m = load(P8M);
+					bool same = p8m && p8h && p8m->entries.size() == p8h->entries.size();
+					for (size_t i = 0; same && i < p8m->entries.size(); ++i)
+					{
+						const pk::entry &x = p8m->entries[i], &y = p8h->entries[i];
+						const pk::record *hx = x.map(pk::kHeight), *hy = y.map(pk::kHeight);
+						same = hx && hy && hx->crc == hy->crc && hx->param == hy->param && hx->bytes == hy->bytes && x.flags == y.flags &&
+							x.map(pk::kColour)->format == pk::kBC7 && x.map(pk::kColour)->crc == y.map(pk::kColour)->crc;
+					}
+					check(code == 0 && same && p8m && p8m->head.maker_version == 311 && count_of(pack_src(P8M), "\t311\t") == 5,
+						"make --heights with BC7: every height record the same bytes and span as make, then heights, give; maker 311 (" + line_with(out, "heights (") + ")");
+				}
+			}
 		}
 		SetEnvironmentVariableW(L"PATH", old_path);
 	}

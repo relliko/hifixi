@@ -5,7 +5,7 @@
 //   - The DATs are pack.src's (each a source an entry was made from), zones first, then the rest, each by path;
 //     --kind (zone: a DAT whose entries are zone ones) and --only narrow them, --limit counts DATs.
 //   - Each DAT's A1 textures with an entry (not no_pack) that has no height record yet (--redo: all of them), the first
-//     DAT with a key doing it: the colour is the entry's colour record (BC2 level 0 decoded) or, with none, the original
+//     DAT with a key doing it: the colour is the entry's colour record (BC2 or BC7 level 0 decoded) or, with none, the original
 //     decoded (chars tex); zones' textures with a height map of their name in the zone's bump DAT take that (flagged
 //     height_from_game), the rest are made from the colour (height.hpp from_colour).
 //   - In batches of --batch-mtexels (24) million map texels, made on --threads threads, put in with
@@ -15,6 +15,7 @@
 //   - Resume needs nothing of its own: an entry that has a height record is done.
 
 #include "heights.hpp"
+#include "bc7.hpp"
 #include "../../src/pack/bc2.hpp"
 #include "../../src/pack/validate.hpp"
 #include "../../src/chars/tex.hpp"
@@ -93,19 +94,38 @@ namespace hifi::texpack::hgt
 		return m;
 	}
 
+	bool colour_record_rgba(pk::reader &rd, const pk::record &col, std::vector<uint8_t> &rgba, std::string &why)
+	{
+		if (col.format != pk::kBC2 && col.format != pk::kBC7)
+		{
+			why = "its colour record's format (" + std::to_string(col.format) + ") isn't BC2 or BC7";
+			return false;
+		}
+		std::vector<uint8_t> buf(col.bytes);
+		std::vector<std::vector<uint8_t>> levels;
+		if (!rd.read_level(col, 0, buf.data(), why))
+			return false;
+		if (!untile(pk::record { col.kind, 1, col.file, col.w, col.h, col.format }, buf, levels) || levels.empty())
+		{
+			why = "its colour record's level 0 can't be laid out";
+			return false;
+		}
+		rgba = bc7::decode_level(col.format, levels[0].data(), col.w, col.h);
+		if (rgba.empty())
+		{
+			why = "its colour record can't be decoded";
+			return false;
+		}
+		return true;
+	}
+
 	bool colour_of(pk::reader &rd, const pk::entry &e, const uint8_t *body, uint32_t size, std::vector<uint8_t> &rgba, uint32_t &cw, uint32_t &ch,
 		std::string &why)
 	{
-		if (const pk::record *col = e.map(pk::kColour); col != nullptr && col->format == pk::kBC2)
+		if (const pk::record *col = e.map(pk::kColour); col != nullptr && colour_record_rgba(rd, *col, rgba, why))
 		{
-			std::vector<uint8_t> buf(col->bytes);
-			std::vector<std::vector<uint8_t>> levels;
-			if (rd.read_level(*col, 0, buf.data(), why) && untile(pk::record { col->kind, 1, col->file, col->w, col->h, col->format }, buf, levels))
-			{
-				rgba = pk::bc2::decode_bc2(levels[0].data(), col->w, col->h);
-				cw = col->w, ch = col->h;
-				return true;
-			}
+			cw = col->w, ch = col->h;
+			return true;
 		}
 		tex::texture t;
 		if (!tex::decode(body, size, t, why) || t.levels.empty())
@@ -416,19 +436,16 @@ namespace hifi::texpack
 					j.threshold = e->source_kind == pk::kSourceZone ? pk::bc2::zone_cut_threshold(e->vcol_a) : pk::bc2::kCharsCutThreshold;
 					// (the colour it's drawn with: the pack's, else the original)
 					bool have = false;
-					if (const pk::record *col = e->map(pk::kColour); col != nullptr && col->format == pk::kBC2)
+					if (const pk::record *col = e->map(pk::kColour); col != nullptr)
 					{
-						std::vector<uint8_t> buf(col->bytes);
-						std::vector<std::vector<uint8_t>> levels;
 						std::string w2;
-						if (rd.read_level(*col, 0, buf.data(), w2) && untile(pk::record { col->kind, 1, col->file, col->w, col->h, col->format }, buf, levels))
+						if (hgt::colour_record_rgba(rd, *col, j.rgba, w2))
 						{
-							j.rgba = pk::bc2::decode_bc2(levels[0].data(), col->w, col->h);
 							j.cw = col->w, j.ch = col->h;
 							have = true;
 						}
 						else
-							no_colour_read++, say("%s: chunk %u '%s': its colour record can't be read (%s): made from the original", d.rel.c_str(), j.chunk,
+							no_colour_read++, say("%s: chunk %u '%s': its colour record can't be read or decoded (%s): made from the original", d.rel.c_str(), j.chunk,
 								j.name.c_str(), w2.c_str());
 					}
 					if (!have)

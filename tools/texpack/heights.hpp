@@ -39,7 +39,10 @@ namespace hifi::texpack::hgt
 	};
 	made make(const uint8_t *rgba, uint32_t cw, uint32_t ch, uint32_t w, uint32_t h, uint8_t alpha_kind, float cut_threshold, const game_map *game,
 		pk::height::scale s);
-	// The colour an entry already in the pack is drawn with (RGBA8 cw x ch): its BC2 colour record read through rd, else
+	// A colour record's level 0 read through rd and decoded to RGBA8 (col.w x col.h): BC2 or BC7 (make writes BC7 by
+	// default since M8; bc7::decode_level). false (why) for another format or when it can't be read
+	bool colour_record_rgba(pk::reader &rd, const pk::record &col, std::vector<uint8_t> &rgba, std::string &why);
+	// The colour an entry already in the pack is drawn with (RGBA8 cw x ch): its colour record (BC2 or BC7) read through rd, else
 	// the original chunk (body, size) decoded, as the heights command takes it. false: neither (why)
 	bool colour_of(pk::reader &rd, const pk::entry &e, const uint8_t *body, uint32_t size, std::vector<uint8_t> &rgba, uint32_t &cw, uint32_t &ch,
 		std::string &why);

@@ -1677,7 +1677,8 @@ int main(int argc, char **argv)
 				continue;
 			}
 			const bool is_one_level = one_level != nullptr && i == ts.size() - 1;
-			levels = levels && it.v.format == DXGI_FORMAT_BC2_UNORM && it.v.first == 0 && it.v.levels == (is_one_level ? 3u : 8u) && it.v.w == recs[i].w;
+			// (the record's own format: BC2, or BC7 since make M8 writes it by default)
+			levels = levels && (it.v.format == DXGI_FORMAT_BC2_UNORM || it.v.format == DXGI_FORMAT_BC7_UNORM) && it.v.format == DXGI_FORMAT(recs[i].format) && it.v.first == 0 && it.v.levels == (is_one_level ? 3u : 8u) && it.v.w == recs[i].w;
 			seen += (seen.empty() ? "" : ", ") + std::to_string(it.v.w) + "x" + std::to_string(it.v.h) + " " + std::to_string(it.v.levels) + " levels";
 			items.push_back(it);
 		}

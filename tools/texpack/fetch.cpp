@@ -4,7 +4,8 @@
 // the official file's (the file deleted), unpacks it with Windows' own tar.exe and keeps only what make runs:
 // realesrgan-ncnn-vulkan.exe, vcomp140.dll (never the debug vcomp140d.dll), models\realesrgan-x4plus.{bin,param} and
 // the readme, plus PROVENANCE.txt saying where they came from. Default folder: <the tool's folder>\upscaler, where
-// make looks.
+// make looks. Then the HDCube model, which ships with the tool (CC0-1.0, <tool folder>\models-hdcube), is copied into
+// its models\ (place_hdcube, hashes checked): make's default model, with no other download.
 
 #include "shared.hpp"
 #include "upscale.hpp"
@@ -88,6 +89,49 @@ namespace hifi::texpack
 					c = L'\\';
 			return p;
 		}
+	}
+
+	namespace
+	{
+		// The HDCube model as it ships (research\ffxi-re\tools\upscale\hdcube\PROVENANCE.txt: 4x_HDCube_200k by Venomalia,
+		// CC0-1.0, converted for realesrgan-ncnn-vulkan 2026-11-03)
+		struct shipped
+		{
+			const wchar_t *name;
+			const char *sha256;
+		};
+		constexpr shipped kHdcube[] = {
+			{ L"realesrgan-hdcube-x4.param", "44b9db926798e1db80604bc66d92facfb4f7397a8eae7e6c93f4f71e30df793d" },
+			{ L"realesrgan-hdcube-x4.bin", "bceee5fdefe51110416c96bffe5d9e09b6b5751c635bcbe512252894afbbcd7b" },
+		};
+	}
+
+	bool place_hdcube(const std::wstring &upscaler, std::string &why)
+	{
+		const std::wstring from = exe_folder() + L"\\models-hdcube", to = no_slash(upscaler) + L"\\models";
+		for (const shipped &f : kHdcube)
+		{
+			const std::string sha = sha256_of(from + L"\\" + f.name);
+			if (sha.empty())
+			{
+				why = narrow(from) + "\\" + narrow(f.name) + " isn't there (it comes in the tool's zip)";
+				return false;
+			}
+			if (sha != f.sha256)
+			{
+				why = narrow(from) + "\\" + narrow(f.name) + " isn't the file the tool shipped with (SHA-256 " + sha + ")";
+				return false;
+			}
+		}
+		CreateDirectoryW(to.c_str(), nullptr);
+		for (const shipped &f : kHdcube)
+			if (sha256_of(to + L"\\" + f.name) != f.sha256 && !CopyFileW((from + L"\\" + f.name).c_str(), (to + L"\\" + f.name).c_str(), FALSE))
+			{
+				why = "it can't be copied into " + narrow(to) + " (error " + std::to_string(GetLastError()) + ")";
+				return false;
+			}
+		CopyFileW((from + L"\\PROVENANCE.txt").c_str(), (to + L"\\PROVENANCE-hdcube.txt").c_str(), FALSE);
+		return true;
 	}
 
 	int get_upscaler(options &o)
@@ -239,6 +283,14 @@ namespace hifi::texpack
 			return kFailed;
 		}
 		std::printf("The upscaler is in %s.\n", narrow(dir).c_str());
+		// (the HDCube model, make's default, ships with the tool: copied in beside x4plus, no download)
+		std::string hd_why;
+		if (place_hdcube(dir, hd_why))
+			std::printf("The HDCube model (CC0-1.0, shipped with the tool) is in %s\\models too.\n", narrow(dir).c_str());
+		else
+			std::printf("The HDCube model couldn't be put beside it: %s. make --upscaler-model x4plus works without it; unpack the tool's zip again "
+						"for HDCube (make's default).\n",
+				hd_why.c_str());
 		return kDone;
 	}
 }

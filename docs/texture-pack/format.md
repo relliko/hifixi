@@ -177,6 +177,17 @@ texels averaged 2x2 and encoded again (`bc2::full_chain`), with alpha by the ent
 - **blended (2), mask (3), mixed (4), none (0)**: the plain 2x2 box. Rescaling would change transparency at a distance
   or the shine's strength (`kSpec*saturate(2*t.a)`).
 
+**BC7 colour (M8, `make --colour bc7`, its default).** The same chain, made on the 8-bit texels before any
+compression (`bc7::rgba_chain`, `tools\texpack\bc7.cpp`): level 0's alpha held to the original's own range
+(`alpha_lo`..`alpha_hi`: the upscale's Lanczos rings past it, and the game's alpha is raw, 0..0x80), each next level the
+last averaged 2x2, a cut-out's alpha scaled per level as above but on 8-bit alpha (BC7 keeps it) and never past
+`alpha_hi`. Each texture's levels are written as an `R8G8B8A8_UNORM` DDS with those mips and compressed to
+`BC7_UNORM` by Microsoft's `texconv.exe` (DirectXTex), which keeps a DDS's own mips when given no `-m`; make reads
+the result back and refuses a file whose size, format or level count isn't ours. BC7's alpha error is up to 4 levels
+past the original's range at sharp edges (BC2's own 4-bit alpha is up to 8 off) and flips fewer alpha tests than BC2
+(0.027% of texels against 0.063%: docs/texture-pack/upscaler.md "BC7"). The reader and streamer took `BC7_UNORM` from
+v1 on: a BC7 pack is a v1 pack (header version 1, flags 1), read by HiFi XI 0.67 as it is.
+
 ### Height records (M9)
 
 An entry may have a height record (kind 2) beside its colour (`src/pack/height.hpp`, `bc4.hpp`; plan §8 "Per-pixel
@@ -208,7 +219,7 @@ that doesn't use heights skips the record (the streamer streams any record kind 
     high-passed (its Gaussian blur at 6 original texels taken out, weighted). The entry's flag 2 `height_from_game` is
     set. On ROM\0\100's 12 bump-mapped textures at game size, the normals made back from the stored record are 0.61
     degrees from the game's own on average (p99 2.6);
-  - else a port of `research\ffxi-re\tools\nmmockup.py` `nmap_multi` on the colour (the colour record's BC2 level 0
+  - else a port of `research\ffxi-re\tools\nmmockup.py` `nmap_multi` on the colour (the colour record's BC2 or BC7 level 0
     decoded, else the original decoded), box-filtered (weighted) onto the record's size: brightness (0.30, 0.59, 0.11),
     less its weighted Gaussian blur at 6 original texels; then the weighted blurs at 0.6, 1.2 and 2.5 map texels summed
     with weights 1, 0.7 and 0.4, times 2.2 (nmap_multi's k), divided by the map texels an original texel (its slopes
@@ -285,11 +296,16 @@ has the details):
   fetched by `get-upscaler`: docs/texture-pack/upscaler.md), zones 2x and models 4x, keyed and tagged as `convert` does,
   each passing the soul test, keys already in the pack skipped before upscaling, unless the DAT being done again
   (`--redo`, say with another factor, or a `convert` pack's line) made that entry: then it is made again and replaces it, as
-  `convert` does. `source` is `texpack make 2`, the
-  maker version 2, so `convert` and `make` each redo the other's `pack.src` lines. Resumable, stopped by `stop`; while
+  `convert` does. Since M8 `source` is `texpack make 3 <model> <colour>` (`texpack make 3 hdcube bc7`) and the
+  maker version `300 + 10 * model + colour` (model 0 x4plus, 1 HDCube; colour 0 BC2, 1 BC7: 311 by default), so
+  `convert` and `make` each redo the other's `pack.src` lines, and `make` with another model or colour format
+  (`--upscaler-model`, `--colour`, or BC2 because `texconv.exe` was missing) makes a DAT again and replaces its own
+  entries. M7's packs (maker 2) are made again by M8's make. Resumable, stopped by `stop`; while
   the game runs it waits (progress.txt `state: paused`). With `--heights` (off by default until M9 is approved) each
-  entry also gets its height record (`--height-scale`), made from its colour's BC2 decoded, so it writes the same bytes
-  as `make` followed by `heights`. A key two zones share is made in the first, but its height comes from the game's map
+  entry also gets its height record (`--height-scale`), made from its colour as stored (the BC7 or BC2 level 0
+  decoded), so it writes the same bytes as `make` followed by `heights`. Heights don't change the maker version: a DAT
+  made again for another model or colour gets new heights with `--heights`; without it its entries are replaced with
+  no height (the old one was made from the old colour) and `heights` adds them again. A key two zones share is made in the first, but its height comes from the game's map
   when any zone met has one (game heights first): a later zone in the batch hands its map to the job; one in a later
   batch makes the committed entry's colour-made height again from its map (`writer::set_map`).
 - `heights --pack <pack>` (M9): height records added to the pack's entries, their other records and fields kept

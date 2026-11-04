@@ -28,9 +28,22 @@ namespace hifi::texpack::upscale
 	bool finish(const uint8_t *orig, uint32_t w, uint32_t h, const uint8_t *esrgan, uint32_t ew, uint32_t eh, uint32_t factor, std::vector<uint8_t> &out,
 		std::string &why);
 
-	// realesrgan-ncnn-vulkan.exe, its vcomp140.dll and its x4plus model in a folder: "" when they're all there, else
-	// what's missing
-	std::string missing_files(const std::wstring &folder);
+	// The models make can run (--upscaler-model), all 4x: hdcube (4x_HDCube_200k, Venomalia, CC0-1.0: ships with the
+	// tool in models-hdcube\, get-upscaler copies it into the upscaler's models\; the default since M8) and x4plus
+	// (Real-ESRGAN's, from the official zip)
+	struct model
+	{
+		const char *id;     // --upscaler-model's word
+		const wchar_t *name; // -n: models\<name>.param and .bin
+		uint8_t number;     // (in make's maker version: 0 x4plus, 1 hdcube)
+	};
+	constexpr model kModels[] = { { "hdcube", L"realesrgan-hdcube-x4", 1 }, { "x4plus", L"realesrgan-x4plus", 0 } };
+	// The model with this id; nullptr when there's none
+	const model *find_model(const std::string &id);
+
+	// realesrgan-ncnn-vulkan.exe, its vcomp140.dll and a model (by its -n name) in a folder: "" when they're all there,
+	// else what's missing
+	std::string missing_files(const std::wstring &folder, const wchar_t *model_name = L"realesrgan-x4plus");
 
 	// How a run of the upscaler ended
 	enum class end
@@ -41,9 +54,23 @@ namespace hifi::texpack::upscale
 		stalled, // no new picture for stall_s: ended
 	};
 
+	// A child program run to its end: what run_program watches
+	struct program_options
+	{
+		std::wstring log;            // its console output, appended ("": none)
+		double poll_s = 3.0, stall_s = 900.0;
+		std::function<std::string()> should_end; // as run_options'
+		std::wstring watch, pattern; // the folder its output files appear in, and their pattern (the stall check)
+	};
+	// exe run with cmd in folder cwd, at below-normal priority, in a job object that ends it when the job's handle
+	// closes (when this returns, and when the builder itself ends, however it ends); polled every poll_s: should_end,
+	// and no new file matching pattern in watch for stall_s counts as stalled. why: the exit code or what ended it
+	end run_program(const std::wstring &exe, std::wstring cmd, const std::wstring &cwd, const program_options &o, std::string &why);
+
 	struct run_options
 	{
 		std::wstring folder;  // the upscaler's (missing_files "")
+		const wchar_t *model = L"realesrgan-x4plus"; // -n (kModels' name)
 		std::wstring in, out; // the batch's folders
 		std::wstring log;     // its console output, appended ("": none)
 		double poll_s = 3.0, stall_s = 900.0;
@@ -51,8 +78,7 @@ namespace hifi::texpack::upscale
 		std::function<std::string()> should_end;
 	};
 
-	// The upscaler run on a folder (realesrgan-ncnn-vulkan -i in -o out -n realesrgan-x4plus -m models -f png, as
-	// upscale.py), at below-normal priority, in a job object that ends it when the job's handle closes: when this
-	// returns, and when the builder itself ends, however it ends. why: the exit code or what ended it
+	// The upscaler run on a folder (realesrgan-ncnn-vulkan -i in -o out -n <model> -m models -s 4 -f png, as
+	// upscale.py) by run_program; the stall check counts its PNGs
 	end run(const run_options &o, std::string &why);
 }
