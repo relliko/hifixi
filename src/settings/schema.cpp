@@ -230,9 +230,10 @@ namespace hifi::settings
 				{ _, _, _, _ },
 				flag, 0.0f, 1.0f, chars::options::kDetailByDefault ? 1.0f : 0.0f },
 			// (the texture pack: src/pack/packoptions.hpp; shown only while a pack folder is on this PC, the module's cached
-			// answer. The Game tab's last section: the menu draws the pack's lines right after it)
+			// answer. The Game tab's last section: the menu draws the pack's lines right after it, and with no pack folder
+			// the section's heading and how to get one)
 			{ "textures.pack", tab::game, "Texture pack", "Use the texture pack",
-				"Sharper scenery and characters, from a texture pack made on this PC from your own game files. It is kept on the "
+				"Sharper scenery and characters, from a texture pack made from your own game files. It is kept on the "
 				"graphics card, so the game's own memory stays small. Anything the pack doesn't have is drawn as the game's own. "
 				"Characters switch at once; scenery switches at the next area you enter. (/hifi textures)", nullptr, nullptr, false, { 0.0f, _, _, _ },
 				flag, 0.0f, 1.0f, pack::options::kPackByDefault ? 1.0f : 0.0f, &pack::folder_exists },
@@ -321,7 +322,7 @@ namespace hifi::settings
 			{ "Display", "How the picture fits your screen." },
 			{ "Left out", "The game's own versions of what HiFi XI draws better itself." },
 			{ "Drawn by HiFi XI", "How HiFi XI lights the scenery and characters it draws in the game's place." },
-			{ "Texture pack", "Higher-resolution textures kept on the graphics card, made on your own PC from your game's files." },
+			{ "Texture pack", "Higher-resolution textures kept on the graphics card, from a texture pack made from your own game's files." },
 			{ "AMD FSR", "The world brought to your screen's size with AMD FidelityFX Super Resolution: sharper and smoother than the game's stretch." },
 			{ "Frame generation", "A frame made between each two the game draws, for motion twice as smooth." },
 			{ "Grass colour", "Where the grass gets its colour from." },

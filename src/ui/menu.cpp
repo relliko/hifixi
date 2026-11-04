@@ -532,10 +532,16 @@ namespace hifi::ui
 		{
 			draw_tab_settings(g, settings::tab::game);
 			// (the texture pack's lines under its setting, the tab's last: what it found, this area, memory, how to remove
-			// it. Strings the module made in its update: nothing here reads a file, asks DXGI or the streamer)
-			if (pack::folder_exists())
-				for (const std::string &line : pack::menu_lines())
-					g.text_wrapped(line.c_str());
+			// it; a pack being made. With no pack folder the setting isn't shown, so the section's heading is drawn here
+			// and the lines say how to get one. Strings the module made in its update: nothing here reads a file, asks
+			// DXGI or the streamer)
+			if (!pack::folder_exists())
+			{
+				heading(g, "Texture pack");
+				g.text_disabled(settings::section_help("Texture pack"));
+			}
+			for (const std::string &line : pack::menu_lines())
+				g.text_wrapped(line.c_str());
 			// The en-spell effect on your weapons ([chars] enspell, as /hifi enspell sets it; the plugin follows it every
 			// half second): the en-spell on you, off, or one held to look at it
 			heading(g, "En-spell effects");

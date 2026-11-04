@@ -23,9 +23,10 @@ namespace hifi::pack
 	// ---- The menu and the settings (cached answers: no file, DXGI or streamer call)
 
 	// A pack folder on this PC (<bootloader>\hifixi-pack\pack.idx there): looked for at the module's first update and at
-	// each /hifi textures on and reload. The setting and the menu's lines are shown only then
+	// each /hifi textures on and reload. The setting is shown only then; the section and its lines always
 	bool folder_exists();
-	// The menu's lines under "Use the texture pack" (what was found, this area, memory, pauses, how to remove it)
+	// The menu's lines under "Use the texture pack" (what was found, this area, memory, pauses, how to remove it; with
+	// no pack, how to get one; a pack being made, how far it is)
 	std::vector<std::string> menu_lines();
 	// The pack's folder for the menu's Files list ("" before the module's first update)
 	std::string folder_text();
@@ -98,6 +99,16 @@ namespace hifi::pack
 	// or the video memory is under 85% of the budget
 	constexpr uint32_t kQuietPresents = 3, kQuietPercent = 85;
 	bool quiet_window(const quiet_inputs &q);
+
+	// ---- A texture pack being made in the pack folder (hifixi-enhanced-textures: texpack make), for the menu and status
+	// What to say of progress.txt's text (memwatch reads it on its thread, every 3 s) and whether pack.lock is there:
+	// "" for a file that isn't make's (convert's, say), is damaged (no state, dats_done or dats_total, a count that isn't
+	// one, more done than there are) or says finished. Running or paused with the lock held: how far and how long left
+	// ("Making the texture pack: 812 of 2,140 areas and models, about 1 h 10 min left (paused: the game is running)");
+	// stopped, failed, or running without the lock (the builder ended without saying): where it stopped and what to do
+	std::string build_line(const std::string &progress_text, bool locked);
+	// Seconds as the menu says them: "under a minute", "25 min", "1 h 10 min", "3 h"
+	std::string duration_text(double seconds);
 
 	namespace test
 	{

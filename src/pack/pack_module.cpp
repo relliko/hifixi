@@ -25,6 +25,10 @@
  *   - As in M1, the game's memory measured and reported: the address space and its largest free block (memwatch, on its
  *     own thread), the video memory, the characters' and the zone's bytes on the GPU, each zone's lowest free memory
  *     (logged once as the next zone comes), and whether a texture bake runs.
+ *   - M7: a pack being made in the pack folder (hifixi-enhanced-textures). memwatch's thread reads its progress.txt and
+ *     whether pack.lock is there every 3 s (set_pack_folder at each look); each update turns that text into a line
+ *     (build_line: nothing for a damaged file or a finished pack), for the menu, the status and, as it appears, the log.
+ *     The menu's section is shown with no pack too: then it says how to get one (no button that starts a build).
  */
 
 #include <windows.h>
@@ -46,6 +50,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 namespace hifi::pack
@@ -114,6 +119,8 @@ namespace hifi::pack
 			uint32_t zone = 0;
 			uint64_t vram_peak = 0;        // (this zone's most video memory used, for its log line)
 			uint8_t bake_logged = mw::kBakeNotChecked;
+			// (M7: a pack being made here, build_line of memwatch's last read; "" none. Logged as it appears)
+			std::string build;
 		};
 		state g;
 
@@ -246,6 +253,7 @@ namespace hifi::pack
 				g.overlay_listed |= CompareStringOrdinal(name.c_str(), -1, L"hifi-textures", -1, TRUE) == CSTR_EQUAL;
 			g_overlay_listed.store(g.overlay_listed);
 			g_folder_exists.store(exists || g.folder_only);
+			mw::set_pack_folder(g.folder);
 			std::lock_guard<std::mutex> lock(g_text_mutex);
 			g_folder_text = narrow(g.folder);
 		}
@@ -652,6 +660,16 @@ namespace hifi::pack
 				if (!g_folder_exists.load())
 				{
 					status.push_back("textures: no texture pack on this PC (" + folder + ")");
+					// (a pack being made says so below instead)
+					if (g.build.empty())
+						menu.push_back("No texture pack yet. You can use a pack you already have (put it in bootloader\\hifixi-pack) or make one on this PC "
+							"with hifixi-enhanced-textures: github.com/relliko/hifixi-enhanced-textures");
+					break;
+				}
+				if (g.folder_only && !g.build.empty())
+				{
+					// (a pack being made has no pack.idx until its first batch is in: not one copied only in part)
+					status.push_back("textures: " + folder + " has no pack.idx yet: nothing of it is used until the pack being made there has its first textures (/hifi textures reload)");
 					break;
 				}
 				if (g.folder_only)
@@ -677,6 +695,12 @@ namespace hifi::pack
 					menu.push_back("Waiting for the game's graphics device.");
 				}
 				break;
+			}
+			// (M7: a pack being made in the folder, right under what the module is doing)
+			if (!g.build.empty())
+			{
+				status.push_back("textures: " + g.build);
+				menu.push_back(g.build);
 			}
 			if (g.m == mode::on)
 			{
@@ -737,7 +761,9 @@ namespace hifi::pack
 				for (const std::string &l : stream::status())
 					status.push_back("textures: " + l);
 			}
-			if (v.status_at != 0)
+			// (with no pack folder the menu's section has only how to get one, or the pack being made)
+			const bool folder_there = g_folder_exists.load();
+			if (v.status_at != 0 && folder_there)
 			{
 				std::snprintf(line, sizeof(line), "Game memory: %.1f of %.1f GB in use", gigabytes(v.total_virtual - std::min(v.total_virtual, v.avail_virtual)),
 					gigabytes(v.total_virtual));
@@ -752,8 +778,11 @@ namespace hifi::pack
 			if (g.overlay_listed)
 				menu.push_back("The hifi-textures XIPivot overlay is still installed, so the game also loads its bigger files. Remove it to save the "
 					"game's memory.");
-			std::snprintf(line, sizeof(line), "To remove the texture pack: turn it off, then delete the hifixi-pack folder (%.1f GB).", gigabytes(g.folder_bytes));
-			menu.push_back(line);
+			if (folder_there)
+			{
+				std::snprintf(line, sizeof(line), "To remove the texture pack: turn it off, then delete the hifixi-pack folder (%.1f GB).", gigabytes(g.folder_bytes));
+				menu.push_back(line);
+			}
 			// (M1's: the game's memory as the pack needs it)
 			if (v.status_at != 0)
 			{
@@ -835,6 +864,14 @@ namespace hifi::pack
 				}
 			}
 			g_fsr.store(g.m == mode::on && game::option_on("textures", "fsr_bias", opt::kFsrBiasByDefault));
+			{
+				// (M7: memwatch's last read of progress.txt; a copy, no file read here)
+				const mw::build_file b = mw::read_build();
+				std::string build = b.there ? build_line(b.text, b.locked) : std::string();
+				if (!build.empty() && g.build.empty())
+					log(0, "texture pack: " + build);
+				g.build = std::move(build);
+			}
 			make_lines(v, chars, zone0, zone1);
 		}
 
@@ -857,6 +894,7 @@ namespace hifi::pack
 				stream::stop();
 			}
 			mw::stop();
+			mw::set_pack_folder(L"");
 			// (the plugin loaded again finds the DLL as it left it: everything from the start, the streamer started again at
 			// the next enable, one more ring's address space, once)
 			g = state {};
@@ -1003,6 +1041,101 @@ namespace hifi::pack
 		if (!q.zone_wanted || q.ready_presents >= kQuietPresents)
 			return false;
 		return q.vram_budget != 0 && q.vram_usage * 100 >= q.vram_budget * kQuietPercent;
+	}
+
+	std::string duration_text(double seconds)
+	{
+		const uint64_t minutes = seconds > 0.0 && seconds < 1e9 ? uint64_t(seconds / 60.0 + 0.5) : 0;
+		if (minutes == 0)
+			return "under a minute";
+		if (minutes < 60)
+			return std::to_string(minutes) + " min";
+		const uint64_t rest = minutes % 60;
+		return std::to_string(minutes / 60) + " h" + (rest != 0 ? " " + std::to_string(rest) + " min" : "");
+	}
+
+	std::string build_line(const std::string &text, bool locked)
+	{
+		// (make's first line; convert's progress.txt, a developer's, says "texpack convert")
+		static const std::string kHead = "texpack make (maker version ";
+		if (text.compare(0, kHead.size(), kHead) != 0)
+			return "";
+		// (a count: digits only, at most 9 of them)
+		auto count = [](const std::string &s, uint64_t &out) {
+			if (s.empty() || s.size() > 9)
+				return false;
+			out = 0;
+			for (char c : s)
+			{
+				if (c < '0' || c > '9')
+					return false;
+				out = out * 10 + uint64_t(c - '0');
+			}
+			return true;
+		};
+		std::string state, paused;
+		uint64_t done = 0, total = 0;
+		bool has_done = false, has_total = false;
+		double eta = -1.0;
+		for (size_t at = 0; at < text.size();)
+		{
+			size_t end = text.find('\n', at);
+			if (end == std::string::npos)
+				end = text.size();
+			std::string line = text.substr(at, end - at);
+			at = end + 1;
+			if (!line.empty() && line.back() == '\r')
+				line.pop_back();
+			const size_t colon = line.find(": ");
+			if (colon == std::string::npos)
+				continue;
+			const std::string key = line.substr(0, colon), value = line.substr(colon + 2);
+			if (key == "state")
+				state = value;
+			else if (key == "paused")
+				paused = value == "-" ? "" : value;
+			else if (key == "dats_done")
+			{
+				if (!(has_done = count(value, done)))
+					return "";
+			}
+			else if (key == "dats_total")
+			{
+				if (!(has_total = count(value, total)))
+					return "";
+			}
+			else if (key == "eta_s")
+			{
+				char *stop = nullptr;
+				const double s = std::strtod(value.c_str(), &stop);
+				eta = stop != value.c_str() && *stop == 0 && s >= 0.0 && s < 1e9 ? s : -1.0;
+			}
+		}
+		if (state.empty() || !has_done || !has_total || done > total)
+			return "";
+		const std::string where = thousands(done) + " of " + thousands(total) + " areas and models";
+		const bool going = state == "running" || state == "paused";
+		if (going && locked)
+		{
+			std::string line = "Making the texture pack: ";
+			if (total == 0)
+				line += "looking through the game's files";
+			else
+			{
+				line += where;
+				if (eta >= 0.0 && done < total)
+					line += ", about " + duration_text(eta) + " left";
+			}
+			if (state == "paused" || !paused.empty())
+				line += " (paused: " + (paused.empty() || paused.rfind("game running", 0) == 0 ? std::string("the game is running") : paused) + ")";
+			return line + ".";
+		}
+		if (state == "failed")
+			return "Making the texture pack failed at " + where + ": texpack.log in the pack folder says why.";
+		if (going || state.rfind("stopped", 0) == 0)
+			return total == 0 ? std::string("Making the texture pack stopped before it began: run hifixi-enhanced-textures again.") :
+				"Making the texture pack stopped at " + where + ": run hifixi-enhanced-textures again and it goes on where it stopped.";
+		return ""; // (finished, or a state this HiFi XI doesn't know)
 	}
 
 	namespace test

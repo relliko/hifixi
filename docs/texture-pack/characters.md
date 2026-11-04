@@ -230,7 +230,7 @@ group as it records). The glue runs in the module's present, between two frames:
   `cache::pack_end(id, serial, ok, view.bytes)`: `ready`, or the pair to `slots_dead` and the ticket to the drop list.
   For `missed` and `gone`: `spent`, the ticket dropped, counted by `stream::reason`. The glue keeps a map ticket slot ->
   (id, serial), as zonepack's `by_slot`.
-- **Pauses:** `kQuiet` holds the whole streamer from a zone change till the area settles (pack_module.cpp:499-541), so
+- **Pauses:** `kQuiet` holds the whole streamer from a zone change till the area settles (pack_module.cpp:507-549), so
   characters' textures wait too: pack work stays off zoning's path. Requests are made meanwhile and wait queued.
 - **Compare:** `cache::set_pack_compare(bool)`, an atomic `texture_view_of` reads: the game pair while it's on. Frees
   nothing, writes nothing.

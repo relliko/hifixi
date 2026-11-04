@@ -13,7 +13,9 @@
  *   - the Upscaling tab with what FSR and frame generation are doing; a line under each section's heading; the
  *     weather debug on Advanced; settings waiting for the next start said under the presets; right-click "Reset to
  *     default"; Custom saying the preset it was changed from, what's changed, and "Back to" it;
- *   - the texture pack's setting (src/pack/pack_module): hidden without a pack folder, in the Game tab and in a search;
+ *   - the texture pack's setting (src/pack/pack_module): hidden without a pack folder, in the Game tab and in a search,
+ *     its section there with the steps to get a pack (M7); a pack being made (progress.txt, pack.lock): its line in the
+ *     section and in /hifi textures status, a damaged progress.txt ignored, build_line's other states;
  *     shown once the module has found one, with its lines under it and the Files line, its help naming scenery and
  *     characters; the Off preset sets it 0, the
  *     others leave it; a click saves it and makes the preset Custom; drawing the menu makes no file, DXGI or streamer
@@ -26,6 +28,7 @@
 #include "../src/backend/backend.hpp"
 #include "../src/game/game.hpp"
 #include "../src/host/passes.hpp"
+#include "../src/pack/memwatch.hpp"
 #include "../src/pack/pack_module.hpp"
 #include "../src/render/worldfx_core.hpp"
 #include <cstdio>
@@ -578,7 +581,7 @@ int main()
 	}
 
 	// 12. The texture pack: its setting shown only while a pack folder is on this PC (the module's answer, cached at its
-	// first update and a reload), in the Game tab and in a search; the Off preset sets it 0, the others leave it; a click
+	// first update and a reload), in the Game tab and in a search; its section and lines to everyone (M7); the Off preset sets it 0, the others leave it; a click
 	// saves it, the preset Custom; drawing the menu makes no file, DXGI or streamer call of the module's (its I/O counter)
 	{
 		const hifi::passes::module *textures = nullptr;
@@ -602,12 +605,72 @@ int main()
 		textures->update(1.0); // (its first: the folder looked for; no device, nothing started)
 		hifi::ui::show_tab(hifi::settings::tab::game);
 		bool balanced = draw();
-		check(balanced && !hifi::pack::folder_exists() && fake::has("En-spell effects") && !fake::has("Texture pack") && !fake::has("Use the texture pack") &&
-			!fake::has("Off: turn it on above."), "no pack folder: the Game tab without the texture pack's section, setting or lines");
+		const char *const steps = "No texture pack yet. You can use a pack you already have (put it in bootloader\\hifixi-pack) or make one on this PC with "
+			"hifixi-enhanced-textures: github.com/relliko/hifixi-enhanced-textures";
+		check(balanced && !hifi::pack::folder_exists() && fake::has("En-spell effects") && fake::has("Texture pack") && fake::has(steps) &&
+			!fake::has("Use the texture pack") && !fake::has("Off: turn it on above.") && !fake::has("To remove the texture pack") && !fake::has("Game memory") &&
+			!fake::has("Making the texture pack"), "no pack folder: the Game tab's Texture pack section with the steps to get one, no setting, no pack's lines");
 		hifi::ui::set_search("texture");
 		draw();
 		check(!fake::has("[Use the texture pack]"), "and a search for \"texture\" doesn't find it");
 		hifi::ui::set_search("");
+
+		// (M7: a pack being made in the folder, its progress.txt as texpack make writes it, read on memwatch's thread;
+		// sample_now reads it here at once. The folder isn't looked for again, so folder_exists stays false)
+		CreateDirectoryW(pack.c_str(), nullptr);
+		auto progress = [](const char *state, const char *done, const char *total, const char *eta, const char *paused) {
+			return std::string("texpack make (maker version 2): ") + state + "\r\nsummary: " + done + " of " + total + " DATs done\r\nstate: " + state +
+				"\r\nphase: batch 3: upscaling 40 textures (900 k texels)\r\npaused: " + paused + "\r\ndats_done: " + done + "\r\ndats_total: " + total +
+				"\r\ndats_done_before: 0\r\neta_s: " + eta + "\r\ntextures_made: 100\r\nlast: ROM\\1\\66.DAT\r\n";
+		};
+		auto make_seen = [&](const std::string &text, bool locked) {
+			write_text(pack + L"progress.txt", text);
+			if (locked)
+				write_text(pack + L"pack.lock", "");
+			else
+				DeleteFileW((pack + L"pack.lock").c_str());
+			hifi::pack::memwatch::sample_now();
+			textures->update(1.2);
+			return draw();
+		};
+		const char *const paused_line = "Making the texture pack: 812 of 2,140 areas and models, about 1 h 10 min left (paused: the game is running).";
+		balanced = make_seen(progress("paused", "812", "2140", "4200", "game running (pol.exe is running)"), true);
+		bool said = false;
+		for (const std::string &l : command("status"))
+			said |= l == std::string("textures: ") + paused_line;
+		check(balanced && !hifi::pack::folder_exists() && fake::has("Texture pack") && fake::has(paused_line) && !fake::has(steps) && said,
+			"progress.txt of a pack being made (pack.lock held, the game running): its line in the Game tab in the steps' place, and in /hifi textures status");
+		make_seen(progress("running", "812", "2140", "65", "-"), true);
+		check(fake::has("Making the texture pack: 812 of 2,140 areas and models, about 1 min left.") && !fake::has("(paused:"), "  running: how far and how long, not paused");
+		make_seen(progress("running", "812", "2140", "65", "-"), false);
+		check(fake::has("Making the texture pack stopped at 812 of 2,140 areas and models: run hifixi-enhanced-textures again and it goes on where it stopped."),
+			"  running but no pack.lock (the builder ended without saying): where it stopped, run it again");
+		balanced = make_seen(progress("running", "8x2", "2140", "65", "-"), true);
+		bool damaged_quiet = balanced && fake::has(steps) && !fake::has("Making the texture pack");
+		make_seen(std::string("texpack make (maker ver"), true);
+		damaged_quiet &= fake::has(steps) && !fake::has("Making the texture pack");
+		make_seen(progress("running", "3000", "2140", "65", "-"), true);
+		damaged_quiet &= fake::has(steps) && !fake::has("Making the texture pack");
+		check(damaged_quiet, "a damaged progress.txt (a count that isn't one, cut short, more done than there are): ignored, the steps shown");
+		{
+			// (build_line itself: the other states and files)
+			namespace pk = hifi::pack;
+			const bool ok = pk::build_line(progress("finished", "2140", "2140", "0", "-"), false).empty() &&
+				pk::build_line("texpack convert (maker version 2): running\r\nstate: running\r\ndats_done: 1\r\ndats_total: 2\r\n", true).empty() &&
+				pk::build_line(progress("failed", "5", "10", "-1", "-"), false) == "Making the texture pack failed at 5 of 10 areas and models: texpack.log in the pack folder says why." &&
+				pk::build_line(progress("stopped (the game)", "5", "10", "-1", "-"), false).find("stopped at 5 of 10") != std::string::npos &&
+				pk::build_line(progress("running", "0", "0", "-1", "-"), true) == "Making the texture pack: looking through the game's files." &&
+				pk::build_line(progress("running", "5", "10", "-1", "-"), true) == "Making the texture pack: 5 of 10 areas and models." &&
+				pk::duration_text(20) == "under a minute" && pk::duration_text(25 * 60) == "25 min" && pk::duration_text(3 * 3600) == "3 h" &&
+				pk::duration_text(4200) == "1 h 10 min";
+			check(ok, "  build_line: finished and convert's file say nothing; failed, stopped, the listing, no time yet; duration_text");
+		}
+		DeleteFileW((pack + L"progress.txt").c_str());
+		DeleteFileW((pack + L"pack.lock").c_str());
+		hifi::pack::memwatch::sample_now();
+		textures->update(1.3);
+		draw();
+		check(fake::has(steps) && !fake::has("Making the texture pack"), "progress.txt gone: the steps again");
 
 		CreateDirectoryW(pack.c_str(), nullptr);
 		write_text(pack + L"pack.idx", "not read: pack=0"); // (only looked for: with pack=0 nothing opens it)

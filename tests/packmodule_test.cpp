@@ -661,7 +661,9 @@ int main()
 		update();
 		present();
 		check(!pk::folder_exists() && !pk::in_use() && pk::test::stream_starts() == 0 && !st::running() &&
-			has(command("status"), "no texture pack on this PC"), "no pack folder (pack=1, a device): not shown, nothing started, the status says so");
+			has(command("status"), "no texture pack on this PC") && has(pk::menu_lines(), "No texture pack yet. You can use a pack you already have") &&
+			!has(pk::menu_lines(), "To remove the texture pack"),
+			"no pack folder (pack=1, a device): the setting not shown, nothing started, the status says so, the menu's lines how to get one");
 		check(pk::folder_text().find("packmodule\\hifixi-pack\\") != std::string::npos, "the Files line's folder: " + pk::folder_text());
 		check(logged("texture pack: none on this PC ("), "the log: what the first look found (none on this PC)");
 	}

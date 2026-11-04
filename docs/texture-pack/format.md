@@ -19,7 +19,9 @@ three.
 | `progress.txt` | The builder's progress, replaced whole each time (written beside it, then moved over it). |
 | `stop` | Present: the builder stops at its next DAT. |
 | `pack.lock` | Present while a builder (convert, prune, compact) writes the folder: opened with no sharing and deleted on close, so it goes with the builder however that ends. A second builder can't open it and is refused ("another texpack is writing this pack"). Readers ignore it. |
-| `texpack.log` | Every line `hifixi-texpack` printed while converting, pruning or compacting there (appended; never read). |
+| `texpack.log` | Every line `hifixi-texpack` printed while converting, making, pruning or compacting there (appended; never read). |
+| `dats.tsv` | `make`'s list of the game's DATs (sortdats.py's six columns), after a `#` line naming what it was made from (VTABLE.DAT, FTABLE.DAT, pivot.ini); made again when those change. Only `make` reads it. |
+| `work\` | `make`'s batch: the pictures the upscaler reads (`in`) and writes (`out`) and its console output (`upscaler.txt`), marked by `made-by-hifixi-texpack-make.txt`. Deleted after each batch (kept with `--keep-work`); a `work` folder without the mark is never deleted (make refuses to start). Never read by HiFi XI. |
 | `pack.idx.new`, `progress.txt.new`, `pack.src.new`, `pack.src.old` | Left only by an interrupted builder (`.new`) or by a resume that found `pack.src` without an index (`.old`); never read. |
 
 ## Byte order and check sums
@@ -239,6 +241,13 @@ has the details):
   a key writes its entry: `file_id` and `chunk` name that DAT, though other DATs hold the same texture; that DAT
   converted again (its overlay copy re-baked, or `--redo`) replaces it. Resumable (`pack.src`), stopped by `stop`,
   refuses to run beside the game and without 20 GB plus its estimate free.
+- `make --out <pack>` (M7): the game's own zone and model DATs' A1 textures upscaled on the player's PC (Real-ESRGAN,
+  fetched by `get-upscaler`: docs/texture-pack/upscaler.md), zones 2x and models 4x, keyed and tagged as `convert` does,
+  each passing the soul test, keys already in the pack skipped before upscaling, unless the DAT being done again
+  (`--redo`, say with another factor, or a `convert` pack's line) made that entry: then it is made again and replaces it, as
+  `convert` does. `source` is `texpack make 2`, the
+  maker version 2, so `convert` and `make` each redo the other's `pack.src` lines. Resumable, stopped by `stop`; while
+  the game runs it waits (progress.txt `state: paused`).
 - `verify [--soul]`: every record and level CRC read back; the soul test against the originals.
 - `stats [--scan]`; `prune` (drops entries no DAT of `pack.src` has any more, takes out the lines of DATs gone or
   changed; stops when a DAT can't be read or more than 1% are gone); `compact` (holds the old pack's `pack.lock`,

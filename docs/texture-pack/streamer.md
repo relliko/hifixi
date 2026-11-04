@@ -104,7 +104,7 @@ COMMON), one per uploaded record.
 
 - **Thread.** One `std::thread`, `stream::worker`, started by `stream::start` and joined by `stream::stop`. Below
   normal priority; raised above normal in `stop()` before the join (memwatch's lesson: below normal it waited seconds
-  for a core while the CPU was busy, memwatch.cpp:174-176).
+  for a core while the CPU was busy, memwatch.cpp:217-219).
 - **Queue.** Its own `D3D12_COMMAND_LIST_TYPE_COPY` queue ("hifixi: pack copy queue"), made on the worker once there's a
   device, like the characters' (`cache.cpp:265-287`), never on the game's thread.
 - **Lists.** Four allocators and four lists, one per copy in flight (`kInFlight` 4, the plan's pacing). Slot k's
@@ -319,7 +319,7 @@ COMMON), one per uploaded record.
   - the copy fence's last signalled value and the last completed value the worker read;
   - ring size, head and tail;
   - the tick of the last progress.
-- `pack::crash_section()` (memwatch.cpp:313, registered at main.cpp:1012 and at the end of the hang report's lines)
+- `pack::crash_section()` (memwatch.cpp:369, registered at main.cpp:1012 and at the end of the hang report's lines)
   reads them and replaces today's "streamer: none yet" line. It takes no lock and calls no device or fence method: it
   runs on the report's thread pool thread with the game's thread perhaps stuck, maybe inside the streamer's mutex.
 - The header has no code of stream.cpp's: memwatch.cpp includes it without linking the streamer, so in M3 (nothing

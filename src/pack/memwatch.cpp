@@ -111,10 +111,47 @@ namespace hifi::pack::memwatch
 			p.bake_at.store(GetTickCount64());
 		}
 
+		// The pack folder named by the module and progress.txt as last read (strings: a mutex of their own, a leaf held
+		// only to copy them; never the thread's wait mutex)
+		std::mutex g_build_mutex;
+		std::wstring g_build_folder;
+		build_file g_build;
+
+		void sample_build()
+		{
+			std::wstring folder;
+			{
+				std::lock_guard<std::mutex> lock(g_build_mutex);
+				folder = g_build_folder;
+			}
+			build_file b;
+			if (!folder.empty())
+			{
+				// (shared for everything: the builder replaces the file by moving another over it, which an open handle
+				// without FILE_SHARE_DELETE would refuse)
+				const HANDLE h = CreateFileW((folder + L"progress.txt").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+					OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+				if (h != INVALID_HANDLE_VALUE)
+				{
+					b.there = true;
+					b.text.resize(kBuildTextMax);
+					DWORD got = 0;
+					if (!ReadFile(h, b.text.data(), DWORD(b.text.size()), &got, nullptr))
+						got = 0;
+					b.text.resize(got);
+					CloseHandle(h);
+					b.locked = GetFileAttributesW((folder + L"pack.lock").c_str()) != INVALID_FILE_ATTRIBUTES;
+				}
+			}
+			b.at = GetTickCount64();
+			std::lock_guard<std::mutex> lock(g_build_mutex);
+			g_build = std::move(b);
+		}
+
 		void run()
 		{
 			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-			uint64_t next_status = 0, next_walk = 0, next_bake = 0;
+			uint64_t next_status = 0, next_walk = 0, next_bake = 0, next_build = 0;
 			uint64_t high = 0; // (the most address space free since the last walk)
 			std::unique_lock<std::mutex> lock(t.mutex);
 			while (!t.quit)
@@ -142,6 +179,11 @@ namespace hifi::pack::memwatch
 				{
 					sample_bake();
 					next_bake = now + 10000;
+				}
+				if (now >= next_build)
+				{
+					sample_build();
+					next_build = now + 3000;
 				}
 				lock.lock();
 				t.wake.wait_for(lock, std::chrono::milliseconds(100), [] { return t.quit; });
@@ -216,11 +258,24 @@ namespace hifi::pack::memwatch
 		p.zone_bytes.store(zone_bytes);
 	}
 
+	void set_pack_folder(const std::wstring &folder)
+	{
+		std::lock_guard<std::mutex> lock(g_build_mutex);
+		g_build_folder = folder;
+	}
+
+	build_file read_build()
+	{
+		std::lock_guard<std::mutex> lock(g_build_mutex);
+		return g_build;
+	}
+
 	void sample_now()
 	{
 		sample_status();
 		sample_walk();
 		sample_bake();
+		sample_build();
 	}
 
 	bool fell(uint64_t avail, uint64_t &high)

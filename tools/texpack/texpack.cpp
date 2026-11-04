@@ -7,6 +7,13 @@
  *                          [--lists <hifi-textures\work\all>] [--ashita <folder>] [--ffximain <file>]
  *                          [--kind zone|model] [--only <rel> ...] [--limit N] [--threads N] [--redo] [--reserve-gb N]
  *                          [--ignore-game] [--soul-mean X] [--soul-p99 X] [--alpha-mean X] [--alpha-p99 X]
+ *   hifixi-texpack make    --out <pack folder> [--ffxi <FINAL FANTASY XI>] [--ashita <folder>] [--upscaler <folder>]
+ *                          [--kind zone|model] [--only <rel> ...] [--limit N] [--zone-factor 2|4] [--model-factor 2|4]
+ *                          [--batch-mtexels N] [--threads N] [--redo] [--rescan] [--no-wait] [--ignore-game]
+ *                          [--reserve-gb N] [--ffximain <file>] [--keep-work] [--soul-mean X] [--soul-p99 X]
+ *                          [--alpha-mean X] [--alpha-p99 X]
+ *                          (tests: [--game-names a.exe,b.exe] [--game-poll-s X] [--game-quiet-s X] [--stall-s X])
+ *   hifixi-texpack get-upscaler [--yes] [--dir <folder>]          (tests: [--url file:///...])
  *   hifixi-texpack verify  --pack <folder> [--soul] [--ffxi ...] [--threads N] [--soul-mean X] [--soul-p99 X]
  *                          [--alpha-mean X] [--alpha-p99 X] [--worst N]
  *   hifixi-texpack stats   --pack <folder> [--scan] [--ffxi ...] [--overlay ...]
@@ -45,7 +52,20 @@
  *     progress.txt says how far it got; texpack.log has every line it printed. It runs at below-normal priority,
  *     refuses to start (and stops) while pol.exe or phoenix-loader.exe run or an Ashita log (logs\*.txt) was written in
  *     the last minute, and refuses when the disk has less than 20 GB plus its estimate free.
- *   - One builder a pack: convert, prune and compact hold its pack.lock (pack_write.hpp).
+ *   - One builder a pack: convert, make, prune and compact hold its pack.lock (pack_write.hpp).
+ * make (make.cpp, M7): the pack straight from the game's own files, with no overlay and no Python: each zone and model
+ *   DAT's A1 textures decoded, keys the pack already has skipped, the rest upscaled in batches of ~24 M original texels
+ *   by Real-ESRGAN x4plus as a child process (upscale.cpp: wrap-pad 8, crop, Lanczos for 2x and the alpha), their texels
+ *   kept (keeptexels.cpp: 8 rounds, EDGE 24, GRAIN 2), BC2, the soul test, convert's alpha tags and coverage mips. Zones
+ *   2x, models 4x; never "other" DATs. Its own dats.tsv in the pack's folder (sortdats.py's, from walking ROM*\);
+ *   pack.src (maker version 2), stop, progress.txt, texpack.log, pack.lock, below-normal priority and the free-space
+ *   check as convert's. The game is checked before each batch and while the upscaler runs: when it starts the upscaler
+ *   is ended (a job object, which also ends it with the builder), the batch thrown away, and make waits until the game
+ *   has been closed for a minute (--no-wait: exit 4, as convert). The upscaler: --upscaler, else <this tool's
+ *   folder>\upscaler; missing, it says to run get-upscaler (exit 1).
+ * get-upscaler (fetch.cpp): Real-ESRGAN's official Windows release zip downloaded on the player's yes (or --yes), refused
+ *   unless its size and SHA-256 are the official file's, unpacked with Windows' tar.exe, only the program, vcomp140.dll,
+ *   the x4plus model and the readme kept, with PROVENANCE.txt (docs\texture-pack\upscaler.md: why it isn't shipped).
  * verify: every record read back (the rules, its CRC, each level's CRC); with --soul, the soul test (plan section 7): the
  *   pack's colour box-filtered to half the game's size against the original's texels averaged 2x2 (keeptexels.py's
  *   GRAIN 2), texels at strong edges left out (keeptexels' own fade, exp(-(grad/24)^2) < 0.5, from the pack's luma
@@ -68,6 +88,7 @@
 #include <tlhelp32.h>
 #include <share.h>
 #include "keys.hpp"
+#include "shared.hpp"
 #include "../../src/pack/pack.hpp"
 #include "../../src/pack/pack_write.hpp"
 #include "../../src/pack/bc2.hpp"
@@ -94,29 +115,19 @@
 #include <unordered_map>
 #include <vector>
 
-namespace
+// What make.cpp and fetch.cpp share with the commands here (shared.hpp), then this file's own (the anonymous namespace
+// from "Convert" on)
+namespace hifi::texpack
 {
-	namespace pk = hifi::pack;
-	namespace bk = hifi::bake;
-	namespace zm = hifi::bake::zonemesh;
-	namespace os2 = hifi::chars::os2;
-	namespace tex = hifi::chars::tex;
-
-	// pack.src's and the header's maker version: a pack.src line of another version is done again
-	constexpr uint32_t kMakerVersion = 1;
-	constexpr int kDone = 0, kFailed = 1, kUsage = 2, kStopped = 3, kGameStarted = 4;
-
 	// ---- Small things
 
-	FILE *g_log = nullptr; // texpack.log in the pack's folder (convert, compact, prune)
+	FILE *g_log = nullptr;
 
-	// texpack.log opened to append (others may read it meanwhile); nullptr when it can't be
 	FILE *open_log(const wchar_t *path)
 	{
 		return _wfsopen(path, L"ab", _SH_DENYWR);
 	}
 
-	// A line to the console and texpack.log
 	void say(const char *format, ...)
 	{
 		char text[4096];
@@ -182,6 +193,44 @@ namespace
 	{
 		const DWORD a = GetFileAttributesW(p.c_str());
 		return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+	}
+
+	void remove_tree(const std::wstring &folder)
+	{
+		// (a junction or symbolic link, here or below: the link itself removed, never what it points to)
+		const DWORD top = GetFileAttributesW(folder.c_str());
+		if (top == INVALID_FILE_ATTRIBUTES)
+			return;
+		if ((top & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+		{
+			WIN32_FIND_DATAW fd;
+			HANDLE f = FindFirstFileW((folder + L"\\*").c_str(), &fd);
+			if (f != INVALID_HANDLE_VALUE)
+			{
+				do
+				{
+					const std::wstring name = fd.cFileName, path = folder + L"\\" + name;
+					if (name == L"." || name == L"..")
+						continue;
+					if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+					{
+						if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+							RemoveDirectoryW(path.c_str());
+						else
+							DeleteFileW(path.c_str());
+					}
+					else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+						remove_tree(path);
+					else
+					{
+						SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+						DeleteFileW(path.c_str());
+					}
+				} while (FindNextFileW(f, &fd));
+				FindClose(f);
+			}
+		}
+		RemoveDirectoryW(folder.c_str());
 	}
 
 	bool file_info(const std::wstring &p, uint64_t &size, uint64_t &mtime)
@@ -264,24 +313,7 @@ namespace
 		return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 	}
 
-	// ---- Options
-
-	struct options
-	{
-		std::string command;
-		std::wstring ffxi, overlay, lists, out, ashita, ffximain;
-		std::string kind; // (convert: only zone or only model DATs)
-		std::vector<std::string> only;
-		uint32_t limit = 0, threads = 0, worst = 20;
-		bool soul = false, ignore_game = false, redo = false, scan = false;
-		double reserve_gb = 20.0;
-		// (the soul test's limits, in 8-bit levels: an entry's colour error mean and 99th percentile over the texels
-		// kept, and its alpha's. Set from the 292 baked zones' 4,750 entries, 2026-11-02: colour mean p50 1.17, max
-		// 2.66; colour p99 p50 2.77, max 12.67; alpha mean max 5.16; alpha p99 p99 14.9, max 30.8. Each limit is about
-		// 1.5 times the zones' worst, so a texture whose painting the bake lost stands out; models measured below them.
-		// verify reports an entry over them; convert leaves it out)
-		double soul_mean = 4.0, soul_p99 = 20.0, alpha_mean = 8.0, alpha_p99 = 48.0;
-	};
+	// ---- Options (shared.hpp)
 
 	void usage()
 	{
@@ -291,6 +323,10 @@ namespace
 			"          [--ashita <folder>] [--ffximain <file>] [--kind zone|model] [--only <rel> ...]\n"
 			"          [--limit N] [--threads N] [--redo] [--reserve-gb N] [--ignore-game]\n"
 			"          [--soul-mean X] [--soul-p99 X] [--alpha-mean X] [--alpha-p99 X]\n"
+			"  make    --out <pack> [--ffxi <FINAL FANTASY XI>] [--ashita <folder>] [--upscaler <folder>] [--kind zone|model]\n"
+			"          [--only <rel> ...] [--limit N] [--zone-factor 2|4] [--model-factor 2|4] [--batch-mtexels N] [--threads N]\n"
+			"          [--redo] [--rescan] [--no-wait] [--ignore-game] [--reserve-gb N] [--ffximain <file>] [--keep-work]\n"
+			"  get-upscaler [--yes] [--dir <folder>]\n"
 			"  verify  --pack <pack> [--soul] [--ffxi ...] [--threads N] [--soul-mean X] [--soul-p99 X] [--alpha-mean X]\n"
 			"          [--alpha-p99 X] [--worst N]\n"
 			"  stats   --pack <pack> [--scan] [--ffxi ...] [--overlay ...]\n"
@@ -382,6 +418,47 @@ namespace
 				o.redo = true;
 			else if (a == L"--ignore-game")
 				o.ignore_game = true;
+			else if (a == L"--upscaler")
+			{
+				if (!next(o.upscaler))
+					return false;
+			}
+			else if (a == L"--dir")
+			{
+				if (!next(o.dir))
+					return false;
+			}
+			else if (a == L"--url")
+			{
+				if (!next(o.url))
+					return false;
+			}
+			else if (a == L"--zone-factor" && number(d) && (d == 2 || d == 4))
+				o.zone_factor = uint32_t(d);
+			else if (a == L"--model-factor" && number(d) && (d == 2 || d == 4))
+				o.model_factor = uint32_t(d);
+			else if (a == L"--batch-mtexels" && number(d) && d > 0)
+				o.batch_mtexels = d;
+			else if (a == L"--game-quiet-s" && number(d))
+				o.game_quiet_s = d;
+			else if (a == L"--game-poll-s" && number(d) && d > 0)
+				o.game_poll_s = d;
+			else if (a == L"--stall-s" && number(d) && d > 0)
+				o.stall_s = d;
+			else if (a == L"--game-names" && next(s))
+			{
+				for (const std::string &n : split(narrow(s), ','))
+					if (!n.empty())
+						o.game_names.push_back(wide(n));
+			}
+			else if (a == L"--no-wait")
+				o.no_wait = true;
+			else if (a == L"--rescan")
+				o.rescan = true;
+			else if (a == L"--keep-work")
+				o.keep_work = true;
+			else if (a == L"--yes")
+				o.yes = true;
 			else
 			{
 				std::printf("unknown option: %s\n", narrow(a).c_str());
@@ -438,15 +515,6 @@ namespace
 		return up(p);
 	}
 
-	// dats.tsv (research\ffxi-re\tools\upscale\sortdats.py): rel path, kind (zone, model, other), textures, texels,
-	// the original's bytes, the XIPivot overlay ahead of ours that has it ('-': none)
-	struct tsv_row
-	{
-		std::string kind, shadow;
-		uint64_t bytes = 0;
-	};
-	using tsv = std::unordered_map<std::string, tsv_row>;
-
 	bool read_tsv(const std::wstring &lists, tsv &out)
 	{
 		bool ok = false;
@@ -457,6 +525,7 @@ namespace
 				continue;
 			tsv_row r;
 			r.kind = f[1];
+			r.texels = std::strtoull(f[3].c_str(), nullptr, 10);
 			r.bytes = std::strtoull(f[4].c_str(), nullptr, 10);
 			r.shadow = f[5];
 			out[f[0]] = r;
@@ -547,71 +616,62 @@ namespace
 
 	// ---- The game's file ids (VTABLE/FTABLE, then ROMn's VTABLEn/FTABLEn, in dat_path's order)
 
-	struct id_table
+	bool id_table::load(const std::wstring &ffxi)
 	{
-		std::vector<std::string> rel_of;           // by file id ("" none)
-		std::unordered_map<std::string, uint32_t> id_of; // (the lowest id naming a file)
-
-		bool load(const std::wstring &ffxi)
+		std::vector<uint8_t> vt, ft;
+		if (!bk::read_file(ffxi + L"\\VTABLE.DAT", vt) || !bk::read_file(ffxi + L"\\FTABLE.DAT", ft))
+			return false;
+		rel_of.assign(vt.size(), std::string());
+		auto name = [&](uint32_t id, const std::vector<uint8_t> &f, unsigned rom) {
+			if ((size_t(id) + 1) * 2 > f.size())
+				return;
+			const uint32_t v = uint32_t(f[size_t(id) * 2] | (f[size_t(id) * 2 + 1] << 8));
+			char text[64];
+			if (rom == 1)
+				std::snprintf(text, sizeof(text), "ROM\\%u\\%u.DAT", v >> 7, v & 0x7F);
+			else
+				std::snprintf(text, sizeof(text), "ROM%u\\%u\\%u.DAT", rom, v >> 7, v & 0x7F);
+			rel_of[id] = text;
+		};
+		for (uint32_t id = 0; id < vt.size(); ++id)
+			if (vt[id] == 1)
+				name(id, ft, 1);
+		for (unsigned n = 2; n < 10; ++n)
 		{
-			std::vector<uint8_t> vt, ft;
-			if (!bk::read_file(ffxi + L"\\VTABLE.DAT", vt) || !bk::read_file(ffxi + L"\\FTABLE.DAT", ft))
-				return false;
-			rel_of.assign(vt.size(), std::string());
-			auto name = [&](uint32_t id, const std::vector<uint8_t> &f, unsigned rom) {
-				if ((size_t(id) + 1) * 2 > f.size())
-					return;
-				const uint32_t v = uint32_t(f[size_t(id) * 2] | (f[size_t(id) * 2 + 1] << 8));
-				char text[64];
-				if (rom == 1)
-					std::snprintf(text, sizeof(text), "ROM\\%u\\%u.DAT", v >> 7, v & 0x7F);
-				else
-					std::snprintf(text, sizeof(text), "ROM%u\\%u\\%u.DAT", rom, v >> 7, v & 0x7F);
-				rel_of[id] = text;
-			};
-			for (uint32_t id = 0; id < vt.size(); ++id)
-				if (vt[id] == 1)
-					name(id, ft, 1);
-			for (unsigned n = 2; n < 10; ++n)
-			{
-				wchar_t v_name[MAX_PATH], f_name[MAX_PATH];
-				std::swprintf(v_name, MAX_PATH, L"%s\\ROM%u\\VTABLE%u.DAT", ffxi.c_str(), n, n);
-				std::swprintf(f_name, MAX_PATH, L"%s\\ROM%u\\FTABLE%u.DAT", ffxi.c_str(), n, n);
-				std::vector<uint8_t> vn, fn;
-				if (!bk::read_file(v_name, vn) || !bk::read_file(f_name, fn))
-					continue;
-				for (uint32_t id = 0; id < vn.size() && id < rel_of.size(); ++id)
-					if (rel_of[id].empty() && vt[id] != 1 && vn[id] == n)
-						name(id, fn, n);
-			}
-			for (uint32_t id = 0; id < rel_of.size(); ++id)
-				if (!rel_of[id].empty())
-					id_of.emplace(rel_of[id], id);
-			return true;
+			wchar_t v_name[MAX_PATH], f_name[MAX_PATH];
+			std::swprintf(v_name, MAX_PATH, L"%s\\ROM%u\\VTABLE%u.DAT", ffxi.c_str(), n, n);
+			std::swprintf(f_name, MAX_PATH, L"%s\\ROM%u\\FTABLE%u.DAT", ffxi.c_str(), n, n);
+			std::vector<uint8_t> vn, fn;
+			if (!bk::read_file(v_name, vn) || !bk::read_file(f_name, fn))
+				continue;
+			for (uint32_t id = 0; id < vn.size() && id < rel_of.size(); ++id)
+				if (rel_of[id].empty() && vt[id] != 1 && vn[id] == n)
+					name(id, fn, n);
 		}
-		uint32_t id(const std::string &rel) const
-		{
-			auto it = id_of.find(rel);
-			return it == id_of.end() ? 0xFFFFFFFFu : it->second;
-		}
-	};
+		for (uint32_t id = 0; id < rel_of.size(); ++id)
+			if (!rel_of[id].empty())
+				id_of.emplace(rel_of[id], id);
+		return true;
+	}
 
 	// ---- Is the game running?
 
-	// Why the game counts as running ("" when it doesn't): pol.exe or phoenix-loader.exe, or one of Ashita's logs
-	// (logs\*.txt) written in the last minute
-	std::string game_running(const std::wstring &ashita)
+	std::string game_running(const std::wstring &ashita, const std::vector<std::wstring> *names)
 	{
+		static const std::vector<std::wstring> game = { L"pol.exe", L"phoenix-loader.exe" };
+		if (names == nullptr || names->empty())
+			names = &game;
 		HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 		if (snap != INVALID_HANDLE_VALUE)
 		{
 			PROCESSENTRY32W p = { sizeof(p) };
 			for (BOOL more = Process32FirstW(snap, &p); more; more = Process32NextW(snap, &p))
-				if (_wcsicmp(p.szExeFile, L"pol.exe") == 0 || _wcsicmp(p.szExeFile, L"phoenix-loader.exe") == 0)
-				{
-					CloseHandle(snap);
-					return narrow(p.szExeFile) + " is running";
-				}
+				for (const std::wstring &n : *names)
+					if (_wcsicmp(p.szExeFile, n.c_str()) == 0)
+					{
+						CloseHandle(snap);
+						return narrow(p.szExeFile) + " is running";
+					}
 			CloseHandle(snap);
 		}
 		if (!ashita.empty())
@@ -639,37 +699,6 @@ namespace
 	}
 
 	// ---- Alpha tags
-
-	// What uses a texture: pieces (zones) or groups (models) by kind, and the vertex alpha of its cut-out pieces
-	struct tag
-	{
-		uint32_t cut = 0, blended = 0, plain = 0, mask = 0;
-		uint64_t vcol[256] = {};
-		void merge(const tag &t)
-		{
-			cut += t.cut, blended += t.blended, plain += t.plain, mask += t.mask;
-			for (int i = 0; i < 256; ++i)
-				vcol[i] += t.vcol[i];
-		}
-		uint8_t median_vcol() const
-		{
-			uint64_t n = 0, seen = 0;
-			for (uint64_t c : vcol)
-				n += c;
-			if (n == 0)
-				return 0;
-			for (int i = 0; i < 256; ++i)
-				if ((seen += vcol[i]) * 2 >= n)
-					return uint8_t(std::max(i, 1));
-			return 0xFF;
-		}
-	};
-
-	struct key_hash
-	{
-		size_t operator()(const pk::key &k) const { return size_t(k.hash ^ (k.hash >> 32) ^ k.bytes); }
-	};
-	using tag_map = std::unordered_map<pk::key, tag, key_hash>;
 
 	// A zone DAT's textures tagged from its meshes (zonemesh, reading the original DAT: the overlay is switched off in
 	// main), by the keys of the original's texture chunks of each name. false (why) when its meshes can't be read
@@ -817,16 +846,6 @@ namespace
 
 	// ---- The soul test
 
-	struct soul_result
-	{
-		bool done = false;
-		std::string why;     // (not done: why)
-		double c_mean = 0, c_p99 = 0, a_mean = 0, a_p99 = 0;
-		double kept = 0;     // the fraction of texels compared for colour (not at a strong edge)
-		uint32_t factor = 0;
-		bool stored_rows = false; // (B1: the original's rows as stored matched better than tex's bottom-up order)
-	};
-
 	double p99_of(std::vector<float> &v)
 	{
 		if (v.empty())
@@ -956,11 +975,15 @@ namespace
 		return r;
 	}
 
-	// Whether a soul test's errors pass the limits (verify reports such an entry; convert leaves it out)
 	bool over_limits(const options &o, const soul_result &s)
 	{
 		return s.c_mean > o.soul_mean || s.c_p99 > o.soul_p99 || s.a_mean > o.alpha_mean || s.a_p99 > o.alpha_p99;
 	}
+}
+
+namespace
+{
+	using namespace hifi::texpack;
 
 	// ---- Convert
 
@@ -2218,6 +2241,7 @@ namespace
 
 int wmain(int argc, wchar_t **argv)
 {
+	using namespace hifi::texpack;
 	options o;
 	if (!parse(argc, argv, o))
 	{
@@ -2238,6 +2262,10 @@ int wmain(int argc, wchar_t **argv)
 		code = compact(o);
 	else if (o.command == "prune")
 		code = prune(o);
+	else if (o.command == "make")
+		code = make(o);
+	else if (o.command == "get-upscaler")
+		code = get_upscaler(o);
 	else
 		usage();
 	if (g_log != nullptr)

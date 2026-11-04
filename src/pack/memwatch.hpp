@@ -9,7 +9,10 @@
 //     second or two: between two 5 s walks the largest block's low-water mark wouldn't see it);
 //   - every 10 s, whether a texture bake is running (realesrgan-ncnn-vulkan.exe, or a python.exe running bakeall.py):
 //     sessions played meanwhile are kept out of the hang analysis. A python.exe whose command line can't be read makes
-//     it "can't tell", not "no".
+//     it "can't tell", not "no";
+//   - every 3 s, once the module has named the pack folder (set_pack_folder): its progress.txt as a texture pack being
+//     made there wrote it (hifixi-enhanced-textures: texpack make), and whether pack.lock is there (a builder holds it
+//     while it runs; deleted when it ends, however it ends). Only the text: the module reads it (pack::build_line).
 // Each value is an atomic (read with no lock: the GPU crash and hang reports read them from their own threads). The
 // lowest free address space and largest block are kept since the last reset_low_water (the module resets them at each
 // zone change, after logging the zone's). Video memory isn't read here: the module reads it on the game's thread
@@ -55,7 +58,20 @@ namespace hifi::pack::memwatch
 	// bytes on the GPU
 	void set_gpu(uint64_t vram_usage, uint64_t vram_budget, uint64_t chars_bytes, uint64_t zone_bytes);
 
-	// For the tests: every probe once, now, on the calling thread (published as the thread would)
+	// The pack folder whose progress.txt the thread reads (with its slash; the module, at each look). "" reads none
+	void set_pack_folder(const std::wstring &folder);
+	// A pack being made there, as the thread last read it: progress.txt's text (at most kBuildTextMax bytes) and
+	// whether pack.lock was there. there false: no progress.txt (or no folder named yet)
+	constexpr size_t kBuildTextMax = 16384;
+	struct build_file
+	{
+		bool there = false, locked = false;
+		std::string text;
+		uint64_t at = 0; // (GetTickCount64 of the read; 0 never)
+	};
+	build_file read_build();
+
+	// For the tests: every probe once (progress.txt too), now, on the calling thread (published as the thread would)
 	void sample_now();
 	// The walk alone: the free address space, its largest block, the time it took
 	struct walk_result

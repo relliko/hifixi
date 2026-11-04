@@ -687,6 +687,69 @@ Work happens in a new worktree, `C:\code\LSB\hifixi-pack`, branch `dev-pack`.
 - **Packaging (Alex, 2026-11-03):** the builder ships as its own package, **hifixi-enhanced-textures** (code, tools and notices only, never
   pack content). HiFi XI's install instructions say a player can put a texture pack they already have in `bootloader\hifixi-pack`, or make
   one with hifixi-enhanced-textures, and link only to that repo (no links to ready-made packs).
+- **Built 2026-11-03 (steps 1-3; on dev-pack 13d3879, not committed):**
+  - **`hifixi-texpack make`** (`tools\texpack\make.cpp`, with `upscale.cpp`, `keeptexels.cpp`, `image_io.cpp`): no Python, no
+    overlay. What convert and make share moved out of texpack.cpp's anonymous namespace into `tools\texpack\shared.hpp`
+    (`namespace hifi::texpack`), convert's code unchanged (`game_running` takes the process names as an optional list;
+    `tsv_row` also reads the texels column).
+    - **Inputs:** its own `dats.tsv` in the pack's folder, made by walking `ROM*\`: on Alex's game, 52,927 DATs read in 13.9 s,
+      36,940 with textures; all six columns byte-equal to sortdats.py's `work\all\dats.tsv` (296 zone, 26,550 model,
+      10,094 other; 3 zone and 479 other DATs another XIPivot overlay has). Made again when VTABLE/FTABLE or pivot.ini
+      change, a listed DAT's size isn't the file's, or `--rescan`. pivot.ini is optional (no Ashita folder: nothing
+      shadowed). `--kind zone` gives the zones-only pack.
+    - **Per batch** (whole DATs up to `--batch-mtexels` 24 M original texels of textures the pack hasn't got): A1 textures
+      with sides multiples of 4 decoded (chars tex), keys in the pack or earlier in the batch skipped before upscaling;
+      wrap-pad 8, PNGs (WIC), `realesrgan-ncnn-vulkan -n realesrgan-x4plus` as a child (job object with kill-on-close,
+      below-normal priority, console to `work\upscaler.txt`); crop, Lanczos (Pillow's own fixed point) for 2x and the
+      alpha; keeptexels (8, 24, 2); BC2; the soul test with convert's limits; convert's tags and coverage mips; appended,
+      then the batch's DATs into pack.src at one commit. Zones `--zone-factor` 2, models `--model-factor` 4.
+    - **Game check** before each batch and every `--game-poll-s` (3 s) while the upscaler runs: when the game starts the
+      job is ended, the batch thrown away, progress.txt says `paused: game running (...)`, and make waits until the game
+      has been closed for `--game-quiet-s` (60 s), then does the batch again. `--no-wait`: exit 4 as convert. A `stop`
+      file also ends the upscaler (exit 3). An upscaler with no new picture for `--stall-s` (900 s) is ended (exit 1); one
+      that exits non-zero stops make with its last console line (and "it needs Vulkan").
+    - **progress.txt:** a plain first line and `summary:` ("10 of 20 DATs done; about 5 s to go; paused: ..."), then
+      `key: value` lines: state, phase, paused, dats_done, dats_total, dats_done_before, eta_s, textures_made,
+      textures_in_pack_already, textures_left_out, entries, written_gb, elapsed_s, waited_s, last.
+    - Free space: 20 GB (`--reserve-gb`) plus the DATs' texels at their factor with mips, plus 2 GB for the batch.
+  - **`hifixi-texpack get-upscaler`** (`tools\texpack\fetch.cpp`): see `docs\texture-pack\upscaler.md` (the licence decision,
+    written down: download on consent, size and SHA-256 checked, only the program, vcomp140.dll, x4plus and the readme
+    kept, never vcomp140d.dll). Not run against the network (texpack_test serves file:// copies).
+  - **Tests** (`texpack_test`, +39; `texpack_test make` runs only these; `tools\build_texpack.cmd` also builds
+    `build\fake_esrgan.exe`: nearest 4x, or slow, hanging, failing): keeptexels against keeptexels.py on 20 textures
+    (`tests\data\texmake_ref.bin` from `tests\texmake_oracle.py`, which runs the script itself): all 20 byte-exact;
+    Lanczos against Pillow on 9 pictures: exact; wrap-pad, crop, finish at 2x and 4x; get-upscaler's wrong size, wrong
+    hash, no answer (and, with `HIFIXI_ESRGAN_ZIP` set, the official zip: what's kept); make on a fake game folder (the
+    tables, ROM\1\66 and 72, ROM\310\0, ROM3\5\110, ROM3\5\31) with PATH System32 only: keys, fields, factors, mips,
+    the models' kinds equal convert's, verify --soul, a rerun does nothing, `--rescan --kind zone --redo`; dedupe (72
+    after 66 upscales only its 13 new textures); killed after a commit (the upscaler gone with it, pack.lock too) and
+    resumed: the same pack; the stop file mid-upscale; the fake game started mid-upscale (child ended, paused, waits,
+    goes on 2 s after it closes, the same pack); `--no-wait` exit 4; a hung and a failing upscaler. 95 of 95 with
+    convert's. texpack_test was already in `tests\run_suites.py` (it runs every `build\*_test.exe`).
+  - **Trial** (game closed, real upscaler copy from research, into `C:\code\LSB\hifi-textures\m7-trial`): zone ROM\1\48
+    (3 textures, 0.15 M texels) 16 s with the 14 s listing, upscaler 2.0 s, 14.4 us per original texel (the upscaler's
+    start dominates so small a batch); 20 model DATs in two runs at `--batch-mtexels 0.4`, stopped by the stop file
+    after batch 2 and resumed: 65 entries, 1.62 M original texels -> 25.8 M, 6.7 and 7.4 us per original texel
+    (upscaler 10.3 s, CPU 1.1 s). verify --soul: 68 entries, 0 bad, 0 over the limits. Against the installed pack
+    (read only) on the 31 entries both name at the same DAT and chunk: alpha errors equal, colour mean lower on all 31
+    (median 0.58 against 0.79; our BC2 encoder against bakeall's), 30 of 31 kinds equal (the other: `--only` left out
+    the DAT whose Os2 names it, as convert would).
+  - **Deviations:** no B1 (palette) textures, as bakeall: so no no_pack entries from make (convert's Giddeus B1s came
+    from bakezone.py). Batches end on the DAT that passes the budget (bakeall stops before it). A stop file during the
+    upscaler ends it at the next poll, not at the next DAT. The tags are still made over every input of the kind at
+    each run (as convert: a few minutes over all model DATs, not cached). The full-game time is not measured yet.
+  - **Left:** steps 4 (the module reading progress.txt, the menu section) and 5 (packaging hifixi-enhanced-textures,
+    notices), `menu_test`, the in-game check, a whole-game run's timing on the 4070 Ti, and the README sentence and link.
+  - **Step 4, built 2026-11-03 (not committed):** memwatch's thread reads `<pack folder>\progress.txt` and whether
+    `pack.lock` is there every 3 s (`memwatch::set_pack_folder`, `read_build`; never the game's thread); the module's
+    update makes its line (`pack::build_line`: make's file only; a damaged one, convert's or a finished build say
+    nothing). The menu's Texture pack section is drawn for everyone: with no pack folder its heading, help and the steps
+    ("No texture pack yet. You can use a pack you already have (put it in bootloader\hifixi-pack) or make one on this PC
+    with hifixi-enhanced-textures: github.com/relliko/hifixi-enhanced-textures"); a build running or paused, "Making the
+    texture pack: 812 of 2,140 areas and models, about 1 h 10 min left (paused: the game is running)."; stopped (or
+    running with no pack.lock: ended without saying) and failed say where and what to do. Also in `/hifi textures status`
+    and, as it appears, the log. No button. README: use a pack you have, or make one with hifixi-enhanced-textures (that
+    repo's link only). Tests: menu_test +7, packmodule_test's no-folder check (the steps, no remove line).
 
 ### M7b — Textures made as you play
 Builds on M7's builder. A setting "Make sharper textures as you play" (off by default) lets HiFi XI have the textures it meets made in the

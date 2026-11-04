@@ -147,7 +147,7 @@ The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md;
 src/pack/pack_module.cpp, docs/texture-pack/zones.md)
 
 - Started once a session by the "textures" module at the first enable with a device (`begin_open`,
-  src/pack/pack_module.cpp:311-327) and kept: turning the pack off closes it and pauses the streamer (`kOff`,
+  src/pack/pack_module.cpp:319-335) and kept: turning the pack off closes it and pauses the streamer (`kOff`,
   `turn_off` :267-284), never stops it (its ring's address space isn't given back). `stop()` only in the module's stop
   (:696-723), first in the plugin's Release (src/plugin/main.cpp:1029-1035), before `retire::release_all` (:1075).
 - Every `close`, `open` (on, reload) and `stop` the module makes is preceded in the same call by the owners'
@@ -156,7 +156,7 @@ src/pack/pack_module.cpp, docs/texture-pack/zones.md)
   holds a ticket of the epoch the call ends when the worker gets to it. A device change: the owners cleared, then
   `set_device` (`device`, :778-798), the epoch the owners ask in read again at once.
 - The zones' glue reads its tickets (`take_done`, src/zone/zonepack.cpp:329) and writes their views in the module's
-  present (src/pack/pack_module.cpp:595-598, each consumer's frame in turn), before `backend::present`'s
+  present (src/pack/pack_module.cpp:603-606, each consumer's frame in turn), before `backend::present`'s
   `retire::on_present` (src/backend/backend.cpp:766). That is safe because a gone ticket keeps its texture (below): a
   view's texture lives while its ticket is held, whatever the epoch does meanwhile.
 - The characters' glue (src/chars/charpack.cpp, docs/texture-pack/characters.md "When tickets are read") reads its

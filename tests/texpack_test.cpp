@@ -17,9 +17,16 @@
  *     prune against a changed game folder (refused while another writer holds the pack), then compact, then convert
  *     against the real one: every entry back;
  *   - tests\pack_oracle.py (python -I) reads every pack it writes.
+ * make (M7, make_tests): keeptexels.cpp and upscale.cpp's Lanczos against keeptexels.py and Pillow (tests\data\
+ * texmake_ref.bin, from tests\texmake_oracle.py); wrap-pad, crop, finish; get-upscaler refusing a wrong size and a wrong
+ * hash served from file:// (no network; HIFIXI_ESRGAN_ZIP naming the official zip also checks what is kept); make on a
+ * fake game folder with build\fake_esrgan.exe and no Python on PATH: keys, fields, factors, the models' kinds as
+ * convert's, verify --soul, dedupe, resume after a kill, the stop file, the fake game started mid-upscale (paused, the
+ * child ended, goes on after it closes), --no-wait, a hung and a failing upscaler.
  *
- *   build\texpack_test.exe     (64-bit, built by tools\build_texpack.cmd; needs build\hifixi-texpack.exe, python, the
- *                               game's files in C:\Games\PhoenixXI and the overlay; work folder build\test\texpack)
+ *   build\texpack_test.exe [make]   (64-bit, built by tools\build_texpack.cmd; needs build\hifixi-texpack.exe,
+ *                               build\fake_esrgan.exe, python, the game's files in C:\Games\PhoenixXI and the overlay;
+ *                               work folder build\test\texpack. "make": only make's tests)
  *
  * Exit code: the number of failures.
  */
@@ -30,7 +37,10 @@
 #include "../src/pack/bc2.hpp"
 #include "../src/pack/validate.hpp"
 #include "../src/bake/dat.hpp"
+#include "../tools/texpack/keeptexels.hpp"
+#include "../tools/texpack/upscale.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -360,7 +370,636 @@ namespace
 	}
 }
 
-int main()
+// ---- make (M7): the C++ ports against the scripts, get-upscaler's refusals, and make run with build\fake_esrgan.exe
+namespace
+{
+	namespace ktx = hifi::texpack::keeptexels;
+	namespace ups = hifi::texpack::upscale;
+
+	const char *kMakeZones[] = { "ROM\\1\\66.DAT", "ROM\\1\\72.DAT" };
+	const char *kMakeModels[] = { "ROM\\310\\0.DAT", "ROM3\\5\\110.DAT", "ROM3\\5\\31.DAT" };
+	const wchar_t *kFakeGame = L"texpack-fakegame.exe";
+
+	bool is_there(const std::wstring &path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+	// (pack.lock is deleted when its writer's handle closes, however the writer ends)
+	bool is_locked(const std::wstring &pack) { return is_there(pack + L"\\pack.lock"); }
+
+	// The largest difference between two byte runs
+	int max_diff(const uint8_t *a, const uint8_t *b, size_t n)
+	{
+		int m = 0;
+		for (size_t i = 0; i < n; ++i)
+			m = std::max(m, std::abs(int(a[i]) - int(b[i])));
+		return m;
+	}
+
+	// tests\data\texmake_ref.bin (tests\texmake_oracle.py): keeptexels.py's outputs and Pillow's Lanczos
+	void ported_steps()
+	{
+		const std::vector<uint8_t> ref = read(root + L"\\tests\\data\\texmake_ref.bin");
+		size_t at = 0;
+		auto u32 = [&]() {
+			uint32_t v = 0;
+			if (at + 4 <= ref.size())
+				std::memcpy(&v, ref.data() + at, 4);
+			at += 4;
+			return v;
+		};
+		check(ref.size() > 8 && std::memcmp(ref.data(), "KTX1", 4) == 0, "tests\\data\\texmake_ref.bin is there");
+		if (ref.size() <= 8 || std::memcmp(ref.data(), "KTX1", 4) != 0)
+			return;
+		at = 4;
+		const uint32_t cases = u32();
+		int worst = 0;
+		uint32_t exact = 0, ok = 0;
+		size_t off_by_one = 0, texels = 0;
+		for (uint32_t c = 0; c < cases; ++c)
+		{
+			const uint32_t w = u32(), h = u32(), s = u32();
+			const size_t n0 = size_t(w) * h * 4, n1 = n0 * s * s;
+			if (at + n0 + 2 * n1 > ref.size())
+				break;
+			const uint8_t *o = ref.data() + at, *u = o + n0, *r = u + n1;
+			at += n0 + 2 * n1;
+			std::vector<uint8_t> mine(u, u + n1);
+			const bool ran = ktx::apply(o, w, h, mine.data(), w * s, h * s);
+			const int d = max_diff(mine.data(), r, n1);
+			worst = std::max(worst, d);
+			ok += ran && d <= 1;
+			exact += ran && d == 0;
+			for (size_t i = 0; i < n1; ++i)
+				off_by_one += mine[i] != r[i];
+			texels += n1;
+		}
+		check(cases == 20 && ok == 20, "keeptexels port within 1 level of keeptexels.py on 20 textures (12 at 4x, 8 at 2x): " + std::to_string(exact) +
+				" exact, worst " + std::to_string(worst) + ", " + std::to_string(off_by_one) + " of " + std::to_string(texels) + " bytes off by one");
+		check(at + 8 <= ref.size() && std::memcmp(ref.data() + at, "LNZ1", 4) == 0, "the Lanczos references follow");
+		at += 4;
+		const uint32_t lcases = u32();
+		uint32_t lok = 0;
+		int lworst = 0;
+		for (uint32_t c = 0; c < lcases; ++c)
+		{
+			const uint32_t w = u32(), h = u32(), ch = u32(), W = u32(), H = u32();
+			const size_t ni = size_t(w) * h * ch, no = size_t(W) * H * ch;
+			if (at + ni + no > ref.size())
+				break;
+			const std::vector<uint8_t> mine = ups::lanczos(ref.data() + at, w, h, ch, W, H);
+			const int d = mine.size() == no ? max_diff(mine.data(), ref.data() + at + ni, no) : 999;
+			lworst = std::max(lworst, d);
+			lok += d <= 1;
+			at += ni + no;
+		}
+		check(lcases == 9 && lok == lcases, "Lanczos (colour 4x to 2x, alpha up 2x and 4x) as Pillow's: " + std::to_string(lok) + " of " + std::to_string(lcases) +
+				" within 1 level (worst " + std::to_string(lworst) + ")");
+
+		// wrap-pad, crop and finish on a 12x8 picture whose texels all differ: the upscaler stood in by nearest 4x
+		const uint32_t w = 12, h = 8;
+		std::vector<uint8_t> p(size_t(w) * h * 4);
+		for (uint32_t i = 0; i < w * h; ++i)
+			p[i * 4] = uint8_t(i), p[i * 4 + 1] = uint8_t(255 - i), p[i * 4 + 2] = uint8_t(i * 7), p[i * 4 + 3] = uint8_t(i % 2 ? 0x80 : 0);
+		const std::vector<uint8_t> padded = ups::wrap_pad_rgb(p.data(), w, h);
+		const uint32_t pw = w + 16, ph = h + 16;
+		bool wrap_ok = padded.size() == size_t(pw) * ph * 3;
+		for (uint32_t y = 0; wrap_ok && y < ph; ++y)
+			for (uint32_t x = 0; x < pw; ++x)
+			{
+				const uint32_t sy = (y + h * 4 - 8) % h, sx = (x + w * 4 - 8) % w;
+				wrap_ok = wrap_ok && std::memcmp(&padded[(size_t(y) * pw + x) * 3], &p[(size_t(sy) * w + sx) * 4], 3) == 0;
+			}
+		check(wrap_ok, "wrap-pad: 8 texels of wrap round a 12x8 picture (numpy.pad 'wrap')");
+		std::vector<uint8_t> big(size_t(pw) * 4 * ph * 4 * 4);
+		for (uint32_t y = 0; y < ph * 4; ++y)
+			for (uint32_t x = 0; x < pw * 4; ++x)
+			{
+				std::memcpy(&big[(size_t(y) * pw * 4 + x) * 4], &padded[(size_t(y / 4) * pw + x / 4) * 3], 3);
+				big[(size_t(y) * pw * 4 + x) * 4 + 3] = 255;
+			}
+		std::vector<uint8_t> f4, f2;
+		std::string why;
+		const bool done4 = ups::finish(p.data(), w, h, big.data(), pw * 4, ph * 4, 4, f4, why), done2 = ups::finish(p.data(), w, h, big.data(), pw * 4, ph * 4, 2, f2, why);
+		bool crop_ok = done4 && f4.size() == size_t(w) * 4 * h * 4 * 4;
+		for (uint32_t y = 0; crop_ok && y < h * 4; ++y)
+			for (uint32_t x = 0; x < w * 4; ++x)
+				crop_ok = crop_ok && std::memcmp(&f4[(size_t(y) * w * 4 + x) * 4], &p[(size_t(y / 4) * w + x / 4) * 4], 3) == 0;
+		std::vector<uint8_t> a1(size_t(w) * h), rgb4(size_t(w) * 4 * h * 4 * 3);
+		for (uint32_t i = 0; i < w * h; ++i)
+			a1[i] = p[i * 4 + 3];
+		const std::vector<uint8_t> a4 = ups::lanczos(a1.data(), w, h, 1, w * 4, h * 4);
+		for (size_t i = 0; crop_ok && i < a4.size(); ++i)
+			crop_ok = f4[i * 4 + 3] == a4[i];
+		check(crop_ok, "finish at 4x: the upscaler's picture cropped back to the texture (nearest 4x of it), the alpha Lanczos'd up");
+		for (uint32_t i = 0; i < w * 4 * h * 4; ++i)
+			std::memcpy(&rgb4[i * 3], &f4[i * 4], 3);
+		const std::vector<uint8_t> rgb2 = ups::lanczos(rgb4.data(), w * 4, h * 4, 3, w * 2, h * 2);
+		bool two_ok = done2 && f2.size() == size_t(w) * 2 * h * 2 * 4;
+		for (uint32_t i = 0; two_ok && i < w * 2 * h * 2; ++i)
+			two_ok = std::memcmp(&f2[i * 4], &rgb2[i * 3], 3) == 0;
+		check(two_ok, "finish at 2x: the cropped 4x Lanczos'd down to 2x");
+		std::vector<uint8_t> none;
+		why.clear();
+		const bool refused = !ups::finish(p.data(), w, h, big.data(), pw * 4 - 4, ph * 4, 4, none, why);
+		check(refused && why.find("upscaler gave") != std::string::npos, "finish refuses a picture of the wrong size (" + why + ")");
+	}
+
+	// A process started with its output to a file
+	struct started
+	{
+		HANDLE process = nullptr;
+		DWORD pid = 0;
+	};
+
+	started start(const std::wstring &exe, const std::wstring &args, const std::wstring &log)
+	{
+		started s;
+		SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+		HANDLE out = log.empty() ? nullptr : CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, 0, nullptr);
+		STARTUPINFOW si = { sizeof(si) };
+		if (out != nullptr && out != INVALID_HANDLE_VALUE)
+		{
+			si.dwFlags = STARTF_USESTDHANDLES;
+			si.hStdOutput = si.hStdError = out;
+		}
+		PROCESS_INFORMATION pi = {};
+		std::wstring cmd = L"\"" + exe + L"\" " + args;
+		if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+		{
+			CloseHandle(pi.hThread);
+			s.process = pi.hProcess;
+			s.pid = pi.dwProcessId;
+		}
+		if (out != nullptr && out != INVALID_HANDLE_VALUE)
+			CloseHandle(out);
+		return s;
+	}
+
+	// Its exit code once it ends within ms (-1: still running, then ended)
+	int finish(started &s, DWORD ms)
+	{
+		if (s.process == nullptr)
+			return -2;
+		DWORD code = DWORD(-1);
+		if (WaitForSingleObject(s.process, ms) == WAIT_OBJECT_0)
+			GetExitCodeProcess(s.process, &code);
+		else
+		{
+			TerminateProcess(s.process, 99);
+			WaitForSingleObject(s.process, 5000);
+		}
+		CloseHandle(s.process);
+		s.process = nullptr;
+		return int(code);
+	}
+
+	std::string text_of(const std::wstring &path)
+	{
+		const std::vector<uint8_t> b = read(path);
+		return std::string(b.begin(), b.end());
+	}
+
+	// Waits up to ms for what to be true (checked every 50 ms)
+	template <class F> bool wait_for(F what, DWORD ms)
+	{
+		for (DWORD t = 0; t < ms; t += 50)
+		{
+			if (what())
+				return true;
+			Sleep(50);
+		}
+		return what();
+	}
+
+	bool alive(DWORD pid)
+	{
+		HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+		if (h == nullptr)
+			return false;
+		const bool running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+		CloseHandle(h);
+		return running;
+	}
+
+	// The fake upscaler's runs from its log: the pids that started, and those of them that got to their end
+	void fake_runs(const std::wstring &log, std::vector<DWORD> &began, std::set<DWORD> &ended)
+	{
+		began.clear(), ended.clear();
+		bool ok = true;
+		std::string line;
+		for (char c : text_of(log) + "\n")
+		{
+			if (c != '\n')
+			{
+				if (c != '\r')
+					line += c;
+				continue;
+			}
+			if (line.rfind("start ", 0) == 0)
+				began.push_back(DWORD(std::strtoul(line.c_str() + 6, nullptr, 10)));
+			else if (line.rfind("end ", 0) == 0)
+				ended.insert(DWORD(std::strtoul(line.c_str() + 4, nullptr, 10)));
+			line.clear();
+		}
+		(void)ok;
+	}
+
+	// The last fake upscaler run that didn't get to its end has gone (ended by make's job object)
+	bool child_gone(const std::wstring &log, std::string &what)
+	{
+		std::vector<DWORD> began;
+		std::set<DWORD> ended;
+		fake_runs(log, began, ended);
+		for (auto it = began.rbegin(); it != began.rend(); ++it)
+			if (ended.count(*it) == 0)
+			{
+				const bool gone = wait_for([&] { return !alive(*it); }, 3000);
+				what = "upscaler pid " + std::to_string(*it) + (gone ? " gone" : " still running");
+				return gone;
+			}
+		what = "no unfinished upscaler run in its log";
+		return false;
+	}
+
+	// The A1 textures make takes from a DAT (sides multiples of 4), by key, in chunk order
+	struct a1_texture
+	{
+		pk::key k;
+		uint32_t chunk = 0, w = 0, h = 0;
+		std::string name;
+	};
+	std::vector<a1_texture> a1_textures(const std::string &rel)
+	{
+		std::vector<a1_texture> out;
+		const std::vector<uint8_t> dat = read(kFFXI + L"\\" + wide(rel));
+		const std::vector<bk::chunk> cs = bk::chunks(dat);
+		for (size_t i = 0; i < cs.size(); ++i)
+		{
+			const bk::chunk &c = cs[i];
+			if (c.type != 0x20 || c.size < 69 || c.body[0] != 0xA1)
+				continue;
+			const int32_t w = i32(c.body + 21), h = std::abs(i32(c.body + 25));
+			if (w <= 0 || h <= 0 || w % 4 != 0 || h % 4 != 0)
+				continue;
+			a1_texture t;
+			t.k = pk::key_of(c.body, c.size);
+			t.chunk = uint32_t(i), t.w = uint32_t(w), t.h = uint32_t(h);
+			t.name.assign(reinterpret_cast<const char *>(c.body + 1), 16);
+			out.push_back(t);
+		}
+		return out;
+	}
+
+	bool copy_into(const std::wstring &from, const std::wstring &to)
+	{
+		make_folders(to.substr(0, to.find_last_of(L'\\')));
+		return CopyFileW(from.c_str(), to.c_str(), FALSE) != 0;
+	}
+
+	void make_tests(const std::shared_ptr<const pk::index> &convert_pack)
+	{
+		ported_steps();
+		const std::wstring mw = work + L"\\make", ffxi = mw + L"\\ffxi", up = mw + L"\\upscaler", fake = root + L"\\build\\fake_esrgan.exe";
+		const std::wstring fake_log = mw + L"\\fake-esrgan.log", game_exe = mw + L"\\game\\" + kFakeGame;
+		remove_tree(mw);
+		make_folders(mw);
+
+		// get-upscaler: what it fetches said, a file of another size or another hash refused and deleted (no network:
+		// a local file:// URL; the official file is never downloaded here)
+		{
+			int code = 0;
+			const std::wstring bad = mw + L"\\bad.zip", dir = mw + L"\\got";
+			write_text(bad, "not the release");
+			std::string out = run("get-upscaler --yes --dir " + q(dir) + " --url \"file:///" + narrow(bad) + "\"", code);
+			check(code == 1 && out.find("not the official 45,474,481") != std::string::npos && out.find("BSD-3-Clause") != std::string::npos &&
+					out.find("abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d") != std::string::npos,
+				"get-upscaler: says what, where from, the licences and the hash; a file of another size refused (" + line_with(out, "refused") + ")");
+			check(!is_there(dir) && !is_there(dir + L".part"), "get-upscaler: nothing left of the refused file");
+			// (the official size, other bytes)
+			HANDLE f = CreateFileW(bad.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+			LARGE_INTEGER size;
+			size.QuadPart = 45474481;
+			SetFilePointerEx(f, size, nullptr, FILE_BEGIN);
+			SetEndOfFile(f);
+			CloseHandle(f);
+			out = run("get-upscaler --yes --dir " + q(dir) + " --url \"file:///" + narrow(bad) + "\"", code);
+			check(code == 1 && out.find("Its SHA-256 is ") != std::string::npos && out.find("refused, deleted") != std::string::npos && !is_there(dir) &&
+					!is_there(dir + L".part"),
+				"get-upscaler: the official size with another SHA-256 refused and deleted (" + line_with(out, "SHA-256 is") + ")");
+			DeleteFileW(bad.c_str());
+			out = run("get-upscaler --dir " + q(dir) + " --url \"file:///" + narrow(bad) + "\" < NUL", code);
+			check(code == 1 && out.find("Nothing downloaded") != std::string::npos && !is_there(dir.c_str()), "get-upscaler: no answer, nothing downloaded");
+			// (a <dir>.part that isn't get-upscaler's is left as it is)
+			make_folders(dir + L".part");
+			write_text(dir + L".part\\mine.txt", "the player's");
+			out = run("get-upscaler --yes --dir " + q(dir) + " --url \"file:///" + narrow(bad) + "\"", code);
+			check(code == 1 && out.find("isn't get-upscaler's") != std::string::npos && is_there(dir + L".part\\mine.txt") && !is_there(dir),
+				"get-upscaler: a .part folder without its mark left alone, exit 1 (" + line_with(out, "isn't") + ")");
+			remove_tree(dir + L".part");
+			// (the official zip, only when HIFIXI_ESRGAN_ZIP names a copy of it: what's kept)
+			wchar_t zip[MAX_PATH] = L"";
+			if (GetEnvironmentVariableW(L"HIFIXI_ESRGAN_ZIP", zip, MAX_PATH) != 0)
+			{
+				std::wstring url = L"file:///";
+				url += zip;
+				out = run("get-upscaler --yes --dir " + q(dir) + " --url \"" + narrow(url) + "\"", code);
+				check(code == 0 && is_there(dir + L"\\realesrgan-ncnn-vulkan.exe") && is_there(dir + L"\\vcomp140.dll") && !is_there(dir + L"\\vcomp140d.dll") &&
+						is_there(dir + L"\\models\\realesrgan-x4plus.bin") && is_there(dir + L"\\models\\realesrgan-x4plus.param") &&
+						!is_there(dir + L"\\models\\realesr-animevideov3-x2.bin") && !is_there(dir + L"\\input.jpg") && is_there(dir + L"\\PROVENANCE.txt") &&
+						!is_there(dir + L".part"),
+					"get-upscaler on the official zip (HIFIXI_ESRGAN_ZIP): the program, vcomp140.dll, x4plus and PROVENANCE.txt kept; no vcomp140d.dll, other models "
+					"or samples (" + last_line(out) + ")");
+			}
+			else
+				std::printf("      (get-upscaler on the official zip not tried: HIFIXI_ESRGAN_ZIP isn't set)\n");
+		}
+
+		// The fake game folder: the tables and five DATs (two zones that share textures, three model DATs)
+		bool copied = copy_into(kFFXI + L"\\VTABLE.DAT", ffxi + L"\\VTABLE.DAT") && copy_into(kFFXI + L"\\FTABLE.DAT", ffxi + L"\\FTABLE.DAT");
+		for (int r = 2; r < 10; ++r)
+		{
+			const std::wstring n = std::to_wstring(r);
+			copy_into(kFFXI + L"\\ROM" + n + L"\\VTABLE" + n + L".DAT", ffxi + L"\\ROM" + n + L"\\VTABLE" + n + L".DAT");
+			copy_into(kFFXI + L"\\ROM" + n + L"\\FTABLE" + n + L".DAT", ffxi + L"\\ROM" + n + L"\\FTABLE" + n + L".DAT");
+		}
+		for (const char *rel : kMakeZones)
+			copied = copied && copy_into(kFFXI + L"\\" + wide(rel), ffxi + L"\\" + wide(rel));
+		for (const char *rel : kMakeModels)
+			copied = copied && copy_into(kFFXI + L"\\" + wide(rel), ffxi + L"\\" + wide(rel));
+		copied = copied && copy_into(fake, up + L"\\realesrgan-ncnn-vulkan.exe") && write_text(up + L"\\vcomp140.dll", "fake") &&
+			write_text(up + L"\\models\\realesrgan-x4plus.param", "fake") &&
+			write_text(up + L"\\models\\realesrgan-x4plus.bin", "fake") && copy_into(fake, game_exe);
+		check(copied, "a fake game folder (tables and five DATs) and the fake upscaler");
+
+		// What make should give: every A1 texture of the five DATs once (the first DAT's), zones 2x, models 4x
+		std::map<pk::key, std::pair<a1_texture, std::string>> want;
+		std::set<pk::key> keys66, keys72;
+		for (const char *rel : kMakeZones)
+			for (const a1_texture &t : a1_textures(rel))
+			{
+				want.emplace(t.k, std::make_pair(t, std::string(rel)));
+				(rel == kMakeZones[0] ? keys66 : keys72).insert(t.k);
+			}
+		for (const char *rel : kMakeModels)
+			for (const a1_texture &t : a1_textures(rel))
+				want.emplace(t.k, std::make_pair(t, std::string(rel)));
+		size_t shared = 0;
+		for (const pk::key &k : keys66)
+			shared += keys72.count(k);
+
+		// (every make here: no Python on PATH, the game the fake one, timings short)
+		wchar_t old_path[32767] = L"";
+		GetEnvironmentVariableW(L"PATH", old_path, 32767);
+		wchar_t system[MAX_PATH] = L"";
+		GetSystemDirectoryW(system, MAX_PATH);
+		SetEnvironmentVariableW(L"PATH", system);
+		SetEnvironmentVariableW(L"FAKE_ESRGAN_LOG", fake_log.c_str());
+		SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
+		auto args = [&](const std::wstring &pack, const std::string &more) {
+			return "make --out " + q(pack) + " --ffxi " + q(ffxi) + " --ffximain " + q(kFFXI + L"\\FFXiMain.dll") + " --upscaler " + q(up) +
+				" --threads 4 --reserve-gb 0 --game-names " + narrow(kFakeGame) + " --game-poll-s 0.2 --game-quiet-s 2 " + more;
+		};
+		auto make_run = [&](const std::wstring &pack, const std::string &more, std::string &out, DWORD ms = 300000) {
+			started s = start(tool, wide(args(pack, more)), mw + L"\\make.out");
+			const int code = finish(s, ms);
+			out = text_of(mw + L"\\make.out");
+			return code;
+		};
+		std::string out;
+		int code = 0;
+		{
+			char py[MAX_PATH];
+			check(SearchPathA(nullptr, "python.exe", nullptr, MAX_PATH, py, nullptr) == 0, "make runs with no Python on PATH (PATH is System32 only)");
+		}
+
+		// No upscaler: says to fetch it
+		code = make_run(mw + L"\\none", "--upscaler " + q(mw + L"\\nowhere"), out);
+		check(code == 1 && out.find("get-upscaler") != std::string::npos && !is_there(mw + L"\\none\\pack.idx"),
+			"make without the upscaler: exit 1, says to run get-upscaler (" + line_with(out, "upscaler") + ")");
+
+		// P1: the whole fake folder in one run
+		const std::wstring P1 = mw + L"\\P1";
+		code = make_run(P1, "", out);
+		std::shared_ptr<const pk::index> p1 = load(P1);
+		check(code == 0 && p1 != nullptr, "make: exit 0, the pack loads (" + line_with(out, "DATs 5") + ")");
+		if (!p1)
+		{
+			std::printf("%s", out.c_str());
+			SetEnvironmentVariableW(L"PATH", old_path);
+			return;
+		}
+		{
+			const std::string tsv = text_of(P1 + L"\\dats.tsv");
+			check(tsv.rfind("# hifixi-texpack make's list of ", 0) == 0 && tsv.find("ROM\\1\\66.DAT\tzone\t") != std::string::npos &&
+					tsv.find("ROM\\1\\72.DAT\tzone\t") != std::string::npos && tsv.find("ROM\\310\\0.DAT\tmodel\t") != std::string::npos &&
+					tsv.find("ROM3\\5\\110.DAT\tmodel\t") != std::string::npos && count_lines(tsv) == 6,
+				"dats.tsv made in the pack's folder from the game's ROM folders: the zones by file id, the models by their Os2");
+			const std::string src = pack_src(P1);
+			check(count_lines(src) == 5 && src.find("\t2\t0\t0") != std::string::npos, "pack.src: the five DATs, maker version 2, no overlay");
+			check(std::string(p1->head.source).rfind("texpack make 2", 0) == 0 && p1->head.maker_version == 2, "the header says texpack make 2");
+			bool keys = p1->entries.size() == want.size(), fields = true, sizes = true;
+			for (const auto &[k, tw] : want)
+			{
+				const pk::entry *e = p1->find(k);
+				if (e == nullptr)
+				{
+					keys = false;
+					continue;
+				}
+				const bool zone = tw.second.find("ROM\\1\\") == 0;
+				const pk::record *r = e->map(pk::kColour);
+				fields = fields && e->chunk == tw.first.chunk && std::memcmp(e->name, tw.first.name.data(), 16) == 0 && e->orig_format == 0xA1 &&
+					e->source_kind == (zone ? pk::kSourceZone : pk::kSourceModel) && (e->flags & pk::kNoPack) == 0;
+				sizes = sizes && r != nullptr && r->w == tw.first.w * (zone ? 2 : 4) && r->h == tw.first.h * (zone ? 2 : 4) && r->format == pk::kBC2 &&
+					r->levels == pk::bc2::chain_levels(r->w, r->h);
+			}
+			check(keys, "make's keys: every A1 texture of the five DATs once (" + std::to_string(p1->entries.size()) + " entries, " + std::to_string(want.size()) +
+					" wanted; the two zones share " + std::to_string(shared) + ")");
+			check(fields, "entries: chunk, name, format and kind from the first DAT with the key; none no_pack");
+			check(sizes, "levels: zones 2x, models 4x, BC2, the whole chain of coverage mips");
+			// (the model DATs' alpha kinds as convert tagged them: the same tags, the same keys)
+			if (convert_pack)
+			{
+				uint32_t same = 0, compared = 0;
+				for (const pk::entry &e : p1->entries)
+					if (e.source_kind == pk::kSourceModel)
+						if (const pk::entry *c = convert_pack->find(e.the_key()))
+							compared++, same += c->alpha_kind == e.alpha_kind && c->file_id == e.file_id && c->chunk == e.chunk;
+				check(compared >= 6 && same == compared, "model entries' alpha kinds, file ids and chunks as convert's pack has them (" + std::to_string(same) + " of " +
+						std::to_string(compared) + ")");
+			}
+			check(out.find("already in the pack " + std::to_string(shared)) != std::string::npos,
+				"the shared textures made once, skipped before upscaling (" + line_with(out, "already in the pack") + ")");
+			int vc = 0;
+			const std::string v = run("verify --pack " + q(P1) + " --soul --ffxi " + q(ffxi) + " --threads 4", vc);
+			check(vc == 0 && v.find(", 0 bad") != std::string::npos && v.find("0 over the limits") != std::string::npos,
+				"verify --soul passes it (" + line_with(v, "soul: ") + ")");
+			const std::string progress = text_of(P1 + L"\\progress.txt");
+			check(progress.find("state: finished") != std::string::npos && progress.find("dats_done: 5") != std::string::npos &&
+					progress.find("dats_total: 5") != std::string::npos && progress.find("summary: 5 of 5 DATs done") != std::string::npos,
+				"progress.txt: plain and key: value (state, dats_done, dats_total, summary)");
+			code = make_run(P1, "", out);
+			std::shared_ptr<const pk::index> again = load(P1);
+			check(code == 0 && out.find("0 DATs (0 zones, 0 models) to make, 5 done before") != std::string::npos && out.find("dats.tsv made") == std::string::npos &&
+					again && same_entries(*p1, *again),
+				"a rerun: nothing to make, dats.tsv kept (" + line_with(out, "to make") + ")");
+			size_t zone_keys = 0;
+			for (const pk::entry &e : p1->entries)
+				zone_keys += e.source_kind == pk::kSourceZone;
+			code = make_run(P1, "--rescan --kind zone --redo", out);
+			check(code == 0 && out.find("dats.tsv made (--rescan)") != std::string::npos && out.find("2 DATs (2 zones, 0 models) to make") != std::string::npos &&
+					out.find("textures made 0") != std::string::npos && out.find("the same key again " + std::to_string(zone_keys) + ",") != std::string::npos,
+				"--rescan --kind zone --redo: listed again, the zones only, each zone texture made again by the DAT whose entry it is, the same bytes (" +
+					line_with(out, "the same key again") + ")");
+			// (--redo with another factor: the zones' entries replaced at 4x, the models' left)
+			code = make_run(P1, "--kind zone --redo --zone-factor 4", out);
+			std::shared_ptr<const pk::index> p4x = load(P1);
+			bool four = p4x != nullptr && p4x->entries.size() == p1->entries.size();
+			if (four)
+				for (const pk::entry &e : p4x->entries)
+				{
+					const pk::record *r = e.map(pk::kColour);
+					four = four && r != nullptr && r->w == e.w * 4 && r->h == e.h * 4;
+					if (!four)
+						break;
+				}
+			check(code == 0 && four && out.find(std::to_string(zone_keys) + " of them replacing") != std::string::npos,
+				"--kind zone --redo --zone-factor 4: every zone entry replaced at 4x, the models' kept (" + line_with(out, "of them replacing") + ")");
+			// (a work folder: make's own is deleted with a link in it unlinked, never followed; one without make's mark is
+			// left and make refuses)
+			const std::wstring outside = mw + L"\\outside";
+			make_folders(outside);
+			write_text(outside + L"\\keep.txt", "not make's");
+			make_folders(P1 + L"\\work");
+			write_text(P1 + L"\\work\\made-by-hifixi-texpack-make.txt", "");
+			const std::wstring link = P1 + L"\\work\\link";
+			_wsystem((L"cmd /c mklink /J \"" + link + L"\" \"" + outside + L"\" > NUL").c_str());
+			const bool linked = is_there(link + L"\\keep.txt");
+			code = make_run(P1, "--kind zone", out);
+			check(code == 0 && linked && !is_there(P1 + L"\\work") && is_there(outside + L"\\keep.txt"),
+				"make's work folder deleted, a junction in it unlinked, the folder it points to kept");
+			make_folders(P1 + L"\\work");
+			write_text(P1 + L"\\work\\mine.txt", "the player's");
+			code = make_run(P1, "--kind zone", out);
+			check(code == 1 && out.find("isn't make's") != std::string::npos && is_there(P1 + L"\\work\\mine.txt") &&
+					text_of(P1 + L"\\progress.txt").find("state: failed") != std::string::npos,
+				"a work folder without make's mark: left, exit 1, progress.txt failed (" + line_with(out, "isn't make's") + ")");
+			remove_tree(P1 + L"\\work");
+		}
+
+		// P2: dedupe across runs: 66, then 72, whose textures 66 shares aren't upscaled again
+		{
+			const std::wstring P2 = mw + L"\\P2";
+			code = make_run(P2, "--only ROM\\1\\66.DAT", out);
+			const int code2 = make_run(P2, "--only ROM\\1\\72.DAT", out);
+			const std::string expect = std::to_string(keys72.size() - shared) + " textures to make";
+			std::shared_ptr<const pk::index> p2 = load(P2);
+			size_t zones = 0;
+			for (const pk::entry &e : p1->entries)
+				zones += e.source_kind == pk::kSourceZone;
+			check(code == 0 && code2 == 0 && out.find(expect) != std::string::npos && p2 && p2->entries.size() == zones,
+				"dedupe: 72 after 66 upscales only the " + std::to_string(keys72.size() - shared) + " textures 66 hasn't (" + line_with(out, "batch 1:") + ")");
+		}
+
+		// P3: killed after its first batch, then run again: the same pack as one run, the upscaler gone with it
+		{
+			const std::wstring P3 = mw + L"\\P3";
+			DeleteFileW(fake_log.c_str());
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", L"slow");
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_SLOW_MS", L"150");
+			started s = start(tool, wide(args(P3, "--batch-mtexels 0.05")), mw + L"\\make.out");
+			const bool committed = wait_for([&] { return count_lines(pack_src(P3)) >= 1 && text_of(P3 + L"\\progress.txt").find("upscaling") != std::string::npos; }, 120000);
+			Sleep(300);
+			TerminateProcess(s.process, 1);
+			finish(s, 5000);
+			std::string what;
+			const bool gone = child_gone(fake_log, what);
+			const size_t lines = count_lines(pack_src(P3));
+			check(committed && gone && lines >= 1 && lines < 5, "killed mid-build after a commit: " + std::to_string(lines) + " DATs in pack.src, " + what);
+			check(load(P3) != nullptr && !is_locked(P3), "the killed run's pack loads, pack.lock went with it");
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
+			code = make_run(P3, "--batch-mtexels 0.05", out);
+			std::shared_ptr<const pk::index> p3 = load(P3);
+			check(code == 0 && p3 && same_entries(*p1, *p3) && out.find(std::to_string(lines) + " done before") != std::string::npos,
+				"resumed: the same pack as one run (" + line_with(out, "done before") + ")");
+		}
+
+		// P4: the stop file while the upscaler runs ends it; delete it and go on
+		{
+			const std::wstring P4 = mw + L"\\P4";
+			DeleteFileW(fake_log.c_str());
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", L"slow");
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_SLOW_MS", L"300");
+			started s = start(tool, wide(args(P4, "")), mw + L"\\make.out");
+			const bool upscaling = wait_for([&] { return text_of(P4 + L"\\progress.txt").find("phase: batch 1: upscaling") != std::string::npos; }, 60000);
+			write_text(P4 + L"\\stop", "");
+			const int c = finish(s, 20000);
+			std::string what;
+			const bool gone = child_gone(fake_log, what);
+			out = text_of(mw + L"\\make.out");
+			check(upscaling && c == 3 && gone && out.find("the upscaler ended") != std::string::npos && text_of(P4 + L"\\progress.txt").find("stopped (the stop file)") != std::string::npos,
+				"the stop file during the upscaler: exit 3, the upscaler ended (" + what + ")");
+			DeleteFileW((P4 + L"\\stop").c_str());
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
+			code = make_run(P4, "", out);
+			std::shared_ptr<const pk::index> p4 = load(P4);
+			check(code == 0 && p4 && same_entries(*p1, *p4), "after the stop file is deleted: the same pack as one run");
+		}
+
+		// P5: the game starts while the upscaler runs: it's ended, make waits (paused) until the game has been closed for
+		// --game-quiet-s, then makes that batch again
+		{
+			const std::wstring P5 = mw + L"\\P5";
+			DeleteFileW(fake_log.c_str());
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", L"slow");
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_SLOW_MS", L"300");
+			started s = start(tool, wide(args(P5, "")), mw + L"\\make.out");
+			const bool upscaling = wait_for([&] { return text_of(P5 + L"\\progress.txt").find("phase: batch 1: upscaling") != std::string::npos; }, 60000);
+			started game = start(game_exe, L"", L"");
+			const bool paused = wait_for([&] { return text_of(P5 + L"\\progress.txt").find("paused: game running (texpack-fakegame.exe is running)") != std::string::npos; }, 20000);
+			std::string what;
+			const bool gone = child_gone(fake_log, what);
+			const std::string progress = text_of(P5 + L"\\progress.txt");
+			check(upscaling && paused && gone && progress.find("state: paused") != std::string::npos,
+				"the game started mid-batch: the upscaler ended (" + what + "), progress.txt says paused: game running");
+			Sleep(1000);
+			check(WaitForSingleObject(s.process, 0) == WAIT_TIMEOUT, "make waits while the game runs");
+			finish(game, 0);
+			const auto closed = GetTickCount64();
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
+			const int c = finish(s, 120000);
+			const double after = double(GetTickCount64() - closed) / 1000;
+			out = text_of(mw + L"\\make.out");
+			std::shared_ptr<const pk::index> p5 = load(P5);
+			char text[64];
+			std::snprintf(text, sizeof(text), "%.1f s", after);
+			check(c == 0 && after >= 2.0 && out.find("The game has been closed for 2 s: going on.") != std::string::npos && p5 && same_entries(*p1, *p5),
+				"the game closed: make went on after the quiet time (done " + std::string(text) + " later), that batch made again: the same pack as one run");
+			// (--no-wait: the game running at the start stops it with exit 4, as convert)
+			game = start(game_exe, L"", L"");
+			wait_for([&] { return alive(game.pid); }, 2000);
+			code = make_run(mw + L"\\P6", "--no-wait", out, 30000);
+			finish(game, 0);
+			check(code == 4 && out.find("texpack-fakegame.exe is running") != std::string::npos, "--no-wait with the game running: exit 4 (" + line_with(out, "Stopped") + ")");
+		}
+
+		// An upscaler that hangs is ended after --stall-s; one that fails stops make
+		{
+			DeleteFileW(fake_log.c_str());
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", L"hang");
+			code = make_run(mw + L"\\P7", "--stall-s 2 --only ROM3\\5\\110.DAT", out, 60000);
+			std::string what;
+			const bool gone = child_gone(fake_log, what);
+			check(code == 1 && out.find("the upscaler stalled") != std::string::npos && gone, "a hung upscaler: ended after --stall-s, exit 1 (" + what + ")");
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", L"fail");
+			code = make_run(mw + L"\\P7", "--only ROM3\\5\\110.DAT", out, 60000);
+			check(code == 1 && out.find("the upscaler failed") != std::string::npos && out.find("exited with code 3") != std::string::npos,
+				"a failing upscaler: exit 1, its exit code said (" + line_with(out, "upscaler failed") + ")");
+			SetEnvironmentVariableW(L"FAKE_ESRGAN_MODE", nullptr);
+		}
+		SetEnvironmentVariableW(L"PATH", old_path);
+	}
+}
+
+int main(int argc, char **argv)
 {
 	wchar_t exe[MAX_PATH];
 	GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -369,6 +1008,14 @@ int main()
 	root = root.substr(0, root.find_last_of(L'\\'));
 	tool = root + L"\\build\\hifixi-texpack.exe";
 	work = root + L"\\build\\test\\texpack";
+	// (texpack_test make: only make's tests, no convert pack to compare the models' tags with)
+	if (argc > 1 && std::string(argv[1]) == "make")
+	{
+		make_folders(work);
+		make_tests(nullptr);
+		std::printf("texpack_test: %d passed, %d failed\n", passes, failures);
+		return failures;
+	}
 	if (GetFileAttributesW((kFFXI + L"\\" + wide(kGiddeus)).c_str()) == INVALID_FILE_ATTRIBUTES ||
 		GetFileAttributesW((kOverlay + L"\\" + wide(kGiddeus)).c_str()) == INVALID_FILE_ATTRIBUTES)
 	{
@@ -900,6 +1547,9 @@ int main()
 				out.find("SOUL FAIL '" + name_y + "'") != std::string::npos && out.find(", 0 bad") != std::string::npos,
 			"verify --soul: two entries' maps swapped (records sound): exactly those two fail (" + line_with(out, "SOUL FAIL") + ")");
 	}
+
+	// ---- make (M7)
+	make_tests(a);
 
 	std::printf("texpack_test: %d passed, %d failed\n", passes, failures);
 	return failures;

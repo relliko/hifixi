@@ -80,9 +80,9 @@ They're kept in the `bootloader` folder (`worldfx-grass\` and the others).
 
 ## Texture pack (optional)
 
-A texture pack is a folder of sharper, higher-resolution copies of the game's textures, made from your own game's files. HiFi XI doesn't come with one and never downloads one: nothing of the game's data ships with it. If you don't have a pack, there is nothing to do and nothing changes: HiFi XI looks exactly as it does without this section, and the menu doesn't show the setting at all.
+A texture pack is a folder of sharper, higher-resolution copies of the game's textures, made from your own game's files. HiFi XI doesn't come with one and never downloads one: nothing of the game's data ships with it. If you don't have a pack, there is nothing to do and nothing changes: HiFi XI looks exactly as it does without this section, and the menu's **Texture pack** section only says how to get one.
 
-**Getting one.** HiFi XI doesn't make texture packs. If you already have one, put it in `bootloader\hifixi-pack`.
+**Getting one.** You can use a pack you already have: put it in `bootloader\hifixi-pack`. Or make one on your own PC, from your own game's files, with [hifixi-enhanced-textures](https://github.com/relliko/hifixi-enhanced-textures), a separate tool that writes it into that folder. While it works, the menu shows how far it has got and about how long is left (it pauses while the game is running).
 
 **With a pack.** Put the `hifixi-pack` folder in your `bootloader` folder (`bootloader\hifixi-pack\pack.idx` and the `pack-000.bin`... files beside it). The menu's **The game's own** tab then shows **Use the texture pack** (off by default) and what it found. Turned on:
 
