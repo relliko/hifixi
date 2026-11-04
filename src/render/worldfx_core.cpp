@@ -271,6 +271,7 @@ namespace
 		// (whether there were some at the last draw, when that was last logged, and the zone whose were logged)
 		bool people = true;
 		ULONGLONG people_logged_at = 0;
+		bool people_none_logged = false; // (the last line said none: the next "back" is always logged)
 		uint32_t people_zone_logged = 0xFFFFFFFFu;
 
 		// Rings on the water from them moving through it. Where the zone's water is: its surface's y in each
@@ -1650,7 +1651,7 @@ namespace
 	// fading out as the next one nears, so none pops in or out. The glows join them (their own strength settings;
 	// an effect's within kGlowByLamp of a lit lamp left out). Fills g.lamp_upload (8 floats each: x, y, z, reach,
 	// colour x strength, 1 when it casts lamp shadows: the zone's lights do, glows don't); returns how many.
-	// Into ReShade.log (mutex held): when the characters from the Ashita addon stop coming or come again (lamp shadows
+	// Into the log (mutex held): when the characters from the game's feed (game/feed.cpp) stop coming or come again (lamp shadows
 	// go and come with them; at most once in 10 s), and once a zone, 3 s after the game says a character is in, how many
 	// came and how far the nearest stands from the camera: a character sent where the game doesn't draw it shows there
 	void log_people(const grass::camera &cam, bool people)
@@ -1659,11 +1660,14 @@ namespace
 		if (people != g.people)
 		{
 			g.people = people;
-			if (now - g.people_logged_at >= 10000)
+			// (at most once in 10 s, but a "back" after a "none" always: a zone-in's first second of none, then none
+			// logged since, read as lamp shadows off all session, 2026-11-04)
+			if (now - g.people_logged_at >= 10000 || (people && g.people_none_logged))
 			{
 				g.people_logged_at = now;
-				log_message(0, people ? "FFXI World FX: characters from the worldfx addon again: lamp shadows back on"
-					: "FFXI World FX: no characters from the worldfx addon (none sent, or none for half a second): no lamp shadows until there are");
+				g.people_none_logged = !people;
+				log_message(0, people ? "FFXI World FX: characters near again (the game's feed): lamp shadows back on"
+					: "FFXI World FX: no characters near from the game's feed (none sent, or none for half a second): no lamp shadows until there are");
 			}
 		}
 		if (g.zone == g.people_zone_logged || !g.in_game || now - g.in_game_since < 3000)
@@ -1671,7 +1675,7 @@ namespace
 		g.people_zone_logged = g.zone;
 		char text[160];
 		if (!people)
-			std::snprintf(text, sizeof(text), "FFXI World FX: zone %u: no characters from the worldfx addon (no lamp shadows)", g.zone);
+			std::snprintf(text, sizeof(text), "FFXI World FX: zone %u: no characters near from the game's feed yet (no lamp shadows till there are)", g.zone);
 		else
 		{
 			float eye[3];
@@ -1984,9 +1988,9 @@ namespace
 		g.look.ripple_count = ripples_for_drawing(GetTickCount64());
 		g.look.lamps = g.lamp_upload;
 		g.look.lamp_count = pick_lamps(cam);
-		// Lamp shadows need the characters near (the Ashita addon's): the march leaves them out, and without them it
+		// Lamp shadows need the characters near (the game's feed: game/feed.cpp): the march leaves them out, and without them it
 		// laid a stepped copy of a character's silhouette away from the lamp (a Jeuno Mog House, 2026-10-21). So none
-		// while the addon sends no one (log_people says so in ReShade.log)
+		// while the feed sends no one (log_people says so in the log)
 		const bool people = fresh && g.actor_count > 0;
 		g.look.lamp_shadows = people ? g.lamp_shadows : 0.0f;
 		log_people(cam, people);
