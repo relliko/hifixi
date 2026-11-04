@@ -189,7 +189,10 @@ namespace hifi::chars::cache
 
 			// The texture pack's part (the game's thread; the worker only pushes onto the asks' list)
 			uint32_t next_serial = 0;
-			bool pack_on = false;                              // (set_pack_on)
+			// (set_detail turned on: the textures added before, serial redetail_below and under, made again with a detail map)
+			bool redetail = false;
+			uint32_t redetail_below = 0;
+			bool pack_on = false;                             // (set_pack_on)
 			std::vector<std::pair<uint32_t, uint32_t>> pack_asks; // (id, serial: textures to ask the pack for)
 			std::unordered_map<uint32_t, uint32_t> pack_by_ticket; // (a held ticket's slot -> its texture)
 			double pack_now = 0.0;
@@ -1100,6 +1103,39 @@ namespace hifi::chars::cache
 			for (uint32_t i = 0; i < g.textures.size(); ++i)
 				if (g.textures[i] && now - g.textures[i]->seen > kForgetSeconds && forgettable(g.textures[i]->s))
 					forget_texture(i);
+			// Detail maps just turned on: the textures known before let go, each with every mesh that names it (a mesh
+			// holds its textures' ids, and ids are reused). One the worker holds waits, and keeps its textures this time
+			if (g.redetail)
+			{
+				const auto stale = [](uint32_t t) {
+					return t != kNone && t < g.textures.size() && g.textures[t] && g.textures[t]->serial <= g.redetail_below;
+				};
+				bool left = false;
+				std::vector<uint32_t> kept;
+				for (uint32_t i = 0; i < g.meshes.size(); ++i)
+					if (g.meshes[i] && std::any_of(g.meshes[i]->textures.begin(), g.meshes[i]->textures.end(), stale))
+					{
+						if (forgettable(g.meshes[i]->s))
+							forget_mesh(i);
+						else
+						{
+							left = true;
+							kept.insert(kept.end(), g.meshes[i]->textures.begin(), g.meshes[i]->textures.end());
+						}
+					}
+				for (uint32_t i = 0; i < g.textures.size(); ++i)
+					if (stale(i))
+					{
+						if (forgettable(g.textures[i]->s) && std::find(kept.begin(), kept.end(), i) == kept.end())
+						{
+							forget_texture(i);
+							g.n.detail_redone++;
+						}
+						else
+							left = true;
+					}
+				g.redetail = left;
+			}
 			if (g.n.forgotten != forgotten)
 			{
 				g.held = false; // (decoded ones let go make room in the batch for those held back)
@@ -1114,7 +1150,14 @@ namespace hifi::chars::cache
 
 	void set_detail(bool on)
 	{
-		g_detail.store(on);
+		// (turned on: the textures already known have none, made only as they're decoded; frame_tick lets them go, and
+		// their meshes, and the game's thread copies both again at the next draw. Off needs nothing: the shader's flag)
+		if (g_detail.exchange(on) != on && on)
+		{
+			std::lock_guard<std::mutex> lock(g.mutex);
+			g.redetail = g.next_serial != 0;
+			g.redetail_below = g.next_serial;
+		}
 	}
 
 	void publish_palettes(const frame &f, uint32_t from, uint32_t to)

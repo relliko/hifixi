@@ -103,11 +103,11 @@ The +2 rule (src/host/retire.hpp)
   never freed under it, and a `then` closure is left unrun (src/host/retire.hpp:195).
 - Users: zone slots (src/zone/native.cpp:66), model-actor DATs (src/zone/actordata.cpp:69, from :112 and :141), effect textures and
   upload buffers (src/fx/fxtextures.cpp:196, :350), effect distortion targets (src/fx/fxrender.cpp:494), character
-  objects (src/chars/cache.cpp:222-223, :1721-1726), and the characters' descriptor pairs through `retire::then`
-  (src/chars/cache.cpp:224-233): a pair let go goes back to `free_slots` only behind the fence, and only while
+  objects (src/chars/cache.cpp:225-226, :1764-1769), and the characters' descriptor pairs through `retire::then`
+  (src/chars/cache.cpp:227-236): a pair let go goes back to `free_slots` only behind the fence, and only while
   `heap_generation` still matches (`make_gpu` and `stop()` make `free_slots` again for a new heap, so a late pair from
   the last heap would otherwise be handed out twice). The characters' texture pack tickets go the same way: `bury`
-  hands them to the drop hook (`stream::drop`, src/chars/cache.cpp:218-220) beside the pairs, and the streamer hands a
+  hands them to the drop hook (`stream::drop`, src/chars/cache.cpp:221-223) beside the pairs, and the streamer hands a
   texture to `retire::later` at its last ticket's drop.
 - retire.hpp covers the game's direct queue only. Anything that ran on another queue must already be finished (CPU
   wait or fence check) before it is handed to `retire::later`.
@@ -134,13 +134,13 @@ The zone's copy queue (src/zone/zone_gpu.cpp)
 
 The characters' cache worker (src/chars/cache.cpp)
 
-- Its own copy queue, allocator, list and fence (src/chars/cache.cpp:340-371), used from the worker thread only.
-- Every batch waits for its fence, at most 10 s (src/chars/cache.cpp:596-612). Only after that are entries marked
-  ready for the game thread, and the allocator is reset only at the start of the next batch (src/chars/cache.cpp:563).
+- Its own copy queue, allocator, list and fence (src/chars/cache.cpp:343-374), used from the worker thread only.
+- Every batch waits for its fence, at most 10 s (src/chars/cache.cpp:599-615). Only after that are entries marked
+  ready for the game thread, and the allocator is reset only at the start of the next batch (src/chars/cache.cpp:566).
 - A batch is at most `kBatchBytes` of upload bytes (one entry bigger than that goes alone), and the worker holds at
   most one batch's textures decoded (`cache.hpp` `kBatchBytes`, `kEntryCap`): that bounds the upload buffer and the
   CPU copies in the game's 32-bit memory, not any GPU lifetime.
-- When the device goes, the queue and fence go through `retire::later` (`stop()`, src/chars/cache.cpp:1840-1845). That is safe
+- When the device goes, the queue and fence go through `retire::later` (`stop()`, src/chars/cache.cpp:1883-1888). That is safe
   because nothing is left running on the copy queue.
 
 The texture pack's streamer (src/pack/stream.cpp; docs/texture-pack/streamer.md; started by the module
@@ -162,16 +162,16 @@ src/pack/pack_module.cpp, docs/texture-pack/zones.md)
 - The characters' glue (src/chars/charpack.cpp, docs/texture-pack/characters.md "When tickets are read") reads its
   tickets there too (`take_done`, :309) and writes the pack pairs' views (:173, :179) before the cache marks them ready.
   Since M9 a texture may hold two tickets (its colour and its height, characters.md "Pack relief"): both kept by the
-  same entry and let go together (`release_pack`, src/chars/cache.cpp:283: each to the drop hook from `bury`), so the
+  same entry and let go together (`release_pack`, src/chars/cache.cpp:286: each to the drop hook from `bury`), so the
   rules below hold for each.
   The game's thread records a character with a pack pair only while its texture reads ready (`texture_view_of`,
-  src/chars/cache.cpp:1166), and nothing of the streamer's is read at record time. The ticket keeps its texture until
+  src/chars/cache.cpp:1209), and nothing of the streamer's is read at record time. The ticket keeps its texture until
   it's dropped; the drop (from `bury`, the game's thread or, for textures no list was recorded with since, the cache's
   worker) and the pair's `retire::then` both land at `signalled + 2`, behind every list recorded before. An epoch
   change is preceded by the characters' `clear_all` (`cache::forget_pack_textures`: every ticket dropped, every pair
   let go, the game's textures kept) as for the zones. charinject_test turns it off between a frame's recording and
   its run 50 times (with copies held on the GPU every fifth time): each frame as recorded, 0 messages under GPU-based
-  validation. Eviction under the streamer's pressure (`cache::pack_evict`, src/chars/cache.cpp:1622-1657, from the
+  validation. Eviction under the streamer's pressure (`cache::pack_evict`, src/chars/cache.cpp:1665-1700, from the
   glue's frame, src/chars/charpack.cpp:94) lets go the same way (`release_pack`: the pair to `retire::then`, the
   ticket to the drop hook, both from `bury` once the mutex is left), so a list recorded with an evicted pair before
   the eviction still runs with its view and texture; charinject_test evicts every texture between a frame's

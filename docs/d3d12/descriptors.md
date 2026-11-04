@@ -96,29 +96,29 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
 
 **Plugin passes with their own heaps** (each switches away from the d3d8 heaps and must hand them back):
 
-- Characters: `src/chars/cache.cpp:352-360` one shader-visible heap of `kDescriptors` 16384 (`cache.hpp:41`), the
-  last `kReserved` 4 for the renderer's own targets (`cache.hpp:103`, `cache.cpp:1191`). A forgotten pair's slots go
-  back to `free_slots` only behind the game queue's fence (`retire::then`, `cache.cpp:224-233`), never into a heap made
+- Characters: `src/chars/cache.cpp:355-363` one shader-visible heap of `kDescriptors` 16384 (`cache.hpp:41`), the
+  last `kReserved` 4 for the renderer's own targets (`cache.hpp:103`, `cache.cpp:1234`). A forgotten pair's slots go
+  back to `free_slots` only behind the game queue's fence (`retire::then`, `cache.cpp:227-236`), never into a heap made
   since (`heap_generation`). Bound in `chardraw.cpp:1720`,
   `1933`, `1957`, `1985`, `2285`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1487`) and 1 for the aura
   (`chardraw.cpp:2160`).
 - The characters' texture pack pairs (docs/texture-pack/characters.md): a texture on the GPU may hold a second pair
   from the same `free_slots`, the pack's view of it. Taken only for a ticket `take_done` handed over ready
-  (`pack_settle`, `cache.cpp:1448`, :1500), and only while more than `kPackSlotFloor` 1,024 pairs are free (:1489; asks
+  (`pack_settle`, `cache.cpp:1491`, :1500), and only while more than `kPackSlotFloor` 1,024 pairs are free (:1489; asks
   are held then too, :1363, and never more are asked than the pairs over it less those on their way, :1370-1383): the meshes and the game's own textures always find one. Written once, on the game's
   thread, with the cache's mutex left (`src/chars/charpack.cpp:178-190`): descriptor `2s` is `stream::write_view` of the
   ticket (BC2, its levels), `2s + 1` a **new view** of the game texture's detail map (`write_pack_detail`,
-  `cache.cpp:1549-1584`, its `MipLevels` from the resource's desc) or the null view the game's pair has. Never a
+  `cache.cpp:1592-1627`, its `MipLevels` from the resource's desc) or the null view the game's pair has. Never a
   `CopyDescriptors` from the game's pair: the cache's heap is shader visible, so it can't be a copy's source (the rule
   above). Since M9 (characters.md "Pack relief") a texture asked with a height has two tickets, and its pair is taken
-  only once both are settled (`pack_settle`, `cache.cpp:1448`; `pack_begin` is its colour-only case): `2s + 1` is then
+  only once both are settled (`pack_settle`, `cache.cpp:1491`; `pack_begin` is its colour-only case): `2s + 1` is then
   `stream::write_view` of the height ticket (BC4, its whole chain; `src/chars/charpack.cpp:187`) in the detail map's
   place, and when the pack has no colour for it (a height alone) `2s` is a new view of the game's own texture
   (`write_pack_detail` again, its `MipLevels` from the resource's desc; the texture AddRef'd under the mutex,
-  `cache.cpp:1524`), never a copy either. Still one pair, written once; the draw says which it holds by flags 4 (below).
+  `cache.cpp:1567`), never a copy either. Still one pair, written once; the draw says which it holds by flags 4 (below).
   Only then does the state say ready (`pack_end`, :1586), and only a ready pair is handed out
   (`texture_view_of`, :1166; the shadow casters ask with the pack refused, `chardraw.cpp:1999`; counted, `char_stats::pack_draws`: charinject_test checks the casters draw none). Let go like a game
-  pair (`release_pack`, `cache.cpp:283`, both tickets with it): behind the fence, never into a heap made since. charcache_test lets 1,000
+  pair (`release_pack`, `cache.cpp:286`, both tickets with it): behind the fence, never into a heap made since. charcache_test lets 1,000
   textures go while upgrading, between `pack_begin` and `pack_end` too, and finds no pair twice and none free before
   the fence. Table 5's layout and root signature 1 are unchanged by M9: a pair whose `2s + 1` is the height is drawn
   with draw-constant flags 4 and the relief scale in the composite's word (dc[5], unused and 0 in a model's draw until

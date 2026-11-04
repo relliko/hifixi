@@ -123,6 +123,8 @@ namespace hifi::chars::cache
 		// Textures on the GPU with a detail map, textures decoded without one while it's on (it would have taken them
 		// over kEntryCap); meshes left to the game for good (a texture of theirs couldn't be read)
 		uint32_t detail_textures = 0, detail_skipped = 0, meshes_left_failed = 0;
+		// (in all: textures let go to be made again with a detail map, as they were turned on: set_detail)
+		uint32_t detail_redone = 0;
 		// Descriptor pairs free, and let go but not given back yet (lists in flight may still read them: retire::then)
 		uint32_t slots_free = 0, slots_retiring = 0;
 		// The texture pack's part. Now: textures on the GPU with a key, with the pack's view ready (and its view bytes),

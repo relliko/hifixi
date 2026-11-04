@@ -1150,7 +1150,7 @@ public:
 			hifi::game::set_option_on("chars", "detail", on);
 			follow_nativechars();
 			say(on ? (hifi::game::option_on("chars", "perpixel", hifi::chars::options::kPerPixelByDefault)
-				? "Character detail maps on: relief, metal's shine and cavities guessed from each texture (for those loaded from now on: change area to see them on everyone)."
+				? "Character detail maps on: relief, metal's shine and cavities guessed from each texture (the characters on screen are loaded again for them: the game draws them for a moment meanwhile)."
 				: "Character detail maps on, but they need per-pixel lighting (/hifi nativechars perpixel on).")
 				: "Character detail maps off.");
 		}

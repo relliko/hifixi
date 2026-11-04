@@ -137,7 +137,7 @@ Breadcrumbs:
 - The characters' pack textures add nothing to the hang report (the streamer's lines above already say what it reads
   and copies, and the characters' pairs aren't bound at a breadcrumb of their own). `/hifi status` has their line
   ("character data: texture pack: N ready (M MB), A asked, S not in it, F failed, G gone, E evicted (...); K skipped
-  for want of descriptors (W waiting); P pairs for pack views; T tickets let go", `src/chars/cache.cpp:1255-1259`
+  for want of descriptors (W waiting); P pairs for pack views; T tickets let go", `src/chars/cache.cpp:1298-1302`
   `status`; the menu's "Characters:" line from `src/chars/charpack.cpp` `lines`): run the same build with the pack off, or
   `[textures] chars=0`, to tell a character pass hang that follows the pack from one that doesn't.
 - The debug layer costs address space of its own per object: 1,000 pack textures took 16.5 MB of address space with

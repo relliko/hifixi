@@ -14,7 +14,9 @@
  *     be over kEntryCap is on the GPU without one; a mesh naming a texture that can't be read isn't ready (left to the
  *     game) while one naming a ready texture is;
  *   - the pairs of descriptors let go wait for the GPU (retire::then): not free after the next present, free once the
- *     fence has passed two; let go before stop() never come back into the next heap (counted once the retire list is
+ *     fence has passed two;
+ *   - detail maps turned on with textures on the GPU without them: those let go at the next frame with the mesh naming
+ *     one (another mesh and a texture added after kept), and added again they come with their maps; let go before stop() never come back into the next heap (counted once the retire list is
  *     empty, so the last heap's closures have run);
  *   - the texture pack's part (docs/texture-pack/characters.md; the streamer on WARP, a made-up pack of 160 4x records
  *     under build\test\charcache, src/chars/charpack driven as the module drives it): with no glue, keys made and nothing
@@ -383,6 +385,37 @@ int main()
 	const int presents = presents_until_back(queue);
 	c = cache::get_counts();
 	check(presents > 0 && c.slots_free == kAllPairs && c.slots_retiring == 0, "  all free again " + std::to_string(presents + 1) + " presents on");
+
+	// Detail maps turned on with textures already on the GPU without them: let go at the next frame with the meshes that
+	// name them, one added after left alone; added again (as the game's thread does at the next draw), with their maps
+	cache::set_detail(false);
+	std::vector<uint32_t> before;
+	for (int i = 0; i < 3; ++i)
+		before.push_back(cache::add_texture(key_of(), chunk(256, 256, true)));
+	const uint32_t naming = cache::add_mesh(key_of(), std::vector<uint8_t>(mesh_bytes), 0, { before[0], cache::kNone });
+	const uint32_t bare = cache::add_mesh(key_of(), std::vector<uint8_t>(mesh_bytes), 0, { cache::kNone });
+	cache::settle(60000);
+	c = cache::get_counts();
+	check(c.textures_ready == 3 && c.detail_textures == 0 && cache::mesh_ready(naming) && cache::mesh_ready(bare),
+		"detail maps off: 3 textures and 2 meshes on the GPU, no maps (" + std::to_string(c.detail_textures) + ")");
+	cache::set_detail(true);
+	const uint32_t after = cache::add_texture(key_of(), chunk(256, 256, true));
+	cache::settle(60000);
+	const uint32_t redone0 = c.detail_redone;
+	cache::frame_tick(device, now);
+	c = cache::get_counts();
+	check(c.detail_redone - redone0 == 3 && c.textures == 1 && c.detail_textures == 1 && !cache::mesh_ready(naming) && cache::mesh_ready(bare) &&
+			cache::texture_view_of(after, view),
+		"  turned on: the 3 let go with the mesh naming one (" + std::to_string(c.detail_redone - redone0) + "), the other mesh and the one added after kept");
+	for (int i = 0; i < 3; ++i)
+		cache::add_texture(key_of(), chunk(256, 256, true));
+	cache::settle(60000);
+	cache::frame_tick(device, now);
+	c = cache::get_counts();
+	check(c.textures_ready == 4 && c.detail_textures == 4 && c.detail_redone - redone0 == 3, "  added again: all 4 with their maps, none let go twice");
+	now += cache::kForgetSeconds + 1.0;
+	cache::frame_tick(device, now);
+	check(presents_until_back(queue) > 0 && cache::get_counts().slots_free == kAllPairs, "  let go, every pair back");
 
 	// Let go before stop(): never into the next heap
 	for (int i = 0; i < 2; ++i)
