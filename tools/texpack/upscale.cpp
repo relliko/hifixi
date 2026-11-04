@@ -173,16 +173,25 @@ namespace hifi::texpack::upscale
 		return true;
 	}
 
-	std::string missing_files(const std::wstring &folder)
+	const model *find_model(const std::string &id)
+	{
+		for (const model &m : kModels)
+			if (id == m.id)
+				return &m;
+		return nullptr;
+	}
+
+	std::string missing_files(const std::wstring &folder, const wchar_t *model_name)
 	{
 		std::string missing;
-		for (const wchar_t *f : { L"realesrgan-ncnn-vulkan.exe", L"vcomp140.dll", L"models\\realesrgan-x4plus.param", L"models\\realesrgan-x4plus.bin" })
+		const std::wstring m = std::wstring(L"models\\") + model_name;
+		for (const std::wstring &f : { std::wstring(L"realesrgan-ncnn-vulkan.exe"), std::wstring(L"vcomp140.dll"), m + L".param", m + L".bin" })
 		{
 			const DWORD a = GetFileAttributesW((folder + L"\\" + f).c_str());
 			if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY) != 0)
 			{
-				char name[128];
-				std::snprintf(name, sizeof(name), "%ls", f);
+				char name[192];
+				std::snprintf(name, sizeof(name), "%ls", f.c_str());
 				missing += (missing.empty() ? "" : ", ") + std::string(name);
 			}
 		}
@@ -191,11 +200,11 @@ namespace hifi::texpack::upscale
 
 	namespace
 	{
-		uint32_t files_in(const std::wstring &folder)
+		uint32_t files_in(const std::wstring &folder, const std::wstring &pattern)
 		{
 			uint32_t n = 0;
 			WIN32_FIND_DATAW fd;
-			HANDLE f = FindFirstFileW((folder + L"\\*.png").c_str(), &fd);
+			HANDLE f = FindFirstFileW((folder + L"\\" + pattern).c_str(), &fd);
 			if (f == INVALID_HANDLE_VALUE)
 				return 0;
 			do
@@ -209,8 +218,15 @@ namespace hifi::texpack::upscale
 	end run(const run_options &o, std::string &why)
 	{
 		const std::wstring exe = o.folder + L"\\realesrgan-ncnn-vulkan.exe";
-		std::wstring cmd = L"\"" + exe + L"\" -i \"" + o.in + L"\" -o \"" + o.out + L"\" -n realesrgan-x4plus -m \"" + o.folder + L"\\models\" -f png";
+		const std::wstring cmd = L"\"" + exe + L"\" -i \"" + o.in + L"\" -o \"" + o.out + L"\" -n " + o.model + L" -m \"" + o.folder + L"\\models\" -s 4 -f png";
+		program_options po;
+		po.log = o.log, po.poll_s = o.poll_s, po.stall_s = o.stall_s, po.should_end = o.should_end;
+		po.watch = o.out, po.pattern = L"*.png";
+		return run_program(exe, cmd, o.folder, po, why);
+	}
 
+	end run_program(const std::wstring &exe, std::wstring cmd, const std::wstring &cwd, const program_options &o, std::string &why)
+	{
 		// (its console output to the log: the only handle it inherits)
 		SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
 		HANDLE log = o.log.empty() ? INVALID_HANDLE_VALUE
@@ -240,7 +256,7 @@ namespace hifi::texpack::upscale
 
 		PROCESS_INFORMATION pi = {};
 		const BOOL started = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-			CREATE_SUSPENDED | CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | (have_attrs ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr, o.folder.c_str(),
+			CREATE_SUSPENDED | CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | (have_attrs ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr, cwd.c_str(),
 			&si.StartupInfo, &pi);
 		const DWORD start_error = started ? 0 : GetLastError();
 		if (have_attrs)
@@ -282,7 +298,7 @@ namespace hifi::texpack::upscale
 					result = end::ended;
 					break;
 				}
-			const uint32_t n = files_in(o.out);
+			const uint32_t n = files_in(o.watch, o.pattern);
 			if (n != seen)
 				seen = n, last_new = std::chrono::steady_clock::now();
 			else if (std::chrono::duration<double>(std::chrono::steady_clock::now() - last_new).count() > o.stall_s)

@@ -177,6 +177,17 @@ texels averaged 2x2 and encoded again (`bc2::full_chain`), with alpha by the ent
 - **blended (2), mask (3), mixed (4), none (0)**: the plain 2x2 box. Rescaling would change transparency at a distance
   or the shine's strength (`kSpec*saturate(2*t.a)`).
 
+**BC7 colour (M8, `make --colour bc7`, its default).** The same chain, made on the 8-bit texels before any
+compression (`bc7::rgba_chain`, `tools\texpack\bc7.cpp`): level 0's alpha held to the original's own range
+(`alpha_lo`..`alpha_hi`: the upscale's Lanczos rings past it, and the game's alpha is raw, 0..0x80), each next level the
+last averaged 2x2, a cut-out's alpha scaled per level as above but on 8-bit alpha (BC7 keeps it) and never past
+`alpha_hi`. Each texture's levels are written as an `R8G8B8A8_UNORM` DDS with those mips and compressed to
+`BC7_UNORM` by Microsoft's `texconv.exe` (DirectXTex), which keeps a DDS's own mips when given no `-m`; make reads
+the result back and refuses a file whose size, format or level count isn't ours. BC7's alpha error is up to 4 levels
+past the original's range at sharp edges (BC2's own 4-bit alpha is up to 8 off) and flips fewer alpha tests than BC2
+(0.027% of texels against 0.063%: docs/texture-pack/upscaler.md "BC7"). The reader and streamer took `BC7_UNORM` from
+v1 on: a BC7 pack is a v1 pack (header version 1, flags 1), read by HiFi XI 0.67 as it is.
+
 ## Rules
 
 **A pack that can't be used** (`pack::load`): nothing of it is read, and the reason is the status ("pack can't be
@@ -245,8 +256,11 @@ has the details):
   fetched by `get-upscaler`: docs/texture-pack/upscaler.md), zones 2x and models 4x, keyed and tagged as `convert` does,
   each passing the soul test, keys already in the pack skipped before upscaling, unless the DAT being done again
   (`--redo`, say with another factor, or a `convert` pack's line) made that entry: then it is made again and replaces it, as
-  `convert` does. `source` is `texpack make 2`, the
-  maker version 2, so `convert` and `make` each redo the other's `pack.src` lines. Resumable, stopped by `stop`; while
+  `convert` does. Since M8 `source` is `texpack make 3 <model> <colour>` (`texpack make 3 hdcube bc7`) and the
+  maker version `300 + 10 * model + colour` (model 0 x4plus, 1 HDCube; colour 0 BC2, 1 BC7: 311 by default), so
+  `convert` and `make` each redo the other's `pack.src` lines, and `make` with another model or colour format
+  (`--upscaler-model`, `--colour`, or BC2 because `texconv.exe` was missing) makes a DAT again and replaces its own
+  entries. M7's packs (maker 2) are made again by M8's make. Resumable, stopped by `stop`; while
   the game runs it waits (progress.txt `state: paused`).
 - `verify [--soul]`: every record and level CRC read back; the soul test against the originals.
 - `stats [--scan]`; `prune` (drops entries no DAT of `pack.src` has any more, takes out the lines of DATs gone or

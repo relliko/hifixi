@@ -18,9 +18,13 @@
 //     made once; the first DAT's file id and chunk are the entry's). A key whose entry this DAT's chunk made (the DAT
 //     done again: --redo, say with another factor, or a convert pack's line) is made again and replaces it. Each texture: decoded (chars tex), wrapped by 8,
 //     written as a PNG; the upscaler run on the batch's folder (upscale.hpp: a child in a job object, below-normal
-//     priority); cropped, Lanczos'd for 2x and for the alpha; keeptexels (8 rounds, EDGE 24, GRAIN 2); BC2; the soul
-//     test against the original (convert's limits: over them, left out); coverage mips by alpha kind (tags from the
-//     zone meshes and Os2, as convert); appended. Then the batch's DATs go into pack.src at a commit.
+//     priority; -n the model, --upscaler-model hdcube by default since M8); cropped, Lanczos'd for 2x and for the
+//     alpha; keeptexels (8 rounds, EDGE 24, GRAIN 2); BC2; the soul test against the original (convert's limits: over
+//     them, left out); coverage mips by alpha kind (tags from the zone meshes and Os2, as convert); appended. Then the
+//     batch's DATs go into pack.src at a commit. BC7 (M8, --colour bc7, the default when texconv.exe is there): after
+//     keeptexels our coverage mips as RGBA8 (bc7::rgba_chain) written as DDS files, texconv on the batch as a child
+//     like the upscaler (the game and the stop file end it the same way), the BC7 files read back (size, format and
+//     level count checked), the soul test on the BC7 level 0. The maker version (make_maker) says model and colour.
 //   - Resume from pack.src (a DAT whose size, time and maker version match is skipped; --redo does them again), a stop
 //     file in the pack's folder (also ends the upscaler), progress.txt ("key: value" lines, with a plain summary),
 //     texpack.log, pack.lock, below-normal priority, and a free-space check (20 GB plus its estimate). The batch's
@@ -34,6 +38,7 @@
 #include "image_io.hpp"
 #include "keeptexels.hpp"
 #include "upscale.hpp"
+#include "bc7.hpp"
 #include "../../src/pack/pack_write.hpp"
 #include "../../src/pack/bc2.hpp"
 #include "../../src/pack/hash.hpp"
@@ -264,7 +269,8 @@ namespace hifi::texpack
 			uint32_t same = 0, differs = 0, add_refused = 0, replaced = 0, batches = 0, pauses = 0;
 			uint32_t by_kind[5] = {};
 			uint64_t texels_in = 0, texels_out = 0;
-			double upscaler_s = 0, cpu_s = 0, waited_s = 0;
+			double upscaler_s = 0, cpu_s = 0, waited_s = 0, texconv_s = 0;
+			uint64_t upscaled_texels = 0, upscaled_out = 0; // (original and made texels the upscaler and texconv ran on: the batches' that finished)
 		};
 
 		std::string duration(double s)
@@ -318,12 +324,37 @@ namespace hifi::texpack
 		if (!find_folders(o, true, false, nullptr))
 			return kFailed;
 		o.upscaler = no_slash(o.upscaler.empty() ? exe_folder() + L"\\upscaler" : o.upscaler);
-		if (const std::string missing = upscale::missing_files(o.upscaler); !missing.empty())
+		const upscale::model *model = upscale::find_model(o.upscaler_model);
+		if (model == nullptr)
+		{
+			say("--upscaler-model is hdcube or x4plus.");
+			return kUsage;
+		}
+		// (HDCube ships beside the tool: put into the upscaler's models\ when the program is there and the model isn't)
+		std::string hd_why;
+		if (model->number == 1 && is_file(o.upscaler + L"\\realesrgan-ncnn-vulkan.exe") && !upscale::missing_files(o.upscaler, model->name).empty() &&
+			!place_hdcube(o.upscaler, hd_why))
+		{
+			say("The HDCube model isn't in %s\\models and can't be put there: %s. Unpack the tool's zip again, or run make with --upscaler-model x4plus.",
+				narrow(o.upscaler).c_str(), hd_why.c_str());
+			return kFailed;
+		}
+		if (const std::string missing = upscale::missing_files(o.upscaler, model->name); !missing.empty())
 		{
 			say("The upscaler isn't in %s (%s missing): run \"hifixi-texpack get-upscaler\" first (or give its folder with --upscaler).", narrow(o.upscaler).c_str(),
 				missing.c_str());
 			return kFailed;
 		}
+		// The colour: BC7 by texconv.exe (beside this tool, or --texconv), else BC2, said
+		bool bc7 = o.colour == "bc7";
+		if (bc7)
+		{
+			if (o.texconv.empty())
+				o.texconv = exe_folder() + L"\\texconv.exe";
+			if (!is_file(o.texconv))
+				bc7 = false;
+		}
+		const uint32_t maker = make_maker(model->number, bc7);
 		std::string why;
 		if (!load_key_tables(o.ffximain.empty() ? o.ffxi + L"\\FFXiMain.dll" : o.ffximain, why))
 		{
@@ -342,8 +373,8 @@ namespace hifi::texpack
 		pk::writer w;
 		pk::writer_options wo;
 		wo.folder = out;
-		wo.maker_version = kMakeVersion;
-		wo.source = "texpack make " + std::to_string(kMakeVersion);
+		wo.maker_version = maker;
+		wo.source = "texpack make " + std::to_string(kMakeVersion) + " " + model->id + (bc7 ? " bc7" : " bc2");
 		wo.client = pk::client_fingerprint(o.ffxi);
 		if (!w.open(wo, why))
 		{
@@ -351,8 +382,13 @@ namespace hifi::texpack
 			return kFailed;
 		}
 		g_log = open_log((out + L"texpack.log").c_str());
-		say("---- texpack make, maker version %u: %s -> %s (upscaler %s; zones %ux, models %ux)", kMakeVersion, narrow(o.ffxi).c_str(), narrow(out).c_str(),
-			narrow(o.upscaler).c_str(), o.zone_factor, o.model_factor);
+		say("---- texpack make, maker version %u: %s -> %s (upscaler %s, model %s; colour %s%s%s; zones %ux, models %ux)", maker, narrow(o.ffxi).c_str(),
+			narrow(out).c_str(), narrow(o.upscaler).c_str(), model->id, bc7 ? "BC7 by " : "BC2", bc7 ? narrow(o.texconv).c_str() : "",
+			!bc7 && o.colour == "bc7" ? " (texconv.exe missing)" : "", o.zone_factor, o.model_factor);
+		if (!bc7 && o.colour == "bc7")
+			say("texconv.exe isn't at %s (it comes in the tool's zip): BC2 colour this run, not BC7. Put texconv.exe back and run make again: the DATs "
+				"made in BC2 are then made again in BC7 (--colour bc2 asks for BC2 and stops this line).",
+				narrow(o.texconv).c_str());
 
 		const auto start = std::chrono::steady_clock::now();
 		counts n;
@@ -367,6 +403,8 @@ namespace hifi::texpack
 			std::snprintf(text, sizeof(text),
 				"texpack make (maker version %u): %s\r\n"
 				"summary: %zu of %zu DATs done%s%s\r\n"
+				"upscaler_model: %s\r\n"
+				"colour: %s\r\n"
 				"state: %s\r\n"
 				"phase: %s\r\n"
 				"paused: %s\r\n"
@@ -382,8 +420,8 @@ namespace hifi::texpack
 				"elapsed_s: %.0f\r\n"
 				"waited_s: %.0f\r\n"
 				"last: %s\r\n",
-				kMakeVersion, state, done_dats + done_before, total, eta >= 0 ? ("; about " + duration(eta) + " to go").c_str() : "",
-				paused.empty() ? "" : ("; paused: " + paused).c_str(), state, phase.c_str(), paused.empty() ? "-" : paused.c_str(), done_dats + done_before, total,
+				maker, state, done_dats + done_before, total, eta >= 0 ? ("; about " + duration(eta) + " to go").c_str() : "",
+				paused.empty() ? "" : ("; paused: " + paused).c_str(), model->id, bc7 ? "bc7" : o.colour == "bc7" ? "bc2 (texconv.exe missing)" : "bc2", state, phase.c_str(), paused.empty() ? "-" : paused.c_str(), done_dats + done_before, total,
 				done_before, eta, n.made, n.deduped, n.soul_failed, w.entries().size(), gb(w.stats().bytes), seconds_since(start), n.waited_s, last.c_str());
 			pk::write_progress(out, text);
 		};
@@ -785,6 +823,7 @@ namespace hifi::texpack
 				phase = std::string(batch_name) + ": upscaling " + std::to_string(jobs.size()) + " textures (" + std::to_string(texels / 1000) + " k texels)";
 				progress("running");
 				upscale::run_options ro;
+				ro.model = model->name;
 				ro.folder = o.upscaler, ro.in = in_dir, ro.out = out_dir, ro.log = work + L"\\upscaler.txt";
 				ro.poll_s = o.game_poll_s, ro.stall_s = o.stall_s;
 				bool stopped = false;
@@ -832,9 +871,130 @@ namespace hifi::texpack
 					code = kFailed;
 					break;
 				}
+				else if (bc7)
+				{
+					// BC7: our mips as RGBA8 DDS files, texconv on the batch, read back, the soul test on what it made
+					// (the upscaler's time and texels are counted once texconv is done: a batch texconv ends is done again)
+					phase = std::string(batch_name) + ": keeping the texels, mips";
+					progress("running");
+					const std::wstring dds_in = work + L"\\dds-in", dds_out = work + L"\\dds-out", list = work + L"\\dds-list.txt";
+					CreateDirectoryW(dds_in.c_str(), nullptr);
+					CreateDirectoryW(dds_out.c_str(), nullptr);
+					auto cpu_began = std::chrono::steady_clock::now();
+					std::vector<uint32_t> chain(jobs.size(), 0);
+					parallel(o.threads, jobs.size(), [&](size_t i) {
+						job &j = jobs[i];
+						image::picture p;
+						std::string w3;
+						std::vector<uint8_t> up;
+						if (!image::read(out_dir + L"\\" + std::to_wstring(i) + L".png", p, w3) || !upscale::finish(j.rgba.data(), j.w, j.h, p.px.data(), p.w, p.h, j.factor, up, w3))
+						{
+							j.no_picture = true;
+							j.why = w3;
+							return;
+						}
+						const uint32_t W = j.w * j.factor, H = j.h * j.factor;
+						keeptexels::apply(j.rgba.data(), j.w, j.h, up.data(), W, H);
+						const std::vector<std::vector<uint8_t>> levels = bc7::rgba_chain(std::move(up), W, H, j.e.alpha_kind, j.threshold, j.e.alpha_lo, j.e.alpha_hi);
+						if (levels.empty() || !bc7::write_rgba_dds(dds_in + L"\\" + std::to_wstring(i) + L".dds", levels, W, H, w3))
+						{
+							j.no_picture = true;
+							j.why = levels.empty() ? "no mips" : "its DDS " + w3;
+							return;
+						}
+						chain[i] = uint32_t(levels.size());
+					});
+					std::string lines;
+					for (size_t i = 0; i < jobs.size(); ++i)
+						if (chain[i] != 0)
+							lines += "dds-in\\" + std::to_string(i) + ".dds\r\n"; // (relative to texconv's cwd, the batch's folder: texconv reads the list without UTF-8, so a non-ASCII pack folder would fail every batch)
+					n.cpu_s += seconds_since(cpu_began);
+					if (!bk::write_file(list, lines.data(), lines.size()))
+					{
+						say("Stopped: the batch's list for texconv can't be written (%s).", narrow(list).c_str());
+						code = kFailed;
+						break;
+					}
+					phase = std::string(batch_name) + ": BC7 by texconv";
+					progress("running");
+					bc7::compress_options co;
+					co.texconv = o.texconv, co.list = list, co.cwd = work, co.out = dds_out, co.log = work + L"\\texconv.txt", co.extra = o.texconv_args;
+					co.poll_s = o.game_poll_s, co.stall_s = o.stall_s, co.should_end = ro.should_end;
+					const auto tc_began = std::chrono::steady_clock::now();
+					std::string why3;
+					const upscale::end tc = lines.empty() ? upscale::end::done : bc7::compress(co, why3);
+					const double tc_took = seconds_since(tc_began);
+					if (tc == upscale::end::ended)
+					{
+						say("%s: texconv ended after %.0f s (%s): the batch is thrown away.", batch_name, tc_took, why3.c_str());
+						if (stopped)
+						{
+							say("Stopped by %sstop (delete it to go on).", narrow(out).c_str());
+							code = kStopped;
+							break;
+						}
+						if ((code = game_gate(game)) != kDone)
+							break;
+						redo = true;
+					}
+					else if (tc != upscale::end::done)
+					{
+						bool ok = false;
+						std::string tail;
+						for (const std::string &l : lines_of(co.log, ok))
+							if (!l.empty())
+								tail = l;
+						say("Stopped: texconv %s on %s (%s; its last line: %s).", tc == upscale::end::stalled ? "stalled" : "failed", batch_name, why3.c_str(),
+							tail.empty() ? "none" : tail.c_str());
+						code = kFailed;
+						break;
+					}
+					else
+					{
+						n.texconv_s += tc_took;
+						n.upscaler_s += took;
+						n.upscaled_texels += texels;
+						for (const job &jj : jobs)
+							n.upscaled_out += uint64_t(jj.w) * jj.factor * jj.h * jj.factor;
+						phase = std::string(batch_name) + ": reading BC7, the soul test";
+						progress("running");
+						cpu_began = std::chrono::steady_clock::now();
+						parallel(o.threads, jobs.size(), [&](size_t i) {
+							job &j = jobs[i];
+							if (chain[i] == 0)
+								return;
+							const uint32_t W = j.w * j.factor, H = j.h * j.factor;
+							std::string w3;
+							std::vector<std::vector<uint8_t>> levels;
+							if (!bc7::read_bc_dds(dds_out + L"\\" + std::to_wstring(i) + L".dds", pk::kBC7, W, H, chain[i], levels, w3))
+							{
+								j.no_picture = true;
+								j.why = w3;
+								return;
+							}
+							j.s = soul(j.body.data(), j.body.size(), levels[0].data(), W, H, pk::kBC7);
+							if (!j.s.done || over_limits(o, j.s))
+							{
+								j.soul_failed = true;
+								return;
+							}
+							j.map.kind = pk::kColour;
+							j.map.format = pk::kBC7;
+							j.map.w = W, j.map.h = H;
+							j.map.levels = std::move(levels);
+							j.made = true;
+							j.rgba.clear();
+							j.rgba.shrink_to_fit();
+						});
+						n.cpu_s += seconds_since(cpu_began);
+					}
+				}
 				else
 				{
 					n.upscaler_s += took;
+					n.upscaled_texels += texels;
+					for (const job &jj : jobs)
+						n.upscaled_out += uint64_t(jj.w) * jj.factor * jj.h * jj.factor;
 					phase = std::string(batch_name) + ": keeping the texels, BC2, mips";
 					progress("running");
 					const auto cpu_began = std::chrono::steady_clock::now();
@@ -983,9 +1143,15 @@ namespace hifi::texpack
 			n.made, n.by_kind[0], n.by_kind[1], n.by_kind[2], n.by_kind[3], n.by_kind[4], n.replaced, n.same, n.differs, n.add_refused, w.entries().size());
 		say("tags: zone textures no mesh uses %u, in zones whose meshes can't be read %u (blended); model textures no Os2 group names %u (none)", n.unused,
 			n.walk_failed, n.untagged);
-		say("time: upscaler %.1f s, keeping texels/BC2/mips %.1f s for %.2f M original texels (%.2f M made): %.2f us per original texel; written %.3f GB",
-			n.upscaler_s, n.cpu_s, double(n.texels_in) / 1e6, double(n.texels_out) / 1e6,
-			n.texels_in > 0 ? (n.upscaler_s + n.cpu_s) * 1e6 / double(n.texels_in) : 0.0, gb(w.stats().bytes));
+		say("time: upscaler (%s) %.1f s, %s %.1f s, keeping texels/mips/soul test %.1f s for %.2f M original texels (%.2f M made): %.2f us per original "
+			"texel; written %.3f GB",
+			model->id, n.upscaler_s, bc7 ? "BC7 by texconv" : "BC2 (in the CPU time)", n.texconv_s, n.cpu_s, double(n.texels_in) / 1e6, double(n.texels_out) / 1e6,
+			n.texels_in > 0 ? (n.upscaler_s + n.texconv_s + n.cpu_s) * 1e6 / double(n.texels_in) : 0.0, gb(w.stats().bytes));
+		if (n.upscaled_texels > 0)
+			say("per original texel the upscaler ran on (%.2f M, %.2f M made): upscaler %.3f us, %s %.3f us (%.4f us per made texel), CPU %.3f us",
+				double(n.upscaled_texels) / 1e6, double(n.upscaled_out) / 1e6, n.upscaler_s * 1e6 / double(n.upscaled_texels), bc7 ? "texconv" : "texconv (none)",
+				n.texconv_s * 1e6 / double(n.upscaled_texels), n.upscaled_out ? n.texconv_s * 1e6 / double(n.upscaled_out) : 0.0,
+				n.cpu_s * 1e6 / double(n.upscaled_texels));
 		w.close();
 		return code;
 	}

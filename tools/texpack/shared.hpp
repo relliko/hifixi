@@ -28,8 +28,12 @@ namespace hifi::texpack
 
 	// pack.src's and the header's maker version for convert: a pack.src line of another version is done again
 	constexpr uint32_t kMakerVersion = 1;
-	// make's (a pack.src line convert wrote is made again by make, and the other way round)
-	constexpr uint32_t kMakeVersion = 2;
+	// make's (a pack.src line convert wrote is made again by make, and the other way round). From 3 (M8) pack.src and
+	// the header hold make_maker's: kMakeVersion * 100 + the upscaler model's number * 10 + the colour's (0 BC2, 1 BC7),
+	// so a DAT made with another model or colour format is made again (its own entries replaced): 311 = make 3, HDCube,
+	// BC7; 300 = make 3, x4plus, BC2
+	constexpr uint32_t kMakeVersion = 3;
+	constexpr uint32_t make_maker(uint8_t model_number, bool bc7) { return kMakeVersion * 100 + model_number * 10u + (bc7 ? 1u : 0u); }
 	constexpr int kDone = 0, kFailed = 1, kUsage = 2, kStopped = 3, kGameStarted = 4;
 
 	// ---- Small things
@@ -88,6 +92,10 @@ namespace hifi::texpack
 		double batch_mtexels = 24.0, game_quiet_s = 60.0, game_poll_s = 3.0, stall_s = 900.0;
 		std::vector<std::wstring> game_names;
 		bool no_wait = false, rescan = false, keep_work = false;
+		// make (M8): --upscaler-model (hdcube, x4plus), --colour (bc7, bc2), --texconv (texconv.exe; default <this
+		// tool's folder>\texconv.exe; missing: BC2, said), --texconv-args (measuring: more texconv options)
+		std::string upscaler_model = "hdcube", colour = "bc7";
+		std::wstring texconv, texconv_args;
 		// get-upscaler (fetch.cpp): --yes (no question), --dir (where; default <exe folder>\upscaler), --url (tests: a
 		// file:// URL in place of the official one; the size and SHA-256 checked are always the official file's)
 		bool yes = false;
@@ -195,8 +203,8 @@ namespace hifi::texpack
 		uint32_t factor = 0;
 		bool stored_rows = false; // (B1: the original's rows as stored matched better than tex's bottom-up order)
 	};
-	// The pack's level 0 (tight BC2, W x H) against the original chunk
-	soul_result soul(const uint8_t *body, size_t size, const uint8_t *level0, uint32_t W, uint32_t H);
+	// The pack's level 0 (tight BC2 or BC7 blocks, by format, W x H) against the original chunk
+	soul_result soul(const uint8_t *body, size_t size, const uint8_t *level0, uint32_t W, uint32_t H, uint32_t format = pk::kBC2);
 	// Whether a soul test's errors pass the limits (verify reports such an entry; convert and make leave it out)
 	bool over_limits(const options &o, const soul_result &s);
 
@@ -204,4 +212,8 @@ namespace hifi::texpack
 
 	int make(options &o);         // make.cpp
 	int get_upscaler(options &o); // fetch.cpp
+	// (fetch.cpp) The HDCube model that ships beside the tool (<tool folder>\models-hdcube: realesrgan-hdcube-x4.param,
+	// .bin and PROVENANCE.txt) copied into an upscaler folder's models\, each file's SHA-256 checked first: get-upscaler
+	// does it after the download, make when the upscaler folder lacks it. false (why) when it isn't there or differs
+	bool place_hdcube(const std::wstring &upscaler, std::string &why);
 }

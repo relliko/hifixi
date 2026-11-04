@@ -63,9 +63,15 @@
  *   is ended (a job object, which also ends it with the builder), the batch thrown away, and make waits until the game
  *   has been closed for a minute (--no-wait: exit 4, as convert). The upscaler: --upscaler, else <this tool's
  *   folder>\upscaler; missing, it says to run get-upscaler (exit 1).
+ *   M8: the model --upscaler-model hdcube (default; 4x_HDCube_200k, CC0, shipped in <tool>\models-hdcube and copied
+ *   into the upscaler's models by get-upscaler or make) or x4plus; the colour --colour bc7 (default: our mips as RGBA8
+ *   DDS, BC7_UNORM by <tool>\texconv.exe or --texconv as a child process like the upscaler, bc7.cpp) or bc2 (also when
+ *   texconv.exe is missing, said in one line). pack.src and the header's maker version is make_maker's (311: make 3,
+ *   HDCube, BC7), so another model or colour makes a DAT again, replacing its own entries.
  * get-upscaler (fetch.cpp): Real-ESRGAN's official Windows release zip downloaded on the player's yes (or --yes), refused
  *   unless its size and SHA-256 are the official file's, unpacked with Windows' tar.exe, only the program, vcomp140.dll,
- *   the x4plus model and the readme kept, with PROVENANCE.txt (docs\texture-pack\upscaler.md: why it isn't shipped).
+ *   the x4plus model and the readme kept, with PROVENANCE.txt (docs\texture-pack\upscaler.md: why it isn't shipped);
+ *   then HDCube copied in from <tool>\models-hdcube, its hashes checked.
  * verify: every record read back (the rules, its CRC, each level's CRC); with --soul, the soul test (plan section 7): the
  *   pack's colour box-filtered to half the game's size against the original's texels averaged 2x2 (keeptexels.py's
  *   GRAIN 2), texels at strong edges left out (keeptexels' own fade, exp(-(grad/24)^2) < 0.5, from the pack's luma
@@ -89,6 +95,8 @@
 #include <share.h>
 #include "keys.hpp"
 #include "shared.hpp"
+#include "bc7.hpp"
+#include "upscale.hpp"
 #include "../../src/pack/pack.hpp"
 #include "../../src/pack/pack_write.hpp"
 #include "../../src/pack/bc2.hpp"
@@ -326,6 +334,7 @@ namespace hifi::texpack
 			"  make    --out <pack> [--ffxi <FINAL FANTASY XI>] [--ashita <folder>] [--upscaler <folder>] [--kind zone|model]\n"
 			"          [--only <rel> ...] [--limit N] [--zone-factor 2|4] [--model-factor 2|4] [--batch-mtexels N] [--threads N]\n"
 			"          [--redo] [--rescan] [--no-wait] [--ignore-game] [--reserve-gb N] [--ffximain <file>] [--keep-work]\n"
+			"          [--upscaler-model hdcube|x4plus] [--colour bc7|bc2] [--texconv <texconv.exe>]\n"
 			"  get-upscaler [--yes] [--dir <folder>]\n"
 			"  verify  --pack <pack> [--soul] [--ffxi ...] [--threads N] [--soul-mean X] [--soul-p99 X] [--alpha-mean X]\n"
 			"          [--alpha-p99 X] [--worst N]\n"
@@ -457,6 +466,20 @@ namespace hifi::texpack
 				o.rescan = true;
 			else if (a == L"--keep-work")
 				o.keep_work = true;
+			else if (a == L"--upscaler-model" && next(s) && upscale::find_model(narrow(s)) != nullptr)
+				o.upscaler_model = narrow(s);
+			else if (a == L"--colour" && next(s) && (s == L"bc7" || s == L"bc2"))
+				o.colour = narrow(s);
+			else if (a == L"--texconv")
+			{
+				if (!next(o.texconv))
+					return false;
+			}
+			else if (a == L"--texconv-args")
+			{
+				if (!next(o.texconv_args))
+					return false;
+			}
 			else if (a == L"--yes")
 				o.yes = true;
 			else
@@ -876,7 +899,7 @@ namespace hifi::texpack
 	}
 
 	// The pack's level 0 (tight BC2, W x H) against the original chunk (see the top)
-	soul_result soul(const uint8_t *body, size_t size, const uint8_t *level0, uint32_t W, uint32_t H)
+	soul_result soul(const uint8_t *body, size_t size, const uint8_t *level0, uint32_t W, uint32_t H, uint32_t format)
 	{
 		soul_result r;
 		tex::texture t;
@@ -893,7 +916,12 @@ namespace hifi::texpack
 		}
 		const uint32_t s = W / w, g = (w % 2 == 0 && h % 2 == 0) ? 2 : 1, tw = w / g, th = h / g, S = s * g;
 		r.factor = s;
-		const std::vector<uint8_t> P = pk::bc2::decode_bc2(level0, W, H);
+		const std::vector<uint8_t> P = bc7::decode_level(format, level0, W, H);
+		if (P.empty())
+		{
+			r.why = "the pack's colour format isn't BC2 or BC7";
+			return r;
+		}
 		// (the pack shrunk to half the game's size; its luma shrunk to the game's size)
 		std::vector<float> Q(size_t(tw) * th * 4, 0.0f), L(size_t(w) * h, 0.0f);
 		for (uint32_t y = 0; y < H; ++y)
@@ -1686,7 +1714,7 @@ namespace
 								souls[i].why = "its colour record can't be read: " + w2;
 								continue;
 							}
-							souls[i] = soul(cs[c].body, cs[c].size, levels[0].data(), colour->w, colour->h);
+							souls[i] = soul(cs[c].body, cs[c].size, levels[0].data(), colour->w, colour->h, colour->format);
 						}
 					}
 				});

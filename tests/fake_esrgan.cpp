@@ -4,8 +4,8 @@
  * neighbour (WIC, tools\texpack\image_io.cpp) into the output folder under its own name. FAKE_ESRGAN_MODE:
  *   (unset) as above; "slow": FAKE_ESRGAN_SLOW_MS (default 300) ms before each picture; "hang": nothing written, waits
  *   for ever; "fail": exit 3 at once.
- * FAKE_ESRGAN_LOG names a file each run appends "start <pid>" and "end <pid>" to (the test reads which ran and whether
- * one was ended before its end). With no -i it only waits for ever: copied under another name, it is the test's "game".
+ * FAKE_ESRGAN_LOG names a file each run appends "start <pid>", "model <-n> <pid>" and "end <pid>" to (the test reads
+ * which ran, with which model, and whether one was ended before its end). With no -i it only waits for ever: copied under another name, it is the test's "game".
  */
 
 #include <windows.h>
@@ -33,13 +33,15 @@ static void log_line(const char *what)
 
 int wmain(int argc, wchar_t **argv)
 {
-	std::wstring in, out;
+	std::wstring in, out, model;
 	for (int i = 1; i + 1 < argc; ++i)
 	{
 		if (std::wstring(argv[i]) == L"-i")
 			in = argv[++i];
 		else if (std::wstring(argv[i]) == L"-o")
 			out = argv[++i];
+		else if (std::wstring(argv[i]) == L"-n")
+			model = argv[++i];
 	}
 	if (in.empty())
 	{
@@ -50,6 +52,11 @@ int wmain(int argc, wchar_t **argv)
 	GetEnvironmentVariableA("FAKE_ESRGAN_MODE", mode, sizeof(mode));
 	const DWORD slow_ms = GetEnvironmentVariableA("FAKE_ESRGAN_SLOW_MS", slow, sizeof(slow)) ? DWORD(std::atoi(slow)) : 300;
 	log_line("start");
+	{
+		char m[160];
+		std::snprintf(m, sizeof(m), "model %ls", model.c_str());
+		log_line(m);
+	}
 	if (std::string(mode) == "fail")
 		return 3;
 	if (std::string(mode) == "hang")

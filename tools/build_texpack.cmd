@@ -25,15 +25,15 @@ if not exist build\obj64\texpack_test mkdir build\obj64\texpack_test
 if not exist build\obj64\fake_esrgan mkdir build\obj64\fake_esrgan
 
 set "PACK=src\pack\pack.cpp src\pack\pack_write.cpp src\pack\bc2.cpp src\pack\hash.cpp src\pack\validate.cpp"
-set "MAKE=tools\texpack\make.cpp tools\texpack\fetch.cpp tools\texpack\upscale.cpp tools\texpack\keeptexels.cpp tools\texpack\image_io.cpp"
+set "MAKE=tools\texpack\make.cpp tools\texpack\fetch.cpp tools\texpack\bc7.cpp tools\texpack\upscale.cpp tools\texpack\keeptexels.cpp tools\texpack\image_io.cpp"
 cl /nologo /MP /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tools\texpack\texpack.cpp tools\texpack\keys.cpp %MAKE% %PACK% src\bake\dat_core.cpp src\bake\zonemesh.cpp src\chars\tex.cpp src\chars\os2.cpp ^
   /Fo"build\obj64\texpack\\" /Fe"build\hifixi-texpack.exe" /link /NOLOGO user32.lib advapi32.lib ole32.lib windowscodecs.lib bcrypt.lib urlmon.lib || exit /b 1
 echo Built build\hifixi-texpack.exe
 rem The tool on a few of the game's DATs and hand-made overlays (tests\texpack_test.cpp; tests\pack_oracle.py on what it writes)
 cl /nologo /MP /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\texpack_test.cpp %PACK% src\bake\dat_core.cpp tools\texpack\upscale.cpp tools\texpack\keeptexels.cpp tools\texpack\image_io.cpp ^
-  /Fo"build\obj64\texpack_test\\" /Fe"build\texpack_test.exe" /link /NOLOGO user32.lib ole32.lib windowscodecs.lib || exit /b 1
+  tests\texpack_test.cpp %PACK% src\bake\dat_core.cpp tools\texpack\bc7.cpp tools\texpack\upscale.cpp tools\texpack\keeptexels.cpp tools\texpack\image_io.cpp src\chars\tex.cpp ^
+  /Fo"build\obj64\texpack_test\\" /Fe"build\texpack_test.exe" /link /NOLOGO user32.lib ole32.lib windowscodecs.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\texpack_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHsc /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\fake_esrgan.cpp tools\texpack\image_io.cpp ^
