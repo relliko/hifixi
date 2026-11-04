@@ -65,6 +65,9 @@ namespace hifi::pack
 	// (M9) The pack in use with its heights on ([textures] height): the light split marks the pixels lit with a pack normal
 	// (light_split.hpp "Marks"), so World FX's relief fades there
 	bool heights_in_use();
+	// (M9) The parallax's depth while the heights are in use and [textures] parallax is on ([textures] parallax_depth);
+	// else 0 (zone::set_parallax)
+	float parallax_depth();
 
 	// What an owner gives the module (any of them nullptr: nothing to call)
 	struct consumer

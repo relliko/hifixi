@@ -8,6 +8,9 @@
 //   [textures] height          (M9) the pack's heights drawn as relief on scenery and model actors (the menu's "Relief from
 //                              the texture pack", shown with the pack). On by default; 0 asks and draws none of them: the
 //                              picture then as without heights (zones.md "Pack normals")
+//   [textures] parallax        parallax occlusion on the scenery's relief: the stones stand up and hide what's behind
+//                              them (the menu's "Depth from the texture pack (experimental)", under the relief). Off by
+//                              default; needs [textures] height and per-pixel lighting (zones.md "Parallax")
 //
 // Hidden (no menu entry; read by the module every half second unless said otherwise):
 //   [textures] zone            the zone and its second map ask for pack textures (with pack on)
@@ -18,6 +21,7 @@
 //   [textures] ring_mb         the streamer's upload ring, 8-64 MB; read once, when the streamer starts (its address space
 //                              isn't given back: docs/texture-pack/streamer.md "As built")
 //   [textures] per_present_mb  record bytes the streamer starts in one present at most (0: no cap)
+//   [textures] parallax_depth  the parallax's depth, times the height record's span (kParallaxDepth)
 //   [textures] zone_delay_s    seconds after a zone-in before the pack streams (pack work stays off zoning's path)
 // (material and surface: M10-M11's, not read yet)
 
@@ -25,6 +29,7 @@ namespace hifi::pack::options
 {
 	constexpr bool kPackByDefault = false;
 	constexpr bool kZoneByDefault = true, kActorsByDefault = true, kCharsByDefault = true, kFsrBiasByDefault = true;
-	constexpr bool kHeightByDefault = true;
+	constexpr bool kHeightByDefault = true, kParallaxByDefault = false;
+	constexpr float kParallaxDepth = 1.0f;
 	constexpr float kBudgetMb = 0.0f, kRingMb = 32.0f, kPerPresentMb = 64.0f, kZoneDelayS = 2.0f;
 }

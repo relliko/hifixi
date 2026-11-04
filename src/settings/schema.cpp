@@ -243,6 +243,12 @@ namespace hifi::settings
 				"(the game's own bump maps where it has them). Only the light changes, never the textures' colours. Needs the "
 				"scenery lit per pixel; packs made without heights look the same either way. (/hifi textures)", nullptr, "textures.pack", false,
 				{ _, _, _, _ }, flag, 0.0f, 1.0f, pack::options::kHeightByDefault ? 1.0f : 0.0f, &pack::folder_exists },
+			// (parallax occlusion on that relief: zones.md "Parallax")
+			{ "textures.parallax", tab::game, "Texture pack", "Depth from the texture pack (experimental)",
+				"Cobbles, bricks and flagstones stand out of the surface: nearer stones hide the joints behind them and cast "
+				"small shadows of their own, most of all when you look along a street or a wall. Scenery only; edges and "
+				"outlines stay as they are. Needs the relief above. (/hifi textures)", nullptr, "textures.height", false,
+				{ _, _, _, _ }, flag, 0.0f, 1.0f, pack::options::kParallaxByDefault ? 1.0f : 0.0f, &pack::folder_exists },
 			// (the upscale: src/upscale)
 			{ "upscale.fsr", tab::upscaling, "AMD FSR", "Upscale the world with AMD FSR",
 				"When the game's background resolution is below the screen's, the world is stretched to the screen with AMD "

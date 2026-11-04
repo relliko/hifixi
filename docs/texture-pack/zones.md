@@ -752,3 +752,31 @@ Characters (step 3, the detail slot's tilt): characters.md "Pack relief".
   facing away with marks off 28.76). shade_bench's `relief` mode.
 - **Not done**: the in-game look, and Alex's answer to question 11 (the pack's `--height-scale` default stays `half`).
   Characters (step 3) since 2026-11-04: characters.md "Pack relief".
+
+## Parallax (2026-11-04: parallax occlusion on the pack's relief)
+
+Alex asked for it after the relief and a demo of parallax occlusion against relief lighting. The texture pack's height
+(the same record and view as "Pack normals") also moves where a pixel reads its textures: the stones stand out of the
+flat surface and the nearer ones hide the joints behind them. Edges and outlines stay the triangles', and the depth the
+zone writes, the light split's and World FX's, stay the flat surface's.
+
+- **The shader** (`src/zone/draw.cpp` `parallax_uv`): per pixel, on a solid piece (not alpha-tested, not blended) with
+  `kPackRelief`, while the frame's `tex_bias.y` (the depth) is over 0; no new flag, root constant, pipeline or binding.
+  The view ray enters the relief's top half its depth above the triangle (a texel at mid height stays put), is stepped
+  down 8 (face on) to 24 (edge on) steps through the height, then placed between the last two. The surface's frame is
+  the uv's gradients in the world from the derivatives (the same cotangent frame as `kMapped`'s, kept to scale). The
+  depth: `tex_bias.y x kParallaxTexels` (1.2) of the height map's texels in uv, held at 4 times that edge on (the
+  record's span gave next to nothing: 16 times it moved 0.1% of Bastok Markets' street); faded out from 3 to 8 map
+  texels a pixel. zone_view of 235's street, low sun: 0.6 texels faint, 1.2 the cobbles stand up, 2.4 lumpy, 9.6 spikes.
+  Where the heights came from the colour, bright joints come out raised (the colour's guess, not the parallax's). The colour,
+  its alpha and `pack_tilt` read at the new uv with the pixel's own derivatives (`SampleGrad`; the colour's with
+  `exp2(tex_bias.x)` for the FSR bias), so nothing seams where it jumps. Its own shadow: 8 steps from the point met
+  toward the sun; what stands above that ray takes up to 80% of the sun (only the sun's term: the sky and lamps stay).
+- **The switch**: `[textures] parallax` (packoptions.hpp, off by default; the menu's "Depth from the texture pack
+  (experimental)", under "Relief from the texture pack"), hidden `[textures] parallax_depth` (1.0, 0-4). The module
+  stores the depth while the pack is in use with its heights there and on (`pack::parallax_depth`), the plugin's wiring
+  hands it to `zone::set_parallax` each present (pack_wiring.cpp, beside the marks), every renderer's next pass reads it
+  (the zone's and the model actors'). Off: `tex_bias.y` 0 and the shader's path as before (`pack_tilt` now samples with
+  the pixel's derivatives given, the same values).
+- **zone_view**: `ZONE_VIEW_PARALLAX=<depth>`.
+- **Not done**: the in-game look; characters (their relief is chardraw's detail slot) and grass get none.

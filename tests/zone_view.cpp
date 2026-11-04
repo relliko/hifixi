@@ -25,6 +25,7 @@
  *     whose entry has a height record gets it too, its whole chain, as the glue asks it (zonepack: the view into the
  *     zone's height block with its relief scale, gpu_zone::height_written), drawn as relief with --perpixel
  *   ZONE_VIEW_HEIGHT=0: no height asked ([textures] height=0): the picture as before M9
+ *   ZONE_VIEW_PARALLAX=<depth>: parallax occlusion on the relief at that depth ([textures] parallax_depth; zone::set_parallax)
  *   ZONE_VIEW_SUN="x y z": the day's sun toward there (y down), e.g. "0.9 -0.15 0.4" a low sun for the relief A/B
  *   ZONE_VIEW_BIAS=<b>: the colour maps' extra mip bias (draw_options::texture_bias), for the FSR A/B: e.g. Quality's
  *     -0.585 at ZONE_VIEW_SIZE 2/3 of the full size
@@ -181,6 +182,8 @@ namespace
 		char hv[8] = "";
 		const bool heights = GetEnvironmentVariableA("ZONE_VIEW_HEIGHT", hv, sizeof(hv)) == 0 || hv[0] != '0';
 		hifi::zone::gpu_zone::set_heights(heights);
+		if (const char *pd = std::getenv("ZONE_VIEW_PARALLAX"); pd != nullptr)
+			hifi::zone::set_parallax(float(std::atof(pd)));
 
 		// (the order: the most used first, by the triangles naming each texture times its model's placements)
 		std::vector<uint64_t> placed(d.models.size(), 0), uses(d.textures.size(), 0);
@@ -367,7 +370,8 @@ int main(int argc, char **argv)
 	}
 
 	uintptr_t base = 0;
-	if (dump::map(dump::kDumps[0], base) == 0)
+	// (the other dump when the first's address is taken in this process)
+	if (dump::map(dump::kDumps[0], base) == 0 && dump::map(dump::kDumps[1], base) == 0)
 	{
 		std::printf("the FFXiMain dump couldn't be mapped\n");
 		return 1;

@@ -10,6 +10,7 @@
 #include "../game/charmodel.hpp"
 #include "../pack/pack_module.hpp"
 #include "../upscale/upscale.hpp"
+#include "../zone/draw.hpp"
 #include "../zone/inject.hpp"
 #include "../zone/light_split.hpp"
 #include "../zone/zonepack.hpp"
@@ -56,6 +57,8 @@ namespace hifi::pack_wiring
 		chars::inject::set_texture_bias(bias);
 		// (M9: the light split's marks while the pack's heights are drawn: light_split.hpp "Marks")
 		light::set_marks(pack::heights_in_use());
+		// (and parallax occlusion on that relief, while [textures] parallax is on: zones.md "Parallax")
+		zone::set_parallax(pack::parallax_depth());
 	}
 
 	float texture_bias()

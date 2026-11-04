@@ -22,6 +22,7 @@
 #include "zone_gpu.hpp"
 #include "../host/shadercache.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -31,6 +32,9 @@ namespace hifi::zone
 	namespace
 	{
 		namespace zm = bake::zonemesh;
+
+		// (set_parallax: the parallax's depth for every renderer's next pass; 0 none)
+		std::atomic<float> g_parallax { 0.0f };
 
 		const char *kShader = R"(
 // A lighting environment (frame.hpp's frame_env): the zone's own is 0
@@ -49,7 +53,8 @@ cbuffer frame_constants : register(b0)
 	row_major float4x4 view_proj;
 	float4 options;      // x: per-pixel lighting; yzw: the camera (the fixed-function pieces' range fog)
 	env_t envs[8];
-	float4 tex_bias;     // x: the colour map's extra mip bias (the texture pack's under FSR); 0: Sample as ever
+	float4 tex_bias;     // x: the colour map's extra mip bias (the texture pack's under FSR); 0: Sample as ever;
+	                     // y: (kPackRelief) the parallax's depth ([textures] parallax: set_parallax); 0: none
 };
 cbuffer draw_constants : register(b1)
 {
@@ -147,17 +152,83 @@ float3 near_lamp_light(object o, float3 world, float3 n)
 // units (relief: 4 x span x the map's texels a game texel), so a height made from the game's bump map gives back its
 // normals. The differences one level-0 texel each way through the mip-mapped, filtered height: at a distance the
 // smaller levels' smoother slope, so the relief doesn't sparkle. Only the light it gives changes, never the colour.
-float3 pack_tilt(float2 uv)
+// (the UV's own derivatives given, dx and dy: the same as Sample's at the pixel's uv, and right at a parallax's uv too)
+float3 pack_tilt(float2 uv, float2 dx, float2 dy)
 {
 	float w, h;
 	normal_map.GetDimensions(w, h);
 	const float2 e = 1.0 / max(float2(w, h), 1.0);
-	const float l = normal_map.Sample(wrap, uv - float2(e.x, 0)).r, r = normal_map.Sample(wrap, uv + float2(e.x, 0)).r;
-	const float u = normal_map.Sample(wrap, uv - float2(0, e.y)).r, d = normal_map.Sample(wrap, uv + float2(0, e.y)).r;
+	const float l = normal_map.SampleGrad(wrap, uv - float2(e.x, 0), dx, dy).r, r = normal_map.SampleGrad(wrap, uv + float2(e.x, 0), dx, dy).r;
+	const float u = normal_map.SampleGrad(wrap, uv - float2(0, e.y), dx, dy).r, d = normal_map.SampleGrad(wrap, uv + float2(0, e.y), dx, dy).r;
 	const float k = asfloat(relief);
 	return normalize(float3(k * (u - d), k * (l - r), 1));
 }
 
+// (per pixel, kPackRelief with tex_bias.y: parallax occlusion, docs/texture-pack/zones.md "Parallax") The uv the eye
+// meets on the height under the flat surface: the view ray from where it enters the relief's top (half its depth above
+// the triangle, so a texel at mid height stays where it was) stepped down through the height (BC4 red, 1 the top) to
+// where it goes under, then between the last two steps. The depth: tex_bias.y x kParallaxTexels of the height map's
+// texels as uv (the record's span is far too small for it). The surface's frame from the uv's and the world's derivatives (dx, dy
+// the uv's): gu, gv the uv's gradients in the world. Faded out where a pixel covers 8 or more of the map's texels
+// (it moves little there) and toward edge-on (the offset held at 4 times the depth). sun: how much of the
+// sun reaches the point met, the relief's own shadow from a short walk toward the sun (the slope's light is pack_tilt's).
+static const float kParallaxTexels = 1.2; // (Bastok Markets' cobbles in zone_view: 1.2 stands them up, 2.4 lumpy, 0.6 faint)
+float2 parallax_uv(float2 uv0, float3 world, float3 n, float3 sun_dir, float2 dx, float2 dy, out float sun)
+{
+	sun = 1;
+	float w, h;
+	normal_map.GetDimensions(w, h);
+	const float texels = max(length(dx * float2(w, h)), length(dy * float2(w, h)));
+	const float fade = 1 - smoothstep(3.0, 8.0, texels);
+	const float3 dp1 = ddx(world), dp2 = ddy(world);
+	const float3 p1 = cross(dp2, n), p2 = cross(n, dp1);
+	const float det = dot(dp1, p1);
+	const float3 v = normalize(options.yzw - world);
+	const float nv = dot(n, v);
+	if (fade <= 0 || abs(det) < 1e-20 || nv <= 0.02)
+		return uv0;
+	const float3 gu = (p1 * dx.x + p2 * dy.x) / det, gv = (p1 * dx.y + p2 * dy.y) / det;
+	// (the world's length of a uv unit; the depth in uv)
+	const float per_uv = rsqrt(max(length(gu) * length(gv), 1e-20));
+	const float depth = fade * tex_bias.y * kParallaxTexels / max(w, 1.0) * per_uv;
+	const float2 full = -depth / max(nv, 0.25) * float2(dot(v, gu), dot(v, gv));
+	const float steps = lerp(24.0, 8.0, saturate(nv));
+	const float2 step_uv = full / steps;
+	const float step_d = 1.0 / steps;
+	float2 uv = uv0 - 0.5 * full, prev = uv;
+	float d = 0, gap = 1 - normal_map.SampleGrad(wrap, uv, dx, dy).r, prev_gap = gap;
+	[loop] for (uint k = 0; k < 24; ++k)
+	{
+		if (float(k) >= steps || gap <= 0)
+			break;
+		prev = uv;
+		prev_gap = gap;
+		uv += step_uv;
+		d += step_d;
+		gap = (1 - normal_map.SampleGrad(wrap, uv, dx, dy).r) - d;
+	}
+	const float t = gap < 0 ? gap / (gap - prev_gap) : 0;
+	const float2 at = lerp(uv, prev, saturate(t));
+	// The relief's own shadow: 8 steps from the point met toward the sun, through what's above it
+	const float nl = dot(n, sun_dir);
+	if (nl > 0.02)
+	{
+		const float s0 = normal_map.SampleGrad(wrap, at, dx, dy).r;
+		const float2 up_uv = depth / max(nl, 0.25) * float2(dot(sun_dir, gu), dot(sun_dir, gv)) * (1 - s0);
+		float block = 0;
+		[unroll] for (uint k = 1; k <= 8; ++k)
+		{
+			const float f = k / 8.0;
+			const float above = normal_map.SampleGrad(wrap, at + up_uv * f, dx, dy).r - (s0 + (1 - s0) * f);
+			block = max(block, above * (1 - f) * 6);
+		}
+		sun = 1 - 0.8 * saturate(block) * fade;
+	}
+	return at;
+}
+)"
+// (two literals: MSVC's limit on one)
+R"(
 // (per pixel) The env's ambient a from its sky, at the facing n (world, its length the object's scale)
 float3 sky_ambient(env_t e, float3 a, float3 n)
 {
@@ -240,9 +311,20 @@ v2p vs(uint vid : SV_VertexID)
 // The piece's colour; share: the sun's share of its light (light_share)
 float4 shade(v2p i, out float share)
 {
+	const env_t e = env_of(objects[object_index]);
+	const float2 dx = ddx(i.uv), dy = ddy(i.uv);
+	// (parallax: per pixel on a solid piece with the pack's relief, while tex_bias.y says so; the same for a whole draw.
+	// Its uv for the colour and the relief alike, sampled with the pixel's own derivatives: no seams where it jumps)
+	const bool deep = options.x > 0 && tex_bias.y > 0 && (piece & (kPackRelief | kTested | kBlended)) == kPackRelief;
+	float2 uv = i.uv;
+	float sun_seen = 1;
+	[branch] if (deep)
+		uv = parallax_uv(i.uv, i.world, normalize(i.normal), e.sun_dir.xyz, dx, dy, sun_seen);
 	// (a branch on a constant, the same for every pixel: with no bias, the instruction as it always was)
 	float4 t;
-	[branch] if (tex_bias.x != 0)
+	[branch] if (deep)
+		t = colour_map.SampleGrad(wrap, uv, dx * exp2(tex_bias.x), dy * exp2(tex_bias.x));
+	else if (tex_bias.x != 0)
 		t = colour_map.SampleBias(wrap, i.uv, tex_bias.x);
 	else
 		t = colour_map.Sample(wrap, i.uv);
@@ -251,7 +333,6 @@ float4 shade(v2p i, out float share)
 		discard;
 	float3 lit, spec = 0;
 	const bool bump = (piece & kBump) != 0;
-	const env_t e = env_of(objects[object_index]);
 #ifdef GBUF
 	float3 gbuf_n = normalize(i.normal);
 #endif
@@ -268,7 +349,7 @@ float4 shade(v2p i, out float share)
 		{
 			float3 m;
 			[branch] if ((piece & kPackRelief) != 0)
-				m = pack_tilt(i.uv);
+				m = pack_tilt(uv, dx, dy);
 			else
 				m = normal_map.Sample(wrap, i.uv).rgb * 2 - 1;
 			const float3 dp1 = ddx(i.world), dp2 = ddy(i.world);
@@ -286,7 +367,7 @@ float4 shade(v2p i, out float share)
 		// (the lamps the game names for the object, as per vertex: every lamp in reach, near_lamp_light, lit a Mog House far
 		// too bright, 2026-10-29; kept for a tuned try)
 		const float3 rest = i.vcol.rgb * sky_ambient(e, a_rgb, n) + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
-		lit = saturate(i.vcol.rgb * s_rgb * saturate(dot(n, e.sun_dir.xyz)) + rest);
+		lit = saturate(i.vcol.rgb * s_rgb * sun_seen * saturate(dot(n, e.sun_dir.xyz)) + rest);
 		share = light_share(lit, saturate(rest));
 		// (the highlight goes on after the texture, the sun's all of it)
 		spec = piece_spec(e, i.world, n, s_rgb, i.vcol, t);
@@ -481,6 +562,11 @@ light_out ps_light(v2p i)
 				(n.lamps >> 16) & 255, n.lamps >> 24);
 			return line;
 		}
+	}
+
+	void set_parallax(float depth)
+	{
+		g_parallax.store(std::isfinite(depth) && depth > 0.0f ? depth : 0.0f, std::memory_order_relaxed);
 	}
 
 	std::string breadcrumb_report()
@@ -861,6 +947,7 @@ light_out ps_light(v2p i)
 		c.options[0] = o.per_pixel ? 1.0f : 0.0f;
 		std::memcpy(c.options + 1, p.camera, 12);
 		c.tex_bias[0] = std::isfinite(o.texture_bias) ? o.texture_bias : 0.0f;
+		c.tex_bias[1] = o.per_pixel ? g_parallax.load(std::memory_order_relaxed) : 0.0f;
 		// (the pass's environments; any not filled are its first's)
 		for (uint32_t i = 0; i < kMaxEnvs; ++i)
 		{

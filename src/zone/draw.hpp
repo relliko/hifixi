@@ -135,4 +135,8 @@ namespace hifi::zone
 
 	// Every renderer's breadcrumbs, as the GPU crash report's section has them (tests)
 	std::string breadcrumb_report();
+
+	// (per pixel, on pieces with the texture pack's relief) Parallax occlusion's depth for every renderer's next pass, the
+	// zone's and the model actors' (docs/texture-pack/zones.md "Parallax"): times the height record's span; 0 none
+	void set_parallax(float depth);
 }

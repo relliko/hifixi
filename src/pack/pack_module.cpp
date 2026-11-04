@@ -130,6 +130,7 @@ namespace hifi::pack
 		// after the data files, still shows the setting and the menu's line saying what's missing)
 		std::atomic<bool> g_folder_exists { false }, g_in_use { false }, g_compare { false }, g_quiet { false }, g_fsr { false },
 			g_heights_in_use { false };
+		std::atomic<float> g_parallax { 0.0f };
 		std::atomic<uint32_t> g_epoch { 0 }, g_starts { 0 };
 		std::atomic<uint64_t> g_io { 0 };
 		std::atomic<int> g_force_quiet { -1 };
@@ -211,6 +212,7 @@ namespace hifi::pack
 			{
 				g_fsr.store(false);
 				g_heights_in_use.store(false);
+				g_parallax.store(0.0f);
 			}
 		}
 
@@ -881,6 +883,8 @@ namespace hifi::pack
 			}
 			g_fsr.store(g.m == mode::on && game::option_on("textures", "fsr_bias", opt::kFsrBiasByDefault));
 			g_heights_in_use.store(g.m == mode::on && g.mode.heights && g.heights != 0);
+			g_parallax.store(g.m == mode::on && g.mode.heights && g.heights != 0 && game::option_on("textures", "parallax", opt::kParallaxByDefault) ?
+				std::clamp(game::option_number("textures", "parallax_depth", opt::kParallaxDepth), 0.0f, 4.0f) : 0.0f);
 			{
 				// (M7: memwatch's last read of progress.txt; a copy, no file read here)
 				const mw::build_file b = mw::read_build();
@@ -1032,6 +1036,7 @@ namespace hifi::pack
 	bool quiet() { return g_quiet.load(); }
 	bool fsr_bias_on() { return g_fsr.load(); }
 	bool heights_in_use() { return g_heights_in_use.load(); }
+	float parallax_depth() { return g_parallax.load(); }
 
 	float fsr_bias(float ratio)
 	{
