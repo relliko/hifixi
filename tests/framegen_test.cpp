@@ -469,6 +469,19 @@ int main()
 		const counts c2 = counted();
 		check(on_now() && went_on >= 1500 && c2.made > b2.made && c2.failed == 0, "the game well below half (" + std::to_string(uint32_t(2.0 * 3.0 * alone + 0.5)) +
 			" Hz): on again after " + std::to_string(went_on) + " ms, frames made between again");
+		// FSR 2's frames stopping (a fade, a load) while it's on, the game fast enough alone (the refresh rate twice its
+		// rate alone): off with them, and not on again when they come back (2026-11-04: on again after each fade, the
+		// game at 193 fps on a 240 Hz screen)
+		// (the refresh rate 1.2 times its rate alone: with FSR 2's stand-ins prepared again WARP runs slower, still well
+		// over 75% of half)
+		hifi::framegen::set_refresh_for_tests(uint32_t(1.2 * alone + 0.5));
+		const ULONGLONG t3 = GetTickCount64();
+		run(100000, 1280, 720, true, prepared, presented, [&]() { return GetTickCount64() - t3 > 9000; });
+		const counts d = counted();
+		run(60, 1280, 720, false, prepared, presented);
+		const counts e = counted();
+		check(off_now() && e.made == d.made && prepared == 60, "FSR 2's frames gone 9 s with the game fast alone, then back: generation stays off (" +
+			std::to_string(e.made - d.made) + " made between)");
 		(void)a;
 		(void)n;
 		hifi::framegen::set_refresh_for_tests(0);

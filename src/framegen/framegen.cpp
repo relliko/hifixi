@@ -120,8 +120,11 @@ namespace hifi::framegen
 			uint64_t refresh_at = 0;
 			LARGE_INTEGER last_present = {};
 			double fps = 0.0;
-			bool auto_wants = true;
-			uint64_t auto_since = 0, auto_switched = 0;
+			// (off at the start: on only once the game's own rate has been seen to be slow; alone: its rate when generation
+			// was last turned on, for the gain it gives; held: no turning on before then, after one that gave too little)
+			bool auto_wants = false;
+			uint64_t auto_since = 0, auto_switched = 0, auto_held = 0;
+			double alone = 0.0;
 			uint32_t prepares = 0, generated = 0, repeated = 0, failed = 0, switches = 0;
 			ID3D12Resource *last_output = nullptr;
 			std::string why;
@@ -592,16 +595,32 @@ namespace hifi::framegen
 			return gen.refresh;
 		}
 
-		// (gen.mutex held) Automatic: generation wanted while the game runs below half the refresh rate. With it on, the
-		// game's held at about half (each of its frames shown twice): at 96% of half or more for 3 s, off, to see what it
-		// runs at alone; with it off, below 90% of half for 2 s, on. Not changed again within 5 s of the last change.
+		// (gen.mutex held) Automatic: generation wanted only while the game is slow on its own, judged every present
+		// (FSR 2's frames or not: a fade or a load stops them, and the rate then is the game's own). Generation holds the
+		// game to about half the refresh rate and costs GPU time of its own, so with the game near half it gives little
+		// or less (2026-11-04: 190 fps alone, 101-108 with it, on a 240 Hz screen):
+		// - off (the start): below 75% of half for 2 s, on (its rate then kept as `alone`), unless held;
+		// - on and drawing: at 96% of half or more for 3 s, off, to see what it runs at alone; or showing (twice its rate)
+		//   under 1.2 times its rate alone for 3 s, off and held 60 s;
+		// - wanted but not drawing (no FSR 2 frames): its own rate at 75% of half or more for 3 s, off, so it doesn't come
+		//   back on after a fade with the game fast (it came on at 193 fps).
+		// Not changed again within 5 s of the last change.
 		bool automatic_wants(uint64_t now)
 		{
 			const uint32_t hz = refresh_rate(now);
 			if (hz == 0 || gen.fps <= 0.0)
 				return gen.auto_wants;
 			const double half = hz * 0.5;
-			const bool change = gen.auto_wants ? gen.fps >= 0.96 * half : gen.fps < 0.90 * half;
+			bool small_gain = false, change;
+			if (!gen.auto_wants)
+				change = gen.fps < 0.75 * half && now >= gen.auto_held;
+			else if (gen.enabled)
+			{
+				small_gain = gen.alone > 0.0 && 2.0 * gen.fps < 1.2 * gen.alone;
+				change = gen.fps >= 0.96 * half || small_gain;
+			}
+			else
+				change = gen.fps >= 0.75 * half;
 			if (!change)
 			{
 				gen.auto_since = 0;
@@ -614,6 +633,10 @@ namespace hifi::framegen
 				gen.auto_wants = !gen.auto_wants;
 				gen.auto_switched = now;
 				gen.auto_since = 0;
+				if (gen.auto_wants)
+					gen.alone = gen.fps;
+				else if (small_gain)
+					gen.auto_held = now + 60000;
 			}
 			return gen.auto_wants;
 		}
@@ -643,7 +666,8 @@ namespace hifi::framegen
 			// (on while FSR 2 hands its frames over and the setting's on, automatic: while the game runs below half the
 			// refresh rate; off a second after FSR 2's last frame, else each frame is shown twice)
 			const bool fsr2 = g.on.load() && gen.now != nullptr && now - gen.prepared_at < 1000;
-			const bool want = fsr2 && (!g.automatic.load() || automatic_wants(now));
+			const bool automatic = g.automatic.load() && g.on.load() && gen.now != nullptr ? automatic_wants(now) : true;
+			const bool want = fsr2 && (!g.automatic.load() || automatic);
 			if (want == gen.enabled)
 				return;
 			gen.enabled = want;
@@ -714,6 +738,17 @@ namespace hifi::framegen
 
 	void set_automatic(bool on)
 	{
+		// (turned on while it runs: it starts from what's shown now, judged from there. Asked every frame: the lock only
+		// for a change)
+		if (on == g.automatic.load())
+			return;
+		std::lock_guard<std::mutex> lock(gen.mutex);
+		if (on)
+		{
+			gen.auto_wants = gen.enabled;
+			gen.auto_since = gen.auto_held = 0;
+			gen.alone = 0.0;
+		}
 		g.automatic = on;
 	}
 
@@ -775,9 +810,10 @@ namespace hifi::framegen
 			else if (!gen.enabled && GetTickCount64() - gen.prepared_at >= 1000)
 				std::snprintf(state, sizeof(state), "off (no FSR 2 frames)");
 			else if (!gen.enabled)
-				std::snprintf(state, sizeof(state), "off (automatic: the game runs %.0f fps, at or above half the screen's %u Hz)", gen.fps, gen.refresh);
+				std::snprintf(state, sizeof(state), "off (automatic: the game runs %.0f fps, fast enough alone for the screen's %u Hz%s)", gen.fps, gen.refresh,
+					GetTickCount64() < gen.auto_held ? "; it gave too little the last time" : "");
 			else
-				std::snprintf(state, sizeof(state), "on%s, %s", g.automatic.load() ? " (automatic: the game below half the screen's refresh rate)" : "",
+				std::snprintf(state, sizeof(state), "on%s, %s", g.automatic.load() ? " (automatic: the game slow alone)" : "",
 					gen.apart ? "the UI kept apart" : "the UI moved with the world (FSR 2's picture isn't the screen's size)");
 			std::snprintf(line, sizeof(line), "frame generation: %s; %u frames prepared, %u made between, %u shown twice, %u failed, turned on/off %u times%s%s",
 				state, gen.prepares, gen.generated, gen.repeated, gen.failed, gen.switches, gen.why.empty() ? "" : ": ", gen.why.c_str());

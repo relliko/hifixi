@@ -265,10 +265,12 @@ namespace hifi::settings
 				"the next time the game starts (with FSR on then); off right away, and AMD's swap chain is left out from the next "
 				"start, as it is while FSR is off. (/hifi upscale framegen)", nullptr, "upscale.fsr", false,
 				{ 0.0f, _, _, _ }, flag, 0.0f, 1.0f, 0.0f },
-			{ "upscale.framegen_auto", tab::upscaling, "Frame generation", "Only while the game runs below half the refresh rate",
-				"Frames are made between only while the game runs slower than half the screen's refresh rate (122 at 244 Hz), "
-				"where doubling them fills the screen; when it can run faster alone, it does (every frame a real one, answering "
-				"sooner). Checked every few seconds, so it doesn't flicker on and off.", nullptr, "upscale.framegen", false,
+			{ "upscale.framegen_auto", tab::upscaling, "Frame generation", "Only while the game is slow",
+				"Frames are made between only while the game on its own runs well under half the screen's refresh rate (under "
+				"90 at 240 Hz), where doubling them fills the screen. Frame generation holds the game to half the refresh rate "
+				"and takes GPU time itself, so near that it gives little; when it gives too little it stays off a minute. When "
+				"the game is fast enough alone, every frame is a real one, answering sooner. Checked every few seconds, so it "
+				"doesn't flicker on and off.", nullptr, "upscale.framegen", false,
 				{ _, _, _, _ }, flag, 0.0f, 1.0f, 1.0f },
 
 			// Advanced

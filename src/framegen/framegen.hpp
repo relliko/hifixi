@@ -50,8 +50,9 @@ namespace hifi::framegen
 	void set_wanted(bool on);
 	bool wanted();
 	void set_on(bool on);
-	// Automatic (the setting upscale.framegen_auto): generation only while the game runs below half the screen's
-	// refresh rate (its window's monitor's), off while it can run faster alone; with hysteresis (status() says which)
+	// Automatic (the setting upscale.framegen_auto): generation only while the game alone runs under 75% of half the
+	// screen's refresh rate (its window's monitor's), off from the start, off while it can run faster alone or when it
+	// gives too little; with hysteresis (framegen.cpp automatic_wants; status() says which)
 	void set_automatic(bool on);
 	void set_refresh_for_tests(uint32_t hz); // (0: the monitor's)
 	std::vector<std::string> status();
