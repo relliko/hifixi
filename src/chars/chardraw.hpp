@@ -162,6 +162,7 @@ namespace hifi::chars
 		ID3D12PipelineState *_shadow_pso = nullptr; // (depth only, D32: made in init, not under the injection's mutex)
 		ID3D12Resource *_ring = nullptr; // upload: kFrames slots, each two halves of the frame's constants and its models' (its draw; its shadow)
 		uint8_t *_mapped = nullptr;
+		bool _shadowed = false; // (the last begin applied the sun's shadows: src/render/sun_shadows.hpp)
 		std::unordered_map<uint64_t, ID3D12PipelineState *> _pipelines;
 	};
 

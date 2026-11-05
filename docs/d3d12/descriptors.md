@@ -100,7 +100,7 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   last `kReserved` 4 for the renderer's own targets (`cache.hpp:103`, `cache.cpp:1234`). A forgotten pair's slots go
   back to `free_slots` only behind the game queue's fence (`retire::then`, `cache.cpp:227-236`), never into a heap made
   since (`heap_generation`). Bound in `chardraw.cpp:1720`,
-  `1933`, `1957`, `1985`, `2285`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1487`) and 1 for the aura
+  `1933`, `1957`, `1985`, `2285`. Root signatures 1.0 with 2 static samplers (`chardraw.cpp:1571`) and 1 for the aura
   (`chardraw.cpp:2160`).
 - The characters' texture pack pairs (docs/texture-pack/characters.md): a texture on the GPU may hold a second pair
   from the same `free_slots`, the pack's view of it. Taken only for a ticket `take_done` handed over ready
@@ -125,7 +125,15 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   then; `chardraw.cpp:1879`), so the shader never reads a height as a detail map; charinject_test's heights part
   (a height alone, a colour and a height, a colour alone) is silent under the debug layer and GPU-based validation
   (WARP and the 4070 Ti).
-- Zone: `src/zone/zone_gpu.cpp:258-299` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:922-933`
+- The native sun shadows (`src/render/sun_shadows.hpp`, [zone] nativeshadows): no table, no heap. The zone's root
+  signature has two more root parameters, 8 a CBV at b2 (the shadow block, in the zone's upload ring after the lamps,
+  256-aligned: `draw.cpp` `kShadowAt`) and 9 an SRV at t6 (World FX's shadow map copy, a raw buffer), pixel shader only:
+  10 parameters, 20 DWORDs (`draw.cpp:825`). The characters' the same at 7 (b2, after the ring slot's two halves:
+  `chardraw.cpp` `kShadowAt`) and 8 (t7): 9 parameters, 23 DWORDs (`chardraw.cpp:1571`). Both are always set before a
+  model or zone draw (`zone_renderer::record`, `char_renderer::begin`); with no block to apply the CBV says so (`ss_sun.w`
+  0, the lookup never runs) and the SRV gets the ring's own address, valid and never read: a root SRV has no bounds and
+  no null. The casters' and composite draws bind neither: their shaders don't read b2/t6/t7.
+- Zone: `src/zone/zone_gpu.cpp:258-299` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:1066-1077`
   switches heap only when the next object's zone differs (the second map), and binds that zone's vertex and index
   buffers as root SRVs with it; the breadcrumb
   step `kStepHeap` marks it. `zoneshadow.cpp:494` binds it for the shadow casters.

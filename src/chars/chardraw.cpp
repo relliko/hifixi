@@ -5,6 +5,9 @@
  *   2  SRV t3         the instance's palette rows (48 bytes a bone)        3  SRV t4  the frame's models (the ring)
  *   4  table t0-t1    the mesh's vertices (68 bytes) and corners (12)       5  table t2 the group's texture (or T),
  *                                                                           t6 its detail map (the descriptor after it)
+ *   6  SRV t5         the last frame's palette rows (the motion)
+ *   7  CBV b2         the sun's shadows (src/render/sun_shadows.hpp's block: the ring's slot, after its two halves)
+ *   8  SRV t7         World FX's shadow map copy (sun_shadows.hpp), or the ring when there's none (never read then)
  *   s0                linear, clamped, mips linear (the character pass's sampler, 02BC12)
  * Pipelines are made as targets of new formats or sample counts come: the model draw, the composite.
  * Every index into a root SRV or table is clamped first (a root SRV has no bounds: a wild read can hang the GPU).
@@ -16,7 +19,9 @@
 #include "cache.hpp"
 #include "../zone/hemi_spec.hpp"
 #include "../zone/light_split.hpp"
+#include "../host/retire.hpp"
 #include "../host/shadercache.hpp"
+#include "../render/sun_shadows.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -218,14 +223,17 @@ float3 char_spec(model_t m, float3 n, float3 world, float4 t)
 // sun toward it: within about 10 degrees; a lamp is turned into a light from the lamp). The zone's lamps near it
 // (world: the point lit) light it as they light the zone, through the diffuse as the game's own lamp slot would: never
 // the sun's share.
-float4 lit(model_t m, float3 n, float3 world, out float share)
+// in_sun: how much of the sun's light reaches the point (its shadows, per pixel: sun_shadows.hpp; 1 none), the sun's
+// term alone taken by it
+float4 lit(model_t m, float3 n, float3 world, out float share, float in_sun)
 {
 	float3 diffuse = 0, light_ambient = 0, sun = 0;
 	[unroll] for (int k = 0; k < 4; ++k)
 	{
-		const float3 d = m.light_dir[k].w * m.light_diffuse[k].rgb * light_scale * max(0, dot(n, m.light_dir[k].xyz));
+		const bool is_sun = sun_dir.w > 0 && dot(m.light_dir[k].xyz, sun_dir.xyz) > 0.985;
+		const float3 d = m.light_dir[k].w * m.light_diffuse[k].rgb * light_scale * max(0, dot(n, m.light_dir[k].xyz)) * (is_sun ? in_sun : 1.0);
 		diffuse += d;
-		sun += sun_dir.w > 0 && dot(m.light_dir[k].xyz, sun_dir.xyz) > 0.985 ? d : 0;
+		sun += is_sun ? d : 0;
 		light_ambient += m.light_dir[k].w * m.light_ambient[k].rgb;
 	}
 	[unroll] for (int j = 0; j < 4; ++j)
@@ -238,6 +246,10 @@ float4 lit(model_t m, float3 n, float3 world, out float share)
 	const float3 c = m.material_ambient.rgb * sky_ambient(m, m.ambient.rgb * light_scale + light_ambient, n) + kMaterialDiffuse * diffuse;
 	share = light_share(saturate(c), saturate(c - kMaterialDiffuse * sun));
 	return float4(saturate(c), kMaterialDiffuse);
+}
+float4 lit(model_t m, float3 n, float3 world, out float share)
+{
+	return lit(m, n, world, share, 1.0);
 }
 )" R"(
 struct v2p
@@ -281,7 +293,9 @@ v2p vs(uint vid : SV_VertexID)
 	return r;
 }
 
-float4 shade(v2p i, out float share)
+// shadowed: the sun's and clouds' shadows applied (per pixel, the zone's sun known: sun_shadows.hpp), from the mesh's own
+// facing, two texels more off the body in the casters' map (their own bodies are in it: else acne on low-poly limbs)
+float4 shade(v2p i, out float share, out bool shadowed)
 {
 	const model_t m = models[min(model_index, (uint)options.y - 1)];
 	// (the texture pack's texture under FSR: sampled as finely as the screen's pixels, not the world's. A root constant,
@@ -293,7 +307,9 @@ float4 shade(v2p i, out float share)
 		t = colour_map.Sample(clamp_linear, i.uv);
 	const detail_t dt = detail_at(normalize(i.normal), i.world, i.uv);
 	share = i.share;
-	float4 colour = options.x > 0 ? lit(m, dt.n, i.world, share) : i.colour;
+	shadowed = options.x > 0 && sun_dir.w > 0 && ss_on();
+	const float in_sun = shadowed ? ss_sun_seen(i.world, normalize(i.normal), 2.0) : 1.0;
+	float4 colour = options.x > 0 ? lit(m, dt.n, i.world, share, in_sun) : i.colour;
 	colour.rgb *= (1 - kCavity * dt.cavity) * (1 - (1 - kMetalDiffuse) * dt.metal);
 	const float3 s0 = saturate(2 * t.rgb * colour.rgb);
 	const float a0 = saturate(2 * t.a * m.tfactor.a);
@@ -314,13 +330,13 @@ float4 shade(v2p i, out float share)
 			discard; // (ALPHAFUNC GREATER, ALPHAREF 0x45)
 	}
 	// (the sun's highlight after the texture, the sun's all of it; on metal its own, in its colour, and the sky in it)
-	float3 spec = char_spec(m, dt.n, i.world, t);
+	float3 spec = char_spec(m, dt.n, i.world, t) * in_sun;
 	if (dt.metal > 0 && camera.w > 0)
 	{
 		float3 dir;
 		const float3 sun = sun_light(m, dir);
 		const float3 tint = saturate(2 * t.rgb);
-		spec += dt.metal * tint * sun_spec(dt.n, dir, camera.xyz - i.world, sun, kMetalSharp, kMetalSpec);
+		spec += dt.metal * tint * sun_spec(dt.n, dir, camera.xyz - i.world, sun, kMetalSharp, kMetalSpec) * in_sun;
 		rgb += dt.metal * kMetalSky * (1 - kCavity * dt.cavity) * tint * sky_ambient(m, m.ambient.rgb * light_scale, dt.n);
 	}
 	share = spec_share(share, rgb, spec);
@@ -329,7 +345,8 @@ float4 shade(v2p i, out float share)
 float4 ps(v2p i) : SV_Target
 {
 	float share;
-	return shade(i, share);
+	bool shadowed;
+	return shade(i, share, shadowed);
 }
 // (with the motion target as well: the motion of what's drawn there)
 struct motion_out
@@ -341,7 +358,8 @@ motion_out ps_motion(v2p i)
 {
 	motion_out o;
 	float share;
-	o.colour = shade(i, share);
+	bool shadowed;
+	o.colour = shade(i, share, shadowed);
 	o.motion = i.motion;
 	return o;
 }
@@ -365,8 +383,9 @@ light_out ps_light(v2p i)
 {
 	light_out o;
 	float share;
-	o.colour = shade(i, share);
-	o.light = light_word(i.motion.w, light_facing(i), share);
+	bool shadowed;
+	o.colour = shade(i, share, shadowed);
+	o.light = light_word_ss(i.motion.w, light_facing(i), share, shadowed);
 	return o;
 }
 struct light_motion_out
@@ -379,8 +398,9 @@ light_motion_out ps_light_motion(v2p i)
 {
 	light_motion_out o;
 	float share;
-	o.colour = shade(i, share);
-	o.light = light_word(i.motion.w, light_facing(i), share);
+	bool shadowed;
+	o.colour = shade(i, share, shadowed);
+	o.light = light_word_ss(i.motion.w, light_facing(i), share, shadowed);
 	o.motion = i.motion;
 	return o;
 }
@@ -1244,7 +1264,8 @@ float4 pps(p2p i) : SV_Target
 		// (a slot: the frame's draw's constants and models, then its shadow's: record_casters may come while the GPU has yet
 		// to read the draw's)
 		constexpr UINT64 kHalfSlotBytes = (kConstantsBytes + UINT64(kMaxModels) * sizeof(gpu_model) + 255) & ~UINT64(255);
-		constexpr UINT64 kSlotBytes = 2 * kHalfSlotBytes;
+		constexpr UINT64 kShadowAt = 2 * kHalfSlotBytes; // (the sun's shadows' block: sun_shadows.hpp)
+		constexpr UINT64 kSlotBytes = kShadowAt + sun::kBlockBytes;
 		constexpr UINT64 kModelsAt = kConstantsBytes;
 
 		template <typename T>
@@ -1495,7 +1516,7 @@ float4 pps(p2p i) : SV_Target
 		{
 			ID3DBlob *code = nullptr, *errors = nullptr;
 			const bool en = e.out == &_en_svs || e.out == &_en_sps || e.out == &_en_pvs || e.out == &_en_pps;
-			const std::string src = en ? std::string(kEnShader) : std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
+			const std::string src = en ? std::string(kEnShader) : std::string(light::kHlsl) + light::kHemiSpecHlsl + sun::hlsl("t7") + kShader;
 			if (FAILED(hifi::shadercache::compile(compile, src.data(), src.size(), en ? "hifixi_enspells" : "hifixi_chars", nullptr, nullptr, e.name, e.target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
 			{
 				why = std::string("the character shader didn't compile: ") + (errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "?");
@@ -1513,7 +1534,7 @@ float4 pps(p2p i) : SV_Target
 		// volatile, so the one after a pass's own texture (T, the scene's copy) needn't be one, unread there)
 		D3D12_DESCRIPTOR_RANGE ranges[3] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2 },
 			{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6, 0, 1 } };
-		D3D12_ROOT_PARAMETER p[7] = {};
+		D3D12_ROOT_PARAMETER p[9] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 		p[0].Descriptor.ShaderRegister = 0;
 		p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -1531,6 +1552,13 @@ float4 pps(p2p i) : SV_Target
 		}
 		p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // (the last frame's palette rows for the instance: t5)
 		p[6].Descriptor.ShaderRegister = 5;
+		// (the sun's shadows: their block, World FX's map copy; the pixel shader's only)
+		p[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+		p[7].Descriptor.ShaderRegister = 2;
+		p[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		p[8].Descriptor.ShaderRegister = 7;
+		p[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		D3D12_STATIC_SAMPLER_DESC s[2] = {};
 		s[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 		s[0].AddressU = s[0].AddressV = s[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -1540,7 +1568,7 @@ float4 pps(p2p i) : SV_Target
 		s[1] = s[0];
 		s[1].ShaderRegister = 1;
 		s[1].AddressU = s[1].AddressV = s[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 7, p, 2, s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 9, p, 2, s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -1769,6 +1797,21 @@ float4 pps(p2p i) : SV_Target
 		list->SetGraphicsRootSignature(_root);
 		list->SetGraphicsRootConstantBufferView(0, base);
 		list->SetGraphicsRootShaderResourceView(3, base + kModelsAt);
+		// The sun's shadows (sun_shadows.hpp): World FX's last frame's, per pixel only, and only while the light split is
+		// drawn (World FX learns from it which pixels have them: else darkened twice); its copy held for this list (the
+		// reference handed to retire now: the +2 rule covers what's recorded this frame)
+		{
+			sun::block shadows;
+			const bool shadowed = o.per_pixel && o.sun_known && light && sun::latest(_device, shadows);
+			const uint32_t seq = f.seq.load(std::memory_order_acquire);
+			const UINT64 at = UINT64(seq % kFrames) * kSlotBytes + kShadowAt;
+			const sun::gpu_block ssc = sun::constants_for(shadowed, shadows, float(seq % 64) / 64.0f * 0.618034f);
+			std::memcpy(_mapped + at, &ssc, sizeof(ssc));
+			list->SetGraphicsRootConstantBufferView(7, _ring->GetGPUVirtualAddress() + at);
+			list->SetGraphicsRootShaderResourceView(8, shadowed ? shadows.buffer->GetGPUVirtualAddress() : _ring->GetGPUVirtualAddress());
+			retire::later(shadows.buffer); // (nullptr: nothing)
+			_shadowed = shadowed;
+		}
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		list->SetPipelineState(pso);
 		return true;

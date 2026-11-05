@@ -30,6 +30,12 @@
  *   ZONE_VIEW_BIAS=<b>: the colour maps' extra mip bias (draw_options::texture_bias), for the FSR A/B: e.g. Quality's
  *     -0.585 at ZONE_VIEW_SIZE 2/3 of the full size
  *   HIFIXI_PIVOT_INI: the overlays (zonemesh's dat_core; unset: config\pivot\pivot.ini beside build\, none here)
+ *   ZONE_VIEW_FX=old|native: World FX's shading over the zone as in game (src/render: the sun's cascades from the zone's
+ *     own meshes, src/zone/zoneshadow; the light split): "old" its sun shadows darkened onto the finished picture by its
+ *     shading pass, "native" looked up by the zone pass itself ([zone] nativeshadows, src/render/sun_shadows.hpp). Two
+ *     frames, the second the picture (the zone pass reads what World FX drew the frame before, as in game). No ambient
+ *     occlusion or relief; ZONE_VIEW_SHADOW=<strength> the sun shadows' strength (0.55, the High preset's);
+ *     ZONE_VIEW_CLOUDS: unused (no weather here, so no clouds' shadows)
  */
 
 #include <d3d12.h>
@@ -39,9 +45,13 @@
 #include "../src/host/retire.hpp"
 #include "../src/pack/memwatch.hpp"
 #include "../src/pack/stream.hpp"
+#include "../src/render/grass_render.hpp"
+#include "../src/render/sun_shadows.hpp"
 #include "../src/zone/draw.hpp"
 #include "../src/zone/frame.hpp"
+#include "../src/zone/light_split.hpp"
 #include "../src/zone/zone_gpu.hpp"
+#include "../src/zone/zoneshadow.hpp"
 #include "game_dump.hpp"
 #include <algorithm>
 #include <chrono>
@@ -548,7 +558,8 @@ int main(int argc, char **argv)
 		at[1] = eye[1] + std::sin(tilt);
 		at[2] = eye[2] + std::cos(yaw) * std::cos(tilt);
 	}
-	const mat4 vp = mul(look_at(eye, at, up), perspective(top ? 0.9f : 1.0f, float(W) / H, 0.5f, 20000.0f));
+	const mat4 view = look_at(eye, at, up), proj = perspective(top ? 0.9f : 1.0f, float(W) / H, 0.5f, 20000.0f);
+	const mat4 vp = mul(view, proj);
 
 	// The frame: every placement (the nearest first when there are more than a pass holds), a day's light and fog
 	hifi::zone::frame &f = hifi::zone::frame_slot(1);
@@ -614,20 +625,131 @@ int main(int argc, char **argv)
 	f.lamp_count = 0;
 	hifi::zone::publish(f, 1);
 
-	// Drawn
+	// (ZONE_VIEW_FX: World FX over it, its cascades from the zone's own meshes, the light split for its shading pass)
+	std::string fx_mode;
+	if (char fm[16] = ""; GetEnvironmentVariableA("ZONE_VIEW_FX", fm, sizeof(fm)) != 0)
+		fx_mode = fm;
+	const bool fx = fx_mode == "old" || fx_mode == "native";
+	grass::renderer wfx;
+	hifi::zone::zone_shadow casters;
+	struct caster_context
+	{
+		hifi::zone::gpu_zone *zone;
+		hifi::zone::zone_shadow *shadow;
+	} cc = { &gz, &casters };
+	if (fx)
+	{
+		std::string error;
+		if (!wfx.init(device, error) || !casters.init(device, why))
+		{
+			std::printf("World FX: %s%s\n", error.c_str(), why.c_str());
+			return 1;
+		}
+		wfx.set_zone_casters(
+			[](void *c, float lo[3], float hi[3], uint64_t *generation) {
+				*generation = 1;
+				return static_cast<caster_context *>(c)->shadow->bounds(*static_cast<caster_context *>(c)->zone, lo, hi);
+			},
+			[](void *c, ID3D12GraphicsCommandList *l, const float m[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
+				return static_cast<caster_context *>(c)->shadow->record(l, *static_cast<caster_context *>(c)->zone, m, dsv, size);
+			},
+			&cc);
+		wfx.set_light_source([](void *) { return hifi::light::take(); }, nullptr);
+		hifi::sun::set_native(fx_mode == "native");
+		(void)hifi::light::take(); // (asked: the zone pass draws it from the first frame)
+	}
+	grass::camera cam;
+	std::memcpy(cam.view, view.m, sizeof(cam.view));
+	std::memcpy(cam.proj, proj.m, sizeof(cam.proj));
+	grass::look fl;
+	fl.grass = false;
+	fl.water = false;
+	fl.sea = false;
+	fl.fireflies = 0.0f;
+	std::memcpy(fl.sun, sun_dir, sizeof(fl.sun));
+	fl.sun_shadow = 0.55f;
+	if (char sv[16] = ""; GetEnvironmentVariableA("ZONE_VIEW_SHADOW", sv, sizeof(sv)) != 0)
+		fl.sun_shadow = std::strtof(sv, nullptr);
+	fl.sun_map = true;
+	fl.sun_characters = true;
+	fl.night = night ? 0.5f : 0.0f;
+	grass::target gt;
+	gt.rt = target;
+	gt.ds = depth;
+	gt.rtv = t.rtv;
+	gt.rtv_format = t.rtv_format;
+	gt.dsv_format = t.dsv_format;
+	gt.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	gt.ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+	// Drawn (with World FX: two frames, the picture the second's)
 	ID3D12CommandAllocator *alloc = nullptr;
 	ID3D12GraphicsCommandList *list = nullptr;
 	device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
 	device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
-	list->ClearRenderTargetView(t.rtv, sky, 0, nullptr);
-	list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 	hifi::zone::draw_options o;
 	o.per_pixel = per_pixel;
 	if (char b[32] = ""; GetEnvironmentVariableA("ZONE_VIEW_BIAS", b, sizeof(b)) != 0)
 		o.texture_bias = std::strtof(b, nullptr);
-	t0 = std::chrono::steady_clock::now();
-	const hifi::zone::draw_stats st = renderer.record(list, t, *hifi::zone::published(1), o, 1);
-	const double record_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	ID3D12Fence *fence = nullptr;
+	device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+	HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	hifi::zone::draw_stats st;
+	double record_ms = 0.0;
+	for (uint64_t n = 1; fx && n < 2; ++n)
+	{
+		list->ClearRenderTargetView(t.rtv, sky, 0, nullptr);
+		list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+		hifi::zone::draw_target ft = t;
+		const bool split = hifi::light::begin(list, device, target, ft.light_rtv);
+		renderer.record(list, ft, *hifi::zone::published(1), o, n);
+		if (split)
+			hifi::light::end(list);
+		std::string error;
+		const grass::draw_stats fs = wfx.draw(list, gt, cam, fl, error);
+		std::printf("World FX frame %llu: %s%s, sun map %s (%u cascades), light split %s\n", (unsigned long long)n, fs.sun ? "shaded" : "not shaded",
+			error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read", fs.sun_map_cascades, split ? "drawn" : "not drawn");
+		list->Close();
+		ID3D12CommandList *one[] = { list };
+		direct->ExecuteCommandLists(1, one);
+		direct->Signal(fence, n);
+		fence->SetEventOnCompletion(n, e);
+		WaitForSingleObject(e, 60000);
+		alloc->Reset();
+		list->Reset(alloc, nullptr);
+		wfx.release_old(0);
+		// (the block World FX published counts as fresh for the next frame however long WARP took)
+		{
+			std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+			hifi::sun::detail::g.at = GetTickCount64();
+		}
+	}
+	const uint64_t last = fx ? 2 : 1;
+	list->ClearRenderTargetView(t.rtv, sky, 0, nullptr);
+	list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+	{
+		hifi::zone::draw_target ft = t;
+		if (fx)
+			(void)hifi::light::take(); // (asked again: however long the first frame took)
+		const bool split = fx && hifi::light::begin(list, device, target, ft.light_rtv);
+		t0 = std::chrono::steady_clock::now();
+		st = renderer.record(list, ft, *hifi::zone::published(1), o, last);
+		record_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		if (split)
+			hifi::light::end(list);
+		if (fx)
+		{
+			std::string error;
+			const grass::draw_stats fs = wfx.draw(list, gt, cam, fl, error);
+			std::printf("World FX frame %llu: %s%s, sun map %s, light split %s; the zone pass %s the sun's shadows itself\n", (unsigned long long)last,
+				fs.sun ? "shaded" : "not shaded", error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read", split ? "drawn" : "not drawn",
+				st.shadowed ? "applied" : "didn't apply");
+			uint64_t taken = 0, cleared = 0;
+			hifi::light::counts(taken, cleared);
+			std::printf("  World FX read the light split: %s (taken %llu, cleared %llu)\n", fs.light_split ? "yes" : "no", (unsigned long long)taken,
+				(unsigned long long)cleared);
+		}
+	}
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Transition.pResource = target;
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -644,12 +766,9 @@ int main(int argc, char **argv)
 	ID3D12CommandList *lists[] = { list };
 	t0 = std::chrono::steady_clock::now();
 	direct->ExecuteCommandLists(1, lists);
-	ID3D12Fence *fence = nullptr;
-	device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-	direct->Signal(fence, 1);
-	HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-	fence->SetEventOnCompletion(1, e);
-	WaitForSingleObject(e, 30000);
+	direct->Signal(fence, last);
+	fence->SetEventOnCompletion(last, e);
+	WaitForSingleObject(e, 60000);
 	const double gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 	if (device->GetDeviceRemovedReason() != S_OK)
 	{

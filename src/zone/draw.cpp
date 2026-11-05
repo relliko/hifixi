@@ -6,6 +6,8 @@
  *   4  SRV t2      the frame's objects (80 bytes)        5  SRV t3  its lamps (32 bytes)
  *   6  table t4    the piece's texture                   7  table t5  its normal map, or (kPackRelief) the texture pack's
  *                                                                     height (BC4) from the pack region's height block
+ *   8  CBV b2      the sun's shadows (src/render/sun_shadows.hpp's block: the ring's slot)
+ *   9  SRV t6      World FX's shadow map copy (sun_shadows.hpp), or the ring when there's none (never read then)
  *   s0             anisotropic x8, wrapping, mip bias -0.5 (the zone pass draws without mips: MIPFILTER NONE; the
  *                  game's textures have one level, an overlay's bigger copies step down to the game's size:
  *                  zm::texture::levels, as do the texture pack's); the colour map sampled with draw_options'
@@ -20,7 +22,9 @@
 #include "hemi_spec.hpp"
 #include "light_split.hpp"
 #include "zone_gpu.hpp"
+#include "../host/retire.hpp"
 #include "../host/shadercache.hpp"
+#include "../render/sun_shadows.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -308,9 +312,11 @@ v2p vs(uint vid : SV_VertexID)
 	return r;
 }
 
-// The piece's colour; share: the sun's share of its light (light_share)
-float4 shade(v2p i, out float share)
+// The piece's colour; share: the sun's share of its light (light_share); shadowed: the sun's and clouds' shadows were
+// applied to it (per pixel, sun_shadows.hpp: the sun's term alone, before the texture; the lamps and ambient as they are)
+float4 shade(v2p i, out float share, out bool shadowed)
 {
+	shadowed = false;
 	const env_t e = env_of(objects[object_index]);
 	const float2 dx = ddx(i.uv), dy = ddy(i.uv);
 	// (parallax: per pixel on a solid piece with the pack's relief, while tex_bias.y says so; the same for a whole draw.
@@ -367,10 +373,13 @@ float4 shade(v2p i, out float share)
 		// (the lamps the game names for the object, as per vertex: every lamp in reach, near_lamp_light, lit a Mog House far
 		// too bright, 2026-10-29; kept for a tuned try)
 		const float3 rest = i.vcol.rgb * sky_ambient(e, a_rgb, n) + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
-		lit = saturate(i.vcol.rgb * s_rgb * sun_seen * saturate(dot(n, e.sun_dir.xyz)) + rest);
+		// (the sun's shadows looked up here, from the mesh's own facing: sun_shadows.hpp; 1 when there are none to apply)
+		const float in_sun = ss_sun_seen(i.world, i.normal / max(scale, 1e-6), 0.0);
+		shadowed = ss_on();
+		lit = saturate(i.vcol.rgb * s_rgb * sun_seen * in_sun * saturate(dot(n, e.sun_dir.xyz)) + rest);
 		share = light_share(lit, saturate(rest));
 		// (the highlight goes on after the texture, the sun's all of it)
-		spec = piece_spec(e, i.world, n, s_rgb, i.vcol, t);
+		spec = piece_spec(e, i.world, n, s_rgb, i.vcol, t) * in_sun;
 		share = spec_share(share, 2 * lit * t.rgb, spec);
 	}
 	else if (bump)
@@ -404,7 +413,8 @@ float4 shade(v2p i, out float share)
 float4 ps(v2p i) : SV_Target
 {
 	float share;
-	return shade(i, share);
+	bool shadowed;
+	return shade(i, share, shadowed);
 }
 // (with the light split as well: light_split.hpp; the mesh's own facing, turned toward the camera)
 struct light_out
@@ -416,12 +426,13 @@ light_out ps_light(v2p i)
 {
 	light_out o;
 	float share;
-	o.colour = shade(i, share);
+	bool shadowed;
+	o.colour = shade(i, share, shadowed);
 	const float3 n = i.normal;
 	// (the facing turned toward the camera; on a pixel lit with the texture pack's relief turned away instead: the light
 	// split's mark, light_split.hpp "Marks", so World FX's own relief fades there. World FX turns it back either way)
 	const float3 toward = dot(n, options.yzw - i.world) < 0 ? -n : n;
-	o.light = light_word(i.depth, (piece & kPackRelief) != 0 ? -toward : toward, share);
+	o.light = light_word_ss(i.depth, (piece & kPackRelief) != 0 ? -toward : toward, share, shadowed);
 	return o;
 }
 )";
@@ -455,8 +466,10 @@ light_out ps_light(v2p i)
 		};
 		static_assert(kMaxEnvs == 8); // (the shader's envs[8])
 		static_assert(sizeof(gpu_constants) <= kConstantsBytes);
-		constexpr UINT64 kSlotBytes = (kConstantsBytes + UINT64(kMaxObjects) * sizeof(gpu_object) + UINT64(kMaxLamps) * sizeof(frame_lamp) + 255) & ~UINT64(255);
+		// (a slot: the frame's constants, its objects, its lamps, then the sun's shadows' block at the next 256 bytes)
 		constexpr UINT64 kObjectsAt = kConstantsBytes, kLampsAt = kConstantsBytes + UINT64(kMaxObjects) * sizeof(gpu_object);
+		constexpr UINT64 kShadowAt = (kLampsAt + UINT64(kMaxLamps) * sizeof(frame_lamp) + 255) & ~UINT64(255);
+		constexpr UINT64 kSlotBytes = kShadowAt + sun::kBlockBytes;
 
 		template <typename T>
 		void drop(T *&p)
@@ -752,7 +765,7 @@ light_out ps_light(v2p i)
 			why = "d3dcompiler_47.dll isn't there";
 			return false;
 		}
-		std::string source = std::string(light::kHlsl) + light::kHemiSpecHlsl + kShader;
+		std::string source = std::string(light::kHlsl) + light::kHemiSpecHlsl + sun::hlsl("t6") + kShader;
 #ifdef ZONE_GBUF
 		if (const char *mode = std::getenv("ZONE_GBUF"); mode != nullptr && *mode != '0')
 			source = std::string("#define GBUF ") + mode + "\n" + source;
@@ -775,7 +788,7 @@ light_out ps_light(v2p i)
 		}
 
 		D3D12_DESCRIPTOR_RANGE ranges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5 } };
-		D3D12_ROOT_PARAMETER p[8] = {};
+		D3D12_ROOT_PARAMETER p[10] = {};
 		p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 		p[0].Descriptor.ShaderRegister = 0;
 		p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -793,6 +806,13 @@ light_out ps_light(v2p i)
 			p[6 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
 			p[6 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		}
+		// (the sun's shadows: their block, World FX's map copy; the pixel shader's only)
+		p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+		p[8].Descriptor.ShaderRegister = 2;
+		p[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		p[9].Descriptor.ShaderRegister = 6;
+		p[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		D3D12_STATIC_SAMPLER_DESC s = {};
 		// (anisotropic, a little toward the sharper level: an overlay's bigger textures keep their detail on ground seen
 		// at a slant instead of blurring to a smaller level; the game's own one-level textures just alias less)
@@ -802,7 +822,7 @@ light_out ps_light(v2p i)
 		s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
 		s.MaxLOD = D3D12_FLOAT32_MAX;
 		s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		const D3D12_ROOT_SIGNATURE_DESC rd = { 8, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+		const D3D12_ROOT_SIGNATURE_DESC rd = { 10, p, 1, &s, D3D12_ROOT_SIGNATURE_FLAG_NONE };
 		using serialize_fn = decltype(&D3D12SerializeRootSignature);
 		const auto serialize = reinterpret_cast<serialize_fn>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature"));
 		ID3DBlob *blob = nullptr, *errors = nullptr;
@@ -986,6 +1006,14 @@ light_out ps_light(v2p i)
 		if (lamp_count != 0)
 			std::memcpy(at + kLampsAt, p.lamps, size_t(lamp_count) * sizeof(frame_lamp));
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
+		// The sun's shadows (sun_shadows.hpp): World FX's last frame's, per pixel only, and only while the light split is
+		// drawn (it's how World FX learns which pixels have them: without it they'd be darkened twice); its copy held for
+		// this list (the reference handed to retire once bound)
+		sun::block shadows;
+		const bool shadowed = o.per_pixel && t.light_rtv.ptr != 0 && sun::latest(_device, shadows);
+		const sun::gpu_block ssc = sun::constants_for(shadowed, shadows, float(frame_number % 64) / 64.0f * 0.618034f);
+		std::memcpy(at + kShadowAt, &ssc, sizeof(ssc));
+		st.shadowed = shadowed;
 
 		// (the breadcrumbs, when Direct3D has WriteBufferImmediate: the frame number's low 16 bits, the draw's below; and
 		// the setup's steps before the first draw in word 2, as the GPU's command processor passes them: 0.63's reports
@@ -1016,6 +1044,9 @@ light_out ps_light(v2p i)
 		list->SetGraphicsRootConstantBufferView(0, base);
 		list->SetGraphicsRootShaderResourceView(4, base + kObjectsAt);
 		list->SetGraphicsRootShaderResourceView(5, base + kLampsAt);
+		list->SetGraphicsRootConstantBufferView(8, base + kShadowAt);
+		list->SetGraphicsRootShaderResourceView(9, shadowed ? shadows.buffer->GetGPUVirtualAddress() : base);
+		retire::later(shadows.buffer); // (nullptr: nothing)
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		step(kStepTargets);
 

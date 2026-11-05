@@ -135,6 +135,14 @@ Our own resources:
 - `src/render/grass_render.cpp:4692,5295`, `src/fx/fxrender.cpp:596`: our private depths (floor map, blade depth, fx)
   are DENY_SHADER_RESOURCE on purpose: nothing samples them. Keep it that way, or drop the flag first.
 - `src/render/grass_render.cpp:3564,6120`: UAV barriers between World FX's passes over the same buffer.
+- World FX's shadow map copy read by the native zone and characters (`src/render/sun_shadows.hpp`, [zone]
+  nativeshadows): a buffer World FX writes only with copies (COPY_DEST) and leaves in NON_PIXEL | PIXEL_SHADER_RESOURCE
+  at the end of each of them (`draw_sun_map`, `draw_casters`, and the clouds' shadows' map copied to its end from the sun
+  mask, `grass_render.cpp:6246`: the mask UNORDERED_ACCESS -> COPY_SOURCE -> back, the copy readable -> COPY_DEST ->
+  back, both in the same section). The native passes read it through a root SRV with **no barrier of their own**: it is
+  in that read state between World FX's frames, or decayed to COMMON after an `ExecuteCommandLists` (a buffer), which
+  promotes to a shader read. They read the frame before's drawing: their lists come before World FX's in a frame on the
+  one queue, so no copy of this frame's runs under their reads (sun_shadows.hpp "Frame order").
 - The texture pack's textures (`src/pack/stream.cpp:1007`): committed, made in COMMON, written once on the streamer's
   copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
   queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.

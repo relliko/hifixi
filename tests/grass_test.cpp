@@ -17,6 +17,7 @@
  */
 
 #include "grass_render.hpp" // (HiFi XI's render engine: src\render)
+#include "sun_shadows.hpp"  // (the native passes' shadows: the light split's mark, zinfo.w bit 128)
 #include <algorithm>
 #include <chrono>
 #include <dxgi1_4.h>
@@ -3578,6 +3579,9 @@ int main(int argc, char **argv)
 		} src_ctx = { nullptr };
 		bool split_state_read = false; // (the split texture in kRead, not COPY_DEST)
 		const uint32_t up_bits = uint32_t(std::lround(0.5 * 127.0)) << 11;
+		// (1o6: the words as the native passes write them with [zone] nativeshadows on, sun_shadows.hpp: 1 the share in 6
+		// bits, 2 that and the mark, bit 31, "the sun's shadows applied here")
+		int mark_mode = 0;
 		auto words = [&](const camera &c) {
 			barrier(g.list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			const std::vector<uint8_t> zb = g.read(depth, 4);
@@ -3594,7 +3598,8 @@ int main(int argc, char **argv)
 					{
 						const double vd = ly / (d24 / 16777215.0 - lx);
 						const uint32_t code = uint32_t(std::clamp(std::lround((std::log2(std::max(vd, 1e-3)) + 3.0) * 128.0), 1L, 2047L));
-						v = code | up_bits | uint32_t(std::lround(0.72 * 127.0)) << 25;
+						v = mark_mode == 0 ? code | up_bits | uint32_t(std::lround(0.72 * 127.0)) << 25
+										   : code | up_bits | uint32_t(std::lround(0.72 * 63.0)) << 25 | (mark_mode == 2 ? 1u << 31 : 0u);
 					}
 					w[size_t(y) * (sfp.Footprint.RowPitch / 4) + x] = v;
 				}
@@ -3804,6 +3809,52 @@ int main(int argc, char **argv)
 					fclose(f);
 				}
 			}
+		}
+		// 1o6. The native passes' shadow mark (src/render/sun_shadows.hpp, [zone] nativeshadows): with it on (zinfo.w bit
+		// 128), the share read from 6 bits shades as the 7-bit one did; a word marked "shadowed" (bit 31) isn't shadowed by
+		// the map again (the native pass did it), only its contact march is left; the same word unmarked still is. The
+		// ground's grid points darker than its lit ones by over 15 levels, from the first camera.
+		if (elevation > 30.0f)
+		{
+			const camera c = camera_of(shots[0]);
+			auto dark = [&](const std::vector<float> &v) {
+				std::vector<float> seen;
+				for (float x : v)
+					if (x >= 0.0f)
+						seen.push_back(x);
+				if (seen.empty())
+					return -1.0;
+				std::sort(seen.begin(), seen.end());
+				const float lit = seen[seen.size() * 95 / 100];
+				size_t n = 0;
+				for (float x : seen)
+					n += x < lit - 15.0f ? 1 : 0;
+				return double(n) / double(seen.size());
+			};
+			auto shot_with = [&](int mode) {
+				mark_mode = mode;
+				hifi::sun::set_native(mode != 0);
+				frame(c, true);
+				const std::vector<uint8_t> img = frame(c, true);
+				return sample(img, c);
+			};
+			const std::vector<float> before = shot_with(0), unmarked = shot_with(1), marked = shot_with(2);
+			mark_mode = 0;
+			hifi::sun::set_native(false);
+			double diff = 0.0;
+			size_t both_seen = 0;
+			for (size_t k = 0; k < before.size(); ++k)
+				if (before[k] >= 0.0f && unmarked[k] >= 0.0f)
+				{
+					diff += std::fabs(before[k] - unmarked[k]);
+					both_seen++;
+				}
+			const double d_before = dark(before), d_unmarked = dark(unmarked), d_marked = dark(marked);
+			std::printf("  1o6 the shadow mark: in shadow %.1f%% of the grid (7-bit share), %.1f%% (6-bit, unmarked), %.1f%% (marked); 6-bit against "
+				"7-bit, mean |luma difference| %.2f over %zu points\n", 100.0 * d_before, 100.0 * d_unmarked, 100.0 * d_marked, both_seen ? diff / both_seen : 0.0, both_seen);
+			check(d_before > 0.2 && std::fabs(d_unmarked - d_before) < 0.01 && both_seen > 1000 && diff / both_seen < 1.0,
+				"1o6: the share in 6 bits (nativeshadows on, unmarked) shades as the 7-bit one");
+			check(d_marked >= 0.0 && d_marked < 0.02, "1o6: a word marked shadowed isn't shadowed by World FX's map again");
 		}
 		r.set_light_source(nullptr, nullptr);
 		release(split);

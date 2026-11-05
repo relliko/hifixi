@@ -276,7 +276,7 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
 echo Built build\enspell_view.exe
 rem The native zone renderer's zone data against tests\zonemesh_oracle.py: build\zonemesh_test.exe; and its offline
 rem picture of a zone through the GPU upload (needs the game closed, or --warp; ZONE_VIEW_PACK, a pack's folder: with the
-rem texture pack's textures streamed from it): build\zone_view.exe; the plugin's
+rem texture pack's textures streamed from it; ZONE_VIEW_FX: with World FX's shading over it): build\zone_view.exe; the plugin's
 rem per-zone loading on WARP, and the texture pack's zones (src\zone\zonepack; no address-space randomisation: the
 rem FFXiMain dump goes at its own base): build\zonenative_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
@@ -323,8 +323,9 @@ cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_
   /Fe"build\packjoin_test.exe" /link /NOLOGO /LARGEADDRESSAWARE user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\packjoin_test.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
-  tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp src\game\game.cpp src\pack\memwatch.cpp ^
-  src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp /Fo"build\test\\" /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
+  /I src\render tests\zone_view.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\zone\zoneshadow.cpp src\bake\zonemesh.cpp src\bake\dat.cpp src\bake\dat_core.cpp ^
+  src\game\game.cpp src\pack\memwatch.cpp src\pack\stream.cpp src\pack\pack.cpp src\pack\validate.cpp src\pack\hash.cpp build\engine\worldfx_engine.lib ^
+  /Fo"build\test\\" /Fe"build\zone_view.exe" /link /NOLOGO user32.lib d3d12.lib dxgi.lib || exit /b 1
 echo Built build\zone_view.exe
 cl /nologo /MP /std:c++20 /O2 /MT /EHa /W4 /permissive- /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
   tests\zonenative_test.cpp src\zone\native.cpp src\zone\actordata.cpp src\zone\draw.cpp src\zone\frame.cpp src\zone\zone_gpu.cpp src\bake\zonemesh.cpp ^

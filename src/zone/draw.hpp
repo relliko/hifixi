@@ -67,6 +67,7 @@ namespace hifi::zone
 	struct draw_stats
 	{
 		uint32_t objects = 0, draws = 0, triangles = 0, skipped = 0;
+		bool shadowed = false; // (the sun's shadows applied per pixel: src/render/sun_shadows.hpp)
 	};
 
 	class zone_renderer

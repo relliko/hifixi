@@ -109,6 +109,11 @@ The +2 rule (src/host/retire.hpp)
   the last heap would otherwise be handed out twice). The characters' texture pack tickets go the same way: `bury`
   hands them to the drop hook (`stream::drop`, src/chars/cache.cpp:221-223) beside the pairs, and the streamer hands a
   texture to `retire::later` at its last ticket's drop.
+- World FX's shadow map copy as the native passes use it (`src/render/sun_shadows.hpp`): the published block holds one
+  reference (`publish`, :93, the next publish or `release()` lets it go), and `latest` (:129) hands each pass one more,
+  which the pass gives to `retire::later` right after binding it (`src/zone/draw.cpp:1049`, `src/chars/chardraw.cpp:1812`):
+  a renderer World FX remakes, a device change or a stale block let go never frees the copy under a recorded list. The
+  plugin's unload lets the block's own go before `retire::release_all` (`src/plugin/main.cpp`).
 - retire.hpp covers the game's direct queue only. Anything that ran on another queue must already be finished (CPU
   wait or fence check) before it is handed to `retire::later`.
 

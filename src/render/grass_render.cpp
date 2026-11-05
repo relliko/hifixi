@@ -4,6 +4,7 @@
 
 #include "grass_render.hpp"
 #include "gpu_crash.hpp"
+#include "sun_shadows.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <atomic>
@@ -4179,9 +4180,11 @@ namespace grass
 			_device->GetCopyableFootprints(&far_desc, 0, 1, 0, &far_footprint, nullptr, nullptr, &far_size);
 			_far_map_slot = (far_size + align - 1) / align * align;
 			_far_map_start = 2 * _sun_map_half + caster_bytes;
+			_cloud_copy_at = _far_map_start + 2 * _far_map_slot;
 			D3D12_RESOURCE_DESC bd = {};
 			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			bd.Width = _far_map_start + 2 * _far_map_slot; // (the two halves, the casters' map, the farthest cascade's two)
+			// (the two halves, the casters' map, the farthest cascade's two, the clouds' shadows' map for the native passes)
+			bd.Width = _cloud_copy_at + UINT64(kCloudShadowSize) * kCloudShadowSize * 4;
 			bd.Height = 1;
 			bd.DepthOrArraySize = 1;
 			bd.MipLevels = 1;
@@ -4611,6 +4614,85 @@ namespace grass
 			farthest[30] = fn;
 			farthest[31] = float(_far_map_pitch);
 		}
+	}
+
+	// The cascades (as sun_map_params, in world space: the rows straight from each drawing's world-to-clip), the casters'
+	// map (as caster_params) and the clouds' map (copied to _cloud_copy_at) for HiFi XI's native passes, the next frame's
+	// (sun_shadows.hpp). A whole shadow takes kShareScale x strength of the sun's term there (at most all of it): as much of
+	// the light as grass.hlsl's shadow took where the sun's share is the game's square-on 0.72 or less, so the shadows'
+	// strength setting means what it did.
+	void renderer::publish_sun_shadows(double clock, bool casters, const float *cloud, float strength, const float sun[3]) const
+	{
+		if (_sun_map_copy == nullptr || !_cascades[0].valid || !_cascades[1].valid)
+		{
+			hifi::sun::publish_none();
+			return;
+		}
+		hifi::sun::block b;
+		b.device = _device;
+		b.buffer = _sun_map_copy;
+		hifi::sun::gpu_block &g = b.gpu;
+		auto rows = [](const float *m, float (*o)[4], float texels) {
+			for (int i = 0; i < 4; ++i)
+			{
+				o[0][i] = m[i * 4 + 0] * 0.5f * texels + (i == 3 ? 0.5f * texels : 0.0f);
+				o[1][i] = -m[i * 4 + 1] * 0.5f * texels + (i == 3 ? 0.5f * texels : 0.0f);
+				o[2][i] = m[i * 4 + 2];
+			}
+		};
+		auto per_yalm = [](const float *m) { return std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]); };
+		auto start = [&](uint32_t k, uint32_t slot) {
+			return uint32_t((k < 2 ? slot * _sun_map_half + _sun_map_offset[k] : _far_map_start + slot * _far_map_slot) / 4);
+		};
+		const bool timed = std::isfinite(clock) && clock > 0.0;
+		for (uint32_t k = 0; k < 3; ++k)
+		{
+			const cascade &c = _cascades[k];
+			if (k == 2 && (!c.valid || _far_map == nullptr))
+				break; // (where[2].w 0: not read)
+			const float n = float(cascade_size(k));
+			const bool fading = timed && c.prev_valid;
+			const float *prev = fading ? c.prev_world_to_clip : c.world_to_clip;
+			rows(c.world_to_clip, &g.rows[6 * k], n);
+			rows(prev, &g.rows[6 * k + 3], n);
+			g.cascade[k][0] = per_yalm(c.world_to_clip);
+			g.cascade[k][1] = per_yalm(prev);
+			g.cascade[k][2] = 2.0f * cascade_reach(k) / n;
+			g.cascade[k][3] = fading ? float(std::clamp((clock - c.drawn_at) / kSunMapHold, 0.0, 1.0)) : 1.0f;
+			g.where[k][0] = start(k, c.slot);
+			g.where[k][1] = start(k, c.slot ^ 1u);
+			g.where[k][2] = k < 2 ? _sun_map_pitch : _far_map_pitch;
+			g.where[k][3] = cascade_size(k);
+		}
+		if (casters)
+		{
+			const float n = float(kSunMapSize);
+			rows(_caster_world_to_clip, g.caster_rows, n);
+			g.caster[0] = per_yalm(_caster_world_to_clip);
+			g.caster[1] = 2.0f * kCasterReach / n;
+			g.caster_where[0] = uint32_t(2 * _sun_map_half / 4);
+			g.caster_where[1] = _sun_map_pitch;
+			g.caster_where[2] = kSunMapSize;
+			g.caster_where[3] = 1;
+		}
+		const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+		for (int i = 0; i < 3; ++i)
+			g.sun[i] = len > 0.0f ? sun[i] / len : 0.0f;
+		constexpr float kShareScale = 1.39f; // (grass.hlsl's)
+		g.sun[3] = std::isfinite(strength) ? std::clamp(kShareScale * strength, 0.0f, 1.0f) : 0.0f;
+		if (cloud != nullptr && cloud[3] > 0.0f)
+		{
+			g.cloud[0] = cloud[0];
+			g.cloud[1] = cloud[1];
+			g.cloud[2] = cloud[2];
+			g.cloud[3] = cloud[3];
+			for (int i = 0; i < 3; ++i)
+				g.cloud_light[i] = cloud[4 + i];
+			g.cloud_light[3] = cloud[7];
+			g.cloud_where[0] = uint32_t(_cloud_copy_at / 4);
+			g.cloud_where[1] = kCloudShadowSize;
+		}
+		hifi::sun::publish(b);
 	}
 
 	// The host's casters (set_casters) into their own map, each frame the sun's shadow map is read: looking down the sun's
@@ -5248,10 +5330,16 @@ namespace grass
 			if (size != 0 && size != UINT64(-1) && ed.Width == desc.Width && ed.Height == desc.Height && ed.SampleDesc.Count == 1 &&
 				ed.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
 				_device->GetCopyableFootprints(&ed, 0, 1, at, &extra_footprint, nullptr, nullptr, &extra_size);
-			if (extra_size == 0 || extra_size == UINT64(-1) || extra_footprint.Footprint.RowPitch != footprint.Footprint.RowPitch)
+			// (its rows as long as its own footprint makes them: a D24S8 depth's may be longer than the R32 split's, 6656
+			// bytes against 6400 at 1600 wide on an RTX 4070 Ti, and the split was then never copied; its pitch goes to the
+			// shaders in zinfo.w's high half when it differs, _extra_pitch)
+			if (extra_size == 0 || extra_size == UINT64(-1) || extra_footprint.Footprint.RowPitch / 4 > 0xFFFFu)
 				extra = nullptr;
 			else
+			{
 				size = at + extra_size;
+				_extra_pitch = extra_footprint.Footprint.RowPitch / 4;
+			}
 		}
 		std::string ignored; // without the copy, grass goes on without what it gives rather than not at all
 		// (the depth copy with room at its end for the lamps' shadow maps, once they're wanted: draw_lamp_maps)
@@ -5610,7 +5698,8 @@ namespace grass
 			if ((depth_pitch = copy_out(list, _depth, t.ds, t.ds_state, light, &light_copied)) != 0)
 			{
 				// (bit 64: the light split's facings marked, light_marks: asked with this frame's texture)
-				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u) | (light_copied && _light_marks != nullptr && _light_marks(_light_context) ? 64u : 0u);
+				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u) | (light_copied && _light_marks != nullptr && _light_marks(_light_context) ? 64u : 0u) |
+					(light_copied && hifi::sun::native() ? 128u : 0u); // (sun_shadows.hpp: the words marked)
 				stats.light_split = light_copied;
 				transition(list, t.ds, D3D12_RESOURCE_STATE_COPY_SOURCE, t.ds_state, 0);
 			}
@@ -5980,7 +6069,9 @@ namespace grass
 		// Toward the sun in view space (row vectors: v * the view's rotation)
 		for (int i = 0; i < 3; ++i)
 			constants[33 + i] = l.sun[0] * cam.view[0 * 4 + i] + l.sun[1] * cam.view[1 * 4 + i] + l.sun[2] * cam.view[2 * 4 + i];
-		const uint32_t depth_info[4] = { depth_pitch, static_cast<uint32_t>(ds_desc.Width), ds_desc.Height, depth_kind };
+		// (the light split's row pitch, uints, in w's high half when it isn't the depth's: grass.hlsl light_at)
+		const uint32_t split_pitch = light_copied && _extra_pitch != depth_pitch ? _extra_pitch << 16 : 0u;
+		const uint32_t depth_info[4] = { depth_pitch, static_cast<uint32_t>(ds_desc.Width), ds_desc.Height, depth_kind | split_pitch };
 		std::memcpy(&constants[36], depth_info, sizeof(depth_info));
 		// (d = _33 / _34 + _43 / w for w = view z * _34; the game's projection is right-handed: _33 = _34 = -1)
 		constants[40] = cam.proj[11] != 0.0f ? cam.proj[10] / cam.proj[11] : cam.proj[10];
@@ -6073,6 +6164,7 @@ namespace grass
 			if (sun_pso == nullptr)
 				constants[51] = 0.0f; // (no mask worked out: none read)
 			stats.bound = true;
+			bool cloud_copied = false;
 			// The sun's shadow map: drawn again when it has to be, then its parameters for this camera after the
 			// actors (crowd's rule bit 8 says they're there)
 			if (sun_pso != nullptr && sun_map && actor_data != nullptr)
@@ -6144,6 +6236,19 @@ namespace grass
 				written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 				written.UAV.pResource = _sun_mask;
 				list->ResourceBarrier(1, &written);
+				// (their shadows' map for HiFi XI's native passes, the next frame's: after the shadow map's in its copy,
+				// sun_shadows.hpp; the mask back to UNORDERED_ACCESS and the copy to its readable state for the passes after)
+				if (cloud_shade && stats.sun_map && hifi::sun::native() && _sun_map_copy != nullptr)
+				{
+					const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					transition(list, _sun_mask, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					transition(list, _sun_map_copy, _sun_map_copy_state, D3D12_RESOURCE_STATE_COPY_DEST);
+					list->CopyBufferRegion(_sun_map_copy, _cloud_copy_at, _sun_mask, mask_bytes + 2 * cloud_bytes, UINT64(kCloudShadowSize) * kCloudShadowSize * 4);
+					transition(list, _sun_map_copy, D3D12_RESOURCE_STATE_COPY_DEST, readable);
+					_sun_map_copy_state = readable;
+					transition(list, _sun_mask, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					cloud_copied = true;
+				}
 				stats.clouds = true;
 				stats.clouds_carried = clouds_carried;
 				// (what the next frame carries this picture over with)
@@ -6157,6 +6262,18 @@ namespace grass
 				_cloud_h = cloud_h;
 				_cloud_buffer = _sun_mask;
 				std::memcpy(_cloud_key, cloud_key, sizeof(_cloud_key));
+			}
+			// (the cascades, casters and clouds to HiFi XI's native passes, the next frame's: sun_shadows.hpp)
+			if (hifi::sun::native())
+			{
+				if (stats.sun_map && constants[51] > 0.0f)
+				{
+					const float *const c = actor_data + kWxOffset + kWxParams;
+					const float cloud[8] = { c[32], c[33], c[34], c[37], c[24], c[25], c[26], actor_data[kWxOffset + 7] };
+					publish_sun_shadows(l.clock, stats.casters, cloud_copied ? cloud : nullptr, constants[51], l.sun);
+				}
+				else
+					hifi::sun::publish_none();
 			}
 			if (sun_pso != nullptr)
 			{

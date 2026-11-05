@@ -217,6 +217,12 @@ namespace hifi::settings
 				"for smoother light and sharper detail where a surface has one. (/hifi nativezone perpixel)", nullptr, nullptr, false,
 				{ _, zone::options::kPerPixelByDefault ? 1.0f : _, zone::options::kPerPixelByDefault ? 1.0f : _, zone::options::kPerPixelByDefault ? 1.0f : _ },
 				flag, 0.0f, 1.0f, zone::options::kPerPixelByDefault ? 1.0f : 0.0f },
+			{ "zone.nativeshadows", tab::game, "Drawn by HiFi XI", "Sun shadows lit with the scenery",
+				"The sun's and clouds' shadows worked out as the scenery and characters are lit, each pixel at full size, softer the "
+				"higher what casts them; only the sun's light is taken, lamps and the sky's light stay. Off: they're darkened onto "
+				"the finished picture afterwards, as before. Needs per-pixel lighting.", nullptr, "zone.perpixel", false,
+				{ _, _, _, _ },
+				flag, 0.0f, 1.0f, zone::options::kNativeShadowsByDefault ? 1.0f : 0.0f },
 			// (native characters: their default in src/chars/charoptions.hpp)
 			{ "chars.perpixel", tab::game, "Drawn by HiFi XI", "Light the characters per pixel",
 				"The sun, moon and lamps on characters worked out at each pixel instead of at each corner: smoother light on "

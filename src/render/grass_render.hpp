@@ -828,6 +828,10 @@ namespace grass
 		// memory (u0) after its header; false when there's none (the header then says so)
 		bool draw_floor(ID3D12GraphicsCommandList *list, const float eye[3], double now);
 		void caster_params(const camera &cam, float out[16]) const;
+		// The cascades, the casters' map and the clouds' shadows to HiFi XI's native passes, in world space (sun_shadows.hpp):
+		// casters whether the casters' map was drawn, cloud (8 floats, nullptr: none) the clouds' map's corner x z, texel,
+		// strength, toward the light x y z, ground height; strength the sun's shadows'
+		void publish_sun_shadows(double clock, bool casters, const float *cloud, float strength, const float sun[3]) const;
 		bool lamp_maps_for(std::string &error);
 		void draw_lamp_maps(ID3D12GraphicsCommandList *list, const camera &cam, const look &l, const float eye[3], float out[32], draw_stats &stats);
 		ID3D12PipelineState *vis_pipeline(std::string &error);
@@ -939,6 +943,9 @@ namespace grass
 		ID3D12Resource *_far_map = nullptr;
 		UINT64 _far_map_start = 0, _far_map_slot = 0;
 		UINT _far_map_pitch = 0;
+		// (the clouds' shadows' map copied after the farthest cascade's drawings, for the native passes: sun_shadows.hpp)
+		UINT64 _cloud_copy_at = 0;
+		UINT _extra_pitch = 0; // (copy_out's: the row pitch, uints, the extra (the light split) was copied with)
 		ID3D12PipelineState *_shadow_pso = nullptr;
 		struct cascade
 		{

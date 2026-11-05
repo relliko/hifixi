@@ -129,7 +129,8 @@ float drawn_depth(int2 p)
 }
 
 // The light split (zinfo.w bit 16: the host drew it, HiFi XI's src/zone/light_split.hpp, and it was copied after the
-// depth, at the next 512 bytes, in the same rows): what the native zone and characters know of a pixel's light. A uint
+// depth, at the next 512 bytes, in rows of the depth's pitch or, when zinfo.w's high half isn't 0, of that many uints):
+// what the native zone and characters know of a pixel's light. A uint
 // a pixel: bits 0-10 its view depth, round((log2(depth) + 3) x 128), 0 for none; 11-24 its facing (world, octahedral, 7
 // bits a side); 25-31 the sun's share of the light drawn there (how much of it a full shadow takes away), 0..127.
 // zinfo.w bit 64: the facings are marked (HiFi XI's light_split.hpp "Marks"): one written turned away from the camera
@@ -145,16 +146,23 @@ float3 view_dir(float3 d)
 	return float3(c.x / lin.z, c.y / lin.w, c.w / up_row.w); // (the projection's _11, _22 and _34 undone, as body_in_view)
 }
 bool light_marks() { return (zinfo.w & 64) != 0; }
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked)
+// zinfo.w bit 128: the words carry the native passes' shadow mark (HiFi XI's src/render/sun_shadows.hpp): the share in
+// bits 25-30 (0..63: what's left of the sun's light after its shadows), bit 31 set where the native zone or characters
+// applied the sun's and clouds' shadows themselves (light_at's done): the sun pass then looks only for contact shadows
+// there, and the clouds' aren't taken again
+bool shadow_marks() { return (zinfo.w & 128) != 0; }
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked, out bool done)
 {
 	n = float3(0.0, 0.0, 1.0);
 	share = 0.0;
 	marked = false;
+	done = false;
 	if (!light_split() || any(zinfo.yz != ground.yz) || z > 1e8)
 		return false;
 	p = clamp(p, int2(0, 0), int2(zinfo.yz) - 1);
 	uint at = (zinfo.x * zinfo.z * 4 + 511) & ~511u;
-	uint v = zbuf.Load(at + (p.y * zinfo.x + p.x) * 4);
+	uint pitch = (zinfo.w >> 16) != 0 ? zinfo.w >> 16 : zinfo.x; // (its own rows' pitch when the depth's differs)
+	uint v = zbuf.Load(at + (p.y * pitch + p.x) * 4);
 	uint code = v & 0x7FF;
 	if (code == 0 || abs((log2(max(z, 1e-3)) + 3.0) * 128.0 - float(code)) > 2.5)
 		return false;
@@ -166,13 +174,19 @@ bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool
 	// (a mark: turned away from the camera by more than the 7-bit facing's error near edge on)
 	marked = light_marks() && dot(n, -P) < -0.02 * length(P);
 	n = dot(n, -P) < 0.0 ? -n : n;
-	share = float(v >> 25) / 127.0;
+	share = shadow_marks() ? float((v >> 25) & 63) / 63.0 : float(v >> 25) / 127.0;
+	done = shadow_marks() && (v >> 31) != 0;
 	return true;
+}
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked)
+{
+	bool done;
+	return light_at(p, z, P, n, share, marked, done);
 }
 bool light_at(int2 p, float z, float3 P, out float3 n, out float share)
 {
-	bool marked;
-	return light_at(p, z, P, n, share, marked);
+	bool marked, done;
+	return light_at(p, z, P, n, share, marked, done);
 }
 
 // The ground's colour under p on screen: the zone's own texture, lighting, fog and time of day, from
@@ -1979,7 +1993,7 @@ float3 shimmered(int2 p, float3 P, float z, float3 col)
 // known: the sun's share of the light drawn here as the light split has it (light_at; below 0: not known, sun_share by
 // the facing, as the game lights by day). in_sun: how much of the light drawn here is the sun's and still reaches it
 // (its share, scaled as sun_share's, less the shadows): what the ambient occlusion spares (shade_ps).
-float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float known, out float in_sun)
+float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float known, out float in_sun, bool done)
 {
 	float sunlit = 1.0;
 	const float share = known >= 0.0 ? min(known * kShareScale, 1.0) : sun_share(dot(n, sun_in_view()));
@@ -2010,14 +2024,18 @@ float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float kn
 		in_sun *= 1.0 - max(s.x, s.y);
 	}
 	// The clouds' shadows (cloud_shadow_at): what they keep off the sun's share of this surface's light, as strong as
-	// [kCloud + 9].y says
-	[branch] if (cloud_shade)
+	// [kCloud + 9].y says (none where the native passes applied them: done)
+	[branch] if (cloud_shade && !done)
 	{
 		const float cloud = actors[kCloud + 9].y * (1.0 - cloud_shadow_at(P));
 		sunlit *= 1.0 - cloud * share;
 		in_sun *= 1.0 - cloud;
 	}
 	return sunlit;
+}
+float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float known, out float in_sun)
+{
+	return sun_lit_at(p, z, n, P, cloud_shade, known, in_sun, false);
 }
 
 float4 shade_ps(float4 pos : SV_Position) : SV_Target
@@ -2047,7 +2065,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	float3 n_known;
 	float known_share;
 	bool pack_relief; // (the texture pack's relief lit this pixel: the light split's mark)
-	const bool known = light_at(p, z, P, n_known, known_share, pack_relief);
+	bool shadows_done; // (the native passes applied the sun's and clouds' shadows here: light_at's done)
+	const bool known = light_at(p, z, P, n_known, known_share, pack_relief, shadows_done);
 	if (shade.x > 0.0 || (!known && (shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)))
 		n = surface_normal(p, P, steep);
 	const float3 n_depth = n;
@@ -2108,7 +2127,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		}
 	}
 	float in_sun;
-	float sunlit = sun_lit_at(p, z, n, P, cloud_shade, known ? known_share : -1.0, in_sun);
+	float sunlit = sun_lit_at(p, z, n, P, cloud_shade, known ? known_share : -1.0, in_sun, known && shadows_done);
 	// The ambient occlusion darkens the light from all round, not the sun's straight in: where the light split says how much
 	// of a pixel's light is the sun's still reaching it, that much is spared kAoSunSpared of it (a crease in full sun stays
 	// half as dark as in the shade; under a shadow, all of it)
@@ -2677,7 +2696,9 @@ void sun_ps(float4 pos : SV_Position)
 	float steep = 1.0;
 	float3 n;
 	float known_share;
-	const bool known = light_at(p, z, P, n, known_share);
+	bool relief_mark, done; // (done: the native passes applied the map's and the casters' shadows here, light_at's)
+	const bool known = light_at(p, z, P, n, known_share, relief_mark, done);
+	done = known && done;
 	if (!known)
 		n = surface_normal(p, P, steep);
 	// A character or monster here (inside one of their capsules, t2): its shadow is worked out once, from its
@@ -2722,13 +2743,13 @@ void sun_ps(float4 pos : SV_Position)
 	// slanted; not along an edge, where the depth's facing is anyone's)
 	const float wide = facing > 0.0 && steep < 16.0 ? max(steep / 4.0, 1.0) : 0.0;
 	float covered = 0.0, mapped = 0.0, above = 0.0;
-	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && ((crowd.x >> 16) & 8) != 0)
+	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && ((crowd.x >> 16) & 8) != 0 && !done)
 		mapped = sun_from_map(P, n, to_sun, spin, wide, covered, above);
 	// The characters and monsters from their meshes (casters_from_map): on one of them, from just past their own body
 	// toward the sun (their chest outward by their capsule's radius and a bit: the map has their own body too, and it
 	// was never meant to shade itself here, as the march from the chest leaves it out); elsewhere at the surface
 	float cast = 0.0, cast_covered = 0.0;
-	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && casters_mapped())
+	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && casters_mapped() && !done)
 		cast = casters_from_map(on_actor ? P + to_sun * (self_radius + 0.3) : P, n, to_sun, spin, wide, cast_covered);
 	// (at the share a surface facing up would lose: not all of it. Ground seen at a grazing angle is "unsure" from
 	// about 10 yalms off when the camera is low, so taken whole it was shaded twice as dark as the same ground nearer
@@ -2748,7 +2769,7 @@ void sun_ps(float4 pos : SV_Position)
 		const float width = pixel_width(z);
 		const float3 from = P + n * (2.0 * width);
 		const float t_min = 2.0 * width * clamp(steep, 1.0, 20.0);
-		const bool contact = covered >= 1.0;
+		const bool contact = covered >= 1.0 || done; // (done: the map's shadows are in the colour already, the march only for contact)
 		const float last = contact ? kContact : kLast;
 		const int steps = contact ? 16 : 32;
 
@@ -2819,14 +2840,14 @@ void sun_ps(float4 pos : SV_Position)
 		// The characters' and monsters' own shadows, when asked for (actor_shadow): from where the march starts, past
 		// the surface's own bumps; on someone, from their chest, all but their own. Where the casters' map covers the
 		// point, from it instead (above), faded over its edge.
-		[branch] if (((crowd.x >> 16) & 4) != 0 && count > 0 && cast_covered < 1.0)
+		[branch] if (((crowd.x >> 16) & 4) != 0 && count > 0 && cast_covered < 1.0 && !done)
 			shadow = max(shadow, actor_shadow(from, to_sun, self, t_min) * (1.0 - cast_covered));
 	}
 	if (on_actor)
 	{
 		// (taken whole: not by the facet's facing; by the sun's share of their light where the light split has it, so the
 		// side turned from the sun, lit by the rest already, isn't darkened again)
-		whole = saturate(shadow) * (known ? min(known_share * kShareScale, 1.0) : kActorShare);
+		whole = done ? 0.0 : saturate(shadow) * (known ? min(known_share * kShareScale, 1.0) : kActorShare);
 		shadow = 0.0;
 	}
 	sun_mask.Store((h.y * size.x + h.x) * 4, uint(saturate(shadow) * 255.0 + 0.5) | (uint(saturate(whole) * 255.0 + 0.5) << 8) |

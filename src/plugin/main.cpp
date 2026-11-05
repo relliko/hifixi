@@ -80,6 +80,7 @@
 #include "../zone/draw.hpp"
 #include "../zone/inject.hpp"
 #include "../zone/light_split.hpp"
+#include "../render/sun_shadows.hpp"
 #include "../zone/native.hpp"
 #include "../zone/actordata.hpp"
 #include "../game/modelactor.hpp"
@@ -847,6 +848,9 @@ class hifixi final : public IPlugin
 				hifi::backend::log(0, "HiFi XI: the native zone draw in (17CBA8 through our stub; the renderer made)");
 		}
 		hifi::zone::inject::set_options(hifi::game::option_on("zone", "perpixel", hifi::zone::options::kPerPixelByDefault));
+		// (the sun's shadows looked up by the native zone and characters themselves, World FX's left to what they don't
+		// draw: src/render/sun_shadows.hpp; off, World FX darkens the finished picture as before)
+		hifi::sun::set_native(hifi::game::option_on("zone", "nativeshadows", hifi::zone::options::kNativeShadowsByDefault));
 	}
 	// World FX's casters each frame (worldfx::set_casters): the characters and monsters from their meshes, then the zone's
 	// moving layer (its swaying plants, doors and elevators) into the same map. Whether either drew.
@@ -1072,6 +1076,7 @@ public:
 		hifi::game::hifps::exp::set_ashita(nullptr);
 		g_core = nullptr;
 		hifi::backend::stop();
+		hifi::sun::release(); // (World FX's shadow map copy the native passes were handed: retire holds what lists used)
 		hifi::retire::release_all(); // (nothing of ours is recorded after this: what the GPU has done with let go)
 	}
 
