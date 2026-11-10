@@ -46,6 +46,7 @@
 #include "../src/pack/memwatch.hpp"
 #include "../src/pack/stream.hpp"
 #include "../src/render/grass_render.hpp"
+#include "../src/render/lamp_glow.hpp"
 #include "../src/render/sun_shadows.hpp"
 #include "../src/zone/draw.hpp"
 #include "../src/zone/frame.hpp"
@@ -623,6 +624,84 @@ int main(int argc, char **argv)
 			l = 0xFFFFFFFFu;
 	}
 	f.lamp_count = 0;
+	// (ZONE_VIEW_LAMPS=<folder>: the zone's lamps from its bake there, <map>.bin (LMP2: bootloader\worldfx-lamps), all
+	// fully lit as at night. The zone pass gets the 64 nearest (the game's light: colour x brightness, Attenuation2 0.5),
+	// each object the 4 strongest whose range reaches its box (the game names each object's own: not known here);
+	// World FX the 16 nearest of range 20 or less, as worldfx_core's pick_lamps makes them at the default settings:
+	// reach clamp(range, 1, 12) x 1.5, colour x lamp_glow_strength(0.5), lamp shadows 0.5)
+	std::vector<float> fx_lamps;
+	if (wchar_t lf[MAX_PATH] = L""; GetEnvironmentVariableW(L"ZONE_VIEW_LAMPS", lf, MAX_PATH) != 0)
+	{
+		grass::blade_file file;
+		std::string lamps_why;
+		const std::wstring path = std::wstring(lf) + L"\\" + std::to_wstring(map) + L".bin";
+		if (!grass::read_blade_file(path.c_str(), file, lamps_why, "LMP2", 12))
+		{
+			std::printf("ZONE_VIEW_LAMPS: %s\n", lamps_why.c_str());
+			return 1;
+		}
+		struct baked { float x, y, z, range, r, g, b, brightness; uint32_t id, slot, flags; float window; };
+		std::vector<baked> all;
+		for (uint32_t i = 0; i < file.blade_count(); ++i)
+		{
+			baked b;
+			std::memcpy(&b, &file.blades[size_t(i) * 12], sizeof(b));
+			if ((b.flags & 1) == 0 && std::isfinite(b.x) && std::isfinite(b.range) && b.range > 0.0f && b.brightness > 0.0f)
+				all.push_back(b);
+		}
+		std::sort(all.begin(), all.end(), [&](const baked &a, const baked &b) {
+			const float da = (a.x - eye[0]) * (a.x - eye[0]) + (a.y - eye[1]) * (a.y - eye[1]) + (a.z - eye[2]) * (a.z - eye[2]);
+			const float db = (b.x - eye[0]) * (b.x - eye[0]) + (b.y - eye[1]) * (b.y - eye[1]) + (b.z - eye[2]) * (b.z - eye[2]);
+			return da < db;
+		});
+		for (const baked &b : all)
+		{
+			if (f.lamp_count < hifi::zone::kMaxLamps)
+			{
+				hifi::zone::frame_lamp &l = f.lamps[f.lamp_count++];
+				l.pos[0] = b.x, l.pos[1] = b.y, l.pos[2] = b.z;
+				l.range = b.range;
+				l.colour[0] = b.r * b.brightness, l.colour[1] = b.g * b.brightness, l.colour[2] = b.b * b.brightness;
+				l.attenuation2 = 0.5f;
+			}
+			if (b.range <= 20.0f && fx_lamps.size() < 16 * 8)
+			{
+				const float s = grass::lamp_glow_strength(0.5f, b.brightness, b.brightness);
+				const float o[8] = { b.x, b.y, b.z, std::clamp(b.range, 1.0f, 12.0f) * 1.5f, b.r * s, b.g * s, b.b * s, 1.0f };
+				fx_lamps.insert(fx_lamps.end(), o, o + 8);
+			}
+		}
+		for (uint32_t i = 0; i < f.count; ++i)
+		{
+			hifi::zone::frame_object &o = f.objects[i];
+			const zm::model &mo = d.models[o.model];
+			std::pair<float, uint32_t> best[4] = { { 0.0f, 0xFFFFFFFFu }, { 0.0f, 0xFFFFFFFFu }, { 0.0f, 0xFFFFFFFFu }, { 0.0f, 0xFFFFFFFFu } };
+			for (uint32_t k = 0; k < f.lamp_count; ++k)
+			{
+				const hifi::zone::frame_lamp &l = f.lamps[k];
+				float gap2 = 0.0f;
+				for (int a = 0; a < 3; ++a)
+				{
+					const float *row = o.world + a * 4;
+					const float c[3] = { 0.5f * (mo.lo[0] + mo.hi[0]), 0.5f * (mo.lo[1] + mo.hi[1]), 0.5f * (mo.lo[2] + mo.hi[2]) };
+					const float h[3] = { 0.5f * (mo.hi[0] - mo.lo[0]), 0.5f * (mo.hi[1] - mo.lo[1]), 0.5f * (mo.hi[2] - mo.lo[2]) };
+					const float centre = c[0] * row[0] + c[1] * row[1] + c[2] * row[2] + row[3];
+					const float half = std::fabs(row[0]) * h[0] + std::fabs(row[1]) * h[1] + std::fabs(row[2]) * h[2];
+					const float gap = std::max(0.0f, std::fabs(l.pos[a] - centre) - half);
+					gap2 += gap * gap;
+				}
+				if (gap2 >= l.range * l.range)
+					continue;
+				std::pair<float, uint32_t> c = { (0.2126f * l.colour[0] + 0.7152f * l.colour[1] + 0.0722f * l.colour[2]) / std::max(0.5f * gap2, 1e-3f), k };
+				for (auto &b : best)
+					if (c.first > b.first)
+						std::swap(c, b);
+			}
+			for (int k = 0; k < 4; ++k)
+				o.lamps[k] = best[k].second;
+		}
+		std::printf("ZONE_VIEW_LAMPS: %zu lamps baked, %u to the zone pass, %zu to World FX\n", all.size(), f.lamp_count, fx_lamps.size() / 8);
+	}
 	hifi::zone::publish(f, 1);
 
 	// (ZONE_VIEW_FX: World FX over it, its cascades from the zone's own meshes, the light split for its shading pass)
@@ -666,6 +745,12 @@ int main(int argc, char **argv)
 	fl.water = false;
 	fl.sea = false;
 	fl.fireflies = 0.0f;
+	if (!fx_lamps.empty())
+	{
+		fl.lamps = fx_lamps.data();
+		fl.lamp_count = uint32_t(fx_lamps.size() / 8);
+		fl.lamp_shadows = 0.5f;
+	}
 	std::memcpy(fl.sun, sun_dir, sizeof(fl.sun));
 	fl.sun_shadow = 0.55f;
 	if (char sv[16] = ""; GetEnvironmentVariableA("ZONE_VIEW_SHADOW", sv, sizeof(sv)) != 0)
