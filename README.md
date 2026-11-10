@@ -12,7 +12,7 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **FSR 3.1** builds each frame from the last ones, the world drawn a fraction of a pixel apart every frame: edges as smooth as a background resolution twice the screen's, for far less work. Swaying grass and moving characters carry their own motion, and spells, particles, water and weather are marked so FSR doesn't smear them;
   - with the background resolution at the screen's size it smooths edges; below it, it also upscales, for more frames;
   - **FSR 2** in its place if you prefer it, or where FSR 3.1 can't run; **FSR 1** (edge-aware upscaling and sharpening) when both are off;
-  - **Frame generation (AMD FSR 3):** a frame made between each two the game draws, for motion as smooth as twice the frames, the menus and text kept sharp. By default only while the game runs below half your screen's refresh rate;
+  - **Frame generation (AMD FSR 3):** a frame made between each two the game draws, for motion as smooth as twice the frames, the menus and text kept sharp. By default only while the game on its own is slow for your screen;
   - the menus and text are always drawn at the screen's own size.
 - **Its own Direct3D 8 translator** (`d3d8.dll`): the game's drawing goes straight to Direct3D 12 through HiFi XI's own code, in dgVoodoo's place. HiFi XI knows every pass of the frame from it, with its shaders compiled ahead and kept between sessions.
 - **The zone, the characters and the zone's models drawn by HiFi XI itself** (ships and airships, Mog House furniture, garden plants), from your own game files, in the game's own look:
@@ -68,7 +68,7 @@ In the menu's **Upscaling** tab: FSR on or off, FSR 3.1 or FSR 2 (or FSR 1), how
 
 ### Frame generation
 
-With **Frame generation** on, AMD FSR 3 makes a frame between each two the game draws while FSR 3.1 or FSR 2 draws the world. Your screen shows twice the frames; the game itself then runs at up to half your screen's refresh rate (122 at 244 Hz) and answers a little later. It pays most where the game runs below that: with **Only while the game runs below half the refresh rate** on (the default), it switches itself off whenever the game can run faster alone, and back on when it can't.
+With **Frame generation** on, AMD FSR 3 makes a frame between each two the game draws while FSR 3.1 or FSR 2 draws the world. Your screen shows twice the frames; the game itself then runs at up to half your screen's refresh rate (122 at 244 Hz) and answers a little later. Making those frames also takes graphics-card time, so it pays only where the game on its own runs well below that: with **Only while the game is slow** on (the default), it stays off until the game alone runs under about three quarters of half the refresh rate (under 90 at 240 Hz), switches itself off again whenever the game can run faster alone or the doubled frames add too little, and doesn't come back on after a fade or a load without checking.
 
 Turning it on takes effect the next time the game starts (it replaces the game's swap chain as the game starts); turning it off is immediate. Frame counters in the game count the game's own frames; the menu's **Performance** tab shows both. With a G-Sync or FreeSync screen, a frame cap a little under half your refresh rate (116 at 244 Hz) keeps the pacing even.
 
@@ -89,7 +89,8 @@ A texture pack is a folder of sharper, higher-resolution copies of the game's te
 - scenery, ships, furniture and plants get the pack's textures a moment after you enter an area; characters, gear, NPCs and monsters at once;
 - the pack's textures are kept on the graphics card, not in the game's own memory, so the game stays as light as without it;
 - anything the pack doesn't have is drawn as the game's own, so nothing goes missing;
-- `/hifi textures compare` shows the game's own textures again until you use it a second time, to compare.
+- `/hifi textures compare` shows the game's own textures again until you use it a second time, to compare;
+- a pack made with heights (`hifixi-texpack heights`) also gives **Relief from the texture pack**: stones, bricks and bark catch the light by their own bumps. **Depth from the texture pack (experimental)**, off by default, makes cobbles and bricks stand out of the surface.
 
 A pack copied from another PC works as long as it's whole and made for this version of HiFi XI. If it isn't (a file missing or cut short, or damaged), the menu says what's wrong and HiFi XI simply draws the game's own textures: copy the folder again, then `/hifi textures reload`. A pack made for an older or newer HiFi XI is refused the same way, and the menu says which: update HiFi XI, or get a pack made for this version. A pack made from another version of the game's files still works; only the textures the game changed since are drawn as the game's own, and the menu says so.
 

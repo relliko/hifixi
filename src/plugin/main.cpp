@@ -105,7 +105,7 @@
 
 namespace
 {
-	constexpr double kVersion = 0.67;
+	constexpr double kVersion = 0.68;
 	// A present's steps on the game's thread, timed; the lot in the log when they took over kSlowPresentMs (at most
 	// kSlowPresentLines a session: a zone change takes a second or two every time)
 	struct slow_present
