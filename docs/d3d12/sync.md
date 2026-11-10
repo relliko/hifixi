@@ -110,10 +110,15 @@ The +2 rule (src/host/retire.hpp)
   hands them to the drop hook (`stream::drop`, src/chars/cache.cpp:221-223) beside the pairs, and the streamer hands a
   texture to `retire::later` at its last ticket's drop.
 - World FX's shadow map copy as the native passes use it (`src/render/sun_shadows.hpp`): the published block holds one
-  reference (`publish`, :93, the next publish or `release()` lets it go), and `latest` (:129) hands each pass one more,
-  which the pass gives to `retire::later` right after binding it (`src/zone/draw.cpp:1049`, `src/chars/chardraw.cpp:1812`):
+  reference (`publish`, :142, the next publish or `release()` lets it go), and `latest` (:188) hands each pass one more,
+  which the pass gives to `retire::later` right after binding it (`src/zone/draw.cpp:999`, `src/chars/chardraw.cpp:1832`):
   a renderer World FX remakes, a device change or a stale block let go never frees the copy under a recorded list. The
-  plugin's unload lets the block's own go before `retire::release_all` (`src/plugin/main.cpp`).
+  plugin's unload lets the block's own go before `retire::release_all` (`src/plugin/main.cpp`). With the lamps ([zone]
+  nativelamps) the block's buffer is whichever holds the lamps' cubes: World FX's shadow map copy, or the cubes' own
+  buffer (`_lamp_native`) while there's no such copy, held and handed on the same way; a block with lamps and no cube
+  has no buffer (`latest` then hands none, `retire::later(nullptr)` does nothing). World FX itself lets `_lamp_native`
+  go through its own `keep_old` once the cubes have moved to the sun's copy (`grass_render.cpp:5240` on): its copy
+  lists may still be queued.
 - retire.hpp covers the game's direct queue only. Anything that ran on another queue must already be finished (CPU
   wait or fence check) before it is handed to `retire::later`.
 

@@ -138,11 +138,21 @@ Our own resources:
 - World FX's shadow map copy read by the native zone and characters (`src/render/sun_shadows.hpp`, [zone]
   nativeshadows): a buffer World FX writes only with copies (COPY_DEST) and leaves in NON_PIXEL | PIXEL_SHADER_RESOURCE
   at the end of each of them (`draw_sun_map`, `draw_casters`, and the clouds' shadows' map copied to its end from the sun
-  mask, `grass_render.cpp:6246`: the mask UNORDERED_ACCESS -> COPY_SOURCE -> back, the copy readable -> COPY_DEST ->
+  mask, `grass_render.cpp:6433`: the mask UNORDERED_ACCESS -> COPY_SOURCE -> back, the copy readable -> COPY_DEST ->
   back, both in the same section). The native passes read it through a root SRV with **no barrier of their own**: it is
   in that read state between World FX's frames, or decayed to COMMON after an `ExecuteCommandLists` (a buffer), which
   promotes to a shader read. They read the frame before's drawing: their lists come before World FX's in a frame on the
   one queue, so no copy of this frame's runs under their reads (sun_shadows.hpp "Frame order").
+- The lamps' shadow cubes for the native passes ([zone] nativelamps, sun_shadows.hpp's lamps) ride in the same buffer:
+  `draw_lamp_maps` (`grass_render.cpp:5240`) copies a cube's six faces from the lamps' depth array (DEPTH_WRITE ->
+  COPY_SOURCE -> back) to that copy's end (`_lamp_copy_at`, after the clouds' map; the copy readable -> COPY_DEST ->
+  readable again), only when a cube was just drawn or the buffer is another than it was last copied to. While there is no
+  sun shadow map copy (none wanted yet: indoors, a night start) they go to a buffer of their own, `_lamp_native`: made
+  in COMMON, written only by those copies, left in the same read state, and read by the native passes the same way,
+  **no barrier**, by the same argument (World FX's list of frame N writes it, the native lists of frame N + 1 read it,
+  before World FX's N + 1). Once the sun's copy exists the cubes move to it and `_lamp_native` goes to `keep_old`
+  (the lists that copied into it may still be queued). zoneinject_test's and charinject_test's native-lamp parts read
+  a block's cubes through the root SRV with the debug layer on, 0 messages.
 - The texture pack's textures (`src/pack/stream.cpp:1007`): committed, made in COMMON, written once on the streamer's
   copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
   queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.

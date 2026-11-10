@@ -61,6 +61,8 @@
 #include "../src/pack/pack_write.hpp"
 #include "../src/pack/stream.hpp"
 #include "../src/pack/validate.hpp"
+#include "../src/render/sun_shadows.hpp"
+#include "../src/zone/light_split.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1378,6 +1380,92 @@ int main(int argc, char **argv)
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		}
 		inj::set_lamps(nullptr, 0);
+		// World FX's lamp glow added by the characters' pass itself ([zone] nativelamps: src/render/sun_shadows.hpp's
+		// lamps): the middle one alone under the sun again (seqs 26 on), a block published as World FX publishes it with
+		// a lamp 3.5 yalms in front of it (reach 9), the light split asked for. Per pixel with the option on it gets
+		// brighter and every word it writes is marked; the option off, or per vertex: the picture without a block, byte
+		// for byte. A zone's lamp (it casts): its own capsule doesn't shadow it, another's standing between does.
+		struct glow_pass
+		{
+			bool per_pixel, option, block;
+			float kind;
+			int body; // (0 none, 1 its own capsule, 2 another's between it and the lamp)
+			bool tuned = false; // (the tuned look, the default: sun_shadows.hpp; else the faithful port)
+		};
+		const glow_pass glow_passes[] = {
+			{ true, true, false, 0.0f, 0 },  // 0: no block
+			{ true, true, true, 0.0f, 0 },   // 1: a glow
+			{ true, false, true, 0.0f, 0 },  // 2: the option off
+			{ false, true, false, 0.0f, 0 }, // 3: per vertex, no block
+			{ false, true, true, 0.0f, 0 },  // 4: per vertex
+			{ true, true, true, 1.0f, 0 },   // 5: a zone's lamp
+			{ true, true, true, 1.0f, 1 },   // 6: ... its own capsule
+			{ true, true, true, 1.0f, 2 },   // 7: ... another's between
+			{ true, true, true, 1.0f, 0, true }, // 8: the tuned look: a zone's lamp
+			{ true, true, true, 1.0f, 2, true }, // 9: ... another's capsule between
+		};
+		constexpr int kGlowPasses = int(sizeof(glow_passes) / sizeof(glow_passes[0]));
+		ID3D12Resource *glow_outs[kGlowPasses] = {}, *glow_words[kGlowPasses] = {};
+		bool glow_split[kGlowPasses] = {};
+		for (int k = 0; k < kGlowPasses; ++k)
+		{
+			namespace sun = hifi::sun;
+			const glow_pass &gp = glow_passes[k];
+			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&glow_outs[k]));
+			device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&glow_words[k]));
+			const uint32_t s = 26 + k;
+			lamp_frame(s, false);
+			inj::set_options(gp.per_pixel, getenv("CHARS_DETAIL") != nullptr);
+			sun::set_native_lamps(gp.option);
+			sun::set_lamp_look(gp.tuned ? sun::kLookTuned : sun::kLookFaithful);
+			if (gp.block)
+			{
+				sun::block b;
+				b.device = device;
+				sun::gpu_block &g = b.gpu;
+				g.mode[2] = sun::kHasLamps;
+				g.lamp_head[0] = 1.0f;
+				g.lamp_head[1] = 1.0f;
+				g.lamp_head[2] = gp.body != 0 ? 1.0f : 0.0f;
+				// (3.5 yalms in front here, reach 9: far enough for a lamp's shadows, which start 1.25 yalms off the light)
+				const float at[4] = { centre[0] + 3.5f * way[0] / wl, centre[1], centre[2] + 3.5f * way[2] / wl, 9.0f }, colour[4] = { 1.46f, 1.0f, 0.22f, gp.kind };
+				std::memcpy(g.lamp_pos[0], at, 16);
+				std::memcpy(g.lamp_col[0], colour, 16);
+				const float own[4] = { root[0], root[1], root[2], 1.0f };
+				const float other[4] = { 0.5f * (root[0] + at[0]), root[1], 0.5f * (root[2] + at[2]), 1.0f };
+				std::memcpy(g.body[0], gp.body == 2 ? other : own, 16);
+				sun::publish(b);
+			}
+			else
+				sun::publish_none();
+			hifi::light::take(); // (the light split wanted, as World FX asks each frame)
+			list->ClearRenderTargetView(rtv, kSky, 0, nullptr);
+			list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			inj::on_chars_end(list, w, s & 15);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+			to.pResource = glow_outs[k];
+			to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_TYPELESS, W, H, 1, W * 4 };
+			from.pResource = A;
+			from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			if (ID3D12Resource *const split = hifi::light::take(); split != nullptr)
+			{
+				glow_split[k] = true;
+				barrier(list, split, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, hifi::light::kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				to.pResource = glow_words[k];
+				to.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
+				from.pResource = split;
+				list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+				barrier(list, split, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, hifi::light::kRead);
+			}
+		}
+		hifi::sun::set_native_lamps(false);
+		hifi::sun::release();
+		hifi::sun::set_lamp_look(hifi::sun::kLookTuned);
+		inj::set_options(getenv("CHARS_PERPIXEL") != nullptr, getenv("CHARS_DETAIL") != nullptr);
 		inj::set_sun(nullptr);
 		list->Close();
 		direct->ExecuteCommandLists(1, lists);
@@ -1412,6 +1500,61 @@ int main(int argc, char **argv)
 		check(count[1] > 1000 && mean[1] > mean[2] + 3.0, line);
 		check(mean[1] - mean[2] < 1.5 * (mean[0] - mean[2]) && mean[1] - mean[2] > 0.4 * (mean[0] - mean[2]),
 			"  the zone's lamp stands in for the game's lamp slot (about as bright: the slot left out, not added to)");
+		{
+			std::vector<uint8_t> img[kGlowPasses];
+			double glow_mean[kGlowPasses] = {};
+			uint32_t glow_count[kGlowPasses] = {}, coded[kGlowPasses] = {}, marked[kGlowPasses] = {};
+			for (int k = 0; k < kGlowPasses; ++k)
+			{
+				uint8_t *p = nullptr;
+				glow_outs[k]->Map(0, nullptr, reinterpret_cast<void **>(&p));
+				img[k].assign(p, p + size_t(W) * H * 4);
+				glow_outs[k]->Unmap(0, nullptr);
+				glow_outs[k]->Release();
+				for (UINT y = 0; y < H; ++y)
+					for (UINT x = 0; x < W; ++x)
+					{
+						const uint8_t *q = img[k].data() + (size_t(y) * W + x) * 4;
+						if (middle.inside(float(x) + 0.5f, float(y) + 0.5f, 2) && !is_sky(q))
+						{
+							glow_mean[k] += 0.3 * q[0] + 0.59 * q[1] + 0.11 * q[2];
+							glow_count[k]++;
+						}
+					}
+				glow_mean[k] /= std::max(glow_count[k], 1u);
+				uint32_t *v = nullptr;
+				glow_words[k]->Map(0, nullptr, reinterpret_cast<void **>(&v));
+				for (size_t i = 0; glow_split[k] && i < size_t(W) * H; ++i)
+					if ((v[i] & 0x7FF) != 0)
+					{
+						coded[k]++;
+						marked[k] += v[i] >> 31;
+					}
+				glow_words[k]->Unmap(0, nullptr);
+				glow_words[k]->Release();
+			}
+			std::snprintf(line, sizeof(line), "World FX's lamp glow by the characters' pass (a block with a lamp 3.5 yalms in front): the middle one %.1f -> %.1f, %u of %u words marked "
+				"(none without the block: %u of %u)", glow_mean[0], glow_mean[1], marked[1], coded[1], marked[0], coded[0]);
+			check(glow_mean[1] > glow_mean[0] + 3.0 && coded[1] > 1000 && marked[1] == coded[1] && coded[0] > 1000 && marked[0] == 0, line);
+			check(img[2] == img[0], "  the option off, the block there: the picture as with no block, byte for byte");
+			std::snprintf(line, sizeof(line), "  per vertex with the block: the per-vertex picture, byte for byte, %u of %u words marked", marked[4], coded[4]);
+			check(img[4] == img[3] && img[3] != img[0] && coded[4] > 1000 && marked[4] == 0, line);
+			std::snprintf(line, sizeof(line), "  a zone's lamp %.1f; with its own capsule in the block %.1f (it doesn't shadow itself); another's standing between %.1f",
+				glow_mean[5], glow_mean[6], glow_mean[7]);
+			check(std::fabs(glow_mean[5] - glow_mean[1]) < 0.5 && std::fabs(glow_mean[6] - glow_mean[5]) < 1.0 && glow_mean[7] < glow_mean[5] - 1.0 &&
+				glow_mean[7] >= glow_mean[0] - 0.5, line);
+			std::snprintf(line, sizeof(line), "  the tuned look (the default): the middle one %.1f -> %.1f (the faithful port %.1f), %u of %u words marked; another's capsule between %.1f",
+				glow_mean[0], glow_mean[8], glow_mean[5], marked[8], coded[8], glow_mean[9]);
+			// (CHARS_LAMP_PICTURES=<folder>: the middle one with no lamp, the faithful port's glow, the tuned look's, and the
+			// tuned look with another character's capsule between it and the lamp)
+			if (const char *folder = getenv("CHARS_LAMP_PICTURES"); folder != nullptr)
+			{
+				const std::pair<int, const char *> shots[] = { { 0, "character-nolamp" }, { 5, "character-nativeA" }, { 8, "character-nativeB" }, { 9, "character-nativeB-shadowed" } };
+				for (const auto &sh : shots)
+					write_bmp(std::string(folder) + "\\" + sh.second + ".bmp", img[sh.first]);
+			}
+			check(glow_mean[8] > glow_mean[0] + 1.0 && marked[8] == coded[8] && coded[8] > 1000 && glow_mean[9] < glow_mean[8] - 0.5 && glow_mean[9] >= glow_mean[0] - 0.5, line);
+		}
 
 		// The sun-alone frame again (seq 25), its meshes and textures let go after it's recorded and before it runs (not
 		// named for kForgetSeconds), and a red texture put on the GPU meanwhile: the pairs of descriptors the list reads

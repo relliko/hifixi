@@ -18,6 +18,10 @@
  *   - a lamp in the frame that no object names (the game's per-object lamps): it lights nothing, per pixel or per vertex
  *     (the game's own way: every lamp in reach, draw.cpp near_lamp_light, lit a Mog House far too bright, so it's off);
  *     named by every object, per vertex it lights them;
+ *   - World FX's lamp glow added by the pass itself from a published block (src/render/sun_shadows.hpp's lamps, [zone]
+ *     nativelamps): per pixel with the option on the street under the lamp is lit and its words marked; the option off,
+ *     per vertex or a stale block: the picture without any block, byte for byte, nothing marked; a character's capsule
+ *     and the lamp's cube take a zone's lamp's light;
  *   - the texture pack's FSR bias set as main.cpp sets it (inject::set_texture_bias): the same picture over the game's
  *     one-level textures; over a copy whose textures have a red second level, less red at -1 than at 0;
  *   - the sun's shadows from a made-up zone: the moving layer (a swaying card's shadow moves with its sway, an open door's
@@ -38,6 +42,7 @@
 #include "../src/zone/light_split.hpp"
 #include "../src/zone/zone_gpu.hpp"
 #include "../src/zone/zoneshadow.hpp"
+#include "../src/render/sun_shadows.hpp"
 #include "game_dump.hpp"
 #include "../src/host/shadercache.hpp"
 #include <algorithm>
@@ -728,10 +733,59 @@ int main(int argc, char **argv)
 		double worst = 0.0, sum = 0.0;
 		int drawn = 0;
 		bool alive = true;
+		// (ZONE_NATIVE_LAMPS=1: with World FX's lamp glow added by the pass as well, [zone] nativelamps: a block published
+		// before each pass as World FX publishes it, 16 zone lamps of reach 12 within 10 yalms of the camera, two yalms
+		// under it, lamp shadows at 0.5, four of them with a cube (nothing in the cubes: every tap read, none hides), four
+		// characters' capsules on the street: the most the glow costs. Against the same run without it.)
+		const bool native_lamps = GetEnvironmentVariableA("ZONE_NATIVE_LAMPS", nullptr, 0) != 0;
+		ID3D12Resource *bench_cubes = nullptr;
+		if (native_lamps)
+		{
+			D3D12_HEAP_PROPERTIES up_heap = {};
+			up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+			const UINT64 cube_bytes = UINT64(256) * 256 * 4 * 6 * hifi::sun::kMaxLampCubes;
+			bd.Width = cube_bytes;
+			device->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&bench_cubes));
+			float *texels = nullptr;
+			bench_cubes->Map(0, nullptr, reinterpret_cast<void **>(&texels));
+			for (size_t i = 0; i < size_t(cube_bytes / 4); ++i)
+				texels[i] = 1.0f;
+			bench_cubes->Unmap(0, nullptr);
+			hifi::sun::set_native_lamps(true);
+		}
 		for (uint32_t pass = 0; pass < 20 && alive; ++pass)
 		{
 			const uint32_t seq = 40 + pass;
 			fill(seq, true);
+			if (native_lamps)
+			{
+				hifi::sun::block b;
+				b.device = device;
+				b.buffer = bench_cubes;
+				hifi::sun::gpu_block &g = b.gpu;
+				g.mode[2] = hifi::sun::kHasLamps;
+				g.lamp_head[0] = float(hifi::sun::kMaxLamps);
+				g.lamp_head[1] = 0.5f;
+				g.lamp_head[2] = float(hifi::sun::kMaxBodies);
+				for (uint32_t i = 0; i < hifi::sun::kMaxLamps; ++i)
+				{
+					const float a = 0.7f * float(i), r = 3.0f + float(i % 8);
+					const float at[4] = { eye[0] + r * std::cos(a), eye[1] + 2.0f, eye[2] + r * std::sin(a), 12.0f };
+					const float colour[4] = { 0.73f, 0.5f, 0.11f, i < hifi::sun::kMaxLampCubes ? 2.0f + float(i) : 1.0f };
+					std::memcpy(g.lamp_pos[i], at, 16);
+					std::memcpy(g.lamp_col[i], colour, 16);
+				}
+				g.lamp_where[1] = 256;
+				g.lamp_map[0] = 1.0f;
+				g.lamp_map[1] = 0.95f;
+				g.lamp_map[2] = 1.0f;
+				for (uint32_t j = 0; j < hifi::sun::kMaxBodies; ++j)
+				{
+					const float feet[4] = { eye[0] + 4.0f * std::cos(1.5f * float(j)), eye[1] + 4.5f, eye[2] + 4.0f * std::sin(1.5f * float(j)), 1.0f };
+					std::memcpy(g.body[j], feet, 16);
+				}
+				hifi::sun::publish(b);
+			}
 			hifi::zone::frame &f = hifi::zone::frame_slot(seq);
 			f.lamp_count = hifi::zone::kMaxLamps;
 			for (uint32_t i = 0; i < f.lamp_count; ++i)
@@ -783,9 +837,15 @@ int main(int argc, char **argv)
 			}
 		}
 		const uint32_t big_messages = debug_messages(info, first);
-		char line[256];
-		std::snprintf(line, sizeof(line), "%ux%u, per pixel, 64 lamps: %d passes timed, %.2f ms each on average, %.2f ms the longest; the device %s; %u debug messages", W, H,
+		char line[400];
+		std::snprintf(line, sizeof(line), "%ux%u, per pixel, 64 lamps%s: %d passes timed, %.2f ms each on average, %.2f ms the longest; the device %s; %u debug messages", W, H,
+			native_lamps ? (inj::status()[0].find("the lamps' glow added") != std::string::npos ? ", World FX's glow of 16 lamps (4 cubes, 4 capsules) added by the pass" :
+				", World FX's glow NOT added (no block taken)") : "",
 			drawn, drawn != 0 ? sum / drawn : 0.0, worst, alive ? "still there" : "LOST", big_messages);
+		hifi::sun::set_native_lamps(false);
+		hifi::sun::release();
+		if (bench_cubes != nullptr)
+			bench_cubes->Release();
 		check(alive && worst < 500.0 && big_messages == 0, line + (big_messages != 0 ? ": " + first : std::string()));
 		std::printf("%s", hifi::zone::breadcrumb_report().c_str());
 		for (const std::string &s : inj::status())
@@ -1110,6 +1170,207 @@ int main(int argc, char **argv)
 		const bool first_per_vertex = GetEnvironmentVariableA("ZONE_PERPIXEL", nullptr, 0) == 0;
 		check(!first_per_vertex || std::fabs(lumas[2] - first_luma) < 0.5, "  per vertex, as the game lights: only the lamps an object names (none here)");
 		check(lumas[3] > first_luma + 5.0, "  ... and named by every object, per vertex it lights them: " + std::to_string(lumas[3]));
+
+		// World FX's lamp glow added by the pass itself ([zone] nativelamps: src/render/sun_shadows.hpp's lamps). A block
+		// published as World FX publishes it, with one lamp 3 yalms over that point of the street (reach 9), no lamp in the
+		// frame itself. Per pixel with the option on the street under it gets brighter and every word of the light split
+		// is marked (bit 31); with the option off, per vertex, or the block gone stale, the picture is the one without
+		// any block, byte for byte, and no word is marked. A zone's lamp (it casts) loses light behind a character's
+		// capsule standing under it, and behind what its cube holds (a cube that hides everything: no glow left; an
+		// empty one: all of it).
+		{
+			namespace sun = hifi::sun;
+			D3D12_HEAP_PROPERTIES up_heap = {};
+			up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+			ID3D12Resource *cubes[2] = {};
+			const UINT64 cube_bytes = UINT64(256) * 256 * 4 * 6;
+			bd.Width = cube_bytes;
+			for (int k = 0; k < 2; ++k)
+			{
+				device->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&cubes[k]));
+				float *texels = nullptr;
+				cubes[k]->Map(0, nullptr, reinterpret_cast<void **>(&texels));
+				for (size_t i = 0; i < size_t(cube_bytes / 4); ++i)
+					texels[i] = k == 0 ? 0.0f : 1.0f; // (0: something at the near plane every way; 1: nothing drawn)
+				cubes[k]->Unmap(0, nullptr);
+			}
+			// (kind: 0 a glow, 1 a zone's lamp, 2 one with its cube; body: a character standing on the point)
+			auto publish_lamp = [&](float kind, bool body, ID3D12Resource *cube, bool stale) {
+				sun::block b;
+				b.device = device;
+				b.buffer = cube;
+				sun::gpu_block &g = b.gpu;
+				g.mode[2] = sun::kHasLamps;
+				g.lamp_head[0] = 1.0f;
+				g.lamp_head[1] = 1.0f;
+				g.lamp_head[2] = body ? 1.0f : 0.0f;
+				const float at[4] = { P[0], P[1] - 3.0f, P[2], 9.0f }, colour[4] = { 0.73f, 0.5f, 0.11f, kind };
+				std::memcpy(g.lamp_pos[0], at, 16);
+				std::memcpy(g.lamp_col[0], colour, 16);
+				g.lamp_where[1] = 256;
+				g.lamp_map[0] = 1.0f;
+				g.lamp_map[1] = 0.95f;
+				g.lamp_map[2] = 1.0f;
+				const float feet[4] = { P[0], P[1], P[2], 1.0f };
+				std::memcpy(g.body[0], feet, 16);
+				sun::publish(b);
+				if (stale)
+				{
+					std::lock_guard<std::mutex> lock(sun::detail::g.mutex);
+					sun::detail::g.at -= 10 * sun::kFreshMs;
+				}
+			};
+			struct pass_t
+			{
+				const char *name;
+				bool per_pixel, option;
+				float kind;
+				bool body;
+				int cube; // (-1: no buffer)
+				bool stale;
+				bool tuned = false; // (the tuned look, the default: sun_shadows.hpp; else the faithful port)
+			};
+			const pass_t passes[] = {
+				{ "no block", true, false, 0.0f, false, -1, false },
+				{ "the option off", true, false, 0.0f, false, -1, false },
+				{ "a glow", true, true, 0.0f, false, -1, false },
+				{ "per vertex, no block", false, false, 0.0f, false, -1, false },
+				{ "per vertex", false, true, 0.0f, false, -1, false },
+				{ "a stale block", true, true, 0.0f, false, -1, true },
+				{ "a zone's lamp", true, true, 1.0f, false, -1, false },
+				{ "a zone's lamp, a character under it", true, true, 1.0f, true, -1, false },
+				{ "a zone's lamp, its cube hiding everything", true, true, 2.0f, false, 0, false },
+				{ "a zone's lamp, its cube empty", true, true, 2.0f, false, 1, false },
+				{ "the tuned look: a zone's lamp", true, true, 1.0f, false, -1, false, true },
+				{ "the tuned look: a character under it", true, true, 1.0f, true, -1, false, true },
+				{ "the tuned look: its cube hiding everything", true, true, 2.0f, false, 0, false, true },
+			};
+			constexpr int kPasses = int(sizeof(passes) / sizeof(passes[0]));
+			ID3D12Resource *shots[kPasses] = {}, *words[kPasses] = {};
+			bd.Width = UINT64(W) * 4 * H;
+			for (int k = 0; k < kPasses; ++k)
+			{
+				device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&shots[k]));
+				device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&words[k]));
+			}
+			alloc->Reset();
+			list->Reset(alloc, nullptr);
+			list->SetDescriptorHeaps(1, &srvh);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			bool lamps_added[kPasses] = {}, split_drawn[kPasses] = {};
+			for (int k = 0; k < kPasses; ++k)
+			{
+				const pass_t &ps = passes[k];
+				const uint32_t seq = 40 + uint32_t(k);
+				fill(seq, true);
+				inj::set_options(ps.per_pixel);
+				sun::set_native_lamps(ps.option);
+				sun::set_lamp_look(ps.tuned ? sun::kLookTuned : sun::kLookFaithful);
+				if (k == 0 || k == 3)
+					sun::publish_none();
+				else
+					publish_lamp(ps.kind, ps.body, ps.cube >= 0 ? cubes[ps.cube] : nullptr, ps.stale);
+				hifi::light::take(); // (the light split wanted, as World FX asks each frame)
+				list->ClearRenderTargetView(rtv, sky, 0, nullptr);
+				list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+				inj::on_zone_end(list, w, seq);
+				lamps_added[k] = inj::status()[0].find("the lamps' glow added") != std::string::npos;
+				barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				D3D12_TEXTURE_COPY_LOCATION to = {}, from = {};
+				to.pResource = shots[k];
+				to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_TYPELESS, W, H, 1, W * 4 };
+				from.pResource = A;
+				from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+				barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+				if (ID3D12Resource *const split = hifi::light::take(); split != nullptr)
+				{
+					split_drawn[k] = true;
+					barrier(list, split, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, hifi::light::kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					to.pResource = words[k];
+					to.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
+					from.pResource = split;
+					list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+					barrier(list, split, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, hifi::light::kRead);
+				}
+			}
+			inj::set_options(false);
+			sun::set_native_lamps(false);
+			sun::release();
+			sun::set_lamp_look(sun::kLookTuned);
+			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			list->Close();
+			direct->ExecuteCommandLists(1, lists);
+			const UINT64 fv = fence->GetCompletedValue() + 1;
+			direct->Signal(fence, fv);
+			fence->SetEventOnCompletion(fv, e);
+			WaitForSingleObject(e, 120000);
+			check(device->GetDeviceRemovedReason() == S_OK, "the device still there (the native lamps' passes)");
+			const uint32_t glow_messages = debug_messages(info, first);
+			check(glow_messages == 0, "the debug layer: nothing (" + std::to_string(glow_messages) + (glow_messages != 0 ? ": " + first : std::string()) + ")");
+			{
+				const std::string crumbs = hifi::zone::breadcrumb_report();
+				if (!crumbs.empty())
+					check(crumbs.find("every zone draw the GPU began it finished") != std::string::npos, "the breadcrumbs after the native lamps' passes: every draw begun finished");
+			}
+			std::vector<uint8_t> img[kPasses];
+			uint32_t coded[kPasses] = {}, marked[kPasses] = {};
+			double spot[kPasses] = {};
+			for (int k = 0; k < kPasses; ++k)
+			{
+				uint8_t *p = nullptr;
+				shots[k]->Map(0, nullptr, reinterpret_cast<void **>(&p));
+				img[k].assign(p, p + size_t(W) * H * 4);
+				spot[k] = luma_at(p);
+				shots[k]->Unmap(0, nullptr);
+				shots[k]->Release();
+				uint32_t *v = nullptr;
+				words[k]->Map(0, nullptr, reinterpret_cast<void **>(&v));
+				for (size_t i = 0; split_drawn[k] && i < size_t(W) * H; ++i)
+					if ((v[i] & 0x7FF) != 0)
+					{
+						coded[k]++;
+						marked[k] += v[i] >> 31;
+					}
+				words[k]->Unmap(0, nullptr);
+				words[k]->Release();
+			}
+			for (ID3D12Resource *c : cubes)
+				c->Release();
+			size_t changed = 0;
+			for (size_t i = 0; i < size_t(W) * H; ++i)
+				changed += std::memcmp(&img[2][i * 4], &img[0][i * 4], 3) != 0 ? 1 : 0;
+			std::snprintf(line, sizeof(line), "World FX's lamp glow by the zone pass (a block with one lamp 3 yalms over the street): the street under it %.1f -> %.1f "
+				"(%zu pixels changed), %u of %u words marked; the pass says so: %s", spot[0], spot[2], changed, marked[2], coded[2], lamps_added[2] ? "yes" : "no");
+			check(spot[2] > spot[0] + 5.0 && changed > 1000 && coded[2] > size_t(W) * H / 2 && marked[2] == coded[2] && lamps_added[2], line);
+			check(img[0] == pictures[0], "  no block: the per-pixel picture as the lamp part's first (the same pass again)");
+			std::snprintf(line, sizeof(line), "  the option off, the block there: the picture as with no block, byte for byte (the pass says %s)", lamps_added[1] ? "added" : "not added");
+			check(img[1] == img[0] && !lamps_added[1], line);
+			std::snprintf(line, sizeof(line), "  per vertex with the block: the per-vertex picture, byte for byte, %u of %u words marked", marked[4], coded[4]);
+			check(img[4] == img[3] && img[3] != img[0] && coded[4] > size_t(W) * H / 2 && marked[4] == 0 && !lamps_added[4], line);
+			std::snprintf(line, sizeof(line), "  a stale block: the picture as with no block, byte for byte, %u of %u words marked", marked[5], coded[5]);
+			check(img[5] == img[0] && coded[5] > size_t(W) * H / 2 && marked[5] == 0 && !lamps_added[5], line);
+			std::snprintf(line, sizeof(line), "  a zone's lamp %.1f; a character standing under it %.1f; its cube hiding everything %.1f (no lamp %.1f), empty %.1f",
+				spot[6], spot[7], spot[8], spot[0], spot[9]);
+			check(std::fabs(spot[6] - spot[2]) < 0.5 && spot[7] < spot[6] - 2.0 && spot[7] >= spot[0] - 0.5 && std::fabs(spot[8] - spot[0]) < 0.5 &&
+				std::fabs(spot[9] - spot[6]) < 0.5 && marked[7] == coded[7] && marked[8] == coded[8], line);
+			// (the tuned look, the default: by day the sunlit street takes next to none of it, the light being there already;
+			// what's in the shade round it does)
+			size_t tuned_changed = 0, tuned_hidden = 0;
+			for (size_t i = 0; i < size_t(W) * H; ++i)
+			{
+				tuned_changed += std::memcmp(&img[10][i * 4], &img[0][i * 4], 3) != 0 ? 1 : 0;
+				tuned_hidden += std::memcmp(&img[12][i * 4], &img[0][i * 4], 3) != 0 ? 1 : 0;
+			}
+			std::snprintf(line, sizeof(line), "  the tuned look by day: the sunlit street under the lamp %.1f -> %.1f (the faithful port %.1f), %zu pixels changed (in the shade), "
+				"%u of %u words marked; a character under it %.1f; its cube hiding everything: %zu pixels changed", spot[0], spot[10], spot[6], tuned_changed, marked[10],
+				coded[10], spot[11], tuned_hidden);
+			check(spot[10] >= spot[0] && spot[10] < spot[6] && tuned_changed > 1000 && marked[10] == coded[10] && coded[10] > size_t(W) * H / 2 &&
+				spot[11] <= spot[10] && marked[12] == coded[12] && tuned_hidden < tuned_changed / 4, line);
+		}
 	}
 	if (argc > 1)
 	{
@@ -1315,8 +1576,9 @@ int main(int argc, char **argv)
 		map_out(4, [&] { lamp_triangles = inj::record_zone_casters(list, m_lamp, small_dsv, kSmall); });
 		list->Close();
 		direct->ExecuteCommandLists(1, lists);
-		direct->Signal(fence, 3); // (2 was the lamp's passes')
-		fence->SetEventOnCompletion(3, e);
+		const UINT64 moving_done = fence->GetCompletedValue() + 1; // (after the lamps' passes')
+		direct->Signal(fence, moving_done);
+		fence->SetEventOnCompletion(moving_done, e);
 		WaitForSingleObject(e, 60000);
 		check(device->GetDeviceRemovedReason() == S_OK, "the device still there after the moving layer");
 		const uint32_t later = debug_messages(info, first);

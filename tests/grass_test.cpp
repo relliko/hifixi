@@ -4509,6 +4509,7 @@ lamps:
 		const float *who = nullptr;                      // (characters and monsters, as the Ashita addon sends them)
 		uint32_t who_count = 0;
 		draw_stats lamp_st;                              // (the last frame's)
+		renderer *lamp_r = &r;                           // (the renderer the frames go through: a fresh one for a moment below)
 		auto frame = [&](const float *lamps, uint32_t count, float shadows) {
 			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			g.list->ClearRenderTargetView(world_rtv, night_ground, 0, nullptr);
@@ -4536,9 +4537,10 @@ lamps:
 			l2.lamp_shadows = shadows;
 			l2.actors = who;
 			l2.actor_count = who_count;
-			const draw_stats st = r.draw(g.list, t, cam, l2, error);
+			const draw_stats st = lamp_r->draw(g.list, t, cam, l2, error);
 			lamp_st = st;
-			check(st.shaded == (count != 0) && st.lamps == count, "the shading pass ran for the lamps (and only with some)");
+			if (lamp_r == &r)
+				check(st.shaded == (count != 0) && st.lamps == count, "the shading pass ran for the lamps (and only with some)");
 			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			return g.read(world, 4);
 		};
@@ -4692,6 +4694,83 @@ lamps:
 			const uint32_t hits = lh.hits;
 			const std::vector<uint8_t> kept = frame(low_lamp, 1, 1.0f);
 			const draw_stats kept_st = lamp_st;
+			// With [zone] nativelamps on (HiFi XI's src/render/sun_shadows.hpp's lamps): the cube copied once more, to where
+			// the native passes read it (a whole run's renderer made a sun shadow map earlier: its copy's end), and the block published
+			// says so: the lamp with its cube, the cubes' place and size; a frame later nothing copied again. No light split
+			// here, so World FX shades every pixel itself as before. Then a renderer made now, which never had a sun shadow
+			// map: the cube goes to a buffer of its own, the four cubes' size, and is published with it.
+			hifi::sun::set_native_lamps(true);
+			const std::vector<uint8_t> native_first = frame(low_lamp, 1, 1.0f);
+			const draw_stats native_st = lamp_st;
+			uint32_t native_cubes = 0, native_flags = 0, native_size = 0;
+			float native_count = 0.0f;
+			UINT64 native_bytes = 0;
+			{
+				std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+				const hifi::sun::block &nb = hifi::sun::detail::g.latest;
+				for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
+					native_cubes += nb.gpu.lamp_col[k][3] >= 2.0f ? 1 : 0;
+				native_flags = hifi::sun::detail::g.has ? nb.gpu.mode[2] : 0;
+				native_size = nb.gpu.lamp_where[1];
+				native_count = nb.gpu.lamp_head[0];
+				native_bytes = nb.buffer != nullptr ? nb.buffer->GetDesc().Width : 0;
+			}
+			frame(low_lamp, 1, 1.0f);
+			const draw_stats native_kept_st = lamp_st;
+			hifi::sun::set_native_lamps(false);
+			hifi::sun::release();
+			std::printf("  ... with nativelamps on: %u cube copied for the native passes, then %u; the block: flags %u, %.0f lamp, %u with a cube, faces of %u, a buffer of %llu bytes; ground in front %.1f\n",
+				native_st.lamp_native_copies, native_kept_st.lamp_native_copies, native_flags, native_count, native_cubes, native_size,
+				static_cast<unsigned long long>(native_bytes), around(native_first, in_front).luma);
+			check(native_st.lamp_native_copies == 1 && native_kept_st.lamp_native_copies == 0 && native_flags == hifi::sun::kHasLamps && native_count == 1.0f &&
+				native_cubes == 1 && native_size == 256 && native_bytes >= UINT64(256) * 256 * 4 * 6 * 4,
+				"nativelamps on: the lamp's cube copied once to the native passes' buffer (the sun shadow map copy's end, or its own) and published with the lamp");
+			check(std::fabs(around(native_first, in_front).luma - around(kept, in_front).luma) < 0.5, "  and World FX's own picture is as without it (no light split: nothing marked)");
+			{
+				renderer fresh;
+				std::string fresh_error;
+				const bool made = fresh.init(g.device, fresh_error);
+				fresh.set_zone_casters(
+					[](void *, float lo[3], float hi[3], uint64_t *generation) {
+						for (int a = 0; a < 3; ++a)
+						{
+							lo[a] = -1000.0f;
+							hi[a] = 1000.0f;
+						}
+						*generation = 7;
+						return true;
+					},
+					[](void *, ID3D12GraphicsCommandList *, const float[16], D3D12_CPU_DESCRIPTOR_HANDLE, UINT) -> uint32_t { return 0; }, nullptr);
+				lamp_r = &fresh;
+				hifi::sun::set_native_lamps(true);
+				uint32_t fresh_copies = 0, fresh_frames = 0, fresh_cubes = 0, fresh_flags = 0;
+				bool fresh_shaded = false;
+				for (; fresh_frames < 12 && fresh_copies == 0; ++fresh_frames)
+				{
+					frame(low_lamp, 1, 1.0f);
+					fresh_copies += lamp_st.lamp_native_copies;
+					fresh_shaded = fresh_shaded || lamp_st.shaded;
+				}
+				UINT64 fresh_bytes = 0;
+				{
+					std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+					const hifi::sun::block &nb = hifi::sun::detail::g.latest;
+					for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
+						fresh_cubes += nb.gpu.lamp_col[k][3] >= 2.0f ? 1 : 0;
+					fresh_flags = hifi::sun::detail::g.has ? nb.gpu.mode[2] : 0;
+					fresh_bytes = nb.buffer != nullptr ? nb.buffer->GetDesc().Width : 0;
+				}
+				frame(low_lamp, 1, 1.0f); // (once more: the native passes' buffer read state kept, nothing copied)
+				const uint32_t fresh_again = lamp_st.lamp_native_copies;
+				hifi::sun::set_native_lamps(false);
+				hifi::sun::release();
+				lamp_r = &r; // (the fresh renderer's lists are done: each frame was read back)
+				std::printf("  ... a renderer with no sun shadow map%s: %s; the cube copied after %u frames (%u), then %u; the block: flags %u, %u with a cube, a buffer of %llu bytes\n",
+					made ? "" : (" NOT MADE: " + fresh_error).c_str(), fresh_shaded ? "shaded" : "never shaded", fresh_frames, fresh_copies, fresh_again, fresh_flags,
+					fresh_cubes, static_cast<unsigned long long>(fresh_bytes));
+				check(made && fresh_copies == 1 && fresh_again == 0 && fresh_flags == hifi::sun::kHasLamps && fresh_cubes == 1 && fresh_bytes == UINT64(256) * 256 * 4 * 6 * 4,
+					"  a renderer with no sun shadow map: the cube copied to a buffer of its own (the four cubes' size) and published with it");
+			}
 			r.set_zone_casters(nullptr, nullptr, nullptr);
 			const std::vector<uint8_t> marched = frame(low_lamp, 1, 1.0f);
 			const draw_stats marched_st = lamp_st;
@@ -4903,6 +4982,102 @@ lamps:
 			check(near_glow > near_dark + 5.0, "an effect's glow still lights what the light split knows");
 			check(walled_shadow < walled_lit - 2.0 && walled_shadow >= 0.0, "a lamp shadow takes the lamp's light away where the light split knows the pixel");
 			check(std::fabs(clear_shadow - clear_lit) < 0.5, "and leaves it where the way to the lamp is clear");
+		}
+
+		// 1p3. The native passes' lamp mark (HiFi XI's src/render/sun_shadows.hpp, [zone] nativelamps): the same lantern
+		// 0.6 yalms in front of a wall, every pixel of the wall in the light split. Where a word is marked (bit 31: the
+		// native pass lit the pixel from the published block) and the block the native passes read held the lamps (the
+		// frame's flag, zinfo.w bit 256: what World FX last published), World FX adds no glow: the picture as with no lamp
+		// at all, a zone's lamp or an effect's glow alike. An unmarked word, or a marked one when the block held no lamps
+		// (nothing published, or nativelamps off), gets the glow exactly as before.
+		{
+			const vec3 f = normalize(sub(at, eye));
+			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] };
+			auto at_side = [&](const vec3 &p, float d) { return vec3 { p.x + right.x * d, p.y + right.y * d, p.z + right.z * d }; };
+			const vec3 wall_at = { at.x + f.x, at.y + f.y, at.z + f.z }, light = { wall_at.x - f.x * 0.6f, wall_at.y - f.y * 0.6f, wall_at.z - f.z * 0.6f };
+			float wall_ndc = 0.0f;
+			on_screen(wall_at, &wall_ndc);
+			cards = { { { 0, 0, LONG(W), LONG(H) }, wall_ndc } };
+			const float depth = wall_at.x * vp[3] + wall_at.y * vp[7] + wall_at.z * vp[11] + vp[15];
+			const uint32_t code = uint32_t(std::clamp(std::round((std::log2(std::max(depth, 1e-3f)) + 3.0f) * 128.0f), 1.0f, 2047.0f));
+			// (facing the camera: the octahedral code of the view's -forward, as 1p2's word)
+			vec3 n = { -f.x, -f.y, -f.z };
+			const float s = std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z);
+			n = { n.x / s, n.y / s, n.z / s };
+			const float ox = n.z >= 0.0f ? n.x : (1.0f - std::fabs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f);
+			const float oy = n.z >= 0.0f ? n.y : (1.0f - std::fabs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f);
+			const uint32_t plain_word = code | uint32_t(std::round(std::clamp(ox * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f)) << 11 |
+				uint32_t(std::round(std::clamp(oy * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f)) << 18;
+			auto split_of = [&](uint32_t word) {
+				ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+				ID3D12Resource *up = g.buffer(D3D12_HEAP_TYPE_UPLOAD, UINT64(W) * 4 * H, D3D12_RESOURCE_STATE_GENERIC_READ);
+				uint32_t *words = nullptr;
+				up->Map(0, nullptr, reinterpret_cast<void **>(&words));
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+					words[i] = word;
+				up->Unmap(0, nullptr);
+				D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src = { up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+				dst.SubresourceIndex = 0;
+				src.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
+				g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				g.run();
+				release(up);
+				return split;
+			};
+			ID3D12Resource *unmarked = split_of(plain_word), *marked = split_of(plain_word | 0x80000000u);
+			const float lantern[8] = { light.x, light.y, light.z, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
+			float lantern_glow[8];
+			std::memcpy(lantern_glow, lantern, sizeof(lantern_glow));
+			lantern_glow[7] = 0.0f;
+			// (a frame: the split, the options, what the block the native passes read held, as World FX published it before)
+			auto shot = [&](ID3D12Resource *split, bool native_lamps, bool native_shadows, uint32_t held, const float *lamp) {
+				hifi::sun::set_native(native_shadows);
+				hifi::sun::set_native_lamps(native_lamps);
+				if (held != 0)
+				{
+					hifi::sun::block b;
+					b.device = g.device;
+					b.gpu.mode[2] = held;
+					hifi::sun::publish(b);
+				}
+				else
+					hifi::sun::publish_none();
+				r.set_light_source([](void *c) { return static_cast<ID3D12Resource *>(c); }, split);
+				return frame(lamp, lamp != nullptr ? 1 : 0, 0.0f);
+			};
+			const uint32_t lamps_held = hifi::sun::kHasLamps;
+			const std::vector<uint8_t> dark = shot(unmarked, false, false, 0, nullptr), lit = shot(unmarked, false, false, 0, lantern),
+				lit_glow = shot(unmarked, false, false, 0, lantern_glow);
+			const std::vector<uint8_t> done = shot(marked, true, false, lamps_held, lantern), done_glow = shot(marked, true, false, lamps_held, lantern_glow);
+			const std::vector<uint8_t> not_marked = shot(unmarked, true, false, lamps_held, lantern), not_marked_glow = shot(unmarked, true, false, lamps_held, lantern_glow);
+			const std::vector<uint8_t> none_held = shot(marked, true, false, 0, lantern), lamps_off = shot(marked, false, true, lamps_held, lantern);
+			hifi::sun::set_native(false);
+			hifi::sun::set_native_lamps(false);
+			hifi::sun::publish_none();
+			r.set_light_source(nullptr, nullptr);
+			cards.clear();
+			release(unmarked);
+			release(marked);
+			auto most = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+				int d = 0;
+				for (size_t i = 0; i < size_t(W) * H * 4; ++i)
+					d = std::max(d, std::abs(int(a[i]) - int(b[i])));
+				return d;
+			};
+			auto beside = [&](const std::vector<uint8_t> &img) {
+				return (around(img, on_screen(at_side(wall_at, 0.6f), nullptr)).luma + around(img, on_screen(at_side(wall_at, -0.6f), nullptr)).luma) / 2.0;
+			};
+			std::printf("  1p3 the lamp mark: the wall beside the lantern %.1f unlit, %.1f lit; marked with the lamps held %.1f (%d at most off the unlit, a glow %d); "
+				"unmarked %d off the lit (a glow %d); marked with none held %d off, with nativelamps off %d off\n",
+				beside(dark), beside(lit), beside(done), most(done, dark), most(done_glow, dark), most(not_marked, lit), most(not_marked_glow, lit_glow),
+				most(none_held, lit), most(lamps_off, lit));
+			check(beside(lit) > beside(dark) + 5.0 && beside(lit_glow) > beside(dark) + 5.0, "1p3: the lantern and the glow light the wall (the light split's words unmarked)");
+			check(most(done, dark) <= 1, "1p3: a marked pixel with the lamps frame flag gets no World FX glow");
+			check(most(done_glow, dark) <= 1, "1p3: nor an effect's glow there");
+			check(most(not_marked, lit) == 0 && most(not_marked_glow, lit_glow) == 0, "1p3: an unmarked pixel gets the glow exactly as before, the flag set or not");
+			check(most(none_held, lit) == 0, "1p3: a marked pixel when the block held no lamps gets it exactly as before");
+			check(most(lamps_off, lit) == 0, "1p3: and with nativelamps off (nativeshadows on), whatever was published");
 		}
 		check(g.report_messages() == 0, "no debug-layer errors (lamps)");
 	}

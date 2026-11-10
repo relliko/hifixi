@@ -1949,6 +1949,8 @@ namespace grass
 		release(_sun_map_copy);
 		release(_lamp_map);
 		release(_lamp_map_heap);
+		release(_lamp_native); // (a block published with it holds its own reference: sun_shadows.hpp)
+		_lamp_native_state = D3D12_RESOURCE_STATE_COMMON;
 		for (lamp_cube &c : _lamp_cubes)
 			c = lamp_cube();
 		_lamp_tail = 0;
@@ -4128,6 +4130,8 @@ namespace grass
 		release(_sun_map_copy);
 		release(_caster_map);
 		release(_far_map);
+		for (lamp_cube &c : _lamp_cubes)
+			c.native_to = nullptr; // (the lamps' cubes in the copy let go: copied into the next, draw_lamp_maps)
 		HRESULT hr = S_OK;
 		if (_sun_map_heap == nullptr)
 		{
@@ -4183,8 +4187,10 @@ namespace grass
 			_cloud_copy_at = _far_map_start + 2 * _far_map_slot;
 			D3D12_RESOURCE_DESC bd = {};
 			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			// (the two halves, the casters' map, the farthest cascade's two, the clouds' shadows' map for the native passes)
-			bd.Width = _cloud_copy_at + UINT64(kCloudShadowSize) * kCloudShadowSize * 4;
+			// (the two halves, the casters' map, the farthest cascade's two, the clouds' shadows' map for the native passes,
+			// then the lamps' cubes for them: sun_shadows.hpp's lamps, draw_lamp_maps)
+			_lamp_copy_at = (_cloud_copy_at + UINT64(kCloudShadowSize) * kCloudShadowSize * 4 + align - 1) / align * align;
+			bd.Width = _lamp_copy_at + UINT64(kLampMapSize) * kLampMapSize * 4 * 6 * kLampMaps;
 			bd.Height = 1;
 			bd.DepthOrArraySize = 1;
 			bd.MipLevels = 1;
@@ -4621,17 +4627,15 @@ namespace grass
 	// (sun_shadows.hpp). A whole shadow takes kShareScale x strength of the sun's term there (at most all of it): as much of
 	// the light as grass.hlsl's shadow took where the sun's share is the game's square-on 0.72 or less, so the shadows'
 	// strength setting means what it did.
-	void renderer::publish_sun_shadows(double clock, bool casters, const float *cloud, float strength, const float sun[3]) const
+	bool renderer::sun_shadows_block(hifi::sun::block &b, double clock, bool casters, const float *cloud, float strength, const float sun[3]) const
 	{
-		if (_sun_map_copy == nullptr || !_cascades[0].valid || !_cascades[1].valid)
-		{
-			hifi::sun::publish_none();
-			return;
-		}
-		hifi::sun::block b;
-		b.device = _device;
+		constexpr float kShareScale = 1.39f; // (grass.hlsl's)
+		const float whole = std::isfinite(strength) ? std::clamp(kShareScale * strength, 0.0f, 1.0f) : 0.0f;
+		if (_sun_map_copy == nullptr || !_cascades[0].valid || !_cascades[1].valid || !(whole > 0.0f))
+			return false;
 		b.buffer = _sun_map_copy;
 		hifi::sun::gpu_block &g = b.gpu;
+		g.mode[2] |= hifi::sun::kHasSun;
 		auto rows = [](const float *m, float (*o)[4], float texels) {
 			for (int i = 0; i < 4; ++i)
 			{
@@ -4678,8 +4682,7 @@ namespace grass
 		const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
 		for (int i = 0; i < 3; ++i)
 			g.sun[i] = len > 0.0f ? sun[i] / len : 0.0f;
-		constexpr float kShareScale = 1.39f; // (grass.hlsl's)
-		g.sun[3] = std::isfinite(strength) ? std::clamp(kShareScale * strength, 0.0f, 1.0f) : 0.0f;
+		g.sun[3] = whole;
 		if (cloud != nullptr && cloud[3] > 0.0f)
 		{
 			g.cloud[0] = cloud[0];
@@ -4692,7 +4695,112 @@ namespace grass
 			g.cloud_where[0] = uint32_t(_cloud_copy_at / 4);
 			g.cloud_where[1] = kCloudShadowSize;
 		}
-		hifi::sun::publish(b);
+		return true;
+	}
+
+	ID3D12Resource *renderer::lamp_dest(UINT64 &at) const
+	{
+		at = _sun_map_copy != nullptr ? _lamp_copy_at : 0;
+		return _sun_map_copy != nullptr ? _sun_map_copy : _lamp_native;
+	}
+
+	void renderer::lamps_block(hifi::sun::block &b, const look &l, const float eye[3]) const
+	{
+		const uint32_t count = l.lamps != nullptr ? std::min<uint32_t>(l.lamp_count, kMaxLamps) : 0;
+		if (count == 0)
+			return;
+		static_assert(kMaxLamps == hifi::sun::kMaxLamps && kLampMaps == hifi::sun::kMaxLampCubes);
+		hifi::sun::gpu_block &g = b.gpu;
+		g.mode[2] |= hifi::sun::kHasLamps;
+		const float shadows = std::isfinite(l.lamp_shadows) ? std::clamp(l.lamp_shadows, 0.0f, 1.0f) : 0.0f;
+		g.lamp_head[0] = float(count);
+		g.lamp_head[1] = shadows;
+		UINT64 at = 0;
+		ID3D12Resource *const dest = lamp_dest(at);
+		bool any_cube = false;
+		for (uint32_t i = 0; i < kMaxLamps; ++i)
+		{
+			// (as the shading pass's own list: a lamp that isn't finite, or past the count, far off with no glow)
+			const float *s = i < count ? l.lamps + size_t(i) * 8 : nullptr;
+			for (int k = 0; s != nullptr && k < 7; ++k)
+				if (!std::isfinite(s[k]))
+					s = nullptr;
+			float *p = g.lamp_pos[i], *c = g.lamp_col[i];
+			if (s == nullptr)
+			{
+				p[0] = p[1] = 0.0f;
+				p[2] = 1e6f;
+				p[3] = 1.0f;
+				c[0] = c[1] = c[2] = c[3] = 0.0f;
+				continue;
+			}
+			std::memcpy(p, s, 12);
+			p[3] = std::max(s[3], 0.25f);
+			for (int k = 0; k < 3; ++k)
+				c[k] = std::clamp(s[4 + k], 0.0f, 4.0f);
+			c[3] = std::isfinite(s[7]) && s[7] > 0.5f ? 1.0f : 0.0f; // (casts lamp shadows)
+			// (its cube, when it's drawn and where the native passes read it: 2 + its place)
+			for (uint32_t slot = 0; slot < kLampMaps && c[3] == 1.0f && shadows > 0.0f && dest != nullptr; ++slot)
+			{
+				const lamp_cube &q = _lamp_cubes[slot];
+				if (q.used && q.drawn && q.native_to == dest && q.native_at == at && std::fabs(s[0] - q.pos[0]) < 0.01f && std::fabs(s[1] - q.pos[1]) < 0.01f &&
+					std::fabs(s[2] - q.pos[2]) < 0.01f && std::fabs(s[3] - q.range) < 0.01f)
+				{
+					c[3] = 2.0f + float(slot);
+					any_cube = true;
+				}
+			}
+		}
+		g.lamp_map[0] = kLampMapNear;
+		g.lamp_map[1] = kLampMapScale;
+		g.lamp_map[2] = hifi::sun::kLampCubeReach;
+		// (a small room, a Mog House: World FX's glow as it is, not the tuned look's wider pool: sun_shadows.hpp)
+		g.lamp_map[3] = l.lamp_small_room ? 1.0f : 0.0f;
+		if (any_cube)
+		{
+			g.lamp_where[0] = uint32_t(at / 4);
+			g.lamp_where[1] = kLampMapSize;
+			if (b.buffer == nullptr)
+				b.buffer = dest;
+		}
+		// The characters that may stand in a zone's lamp's light: within its reach and a little, the nearest the camera first
+		if (!(shadows > 0.0f) || l.actors == nullptr)
+			return;
+		const uint32_t actors = std::min<uint32_t>(l.actor_count, kMaxActors);
+		float best[hifi::sun::kMaxBodies];
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < actors; ++i)
+		{
+			const float *a = l.actors + size_t(i) * 4;
+			if (!std::isfinite(a[0]) || !std::isfinite(a[1]) || !std::isfinite(a[2]) || !std::isfinite(a[3]) || !(a[3] > 0.0f))
+				continue;
+			bool lit = false;
+			for (uint32_t k = 0; k < kMaxLamps && !lit; ++k)
+			{
+				const float *p = g.lamp_pos[k];
+				const float dx = p[0] - a[0], dy = p[1] - a[1], dz = p[2] - a[2], reach = p[3] * hifi::sun::kLampCubeReach + 1.0f;
+				lit = g.lamp_col[k][3] > 0.5f && dx * dx + dy * dy + dz * dz < reach * reach;
+			}
+			if (!lit)
+				continue;
+			const float d = (a[0] - eye[0]) * (a[0] - eye[0]) + (a[1] - eye[1]) * (a[1] - eye[1]) + (a[2] - eye[2]) * (a[2] - eye[2]);
+			uint32_t j = n < hifi::sun::kMaxBodies ? n++ : hifi::sun::kMaxBodies;
+			if (j == hifi::sun::kMaxBodies)
+			{
+				if (d >= best[hifi::sun::kMaxBodies - 1])
+					continue;
+				j = hifi::sun::kMaxBodies - 1;
+			}
+			for (; j > 0 && best[j - 1] > d; --j)
+			{
+				best[j] = best[j - 1];
+				std::memcpy(g.body[j], g.body[j - 1], 16);
+			}
+			best[j] = d;
+			std::memcpy(g.body[j], a, 12);
+			g.body[j][3] = std::clamp(a[3], 0.3f, 4.0f);
+		}
+		g.lamp_head[2] = float(n);
 	}
 
 	// The host's casters (set_casters) into their own map, each frame the sun's shadow map is read: looking down the sun's
@@ -5058,7 +5166,9 @@ namespace grass
 			if (!c.used || c.drawn)
 				continue;
 			section(list, L"worldfx: a lamp's shadow map");
-			const float nr = kLampMapNear, fr = c.range, A = fr / (fr - nr), B = -nr * fr / (fr - nr), s = kLampMapScale;
+			// (out to kLampCubeReach times the glow's reach: HiFi XI's native passes light further than the glow here does,
+			// sun_shadows.hpp's tuned look, and what stands past the old reach must still hide the lamp there)
+			const float nr = kLampMapNear, fr = c.range * hifi::sun::kLampCubeReach, A = fr / (fr - nr), B = -nr * fr / (fr - nr), s = kLampMapScale;
 			{
 				const uint32_t f = c.faces;
 				const float *fw = kLampFaces[f][0], *rt = kLampFaces[f][1], *up = kLampFaces[f][2];
@@ -5085,6 +5195,7 @@ namespace grass
 				c.source = source;
 			c.drawn = c.faces == 6;
 			c.copied_to = nullptr;
+			c.native_to = nullptr;
 			break;
 		}
 
@@ -5122,6 +5233,77 @@ namespace grass
 			transition(list, _lamp_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 			transition(list, _depth.buffer, D3D12_RESOURCE_STATE_COPY_DEST, _depth.state);
 		}
+		// ... and where HiFi XI's native passes read them ([zone] nativelamps, sun_shadows.hpp's lamps: lamp_dest), where
+		// they aren't yet: only a cube just drawn, or all of them once after the buffer changed (the sun's copy made, or
+		// made again). Written only by these copies and left readable, as the sun's copy is (docs/d3d12/barriers.md): the
+		// native passes of the next frame read it with no barrier, and this frame's ran before this list.
+		if (hifi::sun::native_lamps())
+		{
+			if (_sun_map_copy != nullptr)
+			{
+				// (no longer where they go: let go once the lists that copied into it are done; a published block and the
+				// native passes' lists hold their own references)
+				if (_lamp_native != nullptr)
+					keep_old(_lamp_native);
+				_lamp_native = nullptr;
+			}
+			else if (_lamp_native == nullptr)
+			{
+				D3D12_HEAP_PROPERTIES heap = {};
+				heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+				D3D12_RESOURCE_DESC bd = {};
+				bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+				bd.Width = face_bytes * 6 * kLampMaps;
+				bd.Height = 1;
+				bd.DepthOrArraySize = 1;
+				bd.MipLevels = 1;
+				bd.SampleDesc.Count = 1;
+				bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+				if (FAILED(_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_lamp_native))))
+					_lamp_native = nullptr;
+				else
+					_lamp_native->SetName(L"worldfx: lamps' shadow maps (the native passes' copy)");
+				_lamp_native_state = D3D12_RESOURCE_STATE_COMMON;
+			}
+			UINT64 native_at = 0;
+			ID3D12Resource *const dest = lamp_dest(native_at);
+			D3D12_RESOURCE_STATES &dest_state = dest == _sun_map_copy ? _sun_map_copy_state : _lamp_native_state;
+			const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			bool to_native = false;
+			for (uint32_t slot = 0; slot < kLampMaps && dest != nullptr; ++slot)
+			{
+				lamp_cube &c = _lamp_cubes[slot];
+				if (!c.drawn || (c.native_to == dest && c.native_at == native_at))
+					continue;
+				if (!to_native)
+				{
+					transition(list, _lamp_map, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					transition(list, dest, dest_state, D3D12_RESOURCE_STATE_COPY_DEST);
+					to_native = true;
+				}
+				for (uint32_t f = 0; f < 6; ++f)
+				{
+					const UINT sub = slot * 6 + f;
+					D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+					dst.pResource = dest;
+					dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+					_device->GetCopyableFootprints(&desc, sub, 1, native_at + UINT64(sub) * face_bytes, &dst.PlacedFootprint, nullptr, nullptr, nullptr);
+					src.pResource = _lamp_map;
+					src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					src.SubresourceIndex = sub;
+					list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+				}
+				c.native_to = dest;
+				c.native_at = native_at;
+				stats.lamp_native_copies++;
+			}
+			if (to_native)
+			{
+				transition(list, _lamp_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+				transition(list, dest, D3D12_RESOURCE_STATE_COPY_DEST, readable);
+				dest_state = readable;
+			}
+		}
 
 		// The parameters
 		for (int i = 0; i < 3; ++i)
@@ -5136,7 +5318,7 @@ namespace grass
 			float *q = out + 16 + slot * 4;
 			for (int k = 0; k < 3; ++k)
 				q[k] = c.pos[0] * cam.view[0 * 4 + k] + c.pos[1] * cam.view[1 * 4 + k] + c.pos[2] * cam.view[2 * 4 + k] + cam.view[3 * 4 + k];
-			q[3] = c.range;
+			q[3] = c.range * hifi::sun::kLampCubeReach; // (the cube's far plane: as it was drawn, above)
 			mapped++;
 		}
 		const uint32_t start = uint32_t(at);
@@ -5698,8 +5880,13 @@ namespace grass
 			if ((depth_pitch = copy_out(list, _depth, t.ds, t.ds_state, light, &light_copied)) != 0)
 			{
 				// (bit 64: the light split's facings marked, light_marks: asked with this frame's texture)
+				// (sun_shadows.hpp: 512 the words marked; what a marked word says was applied, as the block the native passes
+				// read this frame held it, asked before this frame's is published: 128 the sun's and clouds' shadows, 256 the
+				// lamps' glow)
+				const bool words_marked = light_copied && hifi::sun::marked();
+				const uint32_t held = words_marked ? hifi::sun::published() : 0u;
 				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u) | (light_copied && _light_marks != nullptr && _light_marks(_light_context) ? 64u : 0u) |
-					(light_copied && hifi::sun::native() ? 128u : 0u); // (sun_shadows.hpp: the words marked)
+					(words_marked ? 512u : 0u) | ((held & hifi::sun::kHasSun) != 0 ? 128u : 0u) | ((held & hifi::sun::kHasLamps) != 0 ? 256u : 0u);
 				stats.light_split = light_copied;
 				transition(list, t.ds, D3D12_RESOURCE_STATE_COPY_SOURCE, t.ds_state, 0);
 			}
@@ -6263,15 +6450,22 @@ namespace grass
 				_cloud_buffer = _sun_mask;
 				std::memcpy(_cloud_key, cloud_key, sizeof(_cloud_key));
 			}
-			// (the cascades, casters and clouds to HiFi XI's native passes, the next frame's: sun_shadows.hpp)
-			if (hifi::sun::native())
+			// (the cascades, casters and clouds, and the lamps, to HiFi XI's native passes, the next frame's: sun_shadows.hpp;
+			// each when its option is on and there's something of it this frame, the block's flags saying which)
+			if (hifi::sun::marked())
 			{
-				if (stats.sun_map && constants[51] > 0.0f)
+				hifi::sun::block b;
+				b.device = _device;
+				if (hifi::sun::native() && stats.sun_map && constants[51] > 0.0f)
 				{
 					const float *const c = actor_data + kWxOffset + kWxParams;
 					const float cloud[8] = { c[32], c[33], c[34], c[37], c[24], c[25], c[26], actor_data[kWxOffset + 7] };
-					publish_sun_shadows(l.clock, stats.casters, cloud_copied ? cloud : nullptr, constants[51], l.sun);
+					sun_shadows_block(b, l.clock, stats.casters, cloud_copied ? cloud : nullptr, constants[51], l.sun);
 				}
+				if (hifi::sun::native_lamps() && lamps_written != 0)
+					lamps_block(b, l, eye);
+				if (b.gpu.mode[2] != 0)
+					hifi::sun::publish(b);
 				else
 					hifi::sun::publish_none();
 			}

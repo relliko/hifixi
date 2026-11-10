@@ -851,6 +851,9 @@ class hifixi final : public IPlugin
 		// (the sun's shadows looked up by the native zone and characters themselves, World FX's left to what they don't
 		// draw: src/render/sun_shadows.hpp; off, World FX darkens the finished picture as before)
 		hifi::sun::set_native(hifi::game::option_on("zone", "nativeshadows", hifi::zone::options::kNativeShadowsByDefault));
+		// (... and World FX's lamp glow added by them as they light each pixel, World FX's own left to what they don't
+		// draw; off, World FX adds it onto the finished picture as before. Either works without the other.)
+		hifi::sun::set_native_lamps(hifi::game::option_on("zone", "nativelamps", hifi::zone::options::kNativeLampsByDefault));
 	}
 	// World FX's casters each frame (worldfx::set_casters): the characters and monsters from their meshes, then the zone's
 	// moving layer (its swaying plants, doors and elevators) into the same map. Whether either drew.

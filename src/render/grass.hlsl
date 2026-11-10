@@ -146,17 +146,22 @@ float3 view_dir(float3 d)
 	return float3(c.x / lin.z, c.y / lin.w, c.w / up_row.w); // (the projection's _11, _22 and _34 undone, as body_in_view)
 }
 bool light_marks() { return (zinfo.w & 64) != 0; }
-// zinfo.w bit 128: the words carry the native passes' shadow mark (HiFi XI's src/render/sun_shadows.hpp): the share in
-// bits 25-30 (0..63: what's left of the sun's light after its shadows), bit 31 set where the native zone or characters
-// applied the sun's and clouds' shadows themselves (light_at's done): the sun pass then looks only for contact shadows
-// there, and the clouds' aren't taken again
+// zinfo.w bits 128, 256, 512: the words carry the native passes' mark (HiFi XI's src/render/sun_shadows.hpp): with any
+// of them the share is in bits 25-30 (0..63: what's left of the sun's light after the shadows applied there, if any),
+// and bit 31 is set where the native zone or characters lit the pixel from the block World FX published for them. What
+// that block held, the frame says: 128 the sun's and clouds' shadows (light_at's done: the sun pass then looks only for
+// contact shadows there, and the clouds' aren't taken again), 256 the lamps (light_at's lamps_done: their glow is in
+// the colour already, lamp_light isn't added again); 512 alone, neither (the words marked, nothing applied).
+bool words_marked() { return (zinfo.w & (128 | 256 | 512)) != 0; }
 bool shadow_marks() { return (zinfo.w & 128) != 0; }
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked, out bool done)
+bool lamp_marks() { return (zinfo.w & 256) != 0; }
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked, out bool done, out bool lamps_done)
 {
 	n = float3(0.0, 0.0, 1.0);
 	share = 0.0;
 	marked = false;
 	done = false;
+	lamps_done = false;
 	if (!light_split() || any(zinfo.yz != ground.yz) || z > 1e8)
 		return false;
 	p = clamp(p, int2(0, 0), int2(zinfo.yz) - 1);
@@ -174,9 +179,15 @@ bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool
 	// (a mark: turned away from the camera by more than the 7-bit facing's error near edge on)
 	marked = light_marks() && dot(n, -P) < -0.02 * length(P);
 	n = dot(n, -P) < 0.0 ? -n : n;
-	share = shadow_marks() ? float((v >> 25) & 63) / 63.0 : float(v >> 25) / 127.0;
+	share = words_marked() ? float((v >> 25) & 63) / 63.0 : float(v >> 25) / 127.0;
 	done = shadow_marks() && (v >> 31) != 0;
+	lamps_done = lamp_marks() && (v >> 31) != 0;
 	return true;
+}
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked, out bool done)
+{
+	bool lamps_done;
+	return light_at(p, z, P, n, share, marked, done, lamps_done);
 }
 bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked)
 {
@@ -2066,7 +2077,8 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	float known_share;
 	bool pack_relief; // (the texture pack's relief lit this pixel: the light split's mark)
 	bool shadows_done; // (the native passes applied the sun's and clouds' shadows here: light_at's done)
-	const bool known = light_at(p, z, P, n_known, known_share, pack_relief, shadows_done);
+	bool lamps_native; // (... and added the lamps' glow here themselves: light_at's lamps_done)
+	const bool known = light_at(p, z, P, n_known, known_share, pack_relief, shadows_done, lamps_native);
 	if (shade.x > 0.0 || (!known && (shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)))
 		n = surface_normal(p, P, steep);
 	const float3 n_depth = n;
@@ -2139,6 +2151,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	// mid-grey ground's light: sun, shade, night and the game's own lamps carry over), in the game's fog as the rest; the
 	// surface's relief mostly buried under it. A surface seen too nearly edge on for its facing to be told is taken as
 	// facing up. World FX's own shadows, occlusion and lamps then fall on it as on the rest.
+	float snowed = 0.0; // (how much of the colour drawn here the snow took the place of)
 	[branch] if (snowing)
 	{
 		const float3 world_up = -up_row.xyz; // (the world's up in view space: its y is down)
@@ -2161,6 +2174,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 				[branch] if (hazy())
 					snow = lerp(haze_colour(), snow, clear_at(z));
 				col = lerp(col, snow, 0.98 * amount);
+				snowed = 0.98 * amount;
 				relief = lerp(relief, 1.0, 0.9 * amount);
 			}
 		}
@@ -2177,8 +2191,15 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		glow = lamp_light_known(P, n, col, known_share, hidden) * ao;
 		col -= hidden;
 	}
-	else if (lamps)
-		glow = lamp_light(P, n, steep, col) * ao;
+	else
+	{
+		// (where the native zone or characters added the lamps' glow themselves, light_at's lamps_done with zinfo.w bit
+		// 256: HiFi XI's sun_shadows.hpp, [zone] nativelamps, it's in the colour already and none is added; but for the
+		// part of the colour settled snow took the place of just now, lit here as before)
+		const float lamp_part = known && lamps_native ? snowed : 1.0;
+		[branch] if (lamps && lamp_part > 0.0)
+			glow = lamp_light(P, n, steep, col) * (ao * lamp_part);
+	}
 	// Wet path and stone in rain (wet_here), on what faces up: darker (soaked), the overcast sky mirrored more the more
 	// grazing the view (water's own reflectance on the film), and a little highlight toward the game's light. A surface
 	// seen too nearly edge on for its facing to be told (far ground) is taken as facing up.

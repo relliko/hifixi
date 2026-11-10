@@ -310,10 +310,13 @@ namespace hifi::zone::inject
 	{
 		std::lock_guard<std::mutex> lock(g.mutex);
 		std::vector<std::string> lines;
-		char line[320];
-		std::snprintf(line, sizeof(line), "native zone renderer: %s; %llu passes drawn, %llu couldn't be%s%s; the last: %u objects, %u draws, %u triangles",
+		char line[420];
+		// (the last pass's part of World FX's block: src/render/sun_shadows.hpp)
+		std::snprintf(line, sizeof(line), "native zone renderer: %s; %llu passes drawn, %llu couldn't be%s%s; the last: %u objects, %u draws, %u triangles, "
+			"the sun's shadows %s, the lamps' glow %s",
 			g.renderer != nullptr && g.renderer->ready() ? "up" : "not made", static_cast<unsigned long long>(g.drawn), static_cast<unsigned long long>(g.failed),
-			g.why.empty() ? "" : " (the last: ", g.why.empty() ? "" : (g.why + ")").c_str(), g.last.objects, g.last.draws, g.last.triangles);
+			g.why.empty() ? "" : " (the last: ", g.why.empty() ? "" : (g.why + ")").c_str(), g.last.objects, g.last.draws, g.last.triangles,
+			g.last.shadowed ? "applied" : "not applied", g.last.lamps ? "added" : "not added");
 		lines.push_back(line);
 		std::snprintf(line, sizeof(line), "native zone renderer: sun shadow cascades from its data: %s; %llu drawn, %llu triangles in all",
 			g.shadow_up ? "up" : "not made", static_cast<unsigned long long>(g.shadow_frames.load()), static_cast<unsigned long long>(g.shadow_triangles.load()));

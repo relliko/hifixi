@@ -35,7 +35,13 @@
  *     shading pass, "native" looked up by the zone pass itself ([zone] nativeshadows, src/render/sun_shadows.hpp). Two
  *     frames, the second the picture (the zone pass reads what World FX drew the frame before, as in game). No ambient
  *     occlusion or relief; ZONE_VIEW_SHADOW=<strength> the sun shadows' strength (0.55, the High preset's);
- *     ZONE_VIEW_CLOUDS: unused (no weather here, so no clouds' shadows)
+ *     ZONE_VIEW_CLOUDS: unused (no weather here, so no clouds' shadows). With ZONE_VIEW_LAMPS, "native" also has the
+ *     zone pass add World FX's lamp glow itself ([zone] nativelamps, sun_shadows.hpp's lamps; no characters here: no
+ *     capsules), and both modes run 28 frames before the picture's, so the lamps' cubes are drawn (a face a frame) as
+ *     they are in game after a moment; "native-shadows" and "native-lamps": only the one of the two; "native-faithful":
+ *     both, the lamps' glow as World FX's own, ported (sun_shadows.hpp's kLookFaithful; "native" is the tuned look).
+ *     ZONE_VIEW_BODY="x y z size": a character standing there (its capsule: the lamps' shadows); ZONE_VIEW_SMALLROOM=1:
+ *     lit as a Mog House; ZONE_VIEW_FXLAMPS=0: World FX given no lamps; ZONE_VIEW_REPEAT=<n>: the zone pass n times over
  */
 
 #include <d3d12.h>
@@ -701,6 +707,9 @@ int main(int argc, char **argv)
 				o.lamps[k] = best[k].second;
 		}
 		std::printf("ZONE_VIEW_LAMPS: %zu lamps baked, %u to the zone pass, %zu to World FX\n", all.size(), f.lamp_count, fx_lamps.size() / 8);
+		// (the nearest few, for placing a camera by one: x y z, range)
+		for (size_t k = 0; k < all.size() && k < 6; ++k)
+			std::printf("  lamp %zu: %.1f %.1f %.1f, range %.1f\n", k, all[k].x, all[k].y, all[k].z, all[k].range);
 	}
 	hifi::zone::publish(f, 1);
 
@@ -708,7 +717,7 @@ int main(int argc, char **argv)
 	std::string fx_mode;
 	if (char fm[16] = ""; GetEnvironmentVariableA("ZONE_VIEW_FX", fm, sizeof(fm)) != 0)
 		fx_mode = fm;
-	const bool fx = fx_mode == "old" || fx_mode == "native";
+	const bool fx = fx_mode == "old" || fx_mode == "native" || fx_mode == "native-shadows" || fx_mode == "native-lamps" || fx_mode == "native-faithful";
 	grass::renderer wfx;
 	hifi::zone::zone_shadow casters;
 	struct caster_context
@@ -734,7 +743,10 @@ int main(int argc, char **argv)
 			},
 			&cc);
 		wfx.set_light_source([](void *) { return hifi::light::take(); }, nullptr);
-		hifi::sun::set_native(fx_mode == "native");
+		hifi::sun::set_native(fx_mode == "native" || fx_mode == "native-shadows" || fx_mode == "native-faithful");
+		hifi::sun::set_native_lamps(fx_mode == "native" || fx_mode == "native-lamps" || fx_mode == "native-faithful");
+		// ("native-faithful": the lamps' glow as World FX's, ported; "native": the tuned look, the plugin's)
+		hifi::sun::set_lamp_look(fx_mode == "native-faithful" ? hifi::sun::kLookFaithful : hifi::sun::kLookTuned);
 		(void)hifi::light::take(); // (asked: the zone pass draws it from the first frame)
 	}
 	grass::camera cam;
@@ -745,11 +757,31 @@ int main(int argc, char **argv)
 	fl.water = false;
 	fl.sea = false;
 	fl.fireflies = 0.0f;
+	// (ZONE_VIEW_FXLAMPS=0: World FX given no lamps, the zone pass's own kept: what the glow adds, against the same with it)
+	if (char fxl[8] = ""; GetEnvironmentVariableA("ZONE_VIEW_FXLAMPS", fxl, sizeof(fxl)) != 0 && fxl[0] == '0')
+		fx_lamps.clear();
 	if (!fx_lamps.empty())
 	{
 		fl.lamps = fx_lamps.data();
 		fl.lamp_count = uint32_t(fx_lamps.size() / 8);
 		fl.lamp_shadows = 0.5f;
+	}
+	// (ZONE_VIEW_BODY="x y z size": a character standing there for World FX, its feet and size as the add-on hands them:
+	// nothing of it is drawn, its capsule alone shadows the lamps for the zone pass, sun_shadows.hpp's lamps)
+	float body[4] = {};
+	if (const char *bv = std::getenv("ZONE_VIEW_BODY"); bv != nullptr && std::sscanf(bv, "%f %f %f %f", &body[0], &body[1], &body[2], &body[3]) == 4)
+	{
+		fl.actors = body;
+		fl.actor_count = 1;
+	}
+	// (ZONE_VIEW_SMALLROOM=1: as World FX has a Mog House: its glow 0.3 as strong, worldfx_core's kMogHouseGlow, and the
+	// native passes told to keep that glow's own size and look)
+	if (GetEnvironmentVariableA("ZONE_VIEW_SMALLROOM", nullptr, 0) != 0)
+	{
+		fl.lamp_small_room = true;
+		for (size_t k = 0; k + 7 < fx_lamps.size(); k += 8)
+			for (int c = 4; c < 7; ++c)
+				fx_lamps[k + c] *= 0.3f;
 	}
 	std::memcpy(fl.sun, sun_dir, sizeof(fl.sun));
 	fl.sun_shadow = 0.55f;
@@ -781,25 +813,75 @@ int main(int argc, char **argv)
 	HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 	hifi::zone::draw_stats st;
 	double record_ms = 0.0;
-	for (uint64_t n = 1; fx && n < 2; ++n)
+	// (with lamps: frames enough for World FX to keep room for the cubes, then draw the four nearest lamps' six faces)
+	const uint64_t last = fx ? (fx_lamps.empty() ? 2 : 30) : 1;
+	uint32_t lamp_faces = 0, lamp_copies = 0;
+	// (each frame timed on the GPU: timestamps before the zone pass, after it, after World FX; the frames before the
+	// picture's are the same frame over again, so the least of them is the pass's time with nothing else in the way)
+	ID3D12QueryHeap *stamps = nullptr;
+	ID3D12Resource *stamps_back = nullptr;
+	UINT64 stamp_hz = 0;
+	{
+		D3D12_QUERY_HEAP_DESC qd = {};
+		qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+		qd.Count = 3;
+		D3D12_HEAP_PROPERTIES qh = {};
+		qh.Type = D3D12_HEAP_TYPE_READBACK;
+		D3D12_RESOURCE_DESC qb = {};
+		qb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		qb.Width = 3 * sizeof(UINT64);
+		qb.Height = 1;
+		qb.DepthOrArraySize = 1;
+		qb.MipLevels = 1;
+		qb.SampleDesc.Count = 1;
+		qb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		if (FAILED(direct->GetTimestampFrequency(&stamp_hz)) || stamp_hz == 0 || FAILED(device->CreateQueryHeap(&qd, IID_PPV_ARGS(&stamps))) ||
+			FAILED(device->CreateCommittedResource(&qh, D3D12_HEAP_FLAG_NONE, &qb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stamps_back))))
+			stamps = nullptr;
+	}
+	std::vector<double> zone_ms, fx_ms;
+	auto stamps_read = [&] {
+		UINT64 *v = nullptr;
+		const D3D12_RANGE all = { 0, 3 * sizeof(UINT64) };
+		if (stamps == nullptr || FAILED(stamps_back->Map(0, &all, reinterpret_cast<void **>(&v))))
+			return;
+		zone_ms.push_back(1000.0 * double(v[1] - v[0]) / double(stamp_hz));
+		fx_ms.push_back(1000.0 * double(v[2] - v[1]) / double(stamp_hz));
+		stamps_back->Unmap(0, nullptr);
+	};
+	for (uint64_t n = 1; fx && n < last; ++n)
 	{
 		list->ClearRenderTargetView(t.rtv, sky, 0, nullptr);
 		list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 		hifi::zone::draw_target ft = t;
 		const bool split = hifi::light::begin(list, device, target, ft.light_rtv);
+		if (stamps != nullptr)
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
 		renderer.record(list, ft, *hifi::zone::published(1), o, n);
 		if (split)
 			hifi::light::end(list);
+		if (stamps != nullptr)
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
 		std::string error;
 		const grass::draw_stats fs = wfx.draw(list, gt, cam, fl, error);
-		std::printf("World FX frame %llu: %s%s, sun map %s (%u cascades), light split %s\n", (unsigned long long)n, fs.sun ? "shaded" : "not shaded",
-			error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read", fs.sun_map_cascades, split ? "drawn" : "not drawn");
+		if (stamps != nullptr)
+		{
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+			list->ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, stamps_back, 0);
+		}
+		lamp_faces += fs.lamp_map_faces;
+		lamp_copies += fs.lamp_native_copies;
+		if (n == 1 || n + 1 == last || !error.empty())
+			std::printf("World FX frame %llu: %s%s, sun map %s (%u cascades), light split %s; lamps %u, their cubes %u (%u faces drawn so far, %u cubes copied for the zone pass)\n",
+				(unsigned long long)n, fs.sun ? "shaded" : "not shaded", error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read",
+				fs.sun_map_cascades, split ? "drawn" : "not drawn", fs.lamps, fs.lamp_maps, lamp_faces, lamp_copies);
 		list->Close();
 		ID3D12CommandList *one[] = { list };
 		direct->ExecuteCommandLists(1, one);
 		direct->Signal(fence, n);
 		fence->SetEventOnCompletion(n, e);
 		WaitForSingleObject(e, 60000);
+		stamps_read();
 		alloc->Reset();
 		list->Reset(alloc, nullptr);
 		wfx.release_old(0);
@@ -809,7 +891,6 @@ int main(int argc, char **argv)
 			hifi::sun::detail::g.at = GetTickCount64();
 		}
 	}
-	const uint64_t last = fx ? 2 : 1;
 	list->ClearRenderTargetView(t.rtv, sky, 0, nullptr);
 	list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 	{
@@ -817,22 +898,53 @@ int main(int argc, char **argv)
 		if (fx)
 			(void)hifi::light::take(); // (asked again: however long the first frame took)
 		const bool split = fx && hifi::light::begin(list, device, target, ft.light_rtv);
+		// (ZONE_VIEW_REPEAT=<n>: the zone pass recorded n times over in this frame, the target and depth cleared before
+		// each, for timing it: "drawn in" at n less at 1, over n - 1, is one pass's GPU time)
+		uint32_t repeat = 1;
+		if (const char *rv = std::getenv("ZONE_VIEW_REPEAT"); rv != nullptr)
+			repeat = std::clamp<uint32_t>(uint32_t(std::strtoul(rv, nullptr, 10)), 1u, 200u);
+		for (uint32_t k = 1; k < repeat; ++k)
+		{
+			renderer.record(list, ft, *hifi::zone::published(1), o, last);
+			list->ClearRenderTargetView(t.rtv, sky, 0, nullptr);
+			list->ClearDepthStencilView(t.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+		}
 		t0 = std::chrono::steady_clock::now();
+		if (stamps != nullptr)
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
 		st = renderer.record(list, ft, *hifi::zone::published(1), o, last);
 		record_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 		if (split)
 			hifi::light::end(list);
+		if (stamps != nullptr)
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
 		if (fx)
 		{
 			std::string error;
 			const grass::draw_stats fs = wfx.draw(list, gt, cam, fl, error);
-			std::printf("World FX frame %llu: %s%s, sun map %s, light split %s; the zone pass %s the sun's shadows itself\n", (unsigned long long)last,
-				fs.sun ? "shaded" : "not shaded", error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read", split ? "drawn" : "not drawn",
-				st.shadowed ? "applied" : "didn't apply");
+			std::printf("World FX frame %llu: %s%s, sun map %s, light split %s; the zone pass %s the sun's shadows itself, and %s the lamps' glow (%u lamps, %u cubes)\n",
+				(unsigned long long)last, fs.sun ? "shaded" : "not shaded", error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read",
+				split ? "drawn" : "not drawn", st.shadowed ? "applied" : "didn't apply", st.lamps ? "added" : "didn't add", fs.lamps, fs.lamp_maps);
+			{
+				// (what World FX published for the next frame's native passes: sun_shadows.hpp)
+				std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+				const hifi::sun::gpu_block &pb = hifi::sun::detail::g.latest.gpu;
+				uint32_t with_cube = 0;
+				for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
+					with_cube += pb.lamp_col[k][3] >= 2.0f ? 1 : 0;
+				std::printf("  the block published: %s%s; %.0f lamps (%u with a cube), lamp shadows %.2f, %.0f characters' capsules\n",
+					hifi::sun::detail::g.has ? "" : "none", (pb.mode[2] & hifi::sun::kHasSun) != 0 ? "the sun's shadows" : "no sun shadows", pb.lamp_head[0], with_cube,
+					pb.lamp_head[1], pb.lamp_head[2]);
+			}
 			uint64_t taken = 0, cleared = 0;
 			hifi::light::counts(taken, cleared);
 			std::printf("  World FX read the light split: %s (taken %llu, cleared %llu)\n", fs.light_split ? "yes" : "no", (unsigned long long)taken,
 				(unsigned long long)cleared);
+		}
+		if (stamps != nullptr)
+		{
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+			list->ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, stamps_back, 0);
 		}
 	}
 	D3D12_RESOURCE_BARRIER barrier = {};
@@ -855,6 +967,17 @@ int main(int argc, char **argv)
 	fence->SetEventOnCompletion(last, e);
 	WaitForSingleObject(e, 60000);
 	const double gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	stamps_read();
+	if (!zone_ms.empty())
+	{
+		// (the last ten frames: the cubes drawn, the block applied; the least and the middle one)
+		const size_t from = zone_ms.size() > 10 ? zone_ms.size() - 10 : 0;
+		std::vector<double> z(zone_ms.begin() + from, zone_ms.end()), w(fx_ms.begin() + from, fx_ms.end());
+		std::sort(z.begin(), z.end());
+		std::sort(w.begin(), w.end());
+		std::printf("GPU time over the last %zu frames: the zone pass %.2f ms at least, %.2f the middle one; World FX after it %.2f at least, %.2f the middle one\n",
+			z.size(), z.front(), z[z.size() / 2], w.front(), w[w.size() / 2]);
+	}
 	if (device->GetDeviceRemovedReason() != S_OK)
 	{
 		std::printf("the device was removed (0x%08lX)\n", device->GetDeviceRemovedReason());

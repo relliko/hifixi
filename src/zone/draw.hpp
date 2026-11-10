@@ -68,6 +68,7 @@ namespace hifi::zone
 	{
 		uint32_t objects = 0, draws = 0, triangles = 0, skipped = 0;
 		bool shadowed = false; // (the sun's shadows applied per pixel: src/render/sun_shadows.hpp)
+		bool lamps = false;    // (World FX's lamp glow added per pixel: the same block's lamps, [zone] nativelamps)
 	};
 
 	class zone_renderer

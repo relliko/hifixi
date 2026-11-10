@@ -21,6 +21,11 @@
 #include <string>
 #include <vector>
 
+namespace hifi::sun
+{
+	struct block; // (sun_shadows.hpp: what the native passes are handed)
+}
+
 namespace grass
 {
 	// Snapshots of the world for the upscaler's masks (src/upscale/masks), each at the world's end: before World FX's
@@ -329,6 +334,9 @@ namespace grass
 		const float *lamps = nullptr;
 		uint32_t lamp_count = 0;
 		float lamp_shadows = 0.0f;
+		// (a small room whose own lamp lights all of it, a Mog House: HiFi XI's native passes then keep this glow's own
+		// size and look, not their wider one: src/render/sun_shadows.hpp's looks)
+		bool lamp_small_room = false;
 		// The game's own fog, as its weather and the hour have it now: linear by view depth, none at haze_start
 		// yalms, all haze_color at haze_end (the game's fog render states). The grass, the fireflies and the water
 		// fade into it as the scenery does, and what the shading pass darkens (ambient occlusion, relief, shadows)
@@ -551,6 +559,7 @@ namespace grass
 		uint32_t lamps = 0;         // lamps whose glow the shading pass added
 		uint32_t lamp_maps = 0;     // ... with a shadow map ready (draw_lamp_maps): their shadows from it, the rest marched
 		uint32_t lamp_map_faces = 0, lamp_map_triangles = 0; // cube faces drawn into them this frame, and their triangles
+		uint32_t lamp_native_copies = 0; // cubes copied this frame to where HiFi XI's native passes read them (sun_shadows.hpp's lamps)
 		bool wet = false;           // the wet look on path and stone in the shading pass
 		bool snow_cover = false;    // settled snow in the shading pass
 		bool snow_layer = false;    // ... with depth, its layer drawn
@@ -830,8 +839,16 @@ namespace grass
 		void caster_params(const camera &cam, float out[16]) const;
 		// The cascades, the casters' map and the clouds' shadows to HiFi XI's native passes, in world space (sun_shadows.hpp):
 		// casters whether the casters' map was drawn, cloud (8 floats, nullptr: none) the clouds' map's corner x z, texel,
-		// strength, toward the light x y z, ground height; strength the sun's shadows'
-		void publish_sun_shadows(double clock, bool casters, const float *cloud, float strength, const float sun[3]) const;
+		// strength, toward the light x y z, ground height; strength the sun's shadows'. Into b (its buffer the copy, its
+		// flags kHasSun); false: none to hand over
+		bool sun_shadows_block(hifi::sun::block &b, double clock, bool casters, const float *cloud, float strength, const float sun[3]) const;
+		// The lamps to the native passes ([zone] nativelamps, sun_shadows.hpp's lamps): the look's list in world space as
+		// the shading pass got it, the cubes draw_lamp_maps copied for them (lamp_dest), the characters near a lamp that
+		// casts. Into b (flags kHasLamps; its buffer the cubes' when it has none yet and a cube is there)
+		void lamps_block(hifi::sun::block &b, const look &l, const float eye[3]) const;
+		// (where the lamps' cubes are copied for the native passes: the sun's shadow map copy's end when there is one, else
+		// a buffer of their own, made when first wanted; at: where in it)
+		ID3D12Resource *lamp_dest(UINT64 &at) const;
 		bool lamp_maps_for(std::string &error);
 		void draw_lamp_maps(ID3D12GraphicsCommandList *list, const camera &cam, const look &l, const float eye[3], float out[32], draw_stats &stats);
 		ID3D12PipelineState *vis_pipeline(std::string &error);
@@ -1006,11 +1023,20 @@ namespace grass
 			bool used = false, drawn = false;
 			ID3D12Resource *copied_to = nullptr;
 			UINT64 copied_at = 0;
+			// (... and the buffer the native passes read them from, and where in it: lamp_dest; sun_shadows.hpp's lamps)
+			ID3D12Resource *native_to = nullptr;
+			UINT64 native_at = 0;
 		};
 		lamp_cube _lamp_cubes[4];
 		ID3D12Resource *_lamp_map = nullptr;
 		ID3D12DescriptorHeap *_lamp_map_heap = nullptr;
 		UINT64 _lamp_tail = 0;
+		// The cubes for the native passes ([zone] nativelamps): in the sun's shadow map copy after the clouds' map
+		// (_lamp_copy_at), or, while there's no such copy (no sun map wanted yet: indoors, a night start), in a buffer of
+		// their own (_lamp_native: written only by copies, left NON_PIXEL | PIXEL_SHADER_RESOURCE, as the sun's copy)
+		UINT64 _lamp_copy_at = 0;
+		ID3D12Resource *_lamp_native = nullptr;
+		D3D12_RESOURCE_STATES _lamp_native_state = D3D12_RESOURCE_STATE_COMMON;
 
 		ID3D12Resource *_buffer = nullptr;
 		ID3D12Resource *_memory = nullptr; // the ground colour each blade point remembers (12 bytes a point)

@@ -6,8 +6,9 @@
  *   4  SRV t2      the frame's objects (80 bytes)        5  SRV t3  its lamps (32 bytes)
  *   6  table t4    the piece's texture                   7  table t5  its normal map, or (kPackRelief) the texture pack's
  *                                                                     height (BC4) from the pack region's height block
- *   8  CBV b2      the sun's shadows (src/render/sun_shadows.hpp's block: the ring's slot)
- *   9  SRV t6      World FX's shadow map copy (sun_shadows.hpp), or the ring when there's none (never read then)
+ *   8  CBV b2      the sun's shadows and the lamps (src/render/sun_shadows.hpp's block: the ring's slot)
+ *   9  SRV t6      World FX's shadow map copy with the lamps' cubes (sun_shadows.hpp), or the ring when there's none
+ *                  (never read then)
  *   s0             anisotropic x8, wrapping, mip bias -0.5 (the zone pass draws without mips: MIPFILTER NONE; the
  *                  game's textures have one level, an overlay's bigger copies step down to the game's size:
  *                  zm::texture::levels, as do the texture pack's); the colour map sampled with draw_options'
@@ -68,8 +69,7 @@ cbuffer draw_constants : register(b1)
 	uint relief;         // kPackRelief: the height's relief scale (float bits: gpu_zone::height_written); else 0
 };
 struct vertex { float3 pos; float3 normal; uint colour; float2 uv; float3 sway; };
-// (env: its own | a door's << 8; lamp: x the game's 4 lamps, a byte each, then yzw the frame's lamps whose range
-// reaches its box, up to 12, a byte each in order (near_lamps): 255 none, and none after the first none)
+// (env: its own | a door's << 8; lamp: x the game's 4 lamps, a byte each, 255 none; yzw unused, all ones)
 struct object { float4 c0; float4 c1; float4 c2; uint flags; uint model; float sway; uint env; uint4 lamp; };
 struct lamp_t { float3 pos; float range; float3 colour; float att2; };
 StructuredBuffer<vertex> vertices : register(t0);
@@ -81,6 +81,9 @@ Texture2D normal_map : register(t5); // (kPackRelief: the texture pack's height,
 SamplerState wrap : register(s0);
 
 static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kPackRelief = 32, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
+// (a piece flag more: a door's blended piece, which writes the depth but not the light split: World FX takes its pixels
+// as it takes the game's own, and adds the lamps' glow there itself, so the pass adds none: sun_shadows.hpp's lamps)
+static const uint kOverDepth = 64;
 // HiFi XI's own look per pixel (hemi_spec.hpp). The ambient from a sky: x kSkyAbove on what faces up, x kSkyBelow on
 // what faces down, tinted kSkyTint toward the fog's hue from above and the sun's (its light off the ground) from below;
 // a town's street seen from it comes out as bright as the game's on the whole (the ground's a little brighter, walls a
@@ -133,23 +136,9 @@ float3 lamp_light(object o, float3 world, float3 n)
 		sum += one_lamp((o.lamp.x >> (8 * k)) & 255, world, n);
 	return sum;
 }
-// Per pixel: every lamp of the frame whose range reaches the object (near_lamps on the CPU), not only the 4 the game
-// named, so a wall beside a lamp its own object doesn't name is lit as the floor under it is (one lamp light, the same
-// for World FX: it no longer adds the zone's lamps where the light split knows the pixel). The object's list is the
-// same for each of its pixels: the loop ends at its first empty byte, alike across a draw.
-float3 near_lamp_light(object o, float3 world, float3 n)
-{
-	float3 sum = 0;
-	[loop] for (uint w = 0; w < 3; ++w)
-	{
-		const uint word = w == 0 ? o.lamp.y : w == 1 ? o.lamp.z : o.lamp.w;
-		if ((word & 255) == 255)
-			break;
-		[unroll] for (uint k = 0; k < 4; ++k)
-			sum += one_lamp((word >> (8 * k)) & 255, world, n);
-	}
-	return sum;
-}
+// (Every lamp of the frame in reach of the object lit this way, 89af2a3's near_lamp_light, lit a Mog House far too
+// bright and was taken out again, 7688ae9. What lights a wall beside a lamp its object doesn't name is World FX's tuned
+// glow, added here per pixel when the block has the lamps: sun_shadows.hpp's sl_glow, in shade below.)
 
 // (per pixel, kPackRelief: M9, docs/texture-pack/zones.md "Pack normals") The tilt from the texture pack's height at uv,
 // as the game's own normal maps have it (zonemesh::sobel): red the slope along v, green along u, both in the game's
@@ -312,11 +301,13 @@ v2p vs(uint vid : SV_VertexID)
 	return r;
 }
 
-// The piece's colour; share: the sun's share of its light (light_share); shadowed: the sun's and clouds' shadows were
-// applied to it (per pixel, sun_shadows.hpp: the sun's term alone, before the texture; the lamps and ambient as they are)
+// The piece's colour; share: the sun's share of its light (light_share); shadowed: what the published block holds was
+// applied to it (per pixel, sun_shadows.hpp: the sun's and clouds' shadows on the sun's term alone, before the texture,
+// the game's lamps and ambient as they are; World FX's lamp glow added after the texture): the light split's mark
 float4 shade(v2p i, out float share, out bool shadowed)
 {
 	shadowed = false;
+	float3 glow = 0;
 	const env_t e = env_of(objects[object_index]);
 	const float2 dx = ddx(i.uv), dy = ddy(i.uv);
 	// (parallax: per pixel on a solid piece with the pack's relief, while tex_bias.y says so; the same for a whole draw.
@@ -370,17 +361,28 @@ float4 shade(v2p i, out float share, out bool shadowed)
 #endif
 		n *= scale;
 		const float3 s_rgb = bump ? e.sun_bump.rgb : e.sun.rgb, a_rgb = bump ? e.ambient_bump.rgb : e.ambient.rgb;
-		// (the lamps the game names for the object, as per vertex: every lamp in reach, near_lamp_light, lit a Mog House far
-		// too bright, 2026-10-29; kept for a tuned try)
+		// (the lamps the game names for the object, as per vertex: the game's own look)
 		const float3 rest = i.vcol.rgb * sky_ambient(e, a_rgb, n) + i.vcol.rgb * lamp_light(objects[object_index], i.world, n);
 		// (the sun's shadows looked up here, from the mesh's own facing: sun_shadows.hpp; 1 when there are none to apply)
 		const float in_sun = ss_sun_seen(i.world, i.normal / max(scale, 1e-6), 0.0);
-		shadowed = ss_on();
 		lit = saturate(i.vcol.rgb * s_rgb * sun_seen * in_sun * saturate(dot(n, e.sun_dir.xyz)) + rest);
 		share = light_share(lit, saturate(rest));
 		// (the highlight goes on after the texture, the sun's all of it)
 		spec = piece_spec(e, i.world, n, s_rgb, i.vcol, t) * in_sun;
 		share = spec_share(share, 2 * lit * t.rgb, spec);
+		// World FX's lamp glow (sun_shadows.hpp's lamps, [zone] nativelamps: grass.hlsl's lamp_light here, so World FX adds
+		// none on these pixels): onto the colour as drawn before the fog, by the facing it was lit with (turned toward the
+		// camera, as World FX turns the light split's), its lamps' shadows from the mesh's own; none of it the sun's
+		[branch] if (sl_on() && (piece & kOverDepth) == 0)
+		{
+			const float3 toward = options.yzw - i.world;
+			const float3 nl = n / max(scale, 1e-6), ng = i.normal / max(scale, 1e-6);
+			const float3 c = 2 * lit * t.rgb + spec;
+			// (the tuned look: by the texture and the baked vertex shade, faded by the light the pixel has already: lit)
+			glow = sl_lit(sl_glow(i.world, dot(nl, toward) < 0 ? -nl : nl, dot(ng, toward) < 0 ? -ng : ng, false), c, 2 * t.rgb * i.vcol.rgb, lit);
+			share = sl_share(share, c, glow);
+		}
+		shadowed = ss_on() || sl_on();
 	}
 	else if (bump)
 	{
@@ -408,7 +410,7 @@ float4 shade(v2p i, out float share, out bool shadowed)
 	const float3 packed = float3(floor(g24 / 65536), floor(fmod(g24, 65536) / 256), fmod(g24, 256)) / 255;
 	return float4(GBUF == 1 ? t.rgb : GBUF == 2 ? gbuf_n * 0.5 + 0.5 : GBUF == 5 ? i.vcol.rgb : packed, 1);
 #endif
-	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb + spec, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
+	return float4(lerp(e.fog.rgb, 2 * lit * t.rgb + spec + glow, i.fog), (piece & kBlended) != 0 ? a : max(a, 2.0 / 255.0));
 }
 float4 ps(v2p i) : SV_Target
 {
@@ -437,7 +439,7 @@ light_out ps_light(v2p i)
 }
 )";
 
-		constexpr uint32_t kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kPackRelief = 32;
+		constexpr uint32_t kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kPackRelief = 32, kOverDepth = 64;
 		constexpr UINT64 kConstantsBytes = 1024;
 		// Blended pieces' depth bias: the game sends ZBIAS 8 for them (notes-zone, "Blended pieces"), which dgVoodoo 2.87
 		// makes DepthBias trunc(-2.5 ZBIAS) and SlopeScaledDepthBias -0.5 ZBIAS, no clamp (measured: dgvprobe ZBIAS_TEST)
@@ -449,7 +451,7 @@ light_out ps_light(v2p i)
 			uint32_t flags, model;
 			float sway;
 			uint32_t env; // (its own | a door's << 8)
-			uint32_t lamps[4]; // (the game's 4 a byte each; then its near ones, 12 bytes: the shader's object)
+			uint32_t lamps[4]; // (the game's 4 a byte each; the rest unused, all ones: the shader's object)
 		};
 		static_assert(sizeof(gpu_object) == 80);
 		static_assert(kMaxLamps == 64); // (the shader's kMaxLamps; and under 255: a lamp's byte)
@@ -485,56 +487,6 @@ light_out ps_light(v2p i)
 			to[1] = from[1];
 			to[2] = from[2];
 			to[3] = w;
-		}
-
-		// The frame's lamps whose range reaches an object's box (its model's, sways included, through its matrix), for
-		// per-pixel lighting: up to kNearLamps, the strongest at the box first (colour / (a2 d^2) at its nearest point),
-		// a byte each into out (255 none). A box test per lamp: a frame has at most 64, and none by day outdoors.
-		constexpr uint32_t kNearLamps = 12;
-		void near_lamps(const frame_lamp *lamps, uint32_t lamp_count, const frame_object &fo, const zm::model &mo, uint32_t out[3])
-		{
-			out[0] = out[1] = out[2] = 0xFFFFFFFFu;
-			if (lamp_count == 0)
-				return;
-			const float c[3] = { 0.5f * (mo.lo[0] + mo.hi[0]), 0.5f * (mo.lo[1] + mo.hi[1]), 0.5f * (mo.lo[2] + mo.hi[2]) };
-			const float h[3] = { 0.5f * (mo.hi[0] - mo.lo[0]), 0.5f * (mo.hi[1] - mo.lo[1]), 0.5f * (mo.hi[2] - mo.lo[2]) };
-			float centre[3], half[3];
-			for (int k = 0; k < 3; ++k)
-			{
-				const float *r = fo.world + k * 4;
-				centre[k] = c[0] * r[0] + c[1] * r[1] + c[2] * r[2] + r[3];
-				half[k] = std::fabs(r[0]) * h[0] + std::fabs(r[1]) * h[1] + std::fabs(r[2]) * h[2];
-			}
-			uint8_t index[kMaxLamps];
-			float strength[kMaxLamps];
-			uint32_t n = 0;
-			for (uint32_t i = 0; i < lamp_count; ++i)
-			{
-				const frame_lamp &l = lamps[i];
-				if (!(l.range > 0.0f) || !std::isfinite(l.range))
-					continue;
-				float d2 = 0.0f;
-				for (int k = 0; k < 3; ++k)
-				{
-					const float out_by = std::fabs(l.pos[k] - centre[k]) - half[k];
-					d2 += out_by > 0.0f ? out_by * out_by : 0.0f;
-				}
-				if (!(d2 < l.range * l.range))
-					continue;
-				index[n] = uint8_t(i);
-				strength[n] = (0.2126f * l.colour[0] + 0.7152f * l.colour[1] + 0.0722f * l.colour[2]) / std::max(l.attenuation2 * d2, 1e-3f);
-				n++;
-			}
-			// (the strongest first: a box with more in reach keeps those that light it most)
-			for (uint32_t a = 0; a < n && a < kNearLamps; ++a)
-			{
-				uint32_t best = a;
-				for (uint32_t b = a + 1; b < n; ++b)
-					best = strength[b] > strength[best] ? b : best;
-				std::swap(index[a], index[best]);
-				std::swap(strength[a], strength[best]);
-				out[a / 4] = (out[a / 4] & ~(0xFFu << (8 * (a % 4)))) | uint32_t(index[a]) << (8 * (a % 4));
-			}
 		}
 
 		// The renderers with breadcrumbs, for the GPU crash report's section
@@ -993,27 +945,25 @@ light_out ps_light(v2p i)
 			go[i].model = fo.model;
 			go[i].sway = fo.sway;
 			go[i].env = (fo.env < kMaxEnvs ? fo.env : 0) | (fo.door_env < kMaxEnvs ? fo.door_env : 0) << 8;
-			// (the game's 4 a byte each; per pixel, the frame's lamps in reach of the object as well: near_lamps)
+			// (the game's 4 a byte each)
 			go[i].lamps[0] = 0;
 			for (uint32_t k = 0; k < 4; ++k)
 				go[i].lamps[0] |= (fo.lamps[k] < lamp_count ? fo.lamps[k] : 255u) << (8 * k);
-			gpu_zone *const z = zone_of(fo.zone);
-			if (o.per_pixel && z != nullptr && fo.model < z->data().models.size())
-				near_lamps(p.lamps, lamp_count, fo, z->data().models[fo.model], go[i].lamps + 1);
-			else
-				go[i].lamps[1] = go[i].lamps[2] = go[i].lamps[3] = 0xFFFFFFFFu;
+			go[i].lamps[1] = go[i].lamps[2] = go[i].lamps[3] = 0xFFFFFFFFu;
 		}
 		if (lamp_count != 0)
 			std::memcpy(at + kLampsAt, p.lamps, size_t(lamp_count) * sizeof(frame_lamp));
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
-		// The sun's shadows (sun_shadows.hpp): World FX's last frame's, per pixel only, and only while the light split is
-		// drawn (it's how World FX learns which pixels have them: without it they'd be darkened twice); its copy held for
-		// this list (the reference handed to retire once bound)
+		// The sun's shadows and the lamps' glow (sun_shadows.hpp): World FX's last frame's block, per pixel only, and only
+		// while the light split is drawn (it's how World FX learns which pixels have them: without it they'd be darkened,
+		// or lit, twice); its buffer (when it has one: lamps without a cube have none) held for this list (the reference
+		// handed to retire once bound)
 		sun::block shadows;
 		const bool shadowed = o.per_pixel && t.light_rtv.ptr != 0 && sun::latest(_device, shadows);
 		const sun::gpu_block ssc = sun::constants_for(shadowed, shadows, float(frame_number % 64) / 64.0f * 0.618034f);
 		std::memcpy(at + kShadowAt, &ssc, sizeof(ssc));
-		st.shadowed = shadowed;
+		st.shadowed = (ssc.mode[2] & sun::kHasSun) != 0;
+		st.lamps = (ssc.mode[2] & sun::kHasLamps) != 0;
 
 		// (the breadcrumbs, when Direct3D has WriteBufferImmediate: the frame number's low 16 bits, the draw's below; and
 		// the setup's steps before the first draw in word 2, as the GPU's command processor passes them: 0.63's reports
@@ -1045,7 +995,7 @@ light_out ps_light(v2p i)
 		list->SetGraphicsRootShaderResourceView(4, base + kObjectsAt);
 		list->SetGraphicsRootShaderResourceView(5, base + kLampsAt);
 		list->SetGraphicsRootConstantBufferView(8, base + kShadowAt);
-		list->SetGraphicsRootShaderResourceView(9, shadowed ? shadows.buffer->GetGPUVirtualAddress() : base);
+		list->SetGraphicsRootShaderResourceView(9, shadowed && shadows.buffer != nullptr ? shadows.buffer->GetGPUVirtualAddress() : base);
 		retire::later(shadows.buffer); // (nullptr: nothing)
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		step(kStepTargets);
@@ -1101,7 +1051,7 @@ light_out ps_light(v2p i)
 				const bool pack_relief = height.ptr != 0;
 				const uint32_t flags = (pc.normal_map != zm::kNone && mo.bump && !door && !p.no_bump ? kBump : 0) | ((fo.flags & zm::kAlphaTested) != 0 ? kTested : 0) |
 					(door && (pc.bits & zm::kDoorsEnv) != 0 ? kDoorEnv : 0) | (pc.normal_map != zm::kNone && !door && !p.no_bump ? kMapped : 0) |
-					(blended ? kBlended : 0) | (pack_relief ? kPackRelief : 0);
+					(blended ? kBlended : 0) | (pack_relief ? kPackRelief : 0) | (blended && door ? kOverDepth : 0);
 				uint32_t relief_bits = 0;
 				if (pack_relief)
 					std::memcpy(&relief_bits, &relief, 4);

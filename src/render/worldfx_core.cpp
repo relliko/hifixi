@@ -1993,6 +1993,8 @@ namespace
 		// while the feed sends no one (log_people says so in the log)
 		const bool people = fresh && g.actor_count > 0;
 		g.look.lamp_shadows = people ? g.lamp_shadows : 0.0f;
+		// (a Mog House: its glow kMogHouseGlow of a street lamp's already; HiFi XI's native passes keep it at that size too)
+		g.look.lamp_small_room = g.zone >= kMogHouseZone;
 		log_people(cam, people);
 	}
 

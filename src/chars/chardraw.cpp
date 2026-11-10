@@ -6,8 +6,9 @@
  *   4  table t0-t1    the mesh's vertices (68 bytes) and corners (12)       5  table t2 the group's texture (or T),
  *                                                                           t6 its detail map (the descriptor after it)
  *   6  SRV t5         the last frame's palette rows (the motion)
- *   7  CBV b2         the sun's shadows (src/render/sun_shadows.hpp's block: the ring's slot, after its two halves)
- *   8  SRV t7         World FX's shadow map copy (sun_shadows.hpp), or the ring when there's none (never read then)
+ *   7  CBV b2         the sun's shadows and the lamps (src/render/sun_shadows.hpp's block: the ring's slot, after its two halves)
+ *   8  SRV t7         World FX's shadow map copy with the lamps' cubes (sun_shadows.hpp), or the ring when there's none
+ *                     (never read then)
  *   s0                linear, clamped, mips linear (the character pass's sampler, 02BC12)
  * Pipelines are made as targets of new formats or sample counts come: the model draw, the composite.
  * Every index into a root SRV or table is clamped first (a root SRV has no bounds: a wild read can hang the GPU).
@@ -340,7 +341,22 @@ float4 shade(v2p i, out float share, out bool shadowed)
 		rgb += dt.metal * kMetalSky * (1 - kCavity * dt.cavity) * tint * sky_ambient(m, m.ambient.rgb * light_scale, dt.n);
 	}
 	share = spec_share(share, rgb, spec);
-	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb + spec, i.fog), a);
+	// World FX's lamp glow (sun_shadows.hpp's lamps, [zone] nativelamps: grass.hlsl's lamp_light here, so World FX adds
+	// none on these pixels): onto the colour before the fog, by the facing it was lit with (toward the camera, as World
+	// FX turns the light split's); the zone's lamps' cubes and the other characters' capsules shadow it, its own doesn't
+	float3 glow = 0;
+	[branch] if (options.x > 0 && sl_on())
+	{
+		const float3 toward = camera.xyz - i.world;
+		const float3 ng = normalize(i.normal);
+		const bool flip = camera.w > 0;
+		// (the tuned look: by the texture as the pass's own light goes onto it, faded by the light the pixel has already)
+		const float3 albedo = (flags & 1) != 0 ? saturate(2 * t.rgb) : saturate(4 * t.rgb * m.tfactor.rgb);
+		glow = sl_lit(sl_glow(i.world, flip && dot(dt.n, toward) < 0 ? -dt.n : dt.n, flip && dot(ng, toward) < 0 ? -ng : ng, true), rgb + spec, albedo, colour.rgb);
+		share = sl_share(share, rgb + spec, glow);
+	}
+	shadowed = shadowed || (options.x > 0 && sl_on());
+	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb + spec + glow, i.fog), a);
 }
 float4 ps(v2p i) : SV_Target
 {
@@ -1797,20 +1813,25 @@ float4 pps(p2p i) : SV_Target
 		list->SetGraphicsRootSignature(_root);
 		list->SetGraphicsRootConstantBufferView(0, base);
 		list->SetGraphicsRootShaderResourceView(3, base + kModelsAt);
-		// The sun's shadows (sun_shadows.hpp): World FX's last frame's, per pixel only, and only while the light split is
-		// drawn (World FX learns from it which pixels have them: else darkened twice); its copy held for this list (the
-		// reference handed to retire now: the +2 rule covers what's recorded this frame)
+		// The sun's shadows and the lamps' glow (sun_shadows.hpp): World FX's last frame's block, per pixel only, and only
+		// while the light split is drawn (World FX learns from it which pixels have them: else darkened, or lit, twice);
+		// its buffer (when it has one) held for this list (the reference handed to retire now: the +2 rule covers what's
+		// recorded this frame). A marked pixel says all the block held was applied: while the zone's sun isn't known the
+		// sun's shadows can't be (which light is the sun's?), so a block that has them isn't taken at all then.
 		{
 			sun::block shadows;
-			const bool shadowed = o.per_pixel && o.sun_known && light && sun::latest(_device, shadows);
+			bool shadowed = o.per_pixel && light && sun::latest(_device, shadows);
+			if (shadowed && !o.sun_known && (sun::allowed(shadows.gpu.mode[2]) & sun::kHasSun) != 0)
+				shadowed = false;
 			const uint32_t seq = f.seq.load(std::memory_order_acquire);
 			const UINT64 at = UINT64(seq % kFrames) * kSlotBytes + kShadowAt;
 			const sun::gpu_block ssc = sun::constants_for(shadowed, shadows, float(seq % 64) / 64.0f * 0.618034f);
 			std::memcpy(_mapped + at, &ssc, sizeof(ssc));
 			list->SetGraphicsRootConstantBufferView(7, _ring->GetGPUVirtualAddress() + at);
-			list->SetGraphicsRootShaderResourceView(8, shadowed ? shadows.buffer->GetGPUVirtualAddress() : _ring->GetGPUVirtualAddress());
+			list->SetGraphicsRootShaderResourceView(8, shadowed && shadows.buffer != nullptr ? shadows.buffer->GetGPUVirtualAddress() : _ring->GetGPUVirtualAddress());
 			retire::later(shadows.buffer); // (nullptr: nothing)
-			_shadowed = shadowed;
+			_shadowed = (ssc.mode[2] & sun::kHasSun) != 0;
+			_lamps = (ssc.mode[2] & sun::kHasLamps) != 0;
 		}
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		list->SetPipelineState(pso);
