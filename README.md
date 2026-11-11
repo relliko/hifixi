@@ -29,7 +29,7 @@ One Ashita v4 plugin for a better-looking, faster Final Fantasy XI:
   - **Snow that settles** while it snows, deep enough near you to hide feet and the bottoms of the grass, with footprints left by whoever walks through it, filling back in as it keeps snowing;
   - **Weather of its own:** rain and snow, wet ground, clouds, thunderstorms with lightning, dust and sand, wind that bends the grass, heat shimmer, auroras and gloom. While it's drawn, the game's own weather visuals are left out (its sounds, light and fog stay), and with them the birds, butterflies and ducks the game's weather brings;
   - **Sky:** a smooth sky behind the game's own sun, moon and constellations, kept as they are;
-  - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn, and the nearest lamps casting shadows of the zone around them.
+  - **Lamps and glows:** night lamps and glowing things lighting what's around them, the lamps fading in and out with the game's own at dusk and dawn, and every lamp near you casting shadows of the zone and the characters around it, and the grass lit by them too.
 - **En-spell effects:** while Enfire, Enblizzard, Enaero, Enstone, Enthunder, Enwater, Enlight or Endark is on you (the IIs too), your weapons carry its element: flames, frost and ice shards, wind, circling stones, arcs of lightning, flowing water, rays of light or dark smoke. On every melee weapon of every race: along a blade, on an axe's, scythe's, staff's or spear's head, all over hand-to-hand weapons.
 
 Everything is in one menu (`/hifi`): presets in a dropdown (Off, Balanced, High, Ultra, and your own, saved by name), a search box, a tooltip on every setting and a right-click reset.
