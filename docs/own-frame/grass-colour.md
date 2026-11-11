@@ -23,9 +23,9 @@ own colour from the native zone data.
 
 The map holds the ground **lit whole and unshadowed** (the ground pass's own shader, `zoneshadow.cpp ps_ground`: the
 vertex colour x (ambient + sun x N.L), then the texture x 2): never the sun's or clouds' shadows, never a lamp, with
-native shadows on or off. World FX's shading pass used to darken the finished blades afterwards. While the native
-passes light from World FX's block (`src/render/sun_shadows.hpp` "The grass": [zone] nativeshadows / nativelamps), the
-blades take their light themselves instead:
+ever. World FX's shading pass used to darken the finished blades afterwards (until the cleanup of 2026-11-11, which
+took its sun darkening and lamp glow out altogether). The blades take their light themselves from World FX's block
+(`src/render/sun_shadows.hpp` "The grass"), as the zone and the characters do:
 
 - The map's drawer says the light it drew with (`sun::set_ground_light`, from `zone_shadow::record`); `draw_floor` takes
   it and writes into the map's header (words 6 to 12) what a ground facing up gets in all (ambient + sun x its height)

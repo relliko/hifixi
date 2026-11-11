@@ -81,8 +81,8 @@ Texture2D normal_map : register(t5); // (kPackRelief: the texture pack's height,
 SamplerState wrap : register(s0);
 
 static const uint kBump = 1, kTested = 2, kDoorEnv = 4, kMapped = 8, kBlended = 16, kPackRelief = 32, kMaxLamps = 64; // (frame.hpp's kMaxLamps)
-// (a piece flag more: a door's blended piece, which writes the depth but not the light split: World FX takes its pixels
-// as it takes the game's own, and adds the lamps' glow there itself, so the pass adds none: sun_shadows.hpp's lamps)
+// (a piece flag more: a door's blended piece, which writes the depth but not the light split. Lit from the block as
+// every piece is: World FX adds nothing of its own any more)
 static const uint kOverDepth = 64;
 // HiFi XI's own look per pixel (hemi_spec.hpp). The ambient from a sky: x kSkyAbove on what faces up, x kSkyBelow on
 // what faces down, tinted kSkyTint toward the fog's hue from above and the sun's (its light off the ground) from below;
@@ -370,10 +370,10 @@ float4 shade(v2p i, out float share, out bool shadowed)
 		// (the highlight goes on after the texture, the sun's all of it)
 		spec = piece_spec(e, i.world, n, s_rgb, i.vcol, t) * in_sun;
 		share = spec_share(share, 2 * lit * t.rgb, spec);
-		// World FX's lamp glow (sun_shadows.hpp's lamps, [zone] nativelamps: grass.hlsl's lamp_light here, so World FX adds
-		// none on these pixels): onto the colour as drawn before the fog, by the facing it was lit with (turned toward the
-		// camera, as World FX turns the light split's), its lamps' shadows from the mesh's own; none of it the sun's
-		[branch] if (sl_on() && (piece & kOverDepth) == 0)
+		// World FX's lamp glow (sun_shadows.hpp's lamps): onto the colour as drawn before the fog, by the facing it was lit
+		// with (turned toward the camera, as World FX turns the light split's), its lamps' shadows from the mesh's own;
+		// none of it the sun's
+		[branch] if (sl_on())
 		{
 			const float3 toward = options.yzw - i.world;
 			const float3 nl = n / max(scale, 1e-6), ng = i.normal / max(scale, 1e-6);
@@ -396,6 +396,25 @@ float4 shade(v2p i, out float share, out bool shadowed)
 	{
 		lit = i.lit.rgb;
 		share = i.share;
+	}
+	// Lit per vertex (the game's own look: [zone] perpixel off): the block looked up per pixel all the same. The shadow
+	// takes the sun's share of the corner's light (light_share's: by brightness, where per pixel the sun's term itself is
+	// taken); the lamps' glow goes on by the mesh's own facing
+	[branch] if (options.x <= 0 && (ss_on() || sl_on()))
+	{
+		const float3 ng = normalize(i.normal);
+		const float in_sun = ss_sun_seen(i.world, ng, 0.0);
+		const float left = 1 - share * (1 - in_sun);
+		lit *= left;
+		share = share * in_sun / max(left, 1e-4);
+		[branch] if (sl_on())
+		{
+			const float3 nl = dot(ng, options.yzw - i.world) < 0 ? -ng : ng;
+			const float3 c = 2 * lit * t.rgb;
+			glow = sl_lit(sl_glow(i.world, nl, nl, false), c, 2 * t.rgb * i.vcol.rgb, lit);
+			share = sl_share(share, c, glow);
+		}
+		shadowed = true;
 	}
 	// (the world's alpha 1 of 255 marks a name facelift drew, left unshaded by World FX (grass.hlsl name_at): a solid
 	// piece writes at least 2 instead, so the band where a ground layer's vertex alpha fades out doesn't come out 1 (Valkurm's
@@ -954,12 +973,11 @@ light_out ps_light(v2p i)
 		if (lamp_count != 0)
 			std::memcpy(at + kLampsAt, p.lamps, size_t(lamp_count) * sizeof(frame_lamp));
 		const D3D12_GPU_VIRTUAL_ADDRESS base = _ring->GetGPUVirtualAddress() + slot;
-		// The sun's shadows and the lamps' glow (sun_shadows.hpp): World FX's last frame's block, per pixel only, and only
-		// while the light split is drawn (it's how World FX learns which pixels have them: without it they'd be darkened,
-		// or lit, twice); its buffer (when it has one: lamps without a cube have none) held for this list (the reference
-		// handed to retire once bound)
+		// The sun's shadows and the lamps' glow (sun_shadows.hpp): World FX's last frame's block, looked up per pixel
+		// however the piece's light is worked out; its buffer (when it has one: lamps without a cube have none) held for
+		// this list (the reference handed to retire once bound)
 		sun::block shadows;
-		const bool shadowed = o.per_pixel && t.light_rtv.ptr != 0 && sun::latest(_device, shadows);
+		const bool shadowed = sun::latest(_device, shadows);
 		const sun::gpu_block ssc = sun::constants_for(shadowed, shadows, float(frame_number % 64) / 64.0f * 0.618034f);
 		std::memcpy(at + kShadowAt, &ssc, sizeof(ssc));
 		st.shadowed = (ssc.mode[2] & sun::kHasSun) != 0;

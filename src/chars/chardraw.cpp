@@ -308,9 +308,16 @@ float4 shade(v2p i, out float share, out bool shadowed)
 		t = colour_map.Sample(clamp_linear, i.uv);
 	const detail_t dt = detail_at(normalize(i.normal), i.world, i.uv);
 	share = i.share;
-	shadowed = options.x > 0 && sun_dir.w > 0 && ss_on();
+	shadowed = sun_dir.w > 0 && ss_on();
 	const float in_sun = shadowed ? ss_sun_seen(i.world, normalize(i.normal), 2.0) : 1.0;
 	float4 colour = options.x > 0 ? lit(m, dt.n, i.world, share, in_sun) : i.colour;
+	// (lit per vertex: the shadow looked up per pixel all the same, taking the sun's share of the corner's light)
+	if (options.x <= 0 && shadowed)
+	{
+		const float left = 1 - share * (1 - in_sun);
+		colour.rgb *= left;
+		share = share * in_sun / max(left, 1e-4);
+	}
 	colour.rgb *= (1 - kCavity * dt.cavity) * (1 - (1 - kMetalDiffuse) * dt.metal);
 	const float3 s0 = saturate(2 * t.rgb * colour.rgb);
 	const float a0 = saturate(2 * t.a * m.tfactor.a);
@@ -341,11 +348,11 @@ float4 shade(v2p i, out float share, out bool shadowed)
 		rgb += dt.metal * kMetalSky * (1 - kCavity * dt.cavity) * tint * sky_ambient(m, m.ambient.rgb * light_scale, dt.n);
 	}
 	share = spec_share(share, rgb, spec);
-	// World FX's lamp glow (sun_shadows.hpp's lamps, [zone] nativelamps: grass.hlsl's lamp_light here, so World FX adds
-	// none on these pixels): onto the colour before the fog, by the facing it was lit with (toward the camera, as World
-	// FX turns the light split's); the zone's lamps' cubes and the other characters' capsules shadow it, its own doesn't
+	// World FX's lamp glow (sun_shadows.hpp's lamps): onto the colour before the fog, by the facing it was lit with
+	// (toward the camera, as World FX turns the light split's); the zone's lamps' cubes and the other characters'
+	// capsules shadow it, its own doesn't
 	float3 glow = 0;
-	[branch] if (options.x > 0 && sl_on())
+	[branch] if (sl_on())
 	{
 		const float3 toward = camera.xyz - i.world;
 		const float3 ng = normalize(i.normal);
@@ -355,7 +362,7 @@ float4 shade(v2p i, out float share, out bool shadowed)
 		glow = sl_lit(sl_glow(i.world, flip && dot(dt.n, toward) < 0 ? -dt.n : dt.n, flip && dot(ng, toward) < 0 ? -ng : ng, true), rgb + spec, albedo, colour.rgb);
 		share = sl_share(share, rgb + spec, glow);
 	}
-	shadowed = shadowed || (options.x > 0 && sl_on());
+	shadowed = shadowed || sl_on();
 	return float4(lerp(m.fog.w >= 0 ? m.fog.rgb : fog.rgb, rgb + spec + glow, i.fog), a);
 }
 float4 ps(v2p i) : SV_Target
@@ -1813,16 +1820,15 @@ float4 pps(p2p i) : SV_Target
 		list->SetGraphicsRootSignature(_root);
 		list->SetGraphicsRootConstantBufferView(0, base);
 		list->SetGraphicsRootShaderResourceView(3, base + kModelsAt);
-		// The sun's shadows and the lamps' glow (sun_shadows.hpp): World FX's last frame's block, per pixel only, and only
-		// while the light split is drawn (World FX learns from it which pixels have them: else darkened, or lit, twice);
-		// its buffer (when it has one) held for this list (the reference handed to retire now: the +2 rule covers what's
-		// recorded this frame). A marked pixel says all the block held was applied: while the zone's sun isn't known the
-		// sun's shadows can't be (which light is the sun's?), so a block that has them isn't taken at all then.
+		// The sun's shadows and the lamps' glow (sun_shadows.hpp): World FX's last frame's block; its buffer (when it has
+		// one) held for this list (the reference handed to retire now: the +2 rule covers what's recorded this frame).
+		// While the zone's sun isn't known (the login screen, a Mog House) the sun's shadows can't be applied (which light
+		// is the sun's?): the block's lamps alone then.
 		{
 			sun::block shadows;
-			bool shadowed = o.per_pixel && light && sun::latest(_device, shadows);
-			if (shadowed && !o.sun_known && (sun::allowed(shadows.gpu.mode[2]) & sun::kHasSun) != 0)
-				shadowed = false;
+			const bool shadowed = sun::latest(_device, shadows);
+			if (shadowed && !o.sun_known)
+				shadows.gpu.mode[2] &= ~sun::kHasSun;
 			const uint32_t seq = f.seq.load(std::memory_order_acquire);
 			const UINT64 at = UINT64(seq % kFrames) * kSlotBytes + kShadowAt;
 			const sun::gpu_block ssc = sun::constants_for(shadowed, shadows, float(seq % 64) / 64.0f * 0.618034f);

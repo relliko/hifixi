@@ -1243,20 +1243,21 @@ int main(int argc, char **argv)
 				fclose(f);
 			}
 	}
-	// 1b3. The blades' own light (HiFi XI's src/render/sun_shadows.hpp "The grass"): while the native passes' block is in
-	// use ([zone] nativeshadows, nativelamps) the blades light themselves from it at their roots, and at the zone's end
-	// write the light split's words on their pixels, marked, so the shading pass after leaves them alone. The block here
-	// is made by hand, as World FX publishes it: a cascade 128 yalms across around the looked-at blade, a texel 2 yalms,
-	// every texel of it nearer the sun than anything (all in shadow) or empty (none); and a glow 1.5 yalms over the blade.
-	// - after the shading pass (no marker, nothing shading here): under the empty cascade the picture is the one without
-	//   the block, byte for byte; under the full one the blades keep what the ground keeps (the fallback light: the
-	//   ambient 0.39 of a sun overhead, a whole shadow 0.8 of the sun: 0.42); the glow lights them
-	// - both options off: whatever is published, and with the light split offered at the zone's end, the picture is the
-	//   old one byte for byte and no word is written
-	// - at the zone's end, with the split: every blade pixel gets a marked word (bit 31) at its own depth; World FX's
-	//   shading pass then adds no glow of its own there (the picture's blade pixels as with no World FX lamp at all),
-	//   while the ground, which has no word, gets it; with the words wiped before the shading pass the blades get it a
-	//   second time (brighter): the mark is what stops it
+	// 1b3. The blades' own light (HiFi XI's src/render/sun_shadows.hpp "The grass"): the blades light themselves from the
+	// native passes' block at their roots, and at the zone's end write the light split's words on their pixels. The block
+	// here is made by hand, as World FX publishes it: a cascade 128 yalms across around the looked-at blade, a texel 2
+	// yalms, every texel of it nearer the sun than anything (all in shadow) or empty (none); and a glow 1.5 yalms over the
+	// blade.
+	// - after the shading pass (no marker, nothing shading here): with no block, or under the empty cascade, the picture
+	//   is the one before the blades had a light of their own, byte for byte; under the full one the blades keep what the
+	//   ground keeps (the fallback light: the ambient 0.39 of a sun overhead, a whole shadow 0.8 of the sun: 0.42); the
+	//   glow lights them, and nothing but them
+	// - at the zone's end, with the split: every blade pixel gets a marked word (bit 31) at its own depth, lit the same;
+	//   with no block, unmarked words; without the split (a multisampled world) the blades are lit all the same and no
+	//   word is written; World FX's shading pass after, handed a lamp of its own, adds nothing anywhere (its lamp glow is
+	//   gone: one lighting path)
+	// (The cases with [zone] nativeshadows / nativelamps off, the picture then the old one byte for byte, went with the
+	// switches; and "not lit twice by World FX's glow", with its control of words wiped, with World FX's glow itself.)
 	if (!shadows_only)
 	{
 		const UINT kN = 64;
@@ -1321,9 +1322,7 @@ int main(int argc, char **argv)
 			}
 			return nb;
 		};
-		auto options = [&](bool native_sun, bool native_lamps, const hifi::sun::block *nb) {
-			hifi::sun::set_native(native_sun);
-			hifi::sun::set_native_lamps(native_lamps);
+		auto options = [&](const hifi::sun::block *nb) {
 			if (nb != nullptr)
 				hifi::sun::publish(*nb);
 			else
@@ -1344,8 +1343,8 @@ int main(int argc, char **argv)
 		lq.time = 0.0f;
 		lq.distance = 20.0f;
 		draw_stats after_stats = {};
-		auto after = [&](bool native_sun, bool native_lamps, const hifi::sun::block *nb) {
-			options(native_sun, native_lamps, nb);
+		auto after = [&](const hifi::sun::block *nb) {
+			options(nb);
 			world_begin();
 			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 			after_stats = r.draw(g.list, t, cam, lq, error);
@@ -1376,25 +1375,21 @@ int main(int argc, char **argv)
 				d = std::max(d, std::abs(int(a[i]) - int(b[i])));
 			return d;
 		};
-		const hifi::sun::block full = block_of(true, true, false), empty = block_of(true, false, false), lamp_block = block_of(false, false, true),
-			both_blocks = block_of(true, true, true);
-		const std::vector<uint8_t> plain = after(false, false, nullptr);
-		const std::vector<uint8_t> off_published = after(false, false, &both_blocks);
-		const std::vector<uint8_t> in_sun = after(true, false, &empty);
+		const hifi::sun::block full = block_of(true, true, false), empty = block_of(true, false, false), lamp_block = block_of(false, false, true);
+		const std::vector<uint8_t> plain = after(nullptr);
+		const uint32_t plain_native = after_stats.blade_native;
+		const std::vector<uint8_t> in_sun = after(&empty);
 		const uint32_t in_sun_native = after_stats.blade_native;
-		const std::vector<uint8_t> in_shade = after(true, false, &full);
-		const std::vector<uint8_t> sun_off = after(false, true, &full); // (nativelamps alone: the block's sun not allowed)
-		const std::vector<uint8_t> by_lamp = after(false, true, &lamp_block);
+		const std::vector<uint8_t> in_shade = after(&full);
+		const std::vector<uint8_t> by_lamp = after(&lamp_block);
 		const uint32_t by_lamp_native = after_stats.blade_native;
 		uint32_t blade_px = 0;
 		const double l_plain = blades_luma(plain, plain, &blade_px), l_shade = blades_luma(in_shade, plain), l_lamp = blades_luma(by_lamp, plain);
-		std::printf("  1b3 the blades' own light: %u blade pixels by the looked-at one, %.1f as before; under the full cascade %.1f (%.2f of it), "
-			"under the glow %.1f; off with a block published %d apart, under the empty cascade %d, with nativeshadows off %d\n",
-			blade_px, l_plain, l_shade, l_plain > 0.0 ? l_shade / l_plain : 0.0, l_lamp, most(off_published, plain), most(in_sun, plain), most(sun_off, plain));
-		check(blade_px > 300 && most(off_published, plain) == 0, "1b3: both options off, a block published changes nothing (byte for byte)");
-		check(in_sun_native == hifi::sun::kHasSun && most(in_sun, plain) == 0, "1b3: lit from the block, a blade the sun reaches is as before (byte for byte)");
+		std::printf("  1b3 the blades' own light: %u blade pixels by the looked-at one, %.1f with no block; under the full cascade %.1f (%.2f of it), "
+			"under the glow %.1f; under the empty cascade %d apart\n", blade_px, l_plain, l_shade, l_plain > 0.0 ? l_shade / l_plain : 0.0, l_lamp, most(in_sun, plain));
+		check(blade_px > 300 && plain_native == 0, "1b3: with no block the blades are lit by nothing of it");
+		check(in_sun_native == hifi::sun::kHasSun && most(in_sun, plain) == 0, "1b3: lit from the block, a blade the sun reaches is as without it (byte for byte)");
 		check(l_shade > 0.36 * l_plain && l_shade < 0.5 * l_plain, "1b3: a blade under the cascade's shadow keeps what the ground keeps (the sun's part taken, the ambient left)");
-		check(most(sun_off, plain) == 0, "1b3: with nativeshadows off the block's shadows aren't taken (nativelamps alone)");
 		check(by_lamp_native == hifi::sun::kHasLamps && l_lamp > 1.15 * l_plain, "1b3: the block's lamps light the blades by them");
 		{
 			// (the ground is no one's here: nothing shades in these frames)
@@ -1417,8 +1412,8 @@ int main(int argc, char **argv)
 		g.device->CreateRenderTargetView(split, nullptr, split_rtv);
 		draw_stats marker_stats = {};
 		bool with_motion = false; // (the blades' motion written beside them, FSR 2's: three targets then)
-		auto marker = [&](bool native_sun, bool native_lamps, const hifi::sun::block *nb, bool with_split, bool wipe, bool fx_lamp, std::vector<uint8_t> *words) {
-			options(native_sun, native_lamps, nb);
+		auto marker = [&](const hifi::sun::block *nb, bool with_split, bool fx_lamp, std::vector<uint8_t> *words) {
+			options(nb);
 			world_begin();
 			const float none[4] = {};
 			barrier(g.list, split, readable, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1439,8 +1434,6 @@ int main(int argc, char **argv)
 				*words = g.read(split, 4);
 				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			}
-			if (wipe)
-				g.list->ClearRenderTargetView(split_rtv, none, 0, nullptr);
 			barrier(g.list, split, D3D12_RESOURCE_STATE_RENDER_TARGET, readable);
 			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 			look lw = lq;
@@ -1459,35 +1452,31 @@ int main(int argc, char **argv)
 			r.release_old(0);
 			return out;
 		};
-		std::vector<uint8_t> words_off, words_on, words_none;
-		const std::vector<uint8_t> old_way = marker(false, false, nullptr, false, false, true, nullptr);
-		const std::vector<uint8_t> off_split = marker(false, false, &both_blocks, true, false, true, &words_off);
-		const bool off_words = marker_stats.blade_words || marker_stats.blade_native != 0;
-		const std::vector<uint8_t> no_lamp = marker(false, false, nullptr, false, false, false, nullptr); // (no lamp anywhere)
-		const std::vector<uint8_t> lit_once = marker(false, true, &lamp_block, true, false, true, &words_on);
-		const bool on_words = marker_stats.blade_words && marker_stats.blade_native == hifi::sun::kHasLamps;
-		const std::vector<uint8_t> lit_alone = marker(false, true, &lamp_block, true, false, false, nullptr); // (no World FX glow at all)
-		const std::vector<uint8_t> lit_twice = marker(false, true, &lamp_block, true, true, true, nullptr);
-		const std::vector<uint8_t> unlit_words = marker(true, false, nullptr, true, false, false, &words_none); // (marked words, no block)
+		std::vector<uint8_t> words_on, words_none, words_bare;
+		const std::vector<uint8_t> no_lamp = marker(nullptr, true, false, &words_none); // (no block: unmarked words)
 		const bool none_words = marker_stats.blade_words && marker_stats.blade_native == 0;
-		const std::vector<uint8_t> shade_words = marker(true, false, &full, true, false, false, nullptr);
+		const std::vector<uint8_t> lit_alone = marker(&lamp_block, true, false, &words_on);
+		const bool on_words = marker_stats.blade_words && marker_stats.blade_native == hifi::sun::kHasLamps;
+		const std::vector<uint8_t> lit_fx = marker(&lamp_block, true, true, nullptr); // (World FX handed the lamp too)
+		const std::vector<uint8_t> lit_bare = marker(&lamp_block, false, false, &words_bare); // (no split offered)
+		const bool bare_lit = !marker_stats.blade_words && marker_stats.blade_native == hifi::sun::kHasLamps;
+		const std::vector<uint8_t> shade_words = marker(&full, true, false, nullptr);
 		// (with the blades' motion as well: the world, the motion and the split, the same words and the same picture)
 		std::vector<uint8_t> words_motion;
 		with_motion = true;
-		marker(false, true, &lamp_block, true, false, false, nullptr);
-		const std::vector<uint8_t> lit_motion = marker(false, true, &lamp_block, true, false, false, &words_motion);
+		marker(&lamp_block, true, false, nullptr);
+		const std::vector<uint8_t> lit_motion = marker(&lamp_block, true, false, &words_motion);
 		const bool motion_words = marker_stats.blade_words && marker_stats.blade_motion && marker_stats.blade_native == hifi::sun::kHasLamps;
 		with_motion = false;
 		check(motion_words && words_motion == words_on && most(lit_motion, lit_alone) == 0,
 			"1b3: with the blades' motion written beside them (three targets), the same words and the same picture");
-		options(false, false, nullptr);
+		options(nullptr);
 		auto word = [&](const std::vector<uint8_t> &w, size_t i) {
 			uint32_t v = 0;
 			std::memcpy(&v, &w[i * 4], 4);
 			return v;
 		};
-		uint32_t green = 0, marked = 0, marked_off_blade = 0, off_written = 0, unmarked_words = 0, bad_depth = 0;
-		int blade_apart = 0, ground_gain = 0;
+		uint32_t green = 0, marked = 0, marked_off_blade = 0, bare_written = 0, unmarked_words = 0, bad_depth = 0;
 		for (size_t i = 0; i < size_t(W) * H; ++i)
 		{
 			const bool blade = no_lamp[i * 4 + 1] > no_lamp[i * 4];
@@ -1495,31 +1484,22 @@ int main(int argc, char **argv)
 			green += blade;
 			marked += (v >> 31) != 0;
 			marked_off_blade += (v >> 31) != 0 && !blade;
-			off_written += word(words_off, i) != 0;
+			bare_written += word(words_bare, i) != 0;
 			const uint32_t u = word(words_none, i);
 			unmarked_words += u != 0 && (u >> 31) == 0;
 			bad_depth += v != 0 && ((v & 0x7FF) == 0 || (v & 0x7FF) > uint32_t((std::log2(60.0f) + 3.0f) * 128.0f));
-			if ((v >> 31) != 0)
-				for (int c = 0; c < 3; ++c)
-					blade_apart = std::max(blade_apart, std::abs(int(lit_once[i * 4 + c]) - int(lit_alone[i * 4 + c])));
-			else
-				ground_gain = std::max(ground_gain, int(lit_once[i * 4]) - int(lit_alone[i * 4]));
 		}
-		const double l_none = blades_luma(no_lamp, no_lamp), l_once = blades_luma(lit_once, no_lamp), l_twice = blades_luma(lit_twice, no_lamp),
-			l_old = blades_luma(old_way, no_lamp), l_shade_end = blades_luma(shade_words, no_lamp), l_unlit = blades_luma(unlit_words, no_lamp);
-		std::printf("  1b3 at the zone's end: %u blade pixels, %u marked words (%u off the blades, %u with a depth out of range); off: %d apart from the old way, "
-			"%u words written; the blades %.1f unlit, %.1f lit from the block (World FX's glow over it %d apart on them, the ground up to %d brighter), "
-			"%.1f with their words wiped, %.1f the old way; under the full cascade %.1f; marked words with no block: %u unmarked, the blades %.1f\n",
-			green, marked, marked_off_blade, bad_depth, most(off_split, old_way), off_written, l_none, l_once, blade_apart, ground_gain, l_twice, l_old, l_shade_end,
-			unmarked_words, l_unlit);
-		check(!off_words && off_written == 0 && most(off_split, old_way) == 0,
-			"1b3: both options off, the zone's end with the split offered and a block published: no word written, the picture the old one byte for byte");
+		const double l_none = blades_luma(no_lamp, no_lamp), l_once = blades_luma(lit_alone, no_lamp), l_shade_end = blades_luma(shade_words, no_lamp);
+		std::printf("  1b3 at the zone's end: %u blade pixels, %u marked words (%u off the blades, %u with a depth out of range); the blades %.1f with no block "
+			"(%u unmarked words), %.1f lit from the block; World FX handed the lamp too: %d apart; no split offered: %d apart, %u words written; under the full "
+			"cascade %.1f\n", green, marked, marked_off_blade, bad_depth, l_none, unmarked_words, l_once, most(lit_fx, lit_alone), most(lit_bare, lit_alone),
+			bare_written, l_shade_end);
 		check(on_words && green > 1000 && marked == green && marked_off_blade == 0 && bad_depth == 0, "1b3: at the zone's end every blade pixel gets a marked word, at its depth");
 		check(l_once > 1.15 * l_none, "1b3: the blades there are lit by the block's lamps");
-		check(blade_apart <= 1, "1b3: World FX's shading pass adds no glow of its own on the marked blades (not lit twice)");
-		check(ground_gain > 10, "1b3: while the ground beside them, with no word, gets World FX's glow");
-		check(l_twice > l_once + 3.0, "1b3: with their words wiped they'd get it a second time: the mark is what stops it");
-		check(none_words && unmarked_words == green && std::fabs(l_unlit - l_none) < 0.5, "1b3: with no block to light by, the blades write unmarked words and are as before");
+		check(most(lit_fx, lit_alone) == 0, "1b3: World FX's shading pass, handed the lamp itself, adds nothing of its own, on the blades or the ground");
+		check(none_words && unmarked_words == green && std::fabs(l_none - l_plain) < 0.5, "1b3: with no block to light by, the blades write unmarked words and are as without one");
+		check(bare_lit && bare_written == 0 && most(lit_bare, lit_alone) == 0,
+			"1b3: with no light split to write (a multisampled world) the blades are lit from the block all the same, and write no word");
 		check(l_shade_end > 0.36 * l_none && l_shade_end < 0.5 * l_none, "1b3: the cascade's shadow on the blades at the zone's end");
 		check(g.report_messages() == 0, "no debug-layer errors (the blades' own light)");
 		hifi::sun::release();
@@ -2056,7 +2036,7 @@ int main(int argc, char **argv)
 		std::string why;
 		check(!r.set_shader_source("this isn't HLSL", why) && !why.empty(), "a source that doesn't compile is refused, with the compiler's messages");
 		const double before = magenta_share();
-		const std::string marker = "return float4(haze + (col - haze) * (ao * relief * sunlit * wet_dark) + (glow + wet_add) * clear, 1.0);";
+		const std::string marker = "return float4(haze + (col - haze) * (ao * relief * sunlit * wet_dark) + wet_add * clear, 1.0);";
 		std::string painted = source;
 		const size_t at_marker = painted.find(marker);
 		check(at_marker != std::string::npos, "the shading pass's return found in the source");
@@ -2344,7 +2324,7 @@ int main(int argc, char **argv)
 						{
 							const double vd = ly / (d24 / 16777215.0 - lx);
 							const uint32_t code = uint32_t(std::clamp(std::lround((std::log2(std::max(vd, 1e-3)) + 3.0) * 128.0), 1L, 2047L));
-							v = code | facing | uint32_t(std::lround(std::clamp(share, 0.0f, 1.0f) * 127.0f)) << 25;
+							v = code | facing | uint32_t(std::lround(std::clamp(share, 0.0f, 1.0f) * 63.0f)) << 25; // (the share in 6 bits: sun_shadows.hpp)
 						}
 						w[size_t(y) * (sfp.Footprint.RowPitch / 4) + x] = v;
 					}
@@ -2428,52 +2408,6 @@ int main(int argc, char **argv)
 			release(split);
 		}
 
-		// A tall pole (a yalm wide, like a trunk) 20 yalms further off; the sun to the right, low (19 degrees up) and a little away
-		// from the camera: the ground 10 to 13 yalms left of its foot is in its shadow (out of reach of the
-		// 16-step march, 9 yalms along the ray: a tree's shadow stopped short of its height), the ground as far
-		// right of it isn't
-		{
-			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] }, ahead = { -cam.view[2], -cam.view[6], -cam.view[10] };
-			const vec3 foot = { at.x + (at.x - eye.x) * 4.0f, at.y, at.z + (at.z - eye.z) * 4.0f };
-			auto on_screen = [&](const vec3 &p, float *depth) {
-				const float x = p.x * vp[0] + p.y * vp[4] + p.z * vp[8] + vp[12], y = p.x * vp[1] + p.y * vp[5] + p.z * vp[9] + vp[13];
-				const float z = p.x * vp[2] + p.y * vp[6] + p.z * vp[10] + vp[14], w = p.x * vp[3] + p.y * vp[7] + p.z * vp[11] + vp[15];
-				if (depth != nullptr)
-					*depth = z / w;
-				return std::make_pair((x / w + 1.0f) * 0.5f * W, (1.0f - y / w) * 0.5f * H);
-			};
-			auto along = [&](float d) { return vec3 { foot.x + right.x * d, foot.y + right.y * d, foot.z + right.z * d }; };
-			const auto f = on_screen(foot, &pole_depth);
-			pole = { LONG(f.first) - 5, 0, LONG(f.first) + 5, LONG(f.second) }; // (about a yalm wide)
-			const auto l10 = on_screen(along(-10.0f), nullptr), l13 = on_screen(along(-13.0f), nullptr);
-			const auto r10 = on_screen(along(10.0f), nullptr), r13 = on_screen(along(13.0f), nullptr);
-			// (a little away from the camera: the march crosses the pole about half a yalm behind its face, through it,
-			// as through a trunk; at a third of a yalm it was so near the near end of a hit's window that starting the
-			// march two pixel widths off the ground lost it)
-			to_sun = normalize({ right.x + ahead.x * 0.05f, right.y - 0.35f + ahead.y * 0.05f, right.z + ahead.z * 0.05f });
-			const std::vector<uint8_t> pole_lit = frame(false, 0.0f), pole_shadowed = frame(false, 0.6f);
-			// (a trunk's shadow is about as wide as the trunk: on ground 25 yalms off, seen this low, a band two or
-			// three rows tall along the foot's row: its darkest row is measured)
-			auto darkest_row = [&](const std::vector<uint8_t> &img, float x0, float x1, float y) {
-				double least = 1e9;
-				for (LONG row = LONG(y) - 5; row <= LONG(y) + 2; ++row)
-					least = std::min(least, mean(img, LONG(x0), row, LONG(x1), row + 1));
-				return least;
-			};
-			const float ly = (l10.second + l13.second) * 0.5f, ry = (r10.second + r13.second) * 0.5f;
-			const double left_lit = darkest_row(pole_lit, l13.first, l10.first, ly);
-			const double left_shadowed = darkest_row(pole_shadowed, l13.first, l10.first, ly);
-			const double right_lit = darkest_row(pole_lit, r10.first, r13.first, ry);
-			const double right_shadowed = darkest_row(pole_shadowed, r10.first, r13.first, ry);
-			pole = {};
-			std::printf("  a pole 25 yalms off (foot at %.0f, %.0f), sun low to the right: 10-13 yalms left of it (x %.0f..%.0f) %.1f lit, %.1f with shadows; as far right %.1f, %.1f\n",
-				f.first, f.second, l13.first, l10.first, left_lit, left_shadowed, right_lit, right_shadowed);
-			check(l13.first > 0.0f && r13.first < float(W), "the pole's ground in the picture");
-			// (the sun 19 degrees up takes 64% of the strength from flat ground: the sun's share of its light)
-			check(left_shadowed < left_lit * 0.97, "a tall thing's shadow reaches past 9 yalms (the 16-step march: not at all)");
-			check(std::fabs(right_shadowed - right_lit) < 1.0, "not on the sun's side of it");
-		}
-
 		// The box as someone standing there (a character or monster sent by the Ashita addon): it casts no sun
 		// shadow, the game drawing characters' own; with characters asked to cast, it does
 		{
@@ -2489,236 +2423,9 @@ int main(int argc, char **argv)
 			actor_count = 0;
 			characters_cast = false;
 			std::printf("  the box as a character: ground in front of it %.1f lit, %.1f with shadows, %.1f with characters casting\n", near_lit, skipped, cast);
-			check(std::fabs(skipped - near_lit) < 1.5, "a character casts no sun shadow (the game draws its own)");
-			check(cast < near_lit * 0.9, "unless characters are asked to cast");
-		}
-
-		// A character's own shadow (characters asked to cast) is worked out from them as they stand, not by the march
-		// (the march found them only where a step happened to land inside them: whole at the feet, dotted and lighter
-		// toward the head, and nothing of someone off screen).
-		{
-			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] }; // (level: the camera doesn't roll)
-			const vec3 right_h = normalize({ right.x, 0.0f, right.z }), ahead_h = normalize({ -cam.view[2], 0.0f, -cam.view[10] });
-			const vec3 up_c = { cam.view[1], cam.view[5], cam.view[9] }, fwd = { -cam.view[2], -cam.view[6], -cam.view[10] };
-			// (a point's pixel, and its view depth in z)
-			auto project = [&](const vec3 &p) {
-				const float x = p.x * vp[0] + p.y * vp[4] + p.z * vp[8] + vp[12], y = p.x * vp[1] + p.y * vp[5] + p.z * vp[9] + vp[13];
-				const float w = p.x * vp[3] + p.y * vp[7] + p.z * vp[11] + vp[15];
-				return vec3 { (x / w + 1.0f) * 0.5f * W, (1.0f - y / w) * 0.5f * H, w };
-			};
-			// (where the view ray through a pixel's middle meets the ground)
-			auto ground_under = [&](float x, float y) {
-				const float nx = (x + 0.5f) / W * 2.0f - 1.0f, ny = 1.0f - (y + 0.5f) / H * 2.0f;
-				const float a = nx / cam.proj[0], b = ny / cam.proj[5];
-				const vec3 d = { right.x * a + up_c.x * b + fwd.x, right.y * a + up_c.y * b + fwd.y, right.z * a + up_c.z * b + fwd.z };
-				const float t = (at.y - eye.y) / d.y;
-				return vec3 { eye.x + d.x * t, eye.y + d.y * t, eye.z + d.z * t };
-			};
-			auto depth_for = [](float w) { return 1.0f - 0.1f / w; }; // (the game's projection: depth from view depth)
-			auto save = [&](const std::vector<uint8_t> &img, const char *path) { // (a picture for a look)
-				if (FILE *f = nullptr; fopen_s(&f, path, "wb") == 0 && f != nullptr)
-				{
-					std::fprintf(f, "P6 %u %u 255\n", W, H);
-					for (size_t i = 0; i < size_t(W) * H; ++i)
-						std::fwrite(&img[i * 4], 1, 3, f);
-					fclose(f);
-				}
-			};
-			auto luma_at = [&](const std::vector<uint8_t> &img, LONG x, LONG y) {
-				const uint8_t *c = &img[(size_t(y) * W + x) * 4];
-				return 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
-			};
-			// Dark texels standing alone in a rect: darker by over 3 (of 255) than both their neighbours across or both
-			// up and down (a dot, or a line a pixel wide: the march's stipple and hatching; not a soft edge's steps)
-			auto lone_dark = [&](const std::vector<uint8_t> &img, LONG x0, LONG y0, LONG x1, LONG y1) {
-				uint32_t n = 0;
-				for (LONG y = std::max(1L, y0); y < std::min(LONG(H) - 1, y1); ++y)
-					for (LONG x = std::max(1L, x0); x < std::min(LONG(W) - 1, x1); ++x)
-					{
-						const double c = luma_at(img, x, y) + 3.0;
-						const bool across = c < luma_at(img, x - 1, y) && c < luma_at(img, x + 1, y);
-						const bool down = c < luma_at(img, x, y - 1) && c < luma_at(img, x, y + 1);
-						n += across || down ? 1 : 0;
-					}
-				return n;
-			};
-
-			// Someone (size 2) ten yalms left of the looked-at point, off the screen's edge with all of their capsule, the
-			// sun low (20 degrees up) from the left: their shadow runs along the ground across the left of the picture, as
-			// their slim capsule (nothing of them on screen to take their shape from). It's as dark under their head as
-			// under their knees, and its edge fades in row by row, with no dark texel standing alone in it.
-			{
-				const float size = 2.0f, e = 20.0f * 3.14159265f / 180.0f;
-				const vec3 feet = { at.x - right_h.x * 10.0f, at.y, at.z - right_h.z * 10.0f };
-				const float body[4] = { feet.x, feet.y, feet.z, size };
-				to_sun = { -right_h.x * std::cos(e), -std::sin(e), -right_h.z * std::cos(e) };
-				actors = body;
-				actor_count = 1;
-				const std::vector<uint8_t> no_cast = frame(false, 0.6f);
-				characters_cast = true;
-				const std::vector<uint8_t> cast = frame(false, 0.6f);
-				actors = nullptr;
-				actor_count = 0;
-				characters_cast = false;
-				// (the ground under a height of them, along the shadow's middle)
-				auto under = [&](float h) {
-					const float d = h / std::tan(e);
-					return project({ feet.x + right_h.x * d, at.y, feet.z + right_h.z * d });
-				};
-				const vec3 knees = under(1.4f), head = under(3.0f), off_edge = project({ feet.x + right_h.x * 1.6f, at.y, feet.z + right_h.z * 1.6f });
-				auto spot = [&](const std::vector<uint8_t> &img, const vec3 &s) { return mean(img, LONG(s.x) - 3, LONG(s.y) - 1, LONG(s.x) + 4, LONG(s.y) + 2); };
-				const double knees_lit = spot(no_cast, knees), knees_cast = spot(cast, knees), head_lit = spot(no_cast, head), head_cast = spot(cast, head);
-				// (down a column through the knees' shadow, from the lit ground 14 rows above its middle to near the
-				// middle: each row as dark as the one above it or darker, but for a level of rounding)
-				bool fades = true;
-				for (LONG y = LONG(knees.y) - 14; y < LONG(knees.y) - 2; ++y)
-					fades = fades && luma_at(cast, LONG(knees.x), y + 1) <= luma_at(cast, LONG(knees.x), y) + 1.0;
-				const uint32_t alone = lone_dark(cast, 0, LONG(knees.y) - 24, LONG(head.x) + 40, LONG(knees.y) + 24);
-				save(cast, "build\\actor_shadow_test.ppm");
-				std::printf("  someone off screen to the left (their capsule's edge at x %.0f), sun low from the left: under their knees (%.0f, %.0f) %.1f lit, %.1f casting; under their head (%.0f, %.0f) %.1f, %.1f; lone dark texels %u\n",
-					off_edge.x, knees.x, knees.y, knees_lit, knees_cast, head.x, head.y, head_lit, head_cast, alone);
-				check(off_edge.x < 0.0f && knees.x > 8.0f && head.x < float(W) - 8.0f, "their capsule off screen, their shadow on it");
-				check(knees_cast < knees_lit * 0.8, "someone off screen casts (the slim capsule)");
-				check(std::fabs(head_cast - knees_cast) < 0.05 * knees_lit, "as dark under their head as under their knees");
-				check(fades, "its edge fades in row by row");
-				check(alone == 0, "no dark texel standing alone in it");
-			}
-
-			// Someone on screen: their shadow takes their shape from the depth. A shape drawn there as someone standing
-			// legs apart (size 2: two legs from 0.6 to 2 yalms up, half a yalm wide and 0.4 apart, the body over them to
-			// 3.2; all at the depth of their middle, 1.2 up), the sun beyond them, 30 degrees up: on the ground toward the
-			// camera, where the ray toward the sun passes through a leg (by the shape: its stretch just behind the shape,
-			// as deep as a body), it's dark, as dark under the hips as under the knees; where it passes through the gap,
-			// it's lit (the slim capsule alone would cover the gap); no dark texel standing alone. With a wall drawn
-			// behind them, 2 yalms further than the shape (seen through the gap and beside the legs), the same: nothing
-			// but them casts their shadow.
-			{
-				const float size = 2.0f, e = 30.0f * 3.14159265f / 180.0f;
-				const vec3 feet = at, middle = { at.x, at.y - 1.2f, at.z };
-				const float w_shape = project(middle).z, thick = 0.35f * size + 0.15f; // (the shader's kThick)
-				const float body[4] = { feet.x, feet.y, feet.z, size };
-				to_sun = { ahead_h.x * std::cos(e), -std::sin(e), ahead_h.z * std::cos(e) };
-				auto column = [&](float lateral) { return project({ middle.x + right.x * lateral, middle.y, middle.z + right.z * lateral }).x; };
-				auto row = [&](float h) { return project({ feet.x, feet.y - h, feet.z }).y; };
-				const float xl0 = column(-0.7f), xl1 = column(-0.2f), xr0 = column(0.2f), xr1 = column(0.7f);
-				const float y_top = row(3.2f), y_hip = row(2.0f), y_foot = row(0.6f), y_ground = row(0.0f), y_knee = 0.5f * (y_hip + y_foot);
-				const std::vector<card> shape = {
-					{ { LONG(xl0), LONG(y_hip), LONG(xl1), LONG(y_foot) }, depth_for(w_shape) },
-					{ { LONG(xr0), LONG(y_hip), LONG(xr1), LONG(y_foot) }, depth_for(w_shape) },
-					{ { LONG(xl0), LONG(y_top), LONG(xr1), LONG(y_hip) }, depth_for(w_shape) } };
-				const card behind = { { LONG(column(-1.4f)), LONG(row(2.2f)), LONG(column(1.4f)), LONG(y_ground) }, depth_for(w_shape + 2.0f) };
-				actors = body;
-				actor_count = 1;
-				cards = shape;
-				const std::vector<uint8_t> sunless = frame(false, 0.0f);
-				characters_cast = true;
-				const std::vector<uint8_t> shaped = frame(false, 0.6f);
-				cards.insert(cards.begin(), behind);
-				const std::vector<uint8_t> walled = frame(false, 0.6f);
-				cards.clear();
-				actors = nullptr;
-				actor_count = 0;
-				characters_cast = false;
-				save(shaped, "build\\silhouette_test.ppm");
-				save(walled, "build\\silhouette_wall_test.ppm");
-				// Where each ground pixel's ray toward the sun is in its stretch just behind the shape (from 5 cm in to
-				// 5 cm short of its far end), all of it: 1 a leg's lower half, 3 its upper half, 2 the gap, 0 elsewhere
-				// or across an edge (5 pixels in from the edges: the shading pass's average spreads an edge 3 or 4)
-				const vec3 depth_rate = { vp[3], vp[7], vp[11] };
-				auto through = [&](LONG x, LONG y) {
-					const vec3 G = ground_under(float(x), float(y));
-					const float rate = dot(to_sun, depth_rate), wg = project(G).z;
-					vec3 ends[2];
-					for (int k = 0; k < 2; ++k)
-					{
-						const float t = (w_shape + (k == 0 ? 0.05f : thick - 0.05f) - wg) / rate;
-						ends[k] = project({ G.x + to_sun.x * t, G.y + to_sun.y * t, G.z + to_sun.z * t });
-					}
-					auto within = [&](float lo_x, float hi_x, float lo_y, float hi_y) {
-						const float m = 5.0f;
-						return ends[0].x > lo_x + m && ends[0].x < hi_x - m && ends[1].x > lo_x + m && ends[1].x < hi_x - m &&
-							ends[0].y > lo_y + m && ends[0].y < hi_y - m && ends[1].y > lo_y + m && ends[1].y < hi_y - m;
-					};
-					const bool lower = 0.5f * (ends[0].y + ends[1].y) > y_knee;
-					return within(xl0, xl1, y_hip, y_foot) || within(xr0, xr1, y_hip, y_foot) ? (lower ? 1 : 3) : within(xl1, xr0, y_hip, y_foot) ? 2 : 0;
-				};
-				double sum[4][3] = {};
-				uint32_t n[4] = {};
-				for (LONG y = LONG(y_ground) + 2; y < LONG(H) - 1; ++y)
-					for (LONG x = LONG(xl0) - 12; x < LONG(xr1) + 12; ++x)
-					{
-						const int c = through(x, y);
-						sum[c][0] += luma_at(sunless, x, y);
-						sum[c][1] += luma_at(shaped, x, y);
-						sum[c][2] += luma_at(walled, x, y);
-						n[c]++;
-					}
-				auto avg = [&](int c, int k) { return n[c] != 0 ? sum[c][k] / n[c] : 0.0; };
-				const uint32_t alone = lone_dark(shaped, LONG(xl0) - 12, LONG(y_ground) + 2, LONG(xr1) + 12, LONG(H) - 1);
-				std::printf("  someone legs apart (gap at x %.0f..%.0f), sun beyond them: ground in the legs' shadow under the knees (%u px) %.1f lit, %.1f casting, %.1f with a wall behind; under the hips (%u px) %.1f, %.1f, %.1f; the gap's (%u px) %.1f, %.1f, %.1f; lone dark texels %u\n",
-					xl1, xr0, n[1], avg(1, 0), avg(1, 1), avg(1, 2), n[3], avg(3, 0), avg(3, 1), avg(3, 2), n[2], avg(2, 0), avg(2, 1), avg(2, 2), alone);
-				check(n[1] > 30 && n[2] > 20 && n[3] > 30, "the legs' and the gap's shadows on the ground in the picture");
-				check(avg(1, 1) < avg(1, 0) * 0.75, "the legs cast their shadow");
-				check(std::fabs(avg(3, 1) - avg(1, 1)) < 0.05 * avg(1, 0), "as dark under the hips as under the knees");
-				check(avg(2, 1) > avg(2, 0) * 0.95, "the gap between them is lit: the shadow has their shape, not a capsule's");
-				check(alone == 0, "no dark texel standing alone in it");
-				check(std::fabs(avg(1, 2) - avg(1, 1)) < 1.5 && std::fabs(avg(2, 2) - avg(2, 1)) < 1.5 && std::fabs(avg(3, 2) - avg(3, 1)) < 1.5,
-					"with a wall behind them, the same: the wall doesn't cast");
-			}
-
-			// Something thin of theirs (an arm, a tail, a staff: an upright 0.12 yalms wide, 0.6 to 3 up, at the depth of
-			// their middle), the sun from the right, 30 degrees up and turned a little away from the camera: the ray from
-			// the ground crosses it sideways. Along the middle of its shadow (under the upright's middle at each height,
-			// half a body's depth behind it), as dark everywhere, not dashed (the march's steps stepped over it for some
-			// start phases)
-			{
-				const float size = 2.0f, e = 30.0f * 3.14159265f / 180.0f, turn = 25.0f * 3.14159265f / 180.0f;
-				const vec3 feet = at, middle = { at.x, at.y - 1.2f, at.z };
-				const float w_shape = project(middle).z, thick = 0.35f * size + 0.15f;
-				const float body[4] = { feet.x, feet.y, feet.z, size };
-				const vec3 across = normalize({ right_h.x * std::cos(turn) + ahead_h.x * std::sin(turn), 0.0f, right_h.z * std::cos(turn) + ahead_h.z * std::sin(turn) });
-				to_sun = { across.x * std::cos(e), -std::sin(e), across.z * std::cos(e) };
-				auto column = [&](float lateral) { return project({ middle.x + right.x * lateral, middle.y, middle.z + right.z * lateral }).x; };
-				auto row = [&](float h) { return project({ feet.x, feet.y - h, feet.z }).y; };
-				cards = { { { LONG(column(-0.06f)), LONG(row(3.0f)), LONG(column(0.06f)), LONG(row(0.6f)) }, depth_for(w_shape) } };
-				actors = body;
-				actor_count = 1;
-				const std::vector<uint8_t> sunless = frame(false, 0.0f);
-				characters_cast = true;
-				const std::vector<uint8_t> thin = frame(false, 0.6f);
-				cards.clear();
-				actors = nullptr;
-				actor_count = 0;
-				characters_cast = false;
-				save(thin, "build\\thin_part_test.ppm");
-				// (the point half a body's depth behind the upright's middle at a height, and where its shadow falls)
-				auto shadow_of = [&](float h) {
-					const float nx = (column(0.0f) + 0.5f) / W * 2.0f - 1.0f, ny = 1.0f - (row(h) + 0.5f) / H * 2.0f;
-					const float a = nx / cam.proj[0], b = ny / cam.proj[5], w = w_shape + 0.5f * thick;
-					const vec3 X = { eye.x + (right.x * a + up_c.x * b + fwd.x) * w, eye.y + (right.y * a + up_c.y * b + fwd.y) * w, eye.z + (right.z * a + up_c.z * b + fwd.z) * w };
-					const float t = (at.y - X.y) / -to_sun.y;
-					return project({ X.x - to_sun.x * t, at.y, X.z - to_sun.z * t });
-				};
-				double darkest = 1e9, lightest = 0.0, lit_ground = 0.0;
-				std::string along;
-				for (int k = 0; k < 10; ++k)
-				{
-					const vec3 s = shadow_of(0.9f + 0.2f * k);
-					const double v = mean(thin, LONG(s.x) - 1, LONG(s.y) - 1, LONG(s.x) + 2, LONG(s.y) + 2);
-					darkest = std::min(darkest, v);
-					lightest = std::max(lightest, v);
-					lit_ground = std::max(lit_ground, mean(sunless, LONG(s.x) - 1, LONG(s.y) - 1, LONG(s.x) + 2, LONG(s.y) + 2));
-					char part[32];
-					std::snprintf(part, sizeof(part), " %.0f", v);
-					along += part;
-				}
-				const vec3 first = shadow_of(0.9f), last = shadow_of(2.7f);
-				std::printf("  something thin (0.12 yalms), sun from the right: along its shadow from (%.0f, %.0f) to (%.0f, %.0f):%s (lit %.1f)\n",
-					first.x, first.y, last.x, last.y, along.c_str(), lit_ground);
-				check(first.x > 2.0f && last.x > 2.0f && first.y < float(H) - 2.0f && last.y < float(H) - 2.0f, "its shadow in the picture");
-				check(lightest < lit_ground * 0.75, "a thin part's shadow is dark all along");
-				check(lightest - darkest < 0.06 * lit_ground, "and evenly: not dashed");
-			}
+			// (asked to cast or not: a character's shadow is its mesh's, in the casters' map for the native passes; the
+			// capsule shadows the shading pass worked out itself went with the cleanup)
+			check(std::fabs(skipped - near_lit) < 1.5 && std::fabs(cast - near_lit) < 1.5, "a character casts no contact shadow in the march, asked to cast or not");
 		}
 
 		// A name facelift drew into the world, in the box's shadow (its solid pixels marked with alpha 1 by
@@ -2967,14 +2674,64 @@ int main(int argc, char **argv)
 			return normalize({ horizontal.x * std::cos(e), -std::sin(e), horizontal.z * std::cos(e) });
 		};
 
+		// Whether the sun is blocked at a ground point, as the block World FX just published says it (HiFi XI's
+		// src/render/sun_shadows.hpp: what the native passes look up; World FX no longer darkens the picture by its map
+		// itself, so the picture says nothing of it): the texel of the nearest cascade the point is well inside (casters:
+		// of the casters' map), read back from the block's buffer and compared as kHlsl's ss_drawing compares it, for a
+		// ground facing up. 1 blocked, 0 lit, -1 not covered (no block, no such map, the point outside it).
+		auto block_says = [&](const vec3 &P, bool casters) {
+			hifi::sun::block nb;
+			{
+				std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+				if (!hifi::sun::detail::g.has)
+					return -1;
+				nb = hifi::sun::detail::g.latest;
+			}
+			const hifi::sun::gpu_block &q = nb.gpu;
+			if ((q.mode[2] & hifi::sun::kHasSun) == 0 || nb.buffer == nullptr)
+				return -1;
+			auto row = [](const float *r4, const float p[3]) { return r4[0] * p[0] + r4[1] * p[1] + r4[2] * p[2] + r4[3]; };
+			for (uint32_t k = 0; k < (casters ? 1u : 3u); ++k)
+			{
+				const float (*rows)[4] = casters ? q.caster_rows : &q.rows[6 * k];
+				const float texel = casters ? q.caster[1] : q.cascade[k][2], per_yalm = casters ? q.caster[0] : q.cascade[k][0];
+				const uint32_t start = casters ? q.caster_where[0] : q.where[k][0], pitch = casters ? q.caster_where[1] : q.where[k][2];
+				const uint32_t size = casters ? (q.caster_where[3] != 0 ? q.caster_where[2] : 0) : q.where[k][3];
+				if (size == 0)
+					continue;
+				// (off the ground by a texel and a half and toward the sun by one, as ss_inside)
+				const float p[3] = { P.x + q.sun[0] * texel, P.y - 1.5f * texel + q.sun[1] * texel, P.z + q.sun[2] * texel };
+				const float tx = row(rows[0], p), ty = row(rows[1], p);
+				if (std::min(std::min(tx, ty), float(size) - std::max(tx, ty)) < 20.0f)
+					continue;
+				ID3D12Resource *rb = g.buffer(D3D12_HEAP_TYPE_READBACK, 4, D3D12_RESOURCE_STATE_COPY_DEST);
+				const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				barrier(g.list, nb.buffer, readable, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				g.list->CopyBufferRegion(rb, 0, nb.buffer, (UINT64(start) + UINT64(ty) * pitch + UINT64(tx)) * 4, 4);
+				barrier(g.list, nb.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, readable);
+				g.run();
+				float d = 1.0f;
+				void *mapped = nullptr;
+				rb->Map(0, nullptr, &mapped);
+				std::memcpy(&d, mapped, 4);
+				rb->Unmap(0, nullptr);
+				release(rb);
+				return d < row(rows[2], p) - (0.03f + texel) * per_yalm && d < 1.0f ? 1 : 0;
+			}
+			return -1;
+		};
+
 		// The sun behind the slab
 		to_sun = sun_from(dh, 59.0f);
-		const std::vector<uint8_t> behind_off = frame(false, cam), behind_on = frame(true, cam);
+		const std::vector<uint8_t> behind_off = frame(false, cam);
+		const int here_none = block_says(at, false);
+		const std::vector<uint8_t> behind_on = frame(true, cam);
 		const draw_stats first = last;
 		const vec3 far_point = along(-55, 0, 0), far_side = along(-55, 9, 0), near_side = along(0, 5.5f, 0);
 		const double here_off = at_point(behind_off, at, 8, 4), here_on = at_point(behind_on, at, 8, 4);
 		const double far_off = at_point(behind_off, far_point, 3, 1), far_on = at_point(behind_on, far_point, 3, 1);
 		const double side_on = at_point(behind_on, near_side, 4, 4), far_side_on = at_point(behind_on, far_side, 3, 1);
+		const int here_says = block_says(at, false), far_says = block_says(far_point, false), side_says = block_says(near_side, false), far_side_says = block_says(far_side, false);
 		// (a picture of it for a look: build\shadow_map_test.ppm)
 		if (FILE *f = nullptr; fopen_s(&f, "build\\shadow_map_test.ppm", "wb") == 0 && f != nullptr)
 		{
@@ -3031,18 +2788,23 @@ int main(int argc, char **argv)
 			check(vol_stats.volumetric && vol_stats.air && changed > W * H / 4, "the light in the air worked out and laid over the frame");
 			check(side_shaft > here_shaft + 2.0, "  the air lit beside the slab's shadow more than in it (shafts)");
 		}
-		check(here_off > 0.0 && std::fabs(here_off - plain_luma) < 1.5, "without the map, nothing off screen casts (the march can't see it)");
-		check(here_on > 0.0 && here_on < here_off * 0.6, "an off-screen tall caster shadows the ground (near cascade)");
-		check(far_on > 0.0 && far_on < far_off * 0.75, "... and ground 55 yalms out along its shadow (far cascade)");
-		check(side_on > 0.0 && std::fabs(side_on - plain_luma) < 1.5 && far_side_on > 0.0 && std::fabs(far_side_on - plain_luma) < 2.0, "ground beside its shadow isn't shadowed");
+		// (World FX's own picture: the map's shadows aren't darkened onto it any more, with the map or without)
+		std::printf("  the block published says (1 blocked, 0 lit, -1 no map there): the looked-at ground %d (%d without the map), 55 yalms out %d, beside the shadow %d, %d far out\n",
+			here_says, here_none, far_says, side_says, far_side_says);
+		check(here_off > 0.0 && std::fabs(here_off - plain_luma) < 1.5 && here_none == -1, "without the map, nothing off screen casts (the march can't see it), and none is published");
+		check(std::fabs(here_on - plain_luma) < 1.5 && std::fabs(far_on - far_off) < 1.5 && std::fabs(side_on - plain_luma) < 1.5 && std::fabs(far_side_on - plain_luma) < 2.0,
+			"with the map the picture is as without it: its shadows are the native passes', not darkened on afterwards");
+		check(here_says == 1, "an off-screen tall caster shadows the ground in the block published (near cascade)");
+		check(far_says == 1, "... and ground 55 yalms out along its shadow (far cascade)");
+		check(side_says == 0 && far_side_says == 0, "ground beside its shadow isn't shadowed");
 
 		// The sun overhead: the card's opaque half only
 		to_sun = { 0.0f, -1.0f, 0.0f };
-		const std::vector<uint8_t> overhead = frame(true, cam);
-		const double under_opaque = at_point(overhead, { at.x - 2, at.y, at.z }, 3, 3), under_clear = at_point(overhead, { at.x + 2, at.y, at.z }, 3, 3);
-		std::printf("  the sun overhead, a card 30 yalms up cut out to its left half: under the opaque half %.1f, under the clear half %.1f\n", under_opaque, under_clear);
-		check(under_opaque > 0.0 && under_opaque < plain_luma * 0.6, "a cut-out card shades the ground under its opaque texels");
-		check(under_clear > 0.0 && std::fabs(under_clear - plain_luma) < 1.5, "... and not under its clear ones");
+		frame(true, cam);
+		const int under_opaque = block_says({ at.x - 2, at.y, at.z }, false), under_clear = block_says({ at.x + 2, at.y, at.z }, false);
+		std::printf("  the sun overhead, a card 30 yalms up cut out to its left half: under the opaque half %d, under the clear half %d\n", under_opaque, under_clear);
+		check(under_opaque == 1, "a cut-out card shades the ground under its opaque texels");
+		check(under_clear == 0, "... and not under its clear ones");
 
 		// The sun in front: flat ground as it went in, high and low
 		to_sun = sun_from({ -dh.x, 0.0f, -dh.z }, 59.0f);
@@ -3112,31 +2874,6 @@ int main(int argc, char **argv)
 		check((tenth_a & 1) != 0 && (tenth_b & 1) != 0 && ((tenth_a ^ tenth_b) & 2) != 0, "with the sun moving, the near cascade is drawn again every frame, the far one every other frame");
 		check((walked & 1) != 0, "the camera moving draws the near cascade again at once");
 
-		// Smooth: the sun turning a tenth of a degree a frame (as the game eases its light) moves the slab's shadow a
-		// little each frame, not in jumps (drawn only past a degree, it stood still for nine frames, then jumped).
-		// Watched where the shadow's edge, 15 yalms from the slab, sweeps over the ground in those 20 frames.
-		{
-			const vec3 spot = along(-3.0f, 2.74f, 0.0f);
-			std::vector<double> seen;
-			for (int i = 0; i <= 20; ++i)
-			{
-				const float a = 0.1f * float(i) * 3.14159265f / 180.0f;
-				to_sun = sun_from({ dh.x * std::cos(a) + side.x * std::sin(a), 0.0f, dh.z * std::cos(a) + side.z * std::sin(a) }, 59.0f);
-				seen.push_back(at_point(frame(true, cam), spot, 3, 3));
-			}
-			double biggest = 0.0;
-			int moved_frames = 0;
-			for (size_t i = 1; i < seen.size(); ++i)
-			{
-				biggest = std::max(biggest, std::fabs(seen[i] - seen[i - 1]));
-				moved_frames += std::fabs(seen[i] - seen[i - 1]) > 0.5 ? 1 : 0;
-			}
-			const double whole = std::fabs(seen.back() - seen.front());
-			std::printf("  the sun turning 2 degrees a tenth at a time: the shadow's edge there went %.1f -> %.1f, in %d of 20 frames, at most %.1f in one\n",
-				seen.front(), seen.back(), moved_frames, biggest);
-			check(whole > 30.0 && biggest < 0.4 * whole && moved_frames >= 5, "the shadow moves with the sun a little each frame, not in jumps");
-		}
-
 		// Far past the zone's meshes, away from the sun (further from it than anything in the map): nothing shades
 		// the ground there (the map's empty texels are never in the way)
 		{
@@ -3154,25 +2891,8 @@ int main(int argc, char **argv)
 					n++;
 				}
 			std::printf("  5,000 yalms past the zone's meshes, away from the sun: ground %.1f (went in %.1f)\n", sum / n, plain_luma);
-			check(last.sun_map && std::fabs(sum / n - plain_luma) < 1.5, "ground further from the sun than anything in the map isn't shaded by it");
-		}
-
-		// The sun 2 degrees up behind the slab: the flat ground in its shadow loses the sun's share of its light (small
-		// at 2 degrees) alike near, seen face on, and far out, where it's seen nearly edge on (its facing can't be told
-		// from the depth there: each row of pixels yalms further than the last), taken there at the share of a surface
-		// facing up. (Taken whole, the far ground was twice as dark as the near at a low sun, along a line about 10
-		// yalms ahead of a low camera that moved with it. Before that: the facing alone, under 0.05, left both
-		// unshaded, as a ledge's steep face seen edge on under Jugner's trees stayed bright.)
-		{
-			to_sun = sun_from(dh, 2.0f);
-			const std::vector<uint8_t> img = frame(true, cam);
-			const double edge_on = at_point(img, along(-40, 0, 0), 3, 1), far_beside = at_point(img, along(-40, 9, 0), 3, 1);
-			const double near_on = at_point(img, at, 8, 4);
-			std::printf("  the sun 2 degrees up behind the slab: ground 45 yalms off (edge on) %.1f, beside the shadow %.1f; near (face on) %.1f (went in %.1f)\n",
-				edge_on, far_beside, near_on, plain_luma);
-			check(edge_on > 0.0 && edge_on < plain_luma - 2.0 && std::fabs(edge_on - near_on) < 3.0 && std::fabs(far_beside - plain_luma) < 2.0,
-				"flat ground under something far above it is shaded alike seen edge on far out and face on near (no line where the view turns grazing)");
-			check(near_on > plain_luma * 0.88 && near_on < plain_luma - 2.0, "a surface the sun only grazes loses only the sun's share of its light");
+			const int away_says = block_says({ at.x - dh.x * 5000.0f, at.y, at.z - dh.z * 5000.0f }, false);
+			check(last.sun_map && std::fabs(sum / n - plain_luma) < 1.5 && away_says != 1, "ground further from the sun than anything in the map isn't shaded by it");
 		}
 
 		// The host's zone (set_zone_casters: HiFi XI's native zone data) in place of the uploaded meshes: a stand-in that
@@ -3218,29 +2938,30 @@ int main(int argc, char **argv)
 					return 2;
 				},
 				&zh);
-			const std::vector<uint8_t> hosted = frame(true, cam);
+			frame(true, cam);
 			const draw_stats first_host = last;
 			const uint32_t first_draws = zh.draws;
+			const int here_hosted = block_says(at, false), beside_hosted = block_says(along(0, 4, 0), false);
 			frame(true, cam);
 			const uint32_t still = last.sun_map_cascades;
 			zh.generation = 2;
 			frame(true, cam);
 			const uint32_t new_data = last.sun_map_cascades;
 			to_sun = sun_from(dh, 59.0f); // (the sun behind the slab: its shadow on the looked-at ground only from the meshes)
-			const std::vector<uint8_t> slab_hosted = frame(true, cam);
+			frame(true, cam);
+			const int slab_with_host = block_says(at, false);
 			zh.have = false;
-			const std::vector<uint8_t> slab_meshes = frame(true, cam);
+			frame(true, cam);
+			const int slab_with_meshes = block_says(at, false);
 			const draw_stats meshes_back = last;
 			r.set_zone_casters(nullptr, nullptr, nullptr);
-			const double here_hosted = at_point(hosted, at, 3, 3), beside_hosted = at_point(hosted, along(0, 4, 0), 3, 3);
-			const double slab_with_host = at_point(slab_hosted, at, 8, 4), slab_with_meshes = at_point(slab_meshes, at, 8, 4);
-			std::printf("  the host's zone: looked-at ground %.1f, 4 yalms beside %.1f (went in %.1f); cascades drawn by it %u (stats %u, host %d); then %u for the same data, %u for new data; the sun behind the slab: %.1f with the host, %.1f with the meshes (host %d)\n",
-				here_hosted, beside_hosted, plain_luma, first_draws, first_host.sun_map_cascades, first_host.sun_map_host ? 1 : 0, still, new_data, slab_with_host, slab_with_meshes,
+			std::printf("  the host's zone, as the block says: looked-at ground %d, 4 yalms beside %d; cascades drawn by it %u (stats %u, host %d); then %u for the same data, %u for new data; the sun behind the slab: %d with the host, %d with the meshes (host %d)\n",
+				here_hosted, beside_hosted, first_draws, first_host.sun_map_cascades, first_host.sun_map_host ? 1 : 0, still, new_data, slab_with_host, slab_with_meshes,
 				meshes_back.sun_map_host ? 1 : 0);
 			check(first_host.sun_map && first_host.sun_map_host && first_draws == 3 && first_host.sun_map_cascades == 7 && first_host.sun_map_triangles == 6, "with the host's zone, all three cascades drawn by it");
-			check(here_hosted > 0.0 && here_hosted < plain_luma * 0.8 && beside_hosted > 0.0 && std::fabs(beside_hosted - plain_luma) < 1.5, "what it draws shadows the ground behind it, not beside it");
+			check(here_hosted == 1 && beside_hosted == 0, "what it draws shadows the ground behind it, not beside it");
 			check(still == 0 && new_data == 7, "drawn again for new data (all three cascades), not for the same");
-			check(slab_with_host > 0.0 && std::fabs(slab_with_host - plain_luma) < 1.5 && slab_with_meshes < plain_luma * 0.6 && !meshes_back.sun_map_host,
+			check(slab_with_host == 0 && slab_with_meshes == 1 && !meshes_back.sun_map_host,
 				"the uploaded meshes aren't drawn while the host has the zone, and are again once it hasn't");
 		}
 
@@ -3270,25 +2991,26 @@ int main(int argc, char **argv)
 				list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, z, 0, 1, &rc);
 				return true;
 			}, &pl);
+			const vec3 beside = along(0, 3, 0);
 			characters = true;
-			const std::vector<uint8_t> asked = frame(true, cam);
+			frame(true, cam);
 			const draw_stats with_casters = last;
+			const int here_asked = block_says(at, true), beside_asked = block_says(beside, true);
 			characters = false;
-			const std::vector<uint8_t> not_asked = frame(true, cam);
+			frame(true, cam);
 			const draw_stats unasked = last;
+			const int here_unasked = block_says(at, true);
 			r.set_casters(nullptr, nullptr);
 			characters = true;
-			const std::vector<uint8_t> no_hook = frame(true, cam);
+			frame(true, cam);
+			const int here_no_hook = block_says(at, true);
 			characters = false;
-			const vec3 beside = along(0, 3, 0);
-			const double here_asked = at_point(asked, at, 3, 3), beside_asked = at_point(asked, beside, 3, 3);
-			const double here_unasked = at_point(not_asked, at, 3, 3), here_no_hook = at_point(no_hook, at, 3, 3);
-			std::printf("  the host's casters (a plate 1.2 yalms over the ground toward the sun): looked-at ground %.1f, 3 yalms beside %.1f; not asked for %.1f; no hook %.1f (went in %.1f); hook called %u times\n",
-				here_asked, beside_asked, here_unasked, here_no_hook, plain_luma, pl.calls);
-			check(with_casters.casters && !unasked.casters && pl.calls == 1, "the casters' hook called and its map read only with the characters' shadows asked for");
-			check(here_asked > 0.0 && here_asked < plain_luma * 0.8, "what the host draws into the casters' map shadows the ground behind it");
-			check(beside_asked > 0.0 && std::fabs(beside_asked - plain_luma) < 1.5, "... and not the ground beside its shadow");
-			check(std::fabs(here_unasked - plain_luma) < 1.5 && std::fabs(here_no_hook - plain_luma) < 1.5, "not asked for, or with no hook, nothing shades it");
+			std::printf("  the host's casters (a plate 1.2 yalms over the ground toward the sun), as the block says: looked-at ground %d, 3 yalms beside %d; not asked for %d; no hook %d; hook called %u times\n",
+				here_asked, beside_asked, here_unasked, here_no_hook, pl.calls);
+			check(with_casters.casters && !unasked.casters && pl.calls == 1, "the casters' hook called and its map published only with the characters' shadows asked for");
+			check(here_asked == 1, "what the host draws into the casters' map shadows the ground behind it");
+			check(beside_asked == 0, "... and not the ground beside its shadow");
+			check(here_unasked == -1 && here_no_hook == -1, "not asked for, or with no hook, no casters' map is published");
 		}
 
 		// A rough ground (bumps 0.08 yalms high, 0.6 across: their slopes under 40 degrees) in a sun 60 degrees up from
@@ -3338,143 +3060,6 @@ int main(int argc, char **argv)
 		check(!last.sun_map && !r.shadow_loaded(), "without the zone's meshes, no map");
 		check(g.report_messages() == 0, "no debug-layer errors (shadow map)");
 
-	}
-
-	// 1o2. Leaf shadows hold still while the map is drawn again: a card 8 yalms across, 6 over the looked-at point, its
-	// mask 1,024 texels a side (0.8 cm: finer than the near cascade's 3.9 cm texels, as a leaf texture's are) with 70 %
-	// of them opaque at random, over the ground sheet. The sun nearly overhead turns a hundredth of a degree a frame
-	// (the near cascade drawn again each frame, each time on a slightly different grid, as the game's turning sun has
-	// it about ten times a second). Under the card, the ground's brightness from frame to frame: with each map texel
-	// tested on one mask bit (kSunMapCutout 0, the shaders before), the pattern changed each time (dapples flickering
-	// in place, in game 2026-10-21); with the bits over its footprint counted (kSunMapCutout 0.5, kSunMapLeafArea), it
-	// changes far less. A coarse cut-out (1o's, its texels coarser than the map's) is drawn as before.
-	{
-		const float plain[4] = { 0.45f, 0.42f, 0.36f, 0.5f };
-		const vec3 dh = normalize({ eye.x - at.x, 0.0f, eye.z - at.z }), side = { -dh.z, 0.0f, dh.x };
-		auto along = [&](float d, float s, float up) { return vec3 { at.x + dh.x * d + side.x * s, at.y - up, at.z + dh.z * d + side.z * s }; };
-		shadow_file zone;
-		zone.zone = 998;
-		auto corner = [&](const vec3 &v, uint32_t w) {
-			uint32_t bits[3];
-			std::memcpy(bits, &v, 12);
-			zone.triangles.insert(zone.triangles.end(), { bits[0], bits[1], bits[2], w });
-		};
-		auto quad = [&](const vec3 &a, const vec3 &b, const vec3 &c, const vec3 &d, bool card) {
-			const uint32_t wa = card ? (1u << 24) : 0, wb = card ? (4095u | (1u << 24)) : 0, wc = card ? (4095u | (4095u << 12) | (1u << 24)) : 0, wd = card ? ((4095u << 12) | (1u << 24)) : 0;
-			corner(a, wa), corner(b, wb), corner(c, wc);
-			corner(a, wa), corner(c, wc), corner(d, wd);
-		};
-		quad(along(3000, 3000, 0), along(3001, 3000, 0), along(3001, 3001, 0), along(3000, 3001, 0), false);
-		zone.cells.push_back({ 90, 90, 0, zone.triangle_count() });
-		quad(along(-100, -100, 0), along(100, -100, 0), along(100, 100, 0), along(-100, 100, 0), false); // the ground
-		zone.cells.push_back({ 0, 0, 2, 2 });
-		quad({ at.x - 4, at.y - 6, at.z - 4 }, { at.x + 4, at.y - 6, at.z - 4 }, { at.x + 4, at.y - 6, at.z + 4 }, { at.x - 4, at.y - 6, at.z + 4 }, true);
-		zone.cells.push_back({ 1, 0, 4, 2 });
-		zone.masks = { 1024, 1024, 0, 32 };
-		uint32_t seed = 12345u;
-		for (int row = 0; row < 1024; ++row)
-			for (int w = 0; w < 32; ++w)
-			{
-				uint32_t word = 0;
-				for (int k = 0; k < 32; ++k)
-				{
-					seed = seed * 1664525u + 1013904223u;
-					word |= ((seed >> 8) % 100u < 70u ? 1u : 0u) << k;
-				}
-				zone.words.push_back(word);
-			}
-		check(r.upload_shadow(zone, error), "a fine-leaved card's meshes uploaded");
-		auto frame = [&](const vec3 &to_sun) {
-			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
-			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-			ground_depth(cam);
-			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-			look l2 = l;
-			l2.grass = false;
-			l2.ao_strength = 0.0f;
-			l2.relief = 0.0f;
-			l2.water = false;
-			l2.sun[0] = to_sun.x;
-			l2.sun[1] = to_sun.y;
-			l2.sun[2] = to_sun.z;
-			l2.sun_shadow = 0.6f;
-			l2.sun_map = true;
-			r.draw(g.list, t, cam, l2, error);
-			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-			std::vector<uint8_t> img = g.read(world, 4);
-			r.release_old(0);
-			return img;
-		};
-		// (each frame's brightness over a box under the card's middle, and how much it changes frame to frame, per pixel)
-		const int bx = int(px), by = int(py);
-		auto flicker = [&](double &mean_luma) {
-			std::vector<std::vector<double>> frames;
-			for (int f = 0; f < 12; ++f)
-			{
-				const float a = (0.5f + 0.01f * f) * 3.14159265f / 180.0f; // (degrees from straight down)
-				const std::vector<uint8_t> img = frame(normalize({ side.x * std::sin(a), -std::cos(a), side.z * std::sin(a) }));
-				std::vector<double> box;
-				for (int y = by - 8; y <= by + 8; ++y)
-					for (int x = bx - 24; x <= bx + 24; ++x)
-					{
-						const uint8_t *c = &img[(size_t(y) * W + x) * 4];
-						box.push_back(0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]);
-					}
-				frames.push_back(box);
-			}
-			double change = 0.0, sum = 0.0;
-			size_t n = 0;
-			for (size_t f = 2; f < frames.size(); ++f) // (from the third: the first draws both cascades)
-				for (size_t i = 0; i < frames[f].size(); ++i)
-				{
-					change += std::fabs(frames[f][i] - frames[f - 1][i]);
-					sum += frames[f][i];
-					n++;
-				}
-			mean_luma = sum / std::max<size_t>(n, 1);
-			return change / std::max<size_t>(n, 1);
-		};
-		std::string source;
-		if (FILE *f = nullptr; fopen_s(&f, "src\\render\\grass.hlsl", "rb") == 0 && f != nullptr)
-		{
-			char buffer[4096];
-			size_t got;
-			while ((got = fread(buffer, 1, sizeof(buffer), f)) != 0)
-				source.append(buffer, got);
-			fclose(f);
-		}
-		const std::string marker = "static const float kSunMapCutout = 0.5;";
-		std::string one_bit = source;
-		const size_t at_marker = one_bit.find(marker);
-		check(at_marker != std::string::npos, "kSunMapCutout found in the shaders' source");
-		double luma_area = 0.0, luma_bit = 0.0, change_area = 0.0, change_bit = 0.0;
-		if (at_marker != std::string::npos)
-		{
-			change_area = flicker(luma_area);
-			one_bit.replace(at_marker, marker.size(), "static const float kSunMapCutout = 0.0;");
-			grass::shader_code code;
-			bool from_cache = false;
-			std::string why;
-			const bool compiled = grass::compile_shaders(one_bit, L"build\\test\\variant-cache", code, from_cache, why);
-			check(compiled, "the shaders with one mask bit a map texel compile");
-			if (compiled)
-			{
-				r.set_shader_code(std::move(code));
-				change_bit = flicker(luma_bit);
-			}
-			grass::shader_code restored;
-			if (grass::compile_shaders(source, L"build\\test\\variant-cache", restored, from_cache, why))
-				r.set_shader_code(std::move(restored));
-		}
-		std::printf("  a fine-leaved card's shadow with the map drawn again each frame: brightness under it %.1f (one bit) / %.1f (its footprint), changing %.2f / %.2f a pixel a frame\n",
-			luma_bit, luma_area, change_bit, change_area);
-		check(change_bit > 1.0, "one mask bit a map texel: the dapples change each time the map is drawn again");
-		check(change_area < 0.35 * change_bit, "the bits over its footprint: they hold still");
-		const double plain_luma = 0.3 * 0.45 * 255 + 0.59 * 0.42 * 255 + 0.11 * 0.36 * 255;
-		check(luma_area > 0.0 && luma_area < plain_luma * 0.75, "and it still shades the ground");
-		r.unload_shadow();
-		check(g.report_messages() == 0, "no debug-layer errors (leaf shadows)");
 	}
 
 	// 1o3. The map drawn about once a second and faded between drawings (the look's clock, 60 frames a second): a
@@ -3606,7 +3191,9 @@ int main(int argc, char **argv)
 			near_old, far_old, change_old, near_new, far_new, farthest_draws, change_new);
 		check(near_old >= 15, "without the clock: the near cascade drawn again each time the sun has turned a little (10 a second here)");
 		check(near_new <= 3 && far_new <= 3 && near_new >= 1 && farthest_draws <= 2, "with it: about once a second (the farthest cascade no more often)");
-		check(change_new < 0.35 * change_old, "and the leaves' edges change far less from frame to frame (faded, not flipped)");
+		// (that the leaves' edges then change far less from frame to frame, faded and not flipped, was read off World FX's
+		// own picture: the fade is the native lookup's now, sun_shadows.hpp's ss_cascade_shadow, by the block's
+		// cascade[k].w; how far each drawing has faded in is checked just below)
 		// (the fade after the first drawing with the clock past the start: 0 at it, halfway half a second on)
 		size_t drawn = 0;
 		for (size_t i = 20; i < fades.size() && drawn == 0; ++i)
@@ -3636,517 +3223,6 @@ int main(int argc, char **argv)
 		check(settled_fade == 1.0f && most <= 1, "the fade ends on the picture a single drawing gives");
 		r.unload_shadow();
 		check(g.report_messages() == 0, "no debug-layer errors (the map faded between drawings)");
-	}
-
-	// 1o4. Soft by distance, and further (the map's contact hardening, grass.hlsl kSunSpread, and its farthest cascade):
-	// over the ground sheet, two opaque plates 19 yalms square with an edge on the same line a yalm to the left of the
-	// looked-at point (across x), one a yalm over the ground (on the near side of the looked-at point along z), the other
-	// 80 over it (on the far side); and, 250 yalms out from the looked-at point away from the camera, a slab 40 yalms long
-	// (along the view), 30 tall, standing 6 yalms to its right.
-	// - The sun overhead: each plate's shadow's edge on the ground, from wholly shaded to lit (10 to 90 %): under the low
-	//   plate as sharp as the map's 4 x 4 filter and shade_ps's blur make it, with or without the contact hardening
-	//   (kSunSpread 0: the shaders before); under the high one wider (a penumbra half a yalm each way), and wider than the
-	//   low one's; both whole inside. (Here, 640 x 360, the sun pass's half size and shade_ps's 4 x 4 blur alone make an
-	//   edge half a yalm wide: a canopy 25 yalms up hardly shows past that, as it would at 2560 x 1440.)
-	// - The sun 59 degrees up from the right, the camera 100 yalms up looking at the ground 250 yalms out (255 yalms across
-	//   the sun's rays from it: past the far cascade's 160, in the farthest's 600): the slab's shadow shades that ground,
-	//   ground 25 yalms past its far end isn't.
-	{
-		const float plain[4] = { 0.45f, 0.42f, 0.36f, 0.5f };
-		const vec3 dh = normalize({ eye.x - at.x, 0.0f, eye.z - at.z }), side = { -dh.z, 0.0f, dh.x };
-		auto along = [&](float d, float s, float up) { return vec3 { at.x + dh.x * d + side.x * s, at.y - up, at.z + dh.z * d + side.z * s }; };
-		shadow_file zone;
-		zone.zone = 996;
-		auto corner = [&](const vec3 &v) {
-			uint32_t bits[3];
-			std::memcpy(bits, &v, 12);
-			zone.triangles.insert(zone.triangles.end(), { bits[0], bits[1], bits[2], 0u });
-		};
-		auto quad = [&](const vec3 &a, const vec3 &b, const vec3 &c, const vec3 &d) {
-			corner(a), corner(b), corner(c);
-			corner(a), corner(c), corner(d);
-		};
-		quad(along(3000, 3000, 0), along(3001, 3000, 0), along(3001, 3001, 0), along(3000, 3001, 0));
-		zone.cells.push_back({ 90, 90, 0, zone.triangle_count() });
-		quad(along(-400, -400, 0), along(400, -400, 0), along(400, 400, 0), along(-400, 400, 0)); // the ground
-		zone.cells.push_back({ 0, 0, 2, 2 });
-		quad({ at.x - 20, at.y - 1, at.z - 20 }, { at.x - 1, at.y - 1, at.z - 20 }, { at.x - 1, at.y - 1, at.z }, { at.x - 20, at.y - 1, at.z }); // the low plate
-		zone.cells.push_back({ 1, 0, 4, 2 });
-		quad({ at.x - 20, at.y - 80, at.z }, { at.x - 1, at.y - 80, at.z }, { at.x - 1, at.y - 80, at.z + 20 }, { at.x - 20, at.y - 80, at.z + 20 }); // the high one
-		zone.cells.push_back({ 2, 0, 6, 2 });
-		quad(along(-270, 6, 0), along(-230, 6, 0), along(-230, 6, 30), along(-270, 6, 30)); // the slab
-		zone.cells.push_back({ 3, 0, 8, 2 });
-		check(r.upload_shadow(zone, error), "plates and a far slab uploaded for the shadow map");
-		draw_stats st;
-		auto frame = [&](const camera &c, const vec3 &to_sun) {
-			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
-			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-			ground_depth(c);
-			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-			look l2 = l;
-			l2.grass = false;
-			l2.ao_strength = 0.0f;
-			l2.relief = 0.0f;
-			l2.water = false;
-			l2.sun[0] = to_sun.x;
-			l2.sun[1] = to_sun.y;
-			l2.sun[2] = to_sun.z;
-			l2.sun_shadow = 0.6f;
-			l2.sun_map = true;
-			st = r.draw(g.list, t, c, l2, error);
-			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-			std::vector<uint8_t> img = g.read(world, 4);
-			r.release_old(0);
-			return img;
-		};
-		auto luma_at = [&](const std::vector<uint8_t> &img, const camera &c, const vec3 &v, int rx, int ry) {
-			float m[16];
-			multiply(c.view, c.proj, m);
-			const float x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12], y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
-			const float w = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
-			const int sx = int((x / w + 1.0f) * 0.5f * W), sy = int((1.0f - y / w) * 0.5f * H);
-			if (w <= 0.0f || sx < rx || sy < ry || sx >= int(W) - rx || sy >= int(H) - ry)
-				return -1.0;
-			double sum = 0.0;
-			int n = 0;
-			for (int yy = sy - ry; yy <= sy + ry; ++yy)
-				for (int xx = sx - rx; xx <= sx + rx; ++xx)
-				{
-					const uint8_t *c8 = &img[(size_t(yy) * W + xx) * 4];
-					sum += 0.3 * c8[0] + 0.59 * c8[1] + 0.11 * c8[2];
-					n++;
-				}
-			return sum / n;
-		};
-		const double plain_luma = 0.3 * 0.45 * 255 + 0.59 * 0.42 * 255 + 0.11 * 0.36 * 255;
-		// (a plate's shadow edge along x at z: how wide from 10 to 90 % of the way from its inside, 3 yalms in, to lit, yalms;
-		// and how dark inside)
-		auto edge = [&](const std::vector<uint8_t> &img, float z, double &inside) {
-			inside = luma_at(img, cam, { at.x - 4.0f, at.y, z }, 1, 1);
-			const double lit = plain_luma;
-			float x10 = -100.0f, x90 = -100.0f; // (-100: not crossed yet)
-			for (int i = 0; i <= 100; ++i)
-			{
-				const float x = -2.5f + 0.03f * i; // (from 1.5 yalms in under the plate to 1.5 out)
-				const double v = luma_at(img, cam, { at.x + x, at.y, z }, 0, 0);
-				if (v < 0.0)
-					return -1.0f;
-				if (x10 < -50.0f && v > inside + 0.1 * (lit - inside))
-					x10 = x;
-				if (x90 < -50.0f && v > inside + 0.9 * (lit - inside))
-					x90 = x;
-			}
-			return x10 > -50.0f && x90 > -50.0f ? x90 - x10 : -1.0f;
-		};
-		const vec3 overhead = { 0.0f, -1.0f, 0.0f };
-		auto edges = [&](float &low, float &high, double &low_in, double &high_in) {
-			frame(cam, overhead);
-			const std::vector<uint8_t> img = frame(cam, overhead);
-			low = edge(img, at.z - 1.5f, low_in);
-			high = edge(img, at.z + 1.5f, high_in);
-		};
-		float low = 0.0f, high = 0.0f, low_before = 0.0f, high_before = 0.0f;
-		double low_in = 0.0, high_in = 0.0, low_in_before = 0.0, high_in_before = 0.0;
-		edges(low, high, low_in, high_in);
-		std::string source;
-		if (FILE *f = nullptr; fopen_s(&f, "src\\render\\grass.hlsl", "rb") == 0 && f != nullptr)
-		{
-			char buffer[4096];
-			size_t got;
-			while ((got = fread(buffer, 1, sizeof(buffer), f)) != 0)
-				source.append(buffer, got);
-			fclose(f);
-		}
-		const std::string marker = "static const float kSunSpread = 0.006545;";
-		const size_t at_marker = source.find(marker);
-		check(at_marker != std::string::npos, "kSunSpread found in the shaders' source");
-		if (at_marker != std::string::npos)
-		{
-			std::string point_sun = source;
-			point_sun.replace(at_marker, marker.size(), "static const float kSunSpread = 0.0;");
-			grass::shader_code code;
-			bool from_cache = false;
-			std::string why;
-			const bool compiled = grass::compile_shaders(point_sun, L"build\\test\\variant-cache", code, from_cache, why);
-			check(compiled, "the shaders without contact hardening compile");
-			if (compiled)
-			{
-				r.set_shader_code(std::move(code));
-				edges(low_before, high_before, low_in_before, high_in_before);
-			}
-			grass::shader_code restored;
-			if (grass::compile_shaders(source, L"build\\test\\variant-cache", restored, from_cache, why))
-				r.set_shader_code(std::move(restored));
-		}
-		std::printf("  the sun overhead, plates' shadow edges (10 to 90 %%, yalms): a yalm up %.3f, 80 up %.3f (inside %.1f, %.1f); without contact hardening %.3f, %.3f (inside %.1f, %.1f)\n",
-			low, high, low_in, high_in, low_before, high_before, low_in_before, high_in_before);
-		check(low > 0.0f && high > 0.0f && low_in < plain_luma * 0.75 && std::fabs(high_in - low_in) < 2.0, "both plates shade the ground under them wholly");
-		check(low_before > 0.0f && std::fabs(low - low_before) < 0.03f, "a yalm up: as sharp as before");
-		check(high > high_before + 0.2f && high > low + 0.15f, "80 up: wider, as far above as it is (a disc 0.52 yalms each way: 0.65 from 10 to 90 %)");
-
-		// The farthest cascade
-		camera up_high = cam;
-		const vec3 out = along(-250, 0, 0);
-		look_at({ at.x, at.y - 100.0f, at.z }, out, { 0.0f, -1.0f, 0.0f }, up_high.view);
-		const float e = 59.0f * 3.14159265f / 180.0f;
-		const vec3 from_right = normalize({ side.x * std::cos(e), -std::sin(e), side.z * std::cos(e) });
-		frame(up_high, from_right);
-		const std::vector<uint8_t> img = frame(up_high, from_right);
-		const double out_on = luma_at(img, up_high, out, 2, 2), past = luma_at(img, up_high, along(-295, 0, 0), 2, 2);
-		std::printf("  the camera 100 yalms up, ground 250 yalms out in the far slab's shadow %.1f, 25 yalms past its end %.1f (went in %.1f); farthest cascade faded in %.2f\n",
-			out_on, past, plain_luma, st.sun_map_fade[2]);
-		check(out_on > 0.0 && out_on < plain_luma * 0.75 && past > 0.0 && std::fabs(past - plain_luma) < 2.0, "past the far cascade, the farthest one's shadows: there, not beside");
-		r.unload_shadow();
-		check(g.report_messages() == 0, "no debug-layer errors (soft by distance, and further)");
-	}
-
-	// 1o5. Still in the world as the camera moves (notes-native-shadows.md step 0; in game a wooden bridge's shadows in
-	// Windurst Woods slid as the camera moved, 2026-10-30): over the ground sheet, slats 6 yalms up (half a yalm wide, a
-	// yalm apart), a plate 40 up with square holes, and a post 3 tall; the sun 45 degrees up. The camera orbits the
-	// looked-at point as the game's does (pitch, yaw) and walks; each frame the ground's brightness at a grid of world
-	// points (a fifth of a yalm apart, 10 yalms each way) is compared with the first camera's. Without and with the light
-	// split (the native zone's words: facing up, the sun's share 0.72). Pictures: build\test\sweep_*.ppm.
-	{
-		const float plain[4] = { 0.45f, 0.42f, 0.36f, 0.5f };
-		// (the sun 45 degrees up, then 15: each caster moved toward it so its shadow falls on the grid all the same)
-		for (const float elevation : { 45.0f, 15.0f })
-		{
-		const float e = elevation * 3.14159265f / 180.0f;
-		const float lean = std::cos(e) / std::sin(e);
-		shadow_file zone;
-		zone.zone = 995;
-		auto corner = [&](const vec3 &v) {
-			uint32_t bits[3];
-			std::memcpy(bits, &v, 12);
-			zone.triangles.insert(zone.triangles.end(), { bits[0], bits[1], bits[2], 0u });
-		};
-		auto quad = [&](const vec3 &a, const vec3 &b, const vec3 &c, const vec3 &d) {
-			corner(a), corner(b), corner(c);
-			corner(a), corner(c), corner(d);
-		};
-		auto flat = [&](float x0, float z0, float x1, float z1, float up) {
-			quad({ at.x + x0, at.y - up, at.z + z0 }, { at.x + x1, at.y - up, at.z + z0 }, { at.x + x1, at.y - up, at.z + z1 }, { at.x + x0, at.y - up, at.z + z1 });
-		};
-		uint32_t cell = 0;
-		auto close_cell = [&] {
-			const uint32_t first = cell == 0 ? 0u : zone.cells.back().first + zone.cells.back().count;
-			zone.cells.push_back({ int32_t(cell), 0, first, zone.triangle_count() - first });
-			cell++;
-		};
-		flat(-400, -400, 400, 400, 0); // the ground
-		close_cell();
-		for (int i = -12; i <= 12; ++i) // the slats, across x
-			flat(-12 + 6 * 0.894f * lean, i * 1.5f + 6 * 0.447f * lean, 12 + 6 * 0.894f * lean, i * 1.5f + 0.5f + 6 * 0.447f * lean, 6);
-		close_cell();
-		for (int i = -6; i < 6; ++i) // the high plate: 4-yalm squares, every other one a hole
-			for (int j = -6; j < 6; ++j)
-				if (((i + j) & 1) == 0)
-					flat(i * 4.0f + 40 * 0.894f * lean, j * 4.0f + 40 * 0.447f * lean, i * 4.0f + 4 + 40 * 0.894f * lean, j * 4.0f + 4 + 40 * 0.447f * lean, 40);
-		close_cell();
-		quad({ at.x + 2.85f, at.y, at.z + 3 }, { at.x + 3.15f, at.y, at.z + 3 }, { at.x + 3.15f, at.y - 3, at.z + 3 }, { at.x + 2.85f, at.y - 3, at.z + 3 }); // the post
-		quad({ at.x + 3, at.y, at.z + 2.85f }, { at.x + 3, at.y, at.z + 3.15f }, { at.x + 3, at.y - 3, at.z + 3.15f }, { at.x + 3, at.y - 3, at.z + 2.85f });
-		close_cell();
-		check(r.upload_shadow(zone, error), "slats, a holed plate and a post uploaded for the shadow map");
-		const vec3 to_sun = normalize({ std::cos(e) * 0.894f, -std::sin(e), std::cos(e) * 0.447f });
-
-		// (the light split for the ground as drawn, facing up, the sun's share 0.72: as grass_test's 1k2 words)
-		const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-		ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
-		const D3D12_RESOURCE_DESC sd = split->GetDesc();
-		D3D12_PLACED_SUBRESOURCE_FOOTPRINT sfp = {};
-		UINT64 stotal = 0;
-		g.device->GetCopyableFootprints(&sd, 0, 1, 0, &sfp, nullptr, nullptr, &stotal);
-		ID3D12Resource *sup = g.buffer(D3D12_HEAP_TYPE_UPLOAD, stotal, D3D12_RESOURCE_STATE_GENERIC_READ);
-		struct source
-		{
-			ID3D12Resource *texture;
-		} src_ctx = { nullptr };
-		bool split_state_read = false; // (the split texture in kRead, not COPY_DEST)
-		const uint32_t up_bits = uint32_t(std::lround(0.5 * 127.0)) << 11;
-		// (1o6: the words as the native passes write them with [zone] nativeshadows on, sun_shadows.hpp: 1 the share in 6
-		// bits, 2 that and the mark, bit 31, "the sun's shadows applied here")
-		int mark_mode = 0;
-		auto words = [&](const camera &c) {
-			barrier(g.list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-			const std::vector<uint8_t> zb = g.read(depth, 4);
-			barrier(g.list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-			const float lx = c.proj[11] != 0.0f ? c.proj[10] / c.proj[11] : c.proj[10], ly = c.proj[14];
-			uint32_t *w = nullptr;
-			sup->Map(0, nullptr, reinterpret_cast<void **>(&w));
-			for (UINT y = 0; y < H; ++y)
-				for (UINT x = 0; x < W; ++x)
-				{
-					uint32_t v = 0;
-					const uint32_t d24 = (zb[(size_t(y) * W + x) * 4] | zb[(size_t(y) * W + x) * 4 + 1] << 8 | zb[(size_t(y) * W + x) * 4 + 2] << 16);
-					if (d24 < 0xFFFFFF)
-					{
-						const double vd = ly / (d24 / 16777215.0 - lx);
-						const uint32_t code = uint32_t(std::clamp(std::lround((std::log2(std::max(vd, 1e-3)) + 3.0) * 128.0), 1L, 2047L));
-						v = mark_mode == 0 ? code | up_bits | uint32_t(std::lround(0.72 * 127.0)) << 25
-										   : code | up_bits | uint32_t(std::lround(0.72 * 63.0)) << 25 | (mark_mode == 2 ? 1u << 31 : 0u);
-					}
-					w[size_t(y) * (sfp.Footprint.RowPitch / 4) + x] = v;
-				}
-			sup->Unmap(0, nullptr);
-			if (split_state_read)
-				barrier(g.list, split, kRead, D3D12_RESOURCE_STATE_COPY_DEST);
-			D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, from = { sup, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-			from.PlacedFootprint = sfp;
-			g.list->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
-			barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, kRead);
-			split_state_read = true;
-		};
-		auto frame = [&](const camera &c, bool with_split) {
-			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-			g.list->ClearRenderTargetView(world_rtv, plain, 0, nullptr);
-			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-			ground_depth(c);
-			if (with_split)
-				words(c);
-			src_ctx.texture = with_split ? split : nullptr;
-			r.set_light_source(with_split ? [](void *s) { return static_cast<source *>(s)->texture; } : static_cast<ID3D12Resource *(*)(void *)>(nullptr),
-				with_split ? &src_ctx : nullptr);
-			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-			look l2 = l;
-			l2.grass = false;
-			l2.ao_strength = 0.0f;
-			l2.relief = 0.0f;
-			l2.water = false;
-			l2.sun[0] = to_sun.x;
-			l2.sun[1] = to_sun.y;
-			l2.sun[2] = to_sun.z;
-			l2.sun_shadow = 0.6f;
-			l2.sun_map = true;
-			const draw_stats st = r.draw(g.list, t, c, l2, error);
-			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-			std::vector<uint8_t> img = g.read(world, 4);
-			r.release_old(0);
-			(void)st;
-			return img;
-		};
-		auto save = [&](const std::vector<uint8_t> &img, const char *name) {
-			const std::string path = std::string("build\\test\\sweep") + std::to_string(int(elevation)) + "_" + name + ".ppm";
-			if (FILE *f = nullptr; fopen_s(&f, path.c_str(), "wb") == 0 && f != nullptr)
-			{
-				std::fprintf(f, "P6 %u %u 255\n", W, H);
-				for (size_t i = 0; i < size_t(W) * H; ++i)
-					std::fwrite(&img[i * 4], 1, 3, f);
-				fclose(f);
-			}
-		};
-		// (the ground's luma at each grid point seen by c, -1 off screen or within 2 pixels of its edge)
-		constexpr int kHalf = 50;
-		constexpr int kSide = 2 * kHalf + 1;
-		auto sample = [&](const std::vector<uint8_t> &img, const camera &c) {
-			float m[16];
-			multiply(c.view, c.proj, m);
-			std::vector<float> out(size_t(kSide) * kSide, -1.0f);
-			for (int j = 0; j < kSide; ++j)
-				for (int i = 0; i < kSide; ++i)
-				{
-					const vec3 v = { at.x + (i - kHalf) * 0.2f, at.y, at.z + (j - kHalf) * 0.2f };
-					const float x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12], y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
-					const float w = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
-					if (w <= 0.2f)
-						continue;
-					const int sx = int((x / w + 1.0f) * 0.5f * W), sy = int((1.0f - y / w) * 0.5f * H);
-					if (sx < 2 || sy < 2 || sx >= int(W) - 2 || sy >= int(H) - 2)
-						continue;
-					const uint8_t *c8 = &img[(size_t(sy) * W + sx) * 4];
-					out[size_t(j) * kSide + i] = float(0.3 * c8[0] + 0.59 * c8[1] + 0.11 * c8[2]);
-				}
-			return out;
-		};
-		// The cameras: orbiting the looked-at point a yalm over the ground, 6 yalms off, as the game's
-		struct shot
-		{
-			const char *name;
-			float yaw, pitch, walk; // (degrees around, degrees down, yalms walked along +x)
-		};
-		const shot shots[] = {
-			{ "base", 200, 20, 0 }, { "pitch5", 200, 5, 0 }, { "pitch35", 200, 35, 0 }, { "pitch60", 200, 60, 0 },
-			{ "yaw215", 215, 20, 0 }, { "yaw240", 240, 20, 0 }, { "yaw290", 290, 20, 0 },
-			{ "walk05", 200, 20, 0.5f }, { "walk2", 200, 20, 2.0f }, { "walk6", 200, 20, 6.0f },
-			// (out of the near cascade's middle half and back: drawn again around 15 yalms on, then around 3)
-			{ "walk15", 200, 20, 15.0f }, { "back3", 200, 20, 3.0f } };
-		auto camera_of = [&](const shot &s) {
-			camera c = cam;
-			const float yaw = s.yaw * 3.14159265f / 180.0f, pitch = s.pitch * 3.14159265f / 180.0f;
-			const vec3 target = { at.x + s.walk, at.y - 1.0f, at.z };
-			const vec3 eye_at = { target.x + 6.0f * std::cos(pitch) * std::cos(yaw), target.y - 6.0f * std::sin(pitch), target.z + 6.0f * std::cos(pitch) * std::sin(yaw) };
-			look_at(eye_at, target, { 0.0f, -1.0f, 0.0f }, c.view);
-			return c;
-		};
-		for (int variant = 0; variant < 2; ++variant)
-		{
-			const bool with_split = variant == 1;
-			std::vector<float> base;
-			std::printf("  the sun %.0f degrees up, %s the light split: against the first camera, |luma difference| at the ground's grid points seen by both:\n", elevation, with_split ? "with" : "without");
-			for (const shot &s : shots)
-			{
-				const camera c = camera_of(s);
-				frame(c, with_split);
-				const std::vector<uint8_t> img = frame(c, with_split);
-				save(img, (std::string(s.name) + (with_split ? "_split" : "")).c_str());
-				const std::vector<float> v = sample(img, c);
-				if (base.empty())
-				{
-					base = v;
-					size_t seen = 0;
-					double lo = 1e9, hi = 0.0;
-					for (float x : v)
-						if (x >= 0.0f)
-						{
-							seen++;
-							lo = std::min(lo, double(x));
-							hi = std::max(hi, double(x));
-						}
-					std::printf("    %-8s %zu points seen, luma %.1f..%.1f\n", s.name, seen, lo, hi);
-					continue;
-				}
-				// (each point's difference, and the same averaged over the 5 x 5 points around it: a yalm square, so a band
-				// shows and a single pixel's sampling at a shadow's edge doesn't)
-				std::vector<float> d(v.size(), 0.0f);
-				std::vector<uint8_t> both(v.size(), 0);
-				size_t n = 0, over12 = 0;
-				double sum = 0.0, most = 0.0;
-				for (size_t k = 0; k < v.size(); ++k)
-					if (v[k] >= 0.0f && base[k] >= 0.0f)
-					{
-						both[k] = 1;
-						d[k] = v[k] - base[k];
-						n++;
-						sum += std::fabs(d[k]);
-						most = std::max(most, double(std::fabs(d[k])));
-						over12 += std::fabs(d[k]) > 12.0f ? 1 : 0;
-					}
-				double band = 0.0;
-				int band_i = 0, band_j = 0;
-				for (int j = 2; j < kSide - 2; ++j)
-					for (int i = 2; i < kSide - 2; ++i)
-					{
-						double s5 = 0.0;
-						int c5 = 0;
-						for (int b = -2; b <= 2; ++b)
-							for (int a = -2; a <= 2; ++a)
-								if (both[size_t(j + b) * kSide + i + a])
-								{
-									s5 += d[size_t(j + b) * kSide + i + a];
-									c5++;
-								}
-						if (c5 == 25 && std::fabs(s5 / 25.0) > band)
-						{
-							band = std::fabs(s5 / 25.0);
-							band_i = i - kHalf;
-							band_j = j - kHalf;
-						}
-					}
-				// (away from the edges: points whose first camera's brightness is the same within 0.4 yalms each way, the inside
-				// of a shadow or of the light; what changes there is a band, not an edge sampled at another pixel)
-				size_t inner = 0, inner_over6 = 0;
-				double inner_sum = 0.0, inner_most = 0.0;
-				int inner_i = 0, inner_j = 0;
-				for (int j = 2; j < kSide - 2; ++j)
-					for (int i = 2; i < kSide - 2; ++i)
-					{
-						const size_t k = size_t(j) * kSide + i;
-						bool level = both[k] != 0;
-						for (int b = -2; b <= 2 && level; ++b)
-							for (int a = -2; a <= 2 && level; ++a)
-							{
-								const float o = base[size_t(j + b) * kSide + i + a];
-								level = o >= 0.0f && std::fabs(o - base[k]) < 3.0f;
-							}
-						if (!level)
-							continue;
-						inner++;
-						inner_sum += std::fabs(d[k]);
-						inner_over6 += std::fabs(d[k]) > 6.0f ? 1 : 0;
-						if (std::fabs(d[k]) > inner_most)
-						{
-							inner_most = std::fabs(d[k]);
-							inner_i = i - kHalf;
-							inner_j = j - kHalf;
-						}
-					}
-				std::printf("    %-8s %zu points, mean %.2f, most %.1f, over 12: %.2f%%; over a yalm square at most %.2f (at %+.1f, %+.1f yalms); "
-					"away from edges %zu: mean %.2f, most %.1f (at %+.1f, %+.1f), over 6: %.2f%%\n", s.name, n,
-					n ? sum / n : 0.0, most, n ? 100.0 * over12 / n : 0.0, band, band_i * 0.2, band_j * 0.2, inner, inner ? inner_sum / inner : 0.0,
-					inner_most, inner_i * 0.2, inner_j * 0.2, inner ? 100.0 * inner_over6 / inner : 0.0);
-				// (inside the shadows and the light, the same brightness from every camera; the edges are softened on screen, so
-				// they're printed, not checked. At 15 degrees the high plate's penumbra covers nearly all of it: fewer points)
-				const double inner_mean = inner ? inner_sum / inner : 0.0, over6 = inner ? 100.0 * inner_over6 / inner : 0.0;
-				const std::string what = std::string("the ground away from shadow edges as from the first camera: ") + s.name + (with_split ? ", the split" : "") +
-					(elevation > 30.0f ? ", the sun 45 up" : ", the sun 15 up");
-				check(inner >= (elevation > 30.0f ? 300u : 10u) || std::strcmp(s.name, "walk15") == 0, ("enough of it seen: " + what).c_str());
-				check(inner_mean < (elevation > 30.0f ? 1.0 : 1.5) && over6 < (elevation > 30.0f ? 1.0 : 6.0), what.c_str());
-				// (the difference over the grid, for a look: 128 none, +-4 a level)
-				const std::string path = std::string("build\\test\\sweep") + std::to_string(int(elevation)) + "_" + s.name + (with_split ? "_split" : "") + "_diff.pgm";
-				if (FILE *f = nullptr; fopen_s(&f, path.c_str(), "wb") == 0 && f != nullptr)
-				{
-					std::fprintf(f, "P5 %d %d 255\n", kSide, kSide);
-					for (size_t k = 0; k < d.size(); ++k)
-					{
-						const uint8_t px8 = both[k] ? uint8_t(std::clamp(128.0f + 4.0f * d[k], 0.0f, 255.0f)) : 0;
-						std::fwrite(&px8, 1, 1, f);
-					}
-					fclose(f);
-				}
-			}
-		}
-		// 1o6. The native passes' shadow mark (src/render/sun_shadows.hpp, [zone] nativeshadows): with it on (zinfo.w bit
-		// 128), the share read from 6 bits shades as the 7-bit one did; a word marked "shadowed" (bit 31) isn't shadowed by
-		// the map again (the native pass did it), only its contact march is left; the same word unmarked still is. The
-		// ground's grid points darker than its lit ones by over 15 levels, from the first camera.
-		if (elevation > 30.0f)
-		{
-			const camera c = camera_of(shots[0]);
-			auto dark = [&](const std::vector<float> &v) {
-				std::vector<float> seen;
-				for (float x : v)
-					if (x >= 0.0f)
-						seen.push_back(x);
-				if (seen.empty())
-					return -1.0;
-				std::sort(seen.begin(), seen.end());
-				const float lit = seen[seen.size() * 95 / 100];
-				size_t n = 0;
-				for (float x : seen)
-					n += x < lit - 15.0f ? 1 : 0;
-				return double(n) / double(seen.size());
-			};
-			auto shot_with = [&](int mode) {
-				mark_mode = mode;
-				hifi::sun::set_native(mode != 0);
-				frame(c, true);
-				const std::vector<uint8_t> img = frame(c, true);
-				return sample(img, c);
-			};
-			const std::vector<float> before = shot_with(0), unmarked = shot_with(1), marked = shot_with(2);
-			mark_mode = 0;
-			hifi::sun::set_native(false);
-			double diff = 0.0;
-			size_t both_seen = 0;
-			for (size_t k = 0; k < before.size(); ++k)
-				if (before[k] >= 0.0f && unmarked[k] >= 0.0f)
-				{
-					diff += std::fabs(before[k] - unmarked[k]);
-					both_seen++;
-				}
-			const double d_before = dark(before), d_unmarked = dark(unmarked), d_marked = dark(marked);
-			std::printf("  1o6 the shadow mark: in shadow %.1f%% of the grid (7-bit share), %.1f%% (6-bit, unmarked), %.1f%% (marked); 6-bit against "
-				"7-bit, mean |luma difference| %.2f over %zu points\n", 100.0 * d_before, 100.0 * d_unmarked, 100.0 * d_marked, both_seen ? diff / both_seen : 0.0, both_seen);
-			check(d_before > 0.2 && std::fabs(d_unmarked - d_before) < 0.01 && both_seen > 1000 && diff / both_seen < 1.0,
-				"1o6: the share in 6 bits (nativeshadows on, unmarked) shades as the 7-bit one");
-			check(d_marked >= 0.0 && d_marked < 0.02, "1o6: a word marked shadowed isn't shadowed by World FX's map again");
-		}
-		r.set_light_source(nullptr, nullptr);
-		release(split);
-		release(sup);
-		r.unload_shadow();
-		}
-		check(g.report_messages() == 0, "no debug-layer errors (still in the world as the camera moves)");
 	}
 
 	if (shadows_only)
@@ -4779,37 +3855,23 @@ int main(int argc, char **argv)
 	}
 
 lamps:
-	// 1p. Lamps (grass off, the shading pass on for them alone): a San d'Oria street lamp (its colour, range 4,
-	// brightness 6, the glow at its default 0.5 and reach 1.5 times the range, as the add-on works them out) 3 yalms
-	// over the looked-at point on dark flat ground. The ground at its foot gets brighter, and warmer (red more than
-	// blue); ground 3 yalms off less so; ground 10 yalms off (past its reach) and the picture with the lamp at no
-	// strength (the add-on's brightness 0 sends none) as they went in. Lamp shadows: a low lamp behind a wall standing
-	// at the looked-at point (in the depth buffer as the game's walls are), the ground in front of the wall: darker
-	// with lamp shadows on than off; the ground well beside the wall, whose way to the lamp is clear, the same.
+	// 1p. Lamps (grass off, the shading pass on for them alone). World FX adds no lamp light to the picture itself any
+	// more (its lamp_light, its march toward a lamp and its lamp shadows went with the cleanup: the native passes add the
+	// glow from the block, HiFi XI's src/render/sun_shadows.hpp; the glow itself is tested where it's drawn, zoneinject_test,
+	// charinject_test and 1b3's blades). What's left of the lamps here: a lamp in the look leaves the picture as it went
+	// in, and is published in the block (where it is, its reach, its colour, that it casts); none: none published. Its
+	// shadow cube, from the host's zone (set_zone_casters; a stand-in drawing a plate): a face a frame, the six copied
+	// once to where the native passes read them (the sun shadow map copy's end, or a buffer of the cubes' own in a
+	// renderer that never had one) and published with the lamp; then kept, nothing drawn or copied again.
 	{
 		const float night_ground[4] = { 0.12f, 0.11f, 0.1f, 0.5f };
-		D3D12_RECT lamp_wall = {};
-		float wall_depth = 0.0f;
-		std::vector<std::pair<D3D12_RECT, float>> cards; // (more things standing in the depth buffer, drawn in order)
-		const float *who = nullptr;                      // (characters and monsters, as the Ashita addon sends them)
-		uint32_t who_count = 0;
-		draw_stats lamp_st;                              // (the last frame's)
-		renderer *lamp_r = &r;                           // (the renderer the frames go through: a fresh one for a moment below)
+		draw_stats lamp_st;      // (the last frame's)
+		renderer *lamp_r = &r;   // (the renderer the frames go through: a fresh one for a moment below)
 		auto frame = [&](const float *lamps, uint32_t count, float shadows) {
 			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			g.list->ClearRenderTargetView(world_rtv, night_ground, 0, nullptr);
 			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
 			ground_depth(cam);
-			if (lamp_wall.right != 0)
-			{
-				g.list->ClearRenderTargetView(world_rtv, night_ground, 1, &lamp_wall);
-				g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH, wall_depth, 0, 1, &lamp_wall);
-			}
-			for (const auto &c : cards)
-			{
-				g.list->ClearRenderTargetView(world_rtv, night_ground, 1, &c.first);
-				g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH, c.second, 0, 1, &c.first);
-			}
 			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 			look l2 = l;
 			l2.grass = false;
@@ -4820,133 +3882,69 @@ lamps:
 			l2.lamps = lamps;
 			l2.lamp_count = count;
 			l2.lamp_shadows = shadows;
-			l2.actors = who;
-			l2.actor_count = who_count;
-			const draw_stats st = lamp_r->draw(g.list, t, cam, l2, error);
-			lamp_st = st;
-			if (lamp_r == &r)
-				check(st.shaded == (count != 0) && st.lamps == count, "the shading pass ran for the lamps (and only with some)");
+			lamp_st = lamp_r->draw(g.list, t, cam, l2, error);
 			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			return g.read(world, 4);
 		};
-		auto on_screen = [&](const vec3 &p, float *depth) {
-			const float x = p.x * vp[0] + p.y * vp[4] + p.z * vp[8] + vp[12], y = p.x * vp[1] + p.y * vp[5] + p.z * vp[9] + vp[13];
-			const float z = p.x * vp[2] + p.y * vp[6] + p.z * vp[10] + vp[14], w = p.x * vp[3] + p.y * vp[7] + p.z * vp[11] + vp[15];
-			if (depth != nullptr)
-				*depth = z / w;
-			return std::make_pair((x / w + 1.0f) * 0.5f * W, (1.0f - y / w) * 0.5f * H);
-		};
-		// (mean red, green, blue and brightness over a box of 9 x 9 pixels around a point on screen)
-		struct colour { double r, g, b, luma; };
-		auto around = [&](const std::vector<uint8_t> &img, std::pair<float, float> at_px) {
-			colour c = {};
-			uint32_t n = 0;
-			for (LONG y = LONG(at_px.second) - 4; y <= LONG(at_px.second) + 4; ++y)
-				for (LONG x = LONG(at_px.first) - 4; x <= LONG(at_px.first) + 4; ++x)
-					if (x >= 0 && y >= 0 && x < LONG(W) && y < LONG(H))
-					{
-						const uint8_t *p = &img[(size_t(y) * W + x) * 4];
-						c.r += p[0], c.g += p[1], c.b += p[2];
-						n++;
-					}
-			if (n != 0)
-				c.r /= n, c.g /= n, c.b /= n;
-			c.luma = 0.3 * c.r + 0.59 * c.g + 0.11 * c.b;
-			return c;
-		};
-		// (the ground's horizontal way toward the camera, and across it)
-		const vec3 toward = normalize({ eye.x - at.x, 0.0f, eye.z - at.z }), across = { toward.z, 0.0f, -toward.x };
-		const float strength = 0.5f * (1.0f - std::exp(-6.0f / 4.0f));
-		const float lamp[8] = { at.x, at.y - 3.0f, at.z, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
-		const float dark_lamp[8] = { at.x, at.y - 3.0f, at.z, 4.0f * 1.5f, 0.0f, 0.0f, 0.0f, 1.0f };
-		const auto foot = on_screen(at, nullptr);
-		const auto three_off = on_screen({ at.x + across.x * 3.0f, at.y, at.z + across.z * 3.0f }, nullptr);
-		const auto ten_off = on_screen({ at.x - toward.x * 10.0f, at.y, at.z - toward.z * 10.0f }, nullptr);
-		const std::vector<uint8_t> unlit = frame(nullptr, 0, 0.0f), lit = frame(lamp, 1, 0.0f), dark = frame(dark_lamp, 1, 0.0f);
-		const colour foot_unlit = around(unlit, foot), foot_lit = around(lit, foot);
-		const colour three_unlit = around(unlit, three_off), three_lit = around(lit, three_off);
-		const colour ten_unlit = around(unlit, ten_off), ten_lit = around(lit, ten_off);
-		int dark_diff = 0;
-		for (size_t i = 0; i < size_t(W) * H * 4; ++i)
-			dark_diff = std::max(dark_diff, std::abs(int(dark[i]) - int(unlit[i])));
-		std::printf("  a lamp 3 yalms over dark ground: at its foot %.1f -> %.1f (red +%.1f, blue +%.1f); 3 yalms off %.1f -> %.1f; 10 yalms off %.1f -> %.1f; at no strength, %d at most off\n",
-			foot_unlit.luma, foot_lit.luma, foot_lit.r - foot_unlit.r, foot_lit.b - foot_unlit.b, three_unlit.luma, three_lit.luma, ten_unlit.luma, ten_lit.luma, dark_diff);
-		check(foot_lit.luma > foot_unlit.luma * 1.3 + 4.0, "the ground under a lit lamp gets brighter");
-		check(foot_lit.r - foot_unlit.r > 2.0 * (foot_lit.b - foot_unlit.b), "and warmer (a street lamp's colour)");
-		check(three_lit.luma > three_unlit.luma + 1.0 && three_lit.luma < foot_lit.luma - 2.0, "less so 3 yalms off (within its reach)");
-		check(std::fabs(ten_lit.luma - ten_unlit.luma) < 0.5, "ground past its reach as it went in");
-		check(dark_diff <= 1, "a lamp at no strength (the game's brightness 0: none sent) changes nothing");
+		struct said
 		{
-			FILE *f = nullptr;
-			if (fopen_s(&f, "build\\lamp_test.ppm", "wb") == 0 && f != nullptr)
-			{
-				std::fprintf(f, "P6 %u %u 255\n", W, H);
-				for (size_t i = 0; i < size_t(W) * H; ++i)
-					std::fwrite(&lit[i * 4], 1, 3, f);
-				fclose(f);
-			}
-		}
+			uint32_t flags = 0, cubes = 0, face = 0;
+			float count = 0.0f, pos[4] = {}, col[4] = {};
+			UINT64 bytes = 0;
+		};
+		auto block_said = [&] {
+			said s;
+			std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+			const hifi::sun::block &nb = hifi::sun::detail::g.latest;
+			if (!hifi::sun::detail::g.has)
+				return s;
+			s.flags = nb.gpu.mode[2];
+			s.count = nb.gpu.lamp_head[0];
+			std::memcpy(s.pos, nb.gpu.lamp_pos[0], 16);
+			std::memcpy(s.col, nb.gpu.lamp_col[0], 16);
+			for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
+				s.cubes += nb.gpu.lamp_col[k][3] >= 2.0f ? 1 : 0;
+			s.face = nb.gpu.lamp_where[1];
+			s.bytes = nb.buffer != nullptr ? nb.buffer->GetDesc().Width : 0;
+			return s;
+		};
+		// (a street lamp 1.5 yalms over the looked-at point: its reach 6, its colour times its glow, casting)
+		const float lamp[8] = { at.x, at.y - 1.5f, at.z, 6.0f, 1.469f, 1.0f, 0.219f, 1.0f };
+		hifi::sun::release();
+		const std::vector<uint8_t> unlit = frame(nullptr, 0, 0.0f);
+		const bool none_shaded = lamp_st.shaded;
+		const said none = block_said();
+		const std::vector<uint8_t> lit = frame(lamp, 1, 0.0f);
+		const draw_stats lit_st = lamp_st;
+		const said one = block_said();
+		int lamp_diff = 0;
+		for (size_t i = 0; i < size_t(W) * H * 4; ++i)
+			lamp_diff = std::max(lamp_diff, std::abs(int(lit[i]) - int(unlit[i])));
+		std::printf("  a lamp in the look: the picture %d apart from the one without; the block: flags %u, %.0f lamp at %.1f %.1f %.1f reaching %.1f, casting %.0f\n",
+			lamp_diff, one.flags, one.count, one.pos[0], one.pos[1], one.pos[2], one.pos[3], one.col[3]);
+		check(!none_shaded && none.flags == 0, "no lamp (and nothing else to shade): no shading pass, no block");
+		check(lit_st.shaded && lit_st.lamps == 1 && lamp_diff == 0, "a lamp: the shading pass runs for it and adds no light of its own (the picture as it went in)");
+		check(one.flags == hifi::sun::kHasLamps && one.count == 1.0f && std::memcmp(one.pos, lamp, 16) == 0 && std::memcmp(one.col, lamp + 4, 12) == 0 &&
+			one.col[3] == 1.0f && one.cubes == 0, "and it's published for the native passes: where it is, its reach, its colour, casting, no cube yet");
 
-		// The wall: as deep as the looked-at point, a yalm and a half tall over it on screen, about 0.6 yalms each way;
-		// the lamp 2 yalms behind it, half a yalm up; the ground 1.5 yalms in front of it, and 3 yalms beside that
-		const auto top = on_screen({ at.x, at.y - 1.5f, at.z }, nullptr);
-		on_screen(at, &wall_depth);
-		lamp_wall = { LONG(foot.first) - 25, LONG(top.second), LONG(foot.first) + 25, LONG(foot.second) + 1 };
-		const float low_lamp[8] = { at.x - toward.x * 2.0f, at.y - 0.5f, at.z - toward.z * 2.0f, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
-		const vec3 front = { at.x + toward.x * 1.5f, at.y, at.z + toward.z * 1.5f };
-		const auto in_front = on_screen(front, nullptr);
-		const auto beside = on_screen({ front.x + across.x * 3.0f, front.y, front.z + across.z * 3.0f }, nullptr);
-		const std::vector<uint8_t> open = frame(low_lamp, 1, 0.0f), hidden = frame(low_lamp, 1, 1.0f), walled_unlit = frame(nullptr, 0, 0.0f);
-		// (the same wall as someone standing there: a character or monster sent by the Ashita addon)
-		const float body[4] = { at.x, at.y, at.z, 0.9f };
-		who = body;
-		who_count = 1;
-		const std::vector<uint8_t> someone = frame(low_lamp, 1, 1.0f);
-		who = nullptr;
-		who_count = 0;
-		// (the same light sent as a glow, a Home Point's or an effect's: it lights without a lamp shadow)
-		float low_glow[8];
-		std::memcpy(low_glow, low_lamp, sizeof(low_glow));
-		low_glow[7] = 0.0f;
-		const std::vector<uint8_t> glow_hidden = frame(low_glow, 1, 1.0f);
-		lamp_wall = {};
-		const colour front_glow = around(glow_hidden, in_front);
-		const colour front_unlit = around(walled_unlit, in_front), front_open = around(open, in_front), front_hidden = around(hidden, in_front);
-		const colour beside_open = around(open, beside), beside_hidden = around(hidden, beside);
-		const colour front_someone = around(someone, in_front);
-		std::printf("  a low lamp behind a wall: ground in front of the wall %.1f unlit, %.1f lit, %.1f with lamp shadows; beside it %.1f lit, %.1f with lamp shadows; the wall as someone standing there: %.1f\n",
-			front_unlit.luma, front_open.luma, front_hidden.luma, beside_open.luma, beside_hidden.luma, front_someone.luma);
-		check(front_open.luma > front_unlit.luma + 3.0, "the lamp's glow reaches the ground in front of the wall (no shadows)");
-		check(front_hidden.luma < front_open.luma - 0.6 * (front_open.luma - front_unlit.luma), "with lamp shadows, the wall hides the lamp from it");
-		check(beside_open.luma > front_unlit.luma + 0.5 && std::fabs(beside_hidden.luma - beside_open.luma) < 0.5, "ground whose way to the lamp is clear keeps its glow");
-		check(std::fabs(front_someone.luma - front_open.luma) < 0.5, "a character or monster casts no lamp shadow (the game casts their own; the march laid a row of copies)");
-		check(std::fabs(front_glow.luma - front_open.luma) < 0.5, "a glow (a Home Point's, an effect's) casts no lamp shadow: the wall leaves its light (its crystal laid a row of shadows)");
-
-		// The lamp's shadow map from the host's zone (set_zone_casters: HiFi XI's native zone data; draw_lamp_maps): the same
-		// low lamp, the wall not in the depth buffer at all (off screen, as far as the march can tell) but drawn by a
-		// stand-in into the lamp's cube faces, as a plate 0.6 of the way from the light to the ground in front of the wall
-		// (a yalm square across the face looking at it). The first frame only asks for room at the depth copy's end; then
-		// one face a frame, the cube copied there with the sixth: the ground in front darker, as with the wall on screen, the
-		// ground beside keeping its glow; a frame later nothing drawn again (kept); the host gone, marched again (nothing on
-		// screen hides it: lit).
+		// Its shadow cube from the host's zone
 		{
 			struct lamp_host
 			{
 				vec3 q;
 				uint32_t faces = 0, hits = 0;
 			} lh;
-			const vec3 light = { low_lamp[0], low_lamp[1], low_lamp[2] };
-			lh.q = { light.x + 0.6f * (front.x - light.x), light.y + 0.6f * (front.y - light.y), light.z + 0.6f * (front.z - light.z) };
-			r.set_zone_casters(
-				[](void *, float lo[3], float hi[3], uint64_t *generation) {
-					for (int a = 0; a < 3; ++a)
-					{
-						lo[a] = -1000.0f;
-						hi[a] = 1000.0f;
-					}
-					*generation = 7;
-					return true;
-				},
+			lh.q = { lamp[0] + 0.5f, lamp[1] + 0.9f, lamp[2] + 0.3f }; // (a plate under the lamp, a little aside)
+			auto bounds = [](void *, float lo[3], float hi[3], uint64_t *generation) {
+				for (int a = 0; a < 3; ++a)
+				{
+					lo[a] = -1000.0f;
+					hi[a] = 1000.0f;
+				}
+				*generation = 7;
+				return true;
+			};
+			r.set_zone_casters(bounds,
 				[](void *context, ID3D12GraphicsCommandList *list, const float m[16], D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) -> uint32_t {
 					lamp_host &h = *static_cast<lamp_host *>(context);
 					h.faces++;
@@ -4964,405 +3962,57 @@ lamps:
 					return 2;
 				},
 				&lh);
-			frame(low_lamp, 1, 1.0f);
-			const draw_stats asked = lamp_st;
-			std::vector<uint8_t> mapped;
-			uint32_t faces = 0, most_faces = 0, frames = 0;
+			uint32_t faces = 0, most_faces = 0, frames = 0, copies = 0;
 			while (frames < 10 && (frames == 0 || lamp_st.lamp_maps == 0))
 			{
-				mapped = frame(low_lamp, 1, 1.0f);
+				frame(lamp, 1, 1.0f);
 				faces += lamp_st.lamp_map_faces;
 				most_faces = std::max(most_faces, lamp_st.lamp_map_faces);
+				copies += lamp_st.lamp_native_copies;
 				frames++;
 			}
 			const draw_stats drawn = lamp_st;
-			const uint32_t hits = lh.hits;
-			const std::vector<uint8_t> kept = frame(low_lamp, 1, 1.0f);
+			const said cube = block_said();
+			const std::vector<uint8_t> kept = frame(lamp, 1, 1.0f);
 			const draw_stats kept_st = lamp_st;
-			// With [zone] nativelamps on (HiFi XI's src/render/sun_shadows.hpp's lamps): the cube copied once more, to where
-			// the native passes read it (a whole run's renderer made a sun shadow map earlier: its copy's end), and the block published
-			// says so: the lamp with its cube, the cubes' place and size; a frame later nothing copied again. No light split
-			// here, so World FX shades every pixel itself as before. Then a renderer made now, which never had a sun shadow
-			// map: the cube goes to a buffer of its own, the four cubes' size, and is published with it.
-			hifi::sun::set_native_lamps(true);
-			const std::vector<uint8_t> native_first = frame(low_lamp, 1, 1.0f);
-			const draw_stats native_st = lamp_st;
-			uint32_t native_cubes = 0, native_flags = 0, native_size = 0;
-			float native_count = 0.0f;
-			UINT64 native_bytes = 0;
-			{
-				std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
-				const hifi::sun::block &nb = hifi::sun::detail::g.latest;
-				for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
-					native_cubes += nb.gpu.lamp_col[k][3] >= 2.0f ? 1 : 0;
-				native_flags = hifi::sun::detail::g.has ? nb.gpu.mode[2] : 0;
-				native_size = nb.gpu.lamp_where[1];
-				native_count = nb.gpu.lamp_head[0];
-				native_bytes = nb.buffer != nullptr ? nb.buffer->GetDesc().Width : 0;
-			}
-			frame(low_lamp, 1, 1.0f);
-			const draw_stats native_kept_st = lamp_st;
-			hifi::sun::set_native_lamps(false);
-			hifi::sun::release();
-			std::printf("  ... with nativelamps on: %u cube copied for the native passes, then %u; the block: flags %u, %.0f lamp, %u with a cube, faces of %u, a buffer of %llu bytes; ground in front %.1f\n",
-				native_st.lamp_native_copies, native_kept_st.lamp_native_copies, native_flags, native_count, native_cubes, native_size,
-				static_cast<unsigned long long>(native_bytes), around(native_first, in_front).luma);
-			check(native_st.lamp_native_copies == 1 && native_kept_st.lamp_native_copies == 0 && native_flags == hifi::sun::kHasLamps && native_count == 1.0f &&
-				native_cubes == 1 && native_size == 256 && native_bytes >= UINT64(256) * 256 * 4 * 6 * 4,
-				"nativelamps on: the lamp's cube copied once to the native passes' buffer (the sun shadow map copy's end, or its own) and published with the lamp");
-			check(std::fabs(around(native_first, in_front).luma - around(kept, in_front).luma) < 0.5, "  and World FX's own picture is as without it (no light split: nothing marked)");
+			int kept_diff = 0;
+			for (size_t i = 0; i < size_t(W) * H * 4; ++i)
+				kept_diff = std::max(kept_diff, std::abs(int(kept[i]) - int(unlit[i])));
+			std::printf("  its shadow cube: %u faces over %u frames (at most %u a frame; the plate in %u), copied for the native passes %u time(s), then %u faces and %u copies; "
+				"the block: flags %u, %u with a cube, faces of %u, a buffer of %llu bytes\n", faces, frames, most_faces, lh.hits, copies, kept_st.lamp_map_faces,
+				kept_st.lamp_native_copies, cube.flags, cube.cubes, cube.face, static_cast<unsigned long long>(cube.bytes));
+			check(drawn.lamp_maps == 1 && faces == 6 && frames == 6 && most_faces == 1 && lh.hits >= 1 && kept_st.lamp_maps == 1 && kept_st.lamp_map_faces == 0,
+				"the lamp's cube drawn a face a frame (six frames), then kept");
+			check(copies == 1 && kept_st.lamp_native_copies == 0 && cube.flags == hifi::sun::kHasLamps && cube.count == 1.0f && cube.cubes == 1 && cube.face == 256 &&
+				cube.bytes >= UINT64(256) * 256 * 4 * 6 * 4,
+				"and copied once to the native passes' buffer (the sun shadow map copy's end, or its own), published with the lamp");
+			check(kept_diff == 0, "the picture still as it went in (lamp shadows are the native passes' too)");
 			{
 				renderer fresh;
 				std::string fresh_error;
 				const bool made = fresh.init(g.device, fresh_error);
-				fresh.set_zone_casters(
-					[](void *, float lo[3], float hi[3], uint64_t *generation) {
-						for (int a = 0; a < 3; ++a)
-						{
-							lo[a] = -1000.0f;
-							hi[a] = 1000.0f;
-						}
-						*generation = 7;
-						return true;
-					},
-					[](void *, ID3D12GraphicsCommandList *, const float[16], D3D12_CPU_DESCRIPTOR_HANDLE, UINT) -> uint32_t { return 0; }, nullptr);
+				fresh.set_zone_casters(bounds, [](void *, ID3D12GraphicsCommandList *, const float[16], D3D12_CPU_DESCRIPTOR_HANDLE, UINT) -> uint32_t { return 0; }, nullptr);
 				lamp_r = &fresh;
-				hifi::sun::set_native_lamps(true);
-				uint32_t fresh_copies = 0, fresh_frames = 0, fresh_cubes = 0, fresh_flags = 0;
-				bool fresh_shaded = false;
+				uint32_t fresh_copies = 0, fresh_frames = 0;
 				for (; fresh_frames < 12 && fresh_copies == 0; ++fresh_frames)
 				{
-					frame(low_lamp, 1, 1.0f);
+					frame(lamp, 1, 1.0f);
 					fresh_copies += lamp_st.lamp_native_copies;
-					fresh_shaded = fresh_shaded || lamp_st.shaded;
 				}
-				UINT64 fresh_bytes = 0;
-				{
-					std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
-					const hifi::sun::block &nb = hifi::sun::detail::g.latest;
-					for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
-						fresh_cubes += nb.gpu.lamp_col[k][3] >= 2.0f ? 1 : 0;
-					fresh_flags = hifi::sun::detail::g.has ? nb.gpu.mode[2] : 0;
-					fresh_bytes = nb.buffer != nullptr ? nb.buffer->GetDesc().Width : 0;
-				}
-				frame(low_lamp, 1, 1.0f); // (once more: the native passes' buffer read state kept, nothing copied)
+				const said own = block_said();
+				frame(lamp, 1, 1.0f); // (once more: the native passes' buffer's read state kept, nothing copied)
 				const uint32_t fresh_again = lamp_st.lamp_native_copies;
-				hifi::sun::set_native_lamps(false);
 				hifi::sun::release();
 				lamp_r = &r; // (the fresh renderer's lists are done: each frame was read back)
-				std::printf("  ... a renderer with no sun shadow map%s: %s; the cube copied after %u frames (%u), then %u; the block: flags %u, %u with a cube, a buffer of %llu bytes\n",
-					made ? "" : (" NOT MADE: " + fresh_error).c_str(), fresh_shaded ? "shaded" : "never shaded", fresh_frames, fresh_copies, fresh_again, fresh_flags,
-					fresh_cubes, static_cast<unsigned long long>(fresh_bytes));
-				check(made && fresh_copies == 1 && fresh_again == 0 && fresh_flags == hifi::sun::kHasLamps && fresh_cubes == 1 && fresh_bytes == UINT64(256) * 256 * 4 * 6 * 4,
+				std::printf("  ... a renderer with no sun shadow map%s: the cube copied after %u frames (%u), then %u; the block: flags %u, %u with a cube, a buffer of %llu bytes\n",
+					made ? "" : (" NOT MADE: " + fresh_error).c_str(), fresh_frames, fresh_copies, fresh_again, own.flags, own.cubes, static_cast<unsigned long long>(own.bytes));
+				check(made && fresh_copies == 1 && fresh_again == 0 && own.flags == hifi::sun::kHasLamps && own.cubes == 1 && own.bytes == UINT64(256) * 256 * 4 * 6 * 4,
 					"  a renderer with no sun shadow map: the cube copied to a buffer of its own (the four cubes' size) and published with it");
 			}
 			r.set_zone_casters(nullptr, nullptr, nullptr);
-			const std::vector<uint8_t> marched = frame(low_lamp, 1, 1.0f);
-			const draw_stats marched_st = lamp_st;
-			const colour front_mapped = around(mapped, in_front), front_kept = around(kept, in_front), beside_mapped = around(mapped, beside);
-			const colour front_marched = around(marched, in_front);
-			std::printf("  the lamp's shadow map (the wall only in it, a plate the host draws): ground in front %.1f, kept %.1f, beside %.1f; marched without it %.1f (lit %.1f, unlit %.1f); maps %u/%u/%u/%u; faces %u over %u frames (at most %u a frame), then %u (the plate in %u)\n",
-				front_mapped.luma, front_kept.luma, beside_mapped.luma, front_marched.luma, front_open.luma, front_unlit.luma, asked.lamp_maps, drawn.lamp_maps,
-				kept_st.lamp_maps, marched_st.lamp_maps, faces, frames, most_faces, kept_st.lamp_map_faces, hits);
-			check(asked.lamp_maps == 0 && asked.lamp_map_faces == 0 && drawn.lamp_maps == 1 && faces == 6 && frames == 6 && most_faces == 1 && hits >= 1 &&
-				kept_st.lamp_maps == 1 && kept_st.lamp_map_faces == 0 && marched_st.lamp_maps == 0,
-				"the lamp's cube drawn a face a frame once it's asked for (six frames), then kept; none without the host");
-			check(front_mapped.luma < front_open.luma - 0.6 * (front_open.luma - front_unlit.luma) && std::fabs(front_kept.luma - front_mapped.luma) < 0.5,
-				"with its shadow map, what isn't on screen hides the lamp from the ground in front");
-			check(std::fabs(beside_mapped.luma - beside_open.luma) < 0.5, "ground whose way to the lamp is clear keeps its glow (the map)");
-			check(std::fabs(front_marched.luma - front_open.luma) < 0.5, "without the host's zone the march again (nothing on screen between: lit)");
-			check(g.report_messages() == 0, "no debug-layer errors (the lamp's shadow map)");
-		}
-
-		// A lantern hanging 0.6 yalms in front of a wall facing the camera, the light inside it: the wall (as deep as a point
-		// a yalm past the looked-at one) over the middle of the picture, and the lantern's front a quarter yalm in front of
-		// the light, half a yalm across. With lamp shadows on, the wall around the lantern (0.4 to 0.9 yalms off the light,
-		// beside it) keeps its glow as with them off: the lantern around the light doesn't hide it (marched to 85% of the
-		// way, a dark disc there in a ring of glow)
-		{
-			const vec3 f = normalize(sub(at, eye));
-			const vec3 wall_at = { at.x + f.x, at.y + f.y, at.z + f.z };
-			const vec3 light = { wall_at.x - f.x * 0.6f, wall_at.y - f.y * 0.6f, wall_at.z - f.z * 0.6f };
-			const vec3 lantern_front = { light.x - f.x * 0.25f, light.y - f.y * 0.25f, light.z - f.z * 0.25f };
-			float wall_ndc = 0.0f, front_ndc = 0.0f;
-			const auto mid = on_screen(wall_at, &wall_ndc);
-			on_screen(lantern_front, &front_ndc);
-			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] };
-			auto at_side = [&](const vec3 &p, float d) { return vec3 { p.x + right.x * d, p.y + right.y * d, p.z + right.z * d }; };
-			const float lantern_px = on_screen(at_side(lantern_front, 0.25f), nullptr).first - mid.first;
-			cards = { { { LONG(mid.first) - 200, LONG(mid.second) - 120, LONG(mid.first) + 200, LONG(mid.second) + 120 }, wall_ndc },
-				{ { LONG(mid.first - lantern_px), LONG(mid.second - lantern_px), LONG(mid.first + lantern_px), LONG(mid.second + lantern_px) }, front_ndc } };
-			const float lantern[8] = { light.x, light.y, light.z, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
-			const std::vector<uint8_t> plain = frame(lantern, 1, 0.0f), shaded = frame(lantern, 1, 1.0f), dark_wall = frame(nullptr, 0, 0.0f);
-			cards.clear();
-			// (the wall 0.4 to 0.9 yalms beside the light, both sides, along its row)
-			auto beside_lantern = [&](const std::vector<uint8_t> &img) {
-				double sum = 0.0;
-				uint32_t n = 0;
-				for (float d = 0.4f; d <= 0.9f; d += 0.1f)
-					for (float side : { -1.0f, 1.0f })
-					{
-						sum += around(img, on_screen(at_side(wall_at, d * side), nullptr)).luma;
-						n++;
-					}
-				return sum / n;
-			};
-			const double wall_unlit = beside_lantern(dark_wall), wall_plain = beside_lantern(plain), wall_shaded = beside_lantern(shaded);
-			std::printf("  a lantern 0.6 yalms in front of a wall (%.0f px across): the wall beside it %.1f unlit, %.1f lit, %.1f with lamp shadows\n",
-				2.0f * lantern_px, wall_unlit, wall_plain, wall_shaded);
-			check(wall_plain > wall_unlit + 5.0, "the wall behind a lantern glows");
-			check(std::fabs(wall_shaded - wall_plain) < 0.5, "and keeps its glow with lamp shadows on (the lantern around the light doesn't hide it)");
-
-			// The same lantern on its bracket: the wall over the whole picture, and behind the lantern's front a plate 1.6
-			// yalms across as deep as the light (its bracket and back plate, or its glow drawn into the depth). The wall in
-			// a ring 1.4 to 2.4 yalms off the light (beside, above and below it), just outside where lamp shadows start,
-			// keeps its glow with them on: the steps toward the light ended behind the plate and found it, a dark ring
-			// round the lantern (in game, 2026-10-21)
-			float plate_ndc = 0.0f;
-			on_screen(light, &plate_ndc);
-			const float plate_px = on_screen(at_side(light, 0.8f), nullptr).first - mid.first;
-			const vec3 above = { cam.view[1], cam.view[5], cam.view[9] };
-			cards = { { { 0, 0, LONG(W), LONG(H) }, wall_ndc },
-				{ { LONG(mid.first - plate_px), LONG(mid.second - plate_px), LONG(mid.first + plate_px), LONG(mid.second + plate_px) }, plate_ndc },
-				{ { LONG(mid.first - lantern_px), LONG(mid.second - lantern_px), LONG(mid.first + lantern_px), LONG(mid.second + lantern_px) }, front_ndc } };
-			const std::vector<uint8_t> bracket_plain = frame(lantern, 1, 0.0f), bracket_shaded = frame(lantern, 1, 1.0f), bracket_dark = frame(nullptr, 0, 0.0f);
-			cards.clear();
-			auto ring = [&](const std::vector<uint8_t> &img) {
-				double sum = 0.0;
-				uint32_t n = 0;
-				for (float d = 1.4f; d <= 2.45f; d += 0.2f)
-					for (float side : { -1.0f, 1.0f })
-						for (const vec3 &way : { right, above })
-						{
-							sum += around(img, on_screen({ wall_at.x + way.x * d * side, wall_at.y + way.y * d * side, wall_at.z + way.z * d * side }, nullptr)).luma;
-							n++;
-						}
-				return sum / n;
-			};
-			const double ring_unlit = ring(bracket_dark), ring_plain = ring(bracket_plain), ring_shaded = ring(bracket_shaded);
-			std::printf("  the same lantern on a bracket plate (%.0f px across): the wall in a ring round it %.1f unlit, %.1f lit, %.1f with lamp shadows\n",
-				2.0f * plate_px, ring_unlit, ring_plain, ring_shaded);
-			check(ring_plain > ring_unlit + 3.0, "the wall round a lantern on its bracket glows");
-			check(std::fabs(ring_shaded - ring_plain) < 0.5, "and keeps its glow with lamp shadows on: its bracket draws no dark ring round it");
-		}
-
-		// 1v. A Home Point crystal's glow (one of the worldfx addon's glows, as the add-on works it out: blue-cyan 0.35 0.75
-		// 1, reach 7 x 1.5, brightness 6 at the fixture setting 1; lamp shadows at their default 0.5) 1.6 yalms over the
-		// looked-at floor, a wall a yalm behind it (as deep as the point 1.6 yalms up there, from the top of the picture
-		// down to the wall's foot): the wall beside the crystal and the floor at its foot get brighter and bluer (blue up
-		// more than red); the same glow at no strength (its effect gone: the addon sends none) changes nothing.
-		{
-			const vec3 h = normalize({ at.x - eye.x, 0.0f, at.z - eye.z });
-			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] };
-			const vec3 wall_foot = { at.x + h.x, at.y, at.z + h.z }, wall_mid = { wall_foot.x, wall_foot.y - 1.6f, wall_foot.z };
-			float wall_ndc = 0.0f;
-			const auto mid = on_screen(wall_mid, &wall_ndc);
-			const auto foot_row = on_screen(wall_foot, nullptr);
-			cards = { { { LONG(mid.first) - 220, 0, LONG(mid.first) + 220, LONG(foot_row.second) }, wall_ndc } };
-			const float s = 1.0f * (1.0f - std::exp(-6.0f / 4.0f));
-			const float crystal[8] = { at.x, at.y - 1.6f, at.z, 7.0f * 1.5f, 0.35f * s, 0.75f * s, 1.0f * s, 0.0f };
-			const float gone[8] = { at.x, at.y - 1.6f, at.z, 7.0f * 1.5f, 0.0f, 0.0f, 0.0f, 0.0f };
-			const std::vector<uint8_t> hp_unlit = frame(nullptr, 0, 0.5f), hp_lit = frame(crystal, 1, 0.5f), hp_dark = frame(gone, 1, 0.5f);
-			cards.clear();
-			auto on = [&](const vec3 &p) { return on_screen(p, nullptr); };
-			const colour wall_l = around(hp_lit, on({ wall_mid.x - right.x * 0.7f, wall_mid.y, wall_mid.z - right.z * 0.7f }));
-			const colour wall_r = around(hp_lit, on({ wall_mid.x + right.x * 0.7f, wall_mid.y, wall_mid.z + right.z * 0.7f }));
-			const colour wall_l0 = around(hp_unlit, on({ wall_mid.x - right.x * 0.7f, wall_mid.y, wall_mid.z - right.z * 0.7f }));
-			const colour wall_r0 = around(hp_unlit, on({ wall_mid.x + right.x * 0.7f, wall_mid.y, wall_mid.z + right.z * 0.7f }));
-			const vec3 floor_at = { at.x - h.x * 0.5f, at.y, at.z - h.z * 0.5f };
-			const colour floor_lit = around(hp_lit, on(floor_at)), floor_unlit = around(hp_unlit, on(floor_at));
-			int hp_dark_diff = 0;
-			for (size_t i = 0; i < size_t(W) * H * 4; ++i)
-				hp_dark_diff = std::max(hp_dark_diff, std::abs(int(hp_dark[i]) - int(hp_unlit[i])));
-			const double wall_rise = (wall_l.luma + wall_r.luma - wall_l0.luma - wall_r0.luma) / 2.0;
-			const double wall_blue = (wall_l.b + wall_r.b - wall_l0.b - wall_r0.b) / 2.0, wall_red = (wall_l.r + wall_r.r - wall_l0.r - wall_r0.r) / 2.0;
-			std::printf("  a Home Point's glow 1.6 yalms up, a wall a yalm behind: the wall beside it +%.1f (red +%.1f, blue +%.1f); the floor at its foot %.1f -> %.1f (red +%.1f, blue +%.1f); at no strength, %d at most off\n",
-				wall_rise, wall_red, wall_blue, floor_unlit.luma, floor_lit.luma, floor_lit.r - floor_unlit.r, floor_lit.b - floor_unlit.b, hp_dark_diff);
-			check(wall_rise > 5.0 && wall_blue > 2.0 * wall_red, "the wall beside a Home Point's glow gets brighter, and blue");
-			check(floor_lit.luma > floor_unlit.luma + 5.0 && floor_lit.b - floor_unlit.b > 2.0 * (floor_lit.r - floor_unlit.r), "the floor at its foot too");
-			check(hp_dark_diff <= 1, "its glow gone (none sent) changes nothing");
-		}
-
-		// 1p2. With the light split (HiFi XI's native zone and characters drew these pixels, lit by the zone's lamps
-		// already: grass.hlsl lamp_light_known): the lantern 0.6 yalms in front of a wall facing the camera, the wall over
-		// the whole picture and every pixel of it in the light split (its depth, facing the camera, no sun). The wall beside
-		// the lantern comes out as it went in (the lamp's glow isn't added again; without the split it is); the same light
-		// sent as an effect's glow still lights it; and with lamp shadows on, a pillar standing between the lantern and the
-		// wall 2.6 yalms to its side darkens the wall there (the lamp's light the native pass drew there taken away), the
-		// wall as far to the other side, whose way is clear, as it went in.
-		{
-			const vec3 f = normalize(sub(at, eye));
-			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] };
-			auto at_side = [&](const vec3 &p, float d) { return vec3 { p.x + right.x * d, p.y + right.y * d, p.z + right.z * d }; };
-			auto pushed = [&](const vec3 &p, float d) { return vec3 { p.x + f.x * d, p.y + f.y * d, p.z + f.z * d }; };
-			auto view_depth = [&](const vec3 &p) { return p.x * vp[3] + p.y * vp[7] + p.z * vp[11] + vp[15]; };
-			const vec3 wall_at = pushed(at, 1.0f), light = pushed(wall_at, -0.6f), pillar_at = pushed(wall_at, -0.45f);
-			float wall_ndc = 0.0f, pillar_ndc = 0.0f;
-			on_screen(wall_at, &wall_ndc);
-			on_screen(pillar_at, &pillar_ndc);
-			const LONG p0 = LONG(on_screen(at_side(pillar_at, 1.1f), nullptr).first), p1 = LONG(on_screen(at_side(pillar_at, 1.9f), nullptr).first);
-			cards = { { { 0, 0, LONG(W), LONG(H) }, wall_ndc }, { { p0, 0, p1, LONG(H) }, pillar_ndc } };
-			// The light split's words (light_split.hpp): each pixel the topmost card's view depth, facing the camera, no sun
-			auto word = [](float depth, vec3 n) {
-				const uint32_t code = uint32_t(std::clamp(std::round((std::log2(std::max(depth, 1e-3f)) + 3.0f) * 128.0f), 1.0f, 2047.0f));
-				const float s = std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z);
-				n = { n.x / s, n.y / s, n.z / s };
-				const float ox = n.z >= 0.0f ? n.x : (1.0f - std::fabs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f);
-				const float oy = n.z >= 0.0f ? n.y : (1.0f - std::fabs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f);
-				const uint32_t qx = uint32_t(std::round(std::clamp(ox * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f));
-				const uint32_t qy = uint32_t(std::round(std::clamp(oy * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f));
-				return code | qx << 11 | qy << 18;
-			};
-			const vec3 facing = { -f.x, -f.y, -f.z };
-			const uint32_t wall_word = word(view_depth(wall_at), facing), pillar_word = word(view_depth(pillar_at), facing);
-			ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
-			ID3D12Resource *split_up = g.buffer(D3D12_HEAP_TYPE_UPLOAD, UINT64(W) * 4 * H, D3D12_RESOURCE_STATE_GENERIC_READ);
-			{
-				uint32_t *words = nullptr;
-				split_up->Map(0, nullptr, reinterpret_cast<void **>(&words));
-				for (UINT y = 0; y < H; ++y)
-					for (UINT x = 0; x < W; ++x)
-						words[size_t(y) * W + x] = LONG(x) >= p0 && LONG(x) < p1 ? pillar_word : wall_word;
-				split_up->Unmap(0, nullptr);
-				D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src = { split_up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-				dst.SubresourceIndex = 0;
-				src.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
-				g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-				g.run();
-			}
-			const float lantern[8] = { light.x, light.y, light.z, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
-			float lantern_glow[8];
-			std::memcpy(lantern_glow, lantern, sizeof(lantern_glow));
-			lantern_glow[7] = 0.0f;
-			const std::vector<uint8_t> unknown = frame(lantern, 1, 0.0f);
-			r.set_light_source([](void *c) { return static_cast<ID3D12Resource *>(c); }, split);
-			const std::vector<uint8_t> wall_unlit = frame(nullptr, 0, 0.0f), known = frame(lantern, 1, 0.0f), known_glow = frame(lantern_glow, 1, 0.0f),
-				known_shadow = frame(lantern, 1, 1.0f);
-			r.set_light_source(nullptr, nullptr);
-			cards.clear();
-			release(split);
-			release(split_up);
-			auto beside_lantern = [&](const std::vector<uint8_t> &img) {
-				double sum = 0.0;
-				uint32_t n = 0;
-				for (float d = 0.4f; d <= 0.9f; d += 0.1f)
-					for (float side : { -1.0f, 1.0f })
-					{
-						sum += around(img, on_screen(at_side(wall_at, d * side), nullptr)).luma;
-						n++;
-					}
-				return sum / n;
-			};
-			const double near_dark = beside_lantern(wall_unlit), near_unknown = beside_lantern(unknown), near_known = beside_lantern(known),
-				near_glow = beside_lantern(known_glow);
-			const auto walled = on_screen(at_side(wall_at, 2.6f), nullptr), clear = on_screen(at_side(wall_at, -2.6f), nullptr);
-			const double walled_lit = around(known, walled).luma, walled_shadow = around(known_shadow, walled).luma, walled_dark = around(wall_unlit, walled).luma;
-			const double clear_lit = around(known, clear).luma, clear_shadow = around(known_shadow, clear).luma;
-			std::printf("  with the light split: the wall beside a lantern %.1f unlit, %.1f lit without the split, %.1f with it, %.1f lit by a glow; behind a pillar %.1f -> %.1f with lamp shadows (%.1f unlit); clear the other side %.1f -> %.1f\n",
-				near_dark, near_unknown, near_known, near_glow, walled_lit, walled_shadow, walled_dark, clear_lit, clear_shadow);
-			check(near_unknown > near_dark + 5.0, "without the light split the lamp's glow is added as before");
-			// (grass.hlsl kLampsKnown off since 2026-10-29: the native zone lit by the game's own lamps again, World FX's glow on top as before)
-			check(std::fabs(near_known - near_unknown) < 0.5, "with it the zone's lamp glow is added as without it (kLampsKnown off)");
-			check(near_glow > near_dark + 5.0, "an effect's glow still lights what the light split knows");
-			check(walled_shadow < walled_lit - 2.0 && walled_shadow >= 0.0, "a lamp shadow takes the lamp's light away where the light split knows the pixel");
-			check(std::fabs(clear_shadow - clear_lit) < 0.5, "and leaves it where the way to the lamp is clear");
-		}
-
-		// 1p3. The native passes' lamp mark (HiFi XI's src/render/sun_shadows.hpp, [zone] nativelamps): the same lantern
-		// 0.6 yalms in front of a wall, every pixel of the wall in the light split. Where a word is marked (bit 31: the
-		// native pass lit the pixel from the published block) and the block the native passes read held the lamps (the
-		// frame's flag, zinfo.w bit 256: what World FX last published), World FX adds no glow: the picture as with no lamp
-		// at all, a zone's lamp or an effect's glow alike. An unmarked word, or a marked one when the block held no lamps
-		// (nothing published, or nativelamps off), gets the glow exactly as before.
-		{
-			const vec3 f = normalize(sub(at, eye));
-			const vec3 right = { cam.view[0], cam.view[4], cam.view[8] };
-			auto at_side = [&](const vec3 &p, float d) { return vec3 { p.x + right.x * d, p.y + right.y * d, p.z + right.z * d }; };
-			const vec3 wall_at = { at.x + f.x, at.y + f.y, at.z + f.z }, light = { wall_at.x - f.x * 0.6f, wall_at.y - f.y * 0.6f, wall_at.z - f.z * 0.6f };
-			float wall_ndc = 0.0f;
-			on_screen(wall_at, &wall_ndc);
-			cards = { { { 0, 0, LONG(W), LONG(H) }, wall_ndc } };
-			const float depth = wall_at.x * vp[3] + wall_at.y * vp[7] + wall_at.z * vp[11] + vp[15];
-			const uint32_t code = uint32_t(std::clamp(std::round((std::log2(std::max(depth, 1e-3f)) + 3.0f) * 128.0f), 1.0f, 2047.0f));
-			// (facing the camera: the octahedral code of the view's -forward, as 1p2's word)
-			vec3 n = { -f.x, -f.y, -f.z };
-			const float s = std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z);
-			n = { n.x / s, n.y / s, n.z / s };
-			const float ox = n.z >= 0.0f ? n.x : (1.0f - std::fabs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f);
-			const float oy = n.z >= 0.0f ? n.y : (1.0f - std::fabs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f);
-			const uint32_t plain_word = code | uint32_t(std::round(std::clamp(ox * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f)) << 11 |
-				uint32_t(std::round(std::clamp(oy * 0.5f + 0.5f, 0.0f, 1.0f) * 127.0f)) << 18;
-			auto split_of = [&](uint32_t word) {
-				ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
-				ID3D12Resource *up = g.buffer(D3D12_HEAP_TYPE_UPLOAD, UINT64(W) * 4 * H, D3D12_RESOURCE_STATE_GENERIC_READ);
-				uint32_t *words = nullptr;
-				up->Map(0, nullptr, reinterpret_cast<void **>(&words));
-				for (size_t i = 0; i < size_t(W) * H; ++i)
-					words[i] = word;
-				up->Unmap(0, nullptr);
-				D3D12_TEXTURE_COPY_LOCATION dst = { split, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src = { up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-				dst.SubresourceIndex = 0;
-				src.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_UINT, W, H, 1, W * 4 };
-				g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-				g.run();
-				release(up);
-				return split;
-			};
-			ID3D12Resource *unmarked = split_of(plain_word), *marked = split_of(plain_word | 0x80000000u);
-			const float lantern[8] = { light.x, light.y, light.z, 4.0f * 1.5f, 1.469f * strength, 1.0f * strength, 0.219f * strength, 1.0f };
-			float lantern_glow[8];
-			std::memcpy(lantern_glow, lantern, sizeof(lantern_glow));
-			lantern_glow[7] = 0.0f;
-			// (a frame: the split, the options, what the block the native passes read held, as World FX published it before)
-			auto shot = [&](ID3D12Resource *split, bool native_lamps, bool native_shadows, uint32_t held, const float *lamp) {
-				hifi::sun::set_native(native_shadows);
-				hifi::sun::set_native_lamps(native_lamps);
-				if (held != 0)
-				{
-					hifi::sun::block b;
-					b.device = g.device;
-					b.gpu.mode[2] = held;
-					hifi::sun::publish(b);
-				}
-				else
-					hifi::sun::publish_none();
-				r.set_light_source([](void *c) { return static_cast<ID3D12Resource *>(c); }, split);
-				return frame(lamp, lamp != nullptr ? 1 : 0, 0.0f);
-			};
-			const uint32_t lamps_held = hifi::sun::kHasLamps;
-			const std::vector<uint8_t> dark = shot(unmarked, false, false, 0, nullptr), lit = shot(unmarked, false, false, 0, lantern),
-				lit_glow = shot(unmarked, false, false, 0, lantern_glow);
-			const std::vector<uint8_t> done = shot(marked, true, false, lamps_held, lantern), done_glow = shot(marked, true, false, lamps_held, lantern_glow);
-			const std::vector<uint8_t> not_marked = shot(unmarked, true, false, lamps_held, lantern), not_marked_glow = shot(unmarked, true, false, lamps_held, lantern_glow);
-			const std::vector<uint8_t> none_held = shot(marked, true, false, 0, lantern), lamps_off = shot(marked, false, true, lamps_held, lantern);
-			hifi::sun::set_native(false);
-			hifi::sun::set_native_lamps(false);
-			hifi::sun::publish_none();
-			r.set_light_source(nullptr, nullptr);
-			cards.clear();
-			release(unmarked);
-			release(marked);
-			auto most = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
-				int d = 0;
-				for (size_t i = 0; i < size_t(W) * H * 4; ++i)
-					d = std::max(d, std::abs(int(a[i]) - int(b[i])));
-				return d;
-			};
-			auto beside = [&](const std::vector<uint8_t> &img) {
-				return (around(img, on_screen(at_side(wall_at, 0.6f), nullptr)).luma + around(img, on_screen(at_side(wall_at, -0.6f), nullptr)).luma) / 2.0;
-			};
-			std::printf("  1p3 the lamp mark: the wall beside the lantern %.1f unlit, %.1f lit; marked with the lamps held %.1f (%d at most off the unlit, a glow %d); "
-				"unmarked %d off the lit (a glow %d); marked with none held %d off, with nativelamps off %d off\n",
-				beside(dark), beside(lit), beside(done), most(done, dark), most(done_glow, dark), most(not_marked, lit), most(not_marked_glow, lit_glow),
-				most(none_held, lit), most(lamps_off, lit));
-			check(beside(lit) > beside(dark) + 5.0 && beside(lit_glow) > beside(dark) + 5.0, "1p3: the lantern and the glow light the wall (the light split's words unmarked)");
-			check(most(done, dark) <= 1, "1p3: a marked pixel with the lamps frame flag gets no World FX glow");
-			check(most(done_glow, dark) <= 1, "1p3: nor an effect's glow there");
-			check(most(not_marked, lit) == 0 && most(not_marked_glow, lit_glow) == 0, "1p3: an unmarked pixel gets the glow exactly as before, the flag set or not");
-			check(most(none_held, lit) == 0, "1p3: a marked pixel when the block held no lamps gets it exactly as before");
-			check(most(lamps_off, lit) == 0, "1p3: and with nativelamps off (nativeshadows on), whatever was published");
+			frame(lamp, 1, 1.0f);
+			check(lamp_st.lamp_maps == 0 && lamp_st.lamp_map_faces == 0, "without the host's zone no cube is drawn");
+			hifi::sun::release();
 		}
 		check(g.report_messages() == 0, "no debug-layer errors (lamps)");
 	}
@@ -6124,82 +4774,6 @@ lamps:
 		}
 		else
 			std::printf("  (build\\testdata\\rain\\104.bin: %s: the packed rain map not checked)\n", why.c_str());
-	}
-
-	// 1w. The compact shadow file (SHD2: each model once and the zone's placements, packed), as the add-on reads it,
-	// holds what the triangle soup (SHD1) of the same zone holds: the same cells in the same order, every triangle
-	// with its cut-out word, at the same place (within a millimetre: the placements are kept as floats), the same
-	// cut-out masks. Both are written by tests\t_bake_shadow.py (build\test\shd1_<zone>.bin, shd2_<zone>.bin and a
-	// stored, unpacked shd2s_<zone>.bin); a damaged one is refused
-	for (const wchar_t *zone : { L"100", L"104" })
-	{
-		const std::wstring dir = L"build\\test\\";
-		shadow_file soup, compact, stored;
-		std::string why1, why2, why3;
-		const bool r1 = read_shadow_file((dir + L"shd1_" + zone + L".bin").c_str(), soup, why1);
-		if (!r1)
-		{
-			std::printf("  (build\\test\\shd1_%ls.bin: %s: run tests\\t_bake_shadow.py; the compact shadow file not checked)\n", zone, why1.c_str());
-			continue;
-		}
-		const auto t0 = std::chrono::steady_clock::now();
-		const bool r2 = read_shadow_file((dir + L"shd2_" + zone + L".bin").c_str(), compact, why2);
-		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-		const bool r3 = read_shadow_file((dir + L"shd2s_" + zone + L".bin").c_str(), stored, why3);
-		bool cells_same = r2 && soup.cells.size() == compact.cells.size();
-		for (size_t c = 0; cells_same && c < soup.cells.size(); ++c)
-			cells_same = soup.cells[c].cx == compact.cells[c].cx && soup.cells[c].cz == compact.cells[c].cz &&
-				soup.cells[c].first == compact.cells[c].first && soup.cells[c].count == compact.cells[c].count;
-		bool words_same = r2 && soup.triangles.size() == compact.triangles.size();
-		float most = 0.0f;
-		for (size_t i = 0; words_same && i < soup.triangles.size(); i += 4)
-		{
-			words_same = soup.triangles[i + 3] == compact.triangles[i + 3];
-			for (int a = 0; a < 3; ++a)
-			{
-				float x, y;
-				std::memcpy(&x, &soup.triangles[i + a], 4);
-				std::memcpy(&y, &compact.triangles[i + a], 4);
-				most = std::max(most, std::fabs(x - y));
-			}
-		}
-		const bool masks_same = r2 && soup.masks == compact.masks && soup.words == compact.words;
-		const bool stored_same = r3 && stored.triangles == compact.triangles && stored.cells.size() == compact.cells.size() && stored.masks == compact.masks;
-		std::printf("  zone %ls: soup %u triangles in %zu cells; compact read and expanded in %.0f ms: %u triangles in %zu cells, at most %.5f yalms off\n",
-			zone, soup.triangle_count(), soup.cells.size(), ms, compact.triangle_count(), compact.cells.size(), most);
-		check(r2 && cells_same, "a compact shadow file expands into the soup's cells, in its order");
-		check(words_same && most < 1e-3f, "every triangle at the same place with the same cut-out word");
-		check(masks_same, "the same cut-out masks");
-		check(stored_same, "an unpacked (stored) compact file reads the same");
-		// The same file with one placement naming a model that isn't there: refused, nothing kept
-		std::vector<uint8_t> bytes;
-		if (FILE *f = nullptr; _wfopen_s(&f, (dir + L"shd2s_" + zone + L".bin").c_str(), L"rb") == 0 && f != nullptr)
-		{
-			fseek(f, 0, SEEK_END);
-			bytes.resize(size_t(ftell(f)));
-			fseek(f, 0, SEEK_SET);
-			bytes.resize(fread(bytes.data(), 1, bytes.size(), f));
-			fclose(f);
-		}
-		if (bytes.size() > 64)
-		{
-			uint32_t models = 0, model_tris = 0;
-			std::memcpy(&models, bytes.data() + 12, 4);
-			std::memcpy(&model_tris, bytes.data() + 16, 4);
-			const size_t first_placement = 64 + size_t(models) * 8 + size_t(model_tris) * 48;
-			const uint32_t bad = models + 5;
-			std::memcpy(bytes.data() + first_placement, &bad, 4);
-			const std::wstring broken = dir + L"shd2_broken.bin";
-			if (FILE *f = nullptr; _wfopen_s(&f, broken.c_str(), L"wb") == 0 && f != nullptr)
-			{
-				fwrite(bytes.data(), 1, bytes.size(), f);
-				fclose(f);
-			}
-			shadow_file refused;
-			std::string why;
-			check(!read_shadow_file(broken.c_str(), refused, why) && why == "the file is damaged" && refused.triangles.empty(),
-				"a compact file naming a model it doesn't hold is refused");
-		}
 	}
 
 	// 1u. Snow (grass off), on 1s's rain map of flat ground (the camera 2 yalms over it). By name, snow and blizzards
@@ -7264,8 +5838,11 @@ float4 ps_main(vout i) : SV_Target { return i.c; }
 						darker += lum_of(shaded, i) + 4.0 < lum_of(unshaded, i) ? 1 : 0;
 					}
 				std::printf("  the clouds' shadows: %u of %u ground pixels 40 to 600 yalms off darker under them; with the sun's shadows off %u changed\n", darker, ground_n, off_changed);
-				check(st_s.cloud_shadows && !st_o.cloud_shadows && darker > ground_n / 20 && darker < ground_n * 19 / 20,
-					"the clouds' shadows on the ground in patches (their own map made)");
+				// (their map is still made, for the native passes, which take the clouds' shadows from the block with the
+				// sun's: sun_shadows.hpp's ss_cloud_lit; World FX itself no longer darkens the picture by it. The patches on
+				// the ground this checked before are the native passes' to draw: no ground of theirs in this test.)
+				check(st_s.cloud_shadows && !st_o.cloud_shadows && ground_n > 1000 && darker == 0,
+					"the clouds' shadows' own map made (with the sun's shadows on), the picture not darkened by it here");
 				check(off_changed == 0, "no clouds' shadows with the sun's shadows off");
 
 				// By night (the moon's shadows on): none either. The same clouds, the night at its deepest: the ground as without

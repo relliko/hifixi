@@ -30,16 +30,13 @@
  *   ZONE_VIEW_BIAS=<b>: the colour maps' extra mip bias (draw_options::texture_bias), for the FSR A/B: e.g. Quality's
  *     -0.585 at ZONE_VIEW_SIZE 2/3 of the full size
  *   HIFIXI_PIVOT_INI: the overlays (zonemesh's dat_core; unset: config\pivot\pivot.ini beside build\, none here)
- *   ZONE_VIEW_FX=old|native: World FX's shading over the zone as in game (src/render: the sun's cascades from the zone's
- *     own meshes, src/zone/zoneshadow; the light split): "old" its sun shadows darkened onto the finished picture by its
- *     shading pass, "native" looked up by the zone pass itself ([zone] nativeshadows, src/render/sun_shadows.hpp). Two
- *     frames, the second the picture (the zone pass reads what World FX drew the frame before, as in game). No ambient
- *     occlusion or relief; ZONE_VIEW_SHADOW=<strength> the sun shadows' strength (0.55, the High preset's);
- *     ZONE_VIEW_CLOUDS: unused (no weather here, so no clouds' shadows). With ZONE_VIEW_LAMPS, "native" also has the
- *     zone pass add World FX's lamp glow itself ([zone] nativelamps, sun_shadows.hpp's lamps; no characters here: no
- *     capsules), and both modes run 28 frames before the picture's, so the lamps' cubes are drawn (a face a frame) as
- *     they are in game after a moment; "native-shadows" and "native-lamps": only the one of the two; "native-faithful":
- *     both, the lamps' glow as World FX's own, ported (sun_shadows.hpp's kLookFaithful; "native" is the tuned look).
+ *   ZONE_VIEW_FX=native (any word but 0 or off): World FX over the zone as in game (src/render: the sun's cascades from
+ *     the zone's own meshes, src/zone/zoneshadow; the light split), its block looked up by the zone pass itself for the
+ *     sun's shadows and the lamps' glow (src/render/sun_shadows.hpp). Two frames, the second the picture (the zone pass
+ *     reads what World FX drew the frame before, as in game). No ambient occlusion or relief;
+ *     ZONE_VIEW_SHADOW=<strength> the sun shadows' strength (0.55, the High preset's); ZONE_VIEW_CLOUDS: unused (no
+ *     weather here, so no clouds' shadows). With ZONE_VIEW_LAMPS 28 frames run before the picture's, so the lamps' cubes
+ *     are drawn (a face a frame) as they are in game after a moment.
  *     ZONE_VIEW_BODY="x y z size": a character standing there (its capsule: the lamps' shadows); ZONE_VIEW_SMALLROOM=1:
  *     lit as a Mog House; ZONE_VIEW_FXLAMPS=0: World FX given no lamps; ZONE_VIEW_REPEAT=<n>: the zone pass n times over
  *   ZONE_VIEW_GRASS=<folder> (with ZONE_VIEW_FX): the zone's baked grass (<map>.bin: bootloader\worldfx-grass) drawn by
@@ -722,7 +719,8 @@ int main(int argc, char **argv)
 	std::string fx_mode;
 	if (char fm[16] = ""; GetEnvironmentVariableA("ZONE_VIEW_FX", fm, sizeof(fm)) != 0)
 		fx_mode = fm;
-	const bool fx = fx_mode == "old" || fx_mode == "native" || fx_mode == "native-shadows" || fx_mode == "native-lamps" || fx_mode == "native-faithful";
+	// (any of the old modes' names turns it on: there is one lighting path now, the native passes')
+	const bool fx = !fx_mode.empty() && fx_mode != "0" && fx_mode != "off";
 	grass::renderer wfx;
 	hifi::zone::zone_shadow casters;
 	struct caster_context
@@ -780,10 +778,6 @@ int main(int argc, char **argv)
 				return x->shadow->record(l, *x->zone, m, dsv, size, false, x->env, rtv);
 			},
 			&cc);
-		hifi::sun::set_native(fx_mode == "native" || fx_mode == "native-shadows" || fx_mode == "native-faithful");
-		hifi::sun::set_native_lamps(fx_mode == "native" || fx_mode == "native-lamps" || fx_mode == "native-faithful");
-		// ("native-faithful": the lamps' glow as World FX's, ported; "native": the tuned look, the plugin's)
-		hifi::sun::set_lamp_look(fx_mode == "native-faithful" ? hifi::sun::kLookFaithful : hifi::sun::kLookTuned);
 		(void)hifi::light::take(); // (asked: the zone pass draws it from the first frame)
 	}
 	grass::camera cam;
@@ -794,6 +788,33 @@ int main(int argc, char **argv)
 	fl.water = false;
 	fl.sea = false;
 	fl.fireflies = 0.0f;
+	// (ZONE_VIEW_WATER=<folder>: the zone's baked water from there, <map>.bin (WTR2: bootloader\worldfx-water), drawn by
+	// World FX; ZONE_VIEW_SNOW=<folder>: the zone's rain map from there, <map>.bin (bootloader\worldfx-rain), and a whole
+	// layer of settled snow on it, with its depth. Both with ZONE_VIEW_FX.)
+	if (wchar_t wf[MAX_PATH] = L""; fx && GetEnvironmentVariableW(L"ZONE_VIEW_WATER", wf, MAX_PATH) != 0)
+	{
+		grass::blade_file water;
+		std::string water_why;
+		if (!grass::read_blade_file((std::wstring(wf) + L"\\" + std::to_wstring(map) + L".bin").c_str(), water, water_why, "WTR2", 8) || !wfx.upload_water(water, water_why))
+		{
+			std::printf("ZONE_VIEW_WATER: %s\n", water_why.c_str());
+			return 1;
+		}
+		fl.water = true;
+		fl.time = 3.0f;
+	}
+	if (wchar_t sf[MAX_PATH] = L""; fx && GetEnvironmentVariableW(L"ZONE_VIEW_SNOW", sf, MAX_PATH) != 0)
+	{
+		grass::rain_file rain;
+		std::string snow_why;
+		if (!grass::read_rain_file((std::wstring(sf) + L"\\" + std::to_wstring(map) + L".bin").c_str(), rain, snow_why) || !wfx.upload_rain(std::move(rain), snow_why))
+		{
+			std::printf("ZONE_VIEW_SNOW: %s\n", snow_why.c_str());
+			return 1;
+		}
+		fl.snow_cover = 1.0f;
+		fl.snow_depth = 1.0f;
+	}
 	// (ZONE_VIEW_FXLAMPS=0: World FX given no lamps, the zone pass's own kept: what the glow adds, against the same with it)
 	if (char fxl[8] = ""; GetEnvironmentVariableA("ZONE_VIEW_FXLAMPS", fxl, sizeof(fxl)) != 0 && fxl[0] == '0')
 		fx_lamps.clear();
@@ -864,7 +885,7 @@ int main(int argc, char **argv)
 		bt.rtv_format = t.rtv_format;
 		bt.dsv_format = t.dsv_format;
 		bt.blades_into_world_depth = true;
-		const bool split = hifi::sun::marked() && hifi::light::begin(l, device, target, bt.light_rtv);
+		const bool split = hifi::light::begin(l, device, target, bt.light_rtv);
 		if (!split)
 			bt.light_rtv = {};
 		std::string error;

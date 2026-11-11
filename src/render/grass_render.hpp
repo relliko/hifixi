@@ -62,12 +62,12 @@ namespace grass
 	// zone" when there's none (a zone the bake keeps none for has a .none file instead: the same).
 	bool read_sea_file(const wchar_t *path, blade_file &out, uint32_t &sheets, std::string &error);
 
-	// The zone's visual meshes as one triangle soup, for the sun's shadow map (tools/bake_shadow_geo.py, tag
-	// 'SHD1'): triangles grouped in square cells by their centre, 12 words each: three corners of x, y, z (floats)
-	// and w (0 on a solid triangle; on a cut-out one, u | v << 12 | mask << 24: 12-bit texture coordinates and
-	// the cut-out texture's index + 1). The cut-out textures' alpha as bits: 4 words each (width, height, first
-	// word, words a row), then the words. A compact file ('SHD2': each model once and the zone's placements, packed)
-	// is expanded into the same when read.
+	// Casters for the sun's shadow map as one triangle soup (upload_shadow), for a host with no zone of its own to draw
+	// them (set_zone_casters: HiFi XI draws its own; this is what the offline tests draw their cascades from, and what
+	// the baked SHD1 / SHD2 files of the ReShade add-on held: those files aren't read any more): triangles grouped in
+	// square cells by their centre, 12 words each: three corners of x, y, z (floats) and w (0 on a solid triangle; on a
+	// cut-out one, u | v << 12 | mask << 24: 12-bit texture coordinates and the cut-out texture's index + 1). The
+	// cut-out textures' alpha as bits: 4 words each (width, height, first word, words a row), then the words.
 	struct shadow_file
 	{
 		uint32_t zone = 0;
@@ -78,7 +78,6 @@ namespace grass
 		std::vector<uint32_t> words;
 		uint32_t triangle_count() const { return static_cast<uint32_t>(triangles.size() / 12); }
 	};
-	bool read_shadow_file(const wchar_t *path, shadow_file &out, std::string &error);
 
 	// Where a zone's ground is path or stone (tools/bake_wet.py, tag 'WET1'), for the wet look in rain: a mask seen
 	// from above, a bit a square (square yalms across), set where the topmost surface facing up there is path or
@@ -274,9 +273,6 @@ namespace grass
 		uint32_t fighting = 0;
 		const float *cuts = nullptr;
 		uint32_t cut_count = 0;
-		// Colour rules: a root's colour samples leave out what isn't at the ground's height (characters, trees,
-		// names, the background) and samples far brighter or darker than the rest
-		bool rule_in_front = true, rule_outliers = true;
 		bool grass = true;              // the blades (off: only the shading below)
 		// The shading pass, before the grass and the interface: ambient occlusion (0 off) within a radius, and
 		// surface relief from the textures' own detail (0 off: no longer a setting since 0.59, the native zone's and
@@ -284,13 +280,15 @@ namespace grass
 		// into a grain everywhere)
 		float ao_strength = 0.0f, ao_radius = 1.0f, relief = 0.0f;
 		// Sun shadows: toward the sun (the game's world: x east, y height with down positive, z north, a unit
-		// vector) and how dark its shadows are (0: none, the sun down or no sky)
+		// vector) and how dark its shadows are (0: none, the sun down or no sky). The shadows themselves are the native
+		// passes' (sun_shadows.hpp: the cascades drawn here and published for them); the shading pass adds its contact
+		// shadows, a short march across the screen, by the same strength
 		float sun[3] = { 0.0f, -1.0f, 0.0f };
 		float sun_shadow = 0.0f;
-		// Whether characters and monsters (actors) cast sun shadows too: the game draws theirs itself
+		// Whether characters and monsters cast sun shadows too (the game draws its own small ones): their meshes drawn
+		// into the casters' map each frame (set_casters), published with the cascades
 		bool sun_characters = false;
-		// The sun's shadow map from the zone's own meshes (upload_shadow), when loaded: what's off screen casts
-		// too, and the march across the screen only reaches a couple of yalms there (contact shadows)
+		// The sun's shadow map drawn (the cascades, from the host's zone: set_zone_casters)
 		bool sun_map = true;
 		// Water, on the surface rebuilt over the zone's water collision: reflections (0 none, 1 as real water,
 		// up to 2), ripples (0 a still mirror) and darker where deep (0 none), within this many yalms. The sky
@@ -561,7 +559,7 @@ namespace grass
 		uint32_t sea_corners = 0;   // of the sea's sheets drawn
 		uint32_t fireflies = 0;     // firefly homes drawn (most of them dark or empty at any moment)
 		uint32_t lamps = 0;         // lamps whose glow the shading pass added
-		uint32_t lamp_maps = 0;     // ... with a shadow map ready (draw_lamp_maps): their shadows from it, the rest marched
+		uint32_t lamp_maps = 0;     // ... with a shadow cube drawn and where the native passes read it (draw_lamp_maps)
 		uint32_t lamp_map_faces = 0, lamp_map_triangles = 0; // cube faces drawn into them this frame, and their triangles
 		uint32_t lamp_native_copies = 0; // cubes copied this frame to where HiFi XI's native passes read them (sun_shadows.hpp's lamps)
 		bool wet = false;           // the wet look on path and stone in the shading pass
@@ -847,7 +845,6 @@ namespace grass
 		// data has changed or kFloorEvery seconds have passed (the light moves), then copied into the start of the blades'
 		// memory (u0) after its header; false when there's none (the header then says so)
 		bool draw_floor(ID3D12GraphicsCommandList *list, const float eye[3], double now);
-		void caster_params(const camera &cam, float out[16]) const;
 		// The cascades, the casters' map and the clouds' shadows to HiFi XI's native passes, in world space (sun_shadows.hpp):
 		// casters whether the casters' map was drawn, cloud (8 floats, nullptr: none) the clouds' map's corner x z, texel,
 		// strength, toward the light x y z, ground height; strength the sun's shadows'. Into b (its buffer the copy, its
@@ -1032,8 +1029,6 @@ namespace grass
 			uint64_t source = 0;
 			uint32_t faces = 0; // (drawn so far: one a frame)
 			bool used = false, drawn = false;
-			ID3D12Resource *copied_to = nullptr;
-			UINT64 copied_at = 0;
 			// (... and the buffer the native passes read them from, and where in it: lamp_dest; sun_shadows.hpp's lamps)
 			ID3D12Resource *native_to = nullptr;
 			UINT64 native_at = 0;
@@ -1041,7 +1036,6 @@ namespace grass
 		lamp_cube _lamp_cubes[4];
 		ID3D12Resource *_lamp_map = nullptr;
 		ID3D12DescriptorHeap *_lamp_map_heap = nullptr;
-		UINT64 _lamp_tail = 0;
 		// The cubes for the native passes ([zone] nativelamps): in the sun's shadow map copy after the clouds' map
 		// (_lamp_copy_at), or, while there's no such copy (no sun map wanted yet: indoors, a night start), in a buffer of
 		// their own (_lamp_native: written only by copies, left NON_PIXEL | PIXEL_SHADER_RESOURCE, as the sun's copy)

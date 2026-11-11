@@ -29,6 +29,7 @@
 #include "gpu_crash.hpp"
 #include "vistest.hpp"
 #include "lamp_glow.hpp"
+#include "sun_shadows.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -736,6 +737,9 @@ namespace
 		g.weather_share = 1.0f;
 		g.zone_entered_at = GetTickCount64();
 		g.ground_known = false; // (the ground under the camera found again in the new zone)
+		// (the last zone's cascades and lamps aren't the new one's: the block the native passes light from let go at once,
+		// not left to go stale: src/render/sun_shadows.hpp)
+		hifi::sun::release();
 		g.renderer->unload();
 		g.renderer->unload_water();
 		g.renderer->unload_sea();
@@ -857,22 +861,10 @@ namespace
 				std::snprintf(sea_status, sizeof(sea_status), "zone %u: %s", zone, why == "no file for this zone" ? "no sea" : why.c_str());
 			g.sea_status = sea_status;
 		}
-		// The zone's meshes for the sun's shadow map (tools/bake_shadow_geo.py), unless the host draws the zone's casters
-		// itself (set_zone_casters: HiFi XI's native zone)
-		if (g.zone_bounds != nullptr && g.zone_draw != nullptr)
-			g.shadow_status = "zone " + std::to_string(zone) + ": the host's own zone casts the shadows";
-		else
-		{
-			const std::wstring shadow_path = addon_folder() + L"worldfx-shadow\\" + std::wstring(name, name + std::strlen(name));
-			grass::shadow_file meshes;
-			std::string why;
-			char shadow_status[128];
-			if (grass::read_shadow_file(shadow_path.c_str(), meshes, why) && g.renderer->upload_shadow(meshes, why))
-				std::snprintf(shadow_status, sizeof(shadow_status), "zone %u: %u triangles, %zu cut-out textures", zone, meshes.triangle_count(), meshes.masks.size() / 4);
-			else
-				std::snprintf(shadow_status, sizeof(shadow_status), "zone %u: %s", zone, why == "no file for this zone" ? "no meshes (screen-space shadows only)" : why.c_str());
-			g.shadow_status = shadow_status;
-		}
+		// The sun's shadow map is drawn from the host's own zone (set_zone_casters: HiFi XI's native zone). (The baked
+		// meshes, worldfx-shadow\<zone>.bin, SHD2, aren't read any more: a folder of them left behind is ignored.)
+		g.shadow_status = g.zone_bounds != nullptr && g.zone_draw != nullptr ? "zone " + std::to_string(zone) + ": the host's own zone casts the shadows" :
+			"zone " + std::to_string(zone) + ": no zone to cast them (contact shadows only)";
 		const std::wstring path = addon_folder() + L"worldfx-grass\\" + std::wstring(name, name + std::strlen(name));
 		grass::blade_file file;
 		std::string error;

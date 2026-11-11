@@ -125,7 +125,7 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   then; `chardraw.cpp:1879`), so the shader never reads a height as a detail map; charinject_test's heights part
   (a height alone, a colour and a height, a colour alone) is silent under the debug layer and GPU-based validation
   (WARP and the 4070 Ti).
-- The native sun shadows (`src/render/sun_shadows.hpp`, [zone] nativeshadows): no table, no heap. The zone's root
+- The native sun shadows (`src/render/sun_shadows.hpp`): no table, no heap. The zone's root
   signature has two more root parameters, 8 a CBV at b2 (the shadow block, in the zone's upload ring after the lamps,
   256-aligned: `draw.cpp` `kShadowAt`) and 9 an SRV at t6 (World FX's shadow map copy, a raw buffer), pixel shader only:
   10 parameters, 20 DWORDs (`draw.cpp:777`). The characters' the same at 7 (b2, after the ring slot's two halves:
@@ -133,7 +133,7 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   model or zone draw (`zone_renderer::record`, `char_renderer::begin`); with no block to apply the CBV says so (`ss_sun.w`
   0 and `ss_mode.z` 0, no lookup runs) and the SRV gets the ring's own address, valid and never read: a root SRV has no
   bounds and no null. The casters' and composite draws bind neither: their shaders don't read b2/t6/t7.
-- The native lamps ([zone] nativelamps, sun_shadows.hpp's lamps) add **no root parameter**: the same block carries the
+- The native lamps (sun_shadows.hpp's lamps) add **no root parameter**: the same block carries the
   lamp list, the cubes' place and the characters' capsules (`sun::gpu_block` 1168 bytes, the CBV's slot `kBlockBytes`
   1280: both rings' slots grow with it), and the same SRV carries the lamps' cubes (in World FX's copy after the
   clouds' map, or in the cubes' own buffer when there's no sun map). A block with lamps and no cube has no buffer at

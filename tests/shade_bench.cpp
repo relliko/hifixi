@@ -984,15 +984,10 @@ int main(int argc, char **argv)
 	uint32_t map_triangles = 0;
 	if (map_file != nullptr)
 	{
-		shadow_file zone;
-		const std::wstring wide(map_file, map_file + std::strlen(map_file));
-		if (!read_shadow_file(wide.c_str(), zone, error) || !r.upload_shadow(zone, error))
-		{
-			std::printf("shadow map %s: %s\n", map_file, error.c_str());
-			return 1;
-		}
-		map_triangles = zone.triangle_count();
-		std::printf("shadow map: %s, %u triangles\n", map_file, map_triangles);
+		// (the baked shadow files, SHD1 / SHD2, aren't read any more: the sun's map is drawn from the host's own zone, and
+		// its shadows are the native passes'. zone_view times that: ZONE_VIEW_FX)
+		std::printf("map=%s: the baked shadow files aren't read any more (the cleanup of 2026-11-11); use zone_view for the sun's map\n", map_file);
+		return 1;
 	}
 	if (grass_file != nullptr)
 	{

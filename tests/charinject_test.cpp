@@ -1380,11 +1380,11 @@ int main(int argc, char **argv)
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		}
 		inj::set_lamps(nullptr, 0);
-		// World FX's lamp glow added by the characters' pass itself ([zone] nativelamps: src/render/sun_shadows.hpp's
-		// lamps): the middle one alone under the sun again (seqs 26 on), a block published as World FX publishes it with
-		// a lamp 3.5 yalms in front of it (reach 9), the light split asked for. Per pixel with the option on it gets
-		// brighter and every word it writes is marked; the option off, or per vertex: the picture without a block, byte
-		// for byte. A zone's lamp (it casts): its own capsule doesn't shadow it, another's standing between does.
+		// World FX's lamp glow added by the characters' pass itself (src/render/sun_shadows.hpp's lamps): the middle one
+		// alone under the sun again (seqs 26 on), a block published as World FX publishes it with a lamp 3.5 yalms in front
+		// of it (reach 9), the light split asked for. It gets brighter and every word it writes is marked, lit per pixel or
+		// per vertex. A zone's lamp (it casts): its own capsule doesn't shadow it, another's standing between does.
+		// (The cases "[zone] nativelamps off" and "per vertex: the picture without a block" went with the switch.)
 		struct glow_pass
 		{
 			bool per_pixel, option, block;
@@ -1416,8 +1416,6 @@ int main(int argc, char **argv)
 			const uint32_t s = 26 + k;
 			lamp_frame(s, false);
 			inj::set_options(gp.per_pixel, getenv("CHARS_DETAIL") != nullptr);
-			sun::set_native_lamps(gp.option);
-			sun::set_lamp_look(gp.tuned ? sun::kLookTuned : sun::kLookFaithful);
 			if (gp.block)
 			{
 				sun::block b;
@@ -1434,6 +1432,7 @@ int main(int argc, char **argv)
 				const float own[4] = { root[0], root[1], root[2], 1.0f };
 				const float other[4] = { 0.5f * (root[0] + at[0]), root[1], 0.5f * (root[2] + at[2]), 1.0f };
 				std::memcpy(g.body[0], gp.body == 2 ? other : own, 16);
+				g.lamp_map[3] = gp.tuned ? 0.0f : 1.0f; // (the faithful look: the block's small-room word, a Mog House's)
 				sun::publish(b);
 			}
 			else
@@ -1462,9 +1461,7 @@ int main(int argc, char **argv)
 				barrier(list, split, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, hifi::light::kRead);
 			}
 		}
-		hifi::sun::set_native_lamps(false);
 		hifi::sun::release();
-		hifi::sun::set_lamp_look(hifi::sun::kLookTuned);
 		inj::set_options(getenv("CHARS_PERPIXEL") != nullptr, getenv("CHARS_DETAIL") != nullptr);
 		inj::set_sun(nullptr);
 		list->Close();
@@ -1536,9 +1533,9 @@ int main(int argc, char **argv)
 			std::snprintf(line, sizeof(line), "World FX's lamp glow by the characters' pass (a block with a lamp 3.5 yalms in front): the middle one %.1f -> %.1f, %u of %u words marked "
 				"(none without the block: %u of %u)", glow_mean[0], glow_mean[1], marked[1], coded[1], marked[0], coded[0]);
 			check(glow_mean[1] > glow_mean[0] + 3.0 && coded[1] > 1000 && marked[1] == coded[1] && coded[0] > 1000 && marked[0] == 0, line);
-			check(img[2] == img[0], "  the option off, the block there: the picture as with no block, byte for byte");
-			std::snprintf(line, sizeof(line), "  per vertex with the block: the per-vertex picture, byte for byte, %u of %u words marked", marked[4], coded[4]);
-			check(img[4] == img[3] && img[3] != img[0] && coded[4] > 1000 && marked[4] == 0, line);
+			check(img[2] == img[1], "  the same block again: the same picture, byte for byte");
+			std::snprintf(line, sizeof(line), "  per vertex with the block: the middle one %.1f -> %.1f, %u of %u words marked", glow_mean[3], glow_mean[4], marked[4], coded[4]);
+			check(img[3] != img[0] && glow_mean[4] > glow_mean[3] + 3.0 && coded[4] > 1000 && marked[4] == coded[4], line);
 			std::snprintf(line, sizeof(line), "  a zone's lamp %.1f; with its own capsule in the block %.1f (it doesn't shadow itself); another's standing between %.1f",
 				glow_mean[5], glow_mean[6], glow_mean[7]);
 			check(std::fabs(glow_mean[5] - glow_mean[1]) < 0.5 && std::fabs(glow_mean[6] - glow_mean[5]) < 1.0 && glow_mean[7] < glow_mean[5] - 1.0 &&

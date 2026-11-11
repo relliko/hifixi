@@ -8,15 +8,17 @@ cbuffer grass : register(b0)
 	float4 color;  // rgb: the grass's hue, w: seconds (wind)
 	float4 blade;  // x: height, y: half the base, z: blades per tuft, w: first point of this draw (uint bits)
 	uint4 ground;  // x: row pitch in uints, y, z: size, w: 0 none, 1 RGBA8, 2 BGRA8, 3 RGBA16F (the float world)
-	uint4 crowd;   // x: actors in t2 (low 16 bits), colour rules on (bits 16+: 1 only the ground, 2 outliers),
-	               // 4 characters cast sun shadows, 8 the shadow map's parameters in t2, 16 lamps in t2 (after them),
-	               // 32 the game's fog in t2 (after those); y, z, w: toward the sun, view space (float bits)
+	uint4 crowd;   // x: actors in t2 (low 16 bits), what else is there (bits 16+: 8 the shadow map's parameters in t2,
+	               // for the light in the air; 32 the game's fog in t2; the rest where each is described; 1, 2, 4 and
+	               // 16, the colour rules', the capsule shadows' and the lamps', aren't used any more: the lamps'
+	               // place in t2 stays empty); y, z, w: toward the sun, view space (float bits)
 	uint4 zinfo;   // the depth copy: x: row pitch in uints, y, z: size, w: 0 none, 1 D24 (low 24 bits), 2 D32 float
 	float4 lin;    // x: projection _33 / _34, y: _43 (distance along the view w = y / (d - x)); z, w: _11 and _22
 	float4 up_row; // xyz: the view matrix's second row (a view-space point's world height = eye.y + dot(it, this)),
 	               // w: projection _34 (view z = w * it: the game's is right-handed, -1)
 	float4 shade;  // the shading pass: x: ambient occlusion strength, y: its radius (yalms), z: surface relief strength,
-	               // w: sun shadow strength (0: none, the sun down or no sky)
+	               // w: sun shadow strength (0: none, the sun down or no sky): the contact shadows' here, the shadows
+	               // themselves being the native passes' (sun_shadows.hpp)
 	               // (the blades' pass: x: 1 (uint bits) when the native passes' block is in t2, kNative; else 0)
 };
 StructuredBuffer<float4> blades : register(t0);
@@ -133,13 +135,15 @@ float drawn_depth(int2 p)
 // depth, at the next 512 bytes, in rows of the depth's pitch or, when zinfo.w's high half isn't 0, of that many uints):
 // what the native zone and characters know of a pixel's light. A uint
 // a pixel: bits 0-10 its view depth, round((log2(depth) + 3) x 128), 0 for none; 11-24 its facing (world, octahedral, 7
-// bits a side); 25-31 the sun's share of the light drawn there (how much of it a full shadow takes away), 0..127.
+// bits a side); 25-30 the sun's share of the light drawn there, 0..63: what's left of the sun's light after the shadows
+// the pass applied (how much of the pixel's light a contact shadow may still take); bit 31 set where the pass lit the
+// pixel from World FX's block (HiFi XI's src/render/sun_shadows.hpp: not read here any more).
 // zinfo.w bit 64: the facings are marked (HiFi XI's light_split.hpp "Marks"): one written turned away from the camera
 // is a pixel the zone lit with the texture pack's relief (light_at's marked; the facing is turned back either way).
 // light_at: the facing (view space, toward the camera) and the share at p, where the word is this frame's and still
 // what's drawn there (its depth the depth's own within 2.5 codes, about 1.4%: what the game drew over it later, an
-// effect's mesh, a model left to the game, isn't it); false elsewhere, and the old ways stand. (World FX's own blades,
-// drawn at the zone's end, write their own words while the native passes' block is in use: ps_light.)
+// effect's mesh, a model left to the game, isn't it); false elsewhere: the facing then told from the depth, the share
+// guessed by it (sun_share). (World FX's own blades, drawn at the zone's end, write their own words: ps_light.)
 static const float kShareScale = 1.39; // (sun_share's: the game's daylight share of a surface square to the sun is 0.72)
 bool light_split() { return (zinfo.w & 16) != 0; }
 float3 view_dir(float3 d)
@@ -148,22 +152,11 @@ float3 view_dir(float3 d)
 	return float3(c.x / lin.z, c.y / lin.w, c.w / up_row.w); // (the projection's _11, _22 and _34 undone, as body_in_view)
 }
 bool light_marks() { return (zinfo.w & 64) != 0; }
-// zinfo.w bits 128, 256, 512: the words carry the native passes' mark (HiFi XI's src/render/sun_shadows.hpp): with any
-// of them the share is in bits 25-30 (0..63: what's left of the sun's light after the shadows applied there, if any),
-// and bit 31 is set where the native zone or characters lit the pixel from the block World FX published for them. What
-// that block held, the frame says: 128 the sun's and clouds' shadows (light_at's done: the sun pass then looks only for
-// contact shadows there, and the clouds' aren't taken again), 256 the lamps (light_at's lamps_done: their glow is in
-// the colour already, lamp_light isn't added again); 512 alone, neither (the words marked, nothing applied).
-bool words_marked() { return (zinfo.w & (128 | 256 | 512)) != 0; }
-bool shadow_marks() { return (zinfo.w & 128) != 0; }
-bool lamp_marks() { return (zinfo.w & 256) != 0; }
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked, out bool done, out bool lamps_done)
+bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked)
 {
 	n = float3(0.0, 0.0, 1.0);
 	share = 0.0;
 	marked = false;
-	done = false;
-	lamps_done = false;
 	if (!light_split() || any(zinfo.yz != ground.yz) || z > 1e8)
 		return false;
 	p = clamp(p, int2(0, 0), int2(zinfo.yz) - 1);
@@ -181,114 +174,15 @@ bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool
 	// (a mark: turned away from the camera by more than the 7-bit facing's error near edge on)
 	marked = light_marks() && dot(n, -P) < -0.02 * length(P);
 	n = dot(n, -P) < 0.0 ? -n : n;
-	share = words_marked() ? float((v >> 25) & 63) / 63.0 : float(v >> 25) / 127.0;
-	done = shadow_marks() && (v >> 31) != 0;
-	lamps_done = lamp_marks() && (v >> 31) != 0;
+	share = float((v >> 25) & 63) / 63.0;
 	return true;
 }
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked, out bool done)
-{
-	bool lamps_done;
-	return light_at(p, z, P, n, share, marked, done, lamps_done);
-}
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share, out bool marked)
-{
-	bool done;
-	return light_at(p, z, P, n, share, marked, done);
-}
-bool light_at(int2 p, float z, float3 P, out float3 n, out float share)
-{
-	bool marked, done;
-	return light_at(p, z, P, n, share, marked, done);
-}
 
-// The ground's colour under p on screen: the zone's own texture, lighting, fog and time of day, from
-// the taps around it that show the ground (not something nearer the camera than p: a character standing
-// there, a name, a branch). Returns how many did (0..8; 0 off screen too, colour then a fixed guess).
-uint ground_at(float3 p, out float3 colour)
-{
-	colour = color.rgb * 0.5;
-	float4 c = mul(float4(p, 1.0), view_proj);
-	if (ground.w == 0 || c.w <= 0.0 || any(abs(c.xy) > c.w))
-		return 0;
-	int2 px = int2((c.x / c.w * 0.5 + 0.5) * ground.y, (0.5 - c.y / c.w * 0.5) * ground.z);
-	// Eight taps in a ring; of those that see the ground, the middle ones by brightness (up to four) are
-	// averaged, so a few on a shadow's edge or a bright speck don't sway it
-	int r = max(3, ground.y / 400);
-	static const int2 ring[8] = { int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2), int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
-	float3 tap[8];
-	float lum[8];
-	bool seen[8];
-	uint n = 0;
-	[unroll] for (int i = 0; i < 8; ++i)
-	{
-		int2 q = px + ring[i] * r;
-		tap[i] = texel(q);
-		lum[i] = dot(tap[i], float3(0.3, 0.59, 0.11));
-		// (the ground: what's drawn there, put back in the world from its depth, lies at the root's height;
-		// a tiger's flank, a trunk, a name or the background behind a crest doesn't)
-		if (((crowd.x >> 16) & 1) != 0)
-		{
-			float z = drawn_depth(q);
-			float2 ndc = float2((q.x + 0.5) / ground.y * 2.0 - 1.0, 1.0 - (q.y + 0.5) / ground.z * 2.0);
-			float3 v = float3(ndc.x * z / lin.z, ndc.y * z / lin.w, z * up_row.w);
-			seen[i] = z < 1e8 && abs(eye.y + dot(v, up_row.xyz) - p.y) < 0.4 + 0.01 * z;
-		}
-		else
-			seen[i] = true;
-		n += seen[i] ? 1u : 0u;
-	}
-	if (n == 0)
-		return 0;
-	// Then those far brighter or darker than the median of the rest aren't the ground either: a name's glyphs
-	// (facelift draws names into the world, about as far as the ground around the character), a hard shadow
-	float median = 0.0;
-	[unroll] for (int a = 0; a < 8; ++a)
-	{
-		// (the seen tap ranked in the middle: as many darker as fit below it; ties go to the earlier tap)
-		uint below = 0;
-		[unroll] for (int b = 0; b < 8; ++b)
-			below += (seen[b] && (lum[b] < lum[a] || (lum[b] == lum[a] && b < a))) ? 1u : 0u;
-		if (seen[a] && below == (n - 1) / 2)
-			median = lum[a];
-	}
-	n = 0;
-	[unroll] for (int o = 0; o < 8; ++o)
-	{
-		seen[o] = seen[o] && (((crowd.x >> 16) & 2) == 0 || (lum[o] <= median * 1.6 + 0.04 && lum[o] >= median * 0.5 - 0.02));
-		n += seen[o] ? 1u : 0u;
-	}
-	if (n == 0)
-		return 0;
-	uint take = min(n, 4u), lo = (n - take) / 2;
-	float3 sum = 0.0;
-	[unroll] for (int k = 0; k < 8; ++k)
-	{
-		// (its rank among the seen taps: how many are darker; ties go to the earlier tap)
-		uint darker = 0;
-		[unroll] for (int j = 0; j < 8; ++j)
-			darker += (seen[j] && (lum[j] < lum[k] || (lum[j] == lum[k] && j < k))) ? 1u : 0u;
-		if (seen[k] && darker >= lo && darker < lo + take)
-			sum += tap[k];
-	}
-	colour = sum / take;
-	return n;
-}
-
-// Each baked point's ground colour, remembered (12 bytes: f16 r, g | f16 b, f16 how far it was seen from,
-// 0 while not known yet | how much darker the ground under it was in the last sample, unorm16): a frame's
-// sample moves the colour only kFollow of the way, so what changes from frame to frame under a root as the
-// camera moves (texture detail, shadows, things passing over) averages out, while day, night and weather
-// still come through. Points whose ground isn't on screen keep theirs.
-// The darkness isn't learned: it's the last sample's alone, and the blades are darkened by it at once. A
-// shadow passing over (someone's own, which the game draws on the ground under the grass) shows on the
-// grass and leaves with them, where the colour leaves it out on purpose (a moving shadow would stamp dark
-// patches into it). Only darker counts: a flash doesn't light the grass.
-// Then (kMemoryStride bytes a point in all) the point's wear: see wear_of.
+// The blades' memory (u0): the ground's colour map first (below), then each baked point's record (kMemoryStride bytes:
+// 12 that held its learned ground colour before 0.59, unused since; then its wear: see wear_of)
 RWByteAddressBuffer memory : register(u0);
 static const uint kMemoryStride = 20;
 static const uint kMemoryBase = 512 + 1024 * 1024 * 8; // (the ground's colour map first: grass_render.cpp kFloorBytes)
-static const float kFollow = 0.03;
 
 // The ground's own colour under a root, from the host's map (t4: grass_render.cpp draw_floor, the native zone drawn from
 // above, lit, the lowest surface facing up; docs/own-frame/grass-colour.md): its header (the middle x, z, texels a yalm,
@@ -328,64 +222,6 @@ float3 ground_colour(uint point_index, float3 p, bool first_vertex, out float se
 	seen_from = 0.0;
 	bool found;
 	return floor_colour(p, found);
-}
-
-// (the colour as it was learned from the screen before 0.59: kept for reference, no longer called)
-float3 learned_ground_colour(uint point_index, float3 p, bool first_vertex, out float seen_from)
-{
-	uint3 m = memory.Load3(kMemoryBase + point_index * kMemoryStride);
-	float3 kept = float3(f16tof32(m.x), f16tof32(m.x >> 16), f16tof32(m.y));
-	float kept_from = f16tof32(m.y >> 16);
-	// (a colour that isn't a number is learned again, as if never seen)
-	bool known = (m.y >> 16) != 0 && finite4(float4(kept, kept_from));
-	float shaded = 1.0 - (m.z & 0xFFFF) / 65535.0;
-	seen_from = kept_from;
-	if (known && !first_vertex)
-		return kept * shaded;
-	float3 now;
-	uint seen = ground_at(p, now);
-	// Known: only a good view (half the taps on the ground) updates it. Not yet: any view of the ground at
-	// all is remembered (better than guessing again every frame); none, a fixed guess, not remembered.
-	// (without a good view, no darkness either: a body standing on the point doesn't darken its grass)
-	if (known ? seen < 4 : seen == 0)
-	{
-		if (known && first_vertex)
-			memory.Store(kMemoryBase + point_index * kMemoryStride + 8, 0u);
-		seen_from = known ? kept_from : 0.0;
-		return known ? kept * shaded : now;
-	}
-	// A sample much brighter or darker than what's remembered (a shadow passing over, a flash) moves it only a
-	// little: a stray frame, or someone's shadow for a while, can't stamp a patch. Gradual light (dusk,
-	// dawn, weather) comes through as usual.
-	float lk = dot(kept, float3(0.3, 0.59, 0.11)), ln = dot(now, float3(0.3, 0.59, 0.11));
-	// (darker than remembered by more than the ground's own flicker under a moving camera: in proportion,
-	// down to 0.3)
-	float ratio = ln / max(lk, 0.01);
-	float darkness = known && ratio < 0.92 ? 1.0 - max(ratio / 0.92, 0.3) : 0.0;
-	bool sudden = ln > lk * 1.3 + 0.02 || ln < lk * 0.7 - 0.02;
-	float follow = (known && sudden) ? kFollow * 0.25 : kFollow; // (not slower: a wrong colour has to recover too)
-	// A clearly closer view than the one it learned from takes over within a few frames: from afar the
-	// ground is lightened by the fog, and blurred over more of it, so ground first seen from a distance
-	// stayed light as you came up to it
-	float from = max(mul(float4(p, 1.0), view_proj).w, 0.1);
-	if (known && from < kept_from * 0.8)
-		follow = sudden ? 0.2 : 0.3;
-	// (a first view through only a few taps is a start: the next good views correct it)
-	float3 next = known ? lerp(kept, now, follow) : now;
-	float next_from = known ? lerp(kept_from, from, follow) : from;
-	// (one write a point a frame; every vertex draws with what was remembered, so a tuft is one colour and
-	// a frame's update shows from the next)
-	// (a bad sample isn't remembered: next_from 0 = not known)
-	if (!finite4(float4(next, next_from)))
-	{
-		next = float3(0.0, 0.0, 0.0);
-		next_from = 0.0;
-	}
-	if (first_vertex)
-		memory.Store3(kMemoryBase + point_index * kMemoryStride, uint3(f32tof16(next.r) | (f32tof16(next.g) << 16), f32tof16(next.b) | (f32tof16(next_from) << 16),
-			uint(saturate(darkness) * 65535.0 + 0.5)));
-	seen_from = known ? kept_from : from;
-	return known ? kept * shaded : next;
 }
 
 // The grass's wear (crowd.x rule bit 256; t2 after the sky: [kWear] the memory's clock now (seconds since it was
@@ -590,7 +426,7 @@ struct v2p
 	float3 col : COLOR;
 	float3 motion : MOTION; // (FSR 2's: from here to where the blade was last frame, UV units; and its view depth)
 	// (the light split's word for the blade, ps_light: its view depth, the sun's share of its light, 1 when it was lit
-	// from the block (the mark), 1 when the words are written marked; and the facing written, world)
+	// from the block (the mark); and the facing written, world)
 	float4 lit : LIGHT;
 	float3 facing : FACING;
 };
@@ -684,7 +520,7 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 		float share;
 		blade_light(float3(root.x, b.y - 0.1, root.z), kept, native_light, share, native_glow);
 		g *= kept;
-		o.lit = float4(0.0, share, ss_mode.z != 0 ? 1.0 : 0.0, ss_mode.x != 0 ? 1.0 : 0.0);
+		o.lit = float4(0.0, share, ss_mode.z != 0 ? 1.0 : 0.0, 0.0);
 	}
 
 	// Trodden down and cut (wear_of): a cut blade is a stub kStub of its height, growing back slowly at first; a trodden
@@ -865,254 +701,6 @@ float2 screen_of(float3 v)
 {
 	float2 ndc = v.xy * float2(lin.z, lin.w) / max(v.z * up_row.w, 0.2);
 	return float2((ndc.x * 0.5 + 0.5) * ground.y, (0.5 - ndc.y * 0.5) * ground.z);
-}
-
-// Lamps lit near the camera (t2 after the shadow map's parameters, when crowd.x rule bit 16 says they're there;
-// the add-on picks the nearest lit ones in view and grass_render.cpp puts them in view space): [40] how many, and
-// how much of a lamp's glow a surface it can't see loses; then two float4s a lamp: where its light is and how far
-// its glow reaches (yalms), its colour times how strong its glow is (rgb). The rest lie far off with no glow: all
-// kMaxLamps (grass_render.hpp's) are read, a fixed run.
-static const uint kLamps = 40;
-static const uint kMaxLamps = 16;
-
-// A character or monster near (t2, as many as crowd.x's low bits) as the lamps' march sees it: the standing capsule
-// body_in_view (after the shading pass, below) makes of it, its feet in view space, made 1.5 yalms taller and 0.3 wider
-// to take in the name and icon facelift draws over it (in the depth too)
-void lamp_body(uint i, out float3 feet, out float height, out float radius)
-{
-	float4 a = actors[i];
-	float4 c = mul(float4(a.xyz, 1.0), view_proj);
-	feet = float3(c.x / lin.z, c.y / lin.w, c.w / up_row.w);
-	height = 2.3 * a.w + 1.5;
-	radius = 0.6 * a.w + 0.45;
-}
-
-bool in_lamp_body(float3 x, float3 feet, float height, float radius, float3 up)
-{
-	float3 d = x - feet;
-	float3 r = d - up * clamp(dot(d, up), 0.0, height);
-	return dot(r, r) < radius * radius;
-}
-
-// The march toward a lamp (lamp_blocked): kLampSteps steps along the path from a tenth of the way to `last` of it;
-// where a step is just behind what's drawn there (within 0.3 yalms, 1% of the distance and a step's length), something
-// stands between. A hit fades in over its first 5 cm and out toward the back of that window, so no one step turns it
-// on or off outright. What's off screen can't hide the lamp, nor can a name's pixel (name_at), nor a step inside
-// either of the two capsules given (radius 0: none), nor what's drawn within kLampBody of the light (L): the lamp's
-// own post, hook, cage or bowl (they shadowed a ring of the wall behind a lantern, just outside kLampNear where its
-// shadows start: in game, 2026-10-21). The steps are a fixed run, each read on its own, as the sun's.
-static const int kLampSteps = 12;
-static const float kLampBody = 1.0;
-float lamp_march(float3 from, float3 path, float last, float3 L, float3 f0, float h0, float r0, float3 f1, float h1, float r1)
-{
-	float3 up = -up_row.xyz; // (the world's up in view space: its y is down)
-	float step_length = length(path) * (last - 0.1) / kLampSteps;
-	float blocked = 0.0;
-	[unroll] for (int k = 0; k < kLampSteps; ++k)
-	{
-		float3 x = from + path * (0.1 + (last - 0.1) * (k + 0.5) / kLampSteps);
-		float depth = x.z * up_row.w;
-		float2 s = screen_of(x);
-		int2 q = int2(s);
-		bool on = depth > 0.2 && all(s >= 0.0) && all(s < float2(ground.yz));
-		float behind = depth - drawn_depth(q);
-		float thickness = 0.3 + 0.01 * depth + step_length;
-		float hit = saturate(behind / 0.05) * saturate((thickness - behind) / (0.25 * thickness));
-		float3 drawn = view_at(clamp(q, int2(0, 0), int2(ground.yz) - 1));
-		bool lamps_own = dot(drawn - L, drawn - L) < kLampBody * kLampBody;
-		bool theirs = name_at(q) || lamps_own || in_lamp_body(x, f0, h0, r0, up) || in_lamp_body(x, f1, h1, r1, up);
-		blocked = max(blocked, on && !theirs ? hit : 0.0);
-	}
-	return blocked;
-}
-
-// The lamps' shadow maps (grass_render.cpp draw_lamp_maps; t2 after the blades' motion's, kMotion's 9): [kLampMap ..
-// + 2] the view's rows (a view-space direction's world x, y and z), [kLampMap + 3] how many maps, where they start in the
-// depth copy (bytes, as bits: zbuf, past the depth and the light split), the near plane and the faces' scale; [kLampMap
-// + 4 + k] map k's lamp (view space) and its far plane (0: no map in that place). Each map a cube of kLampMapSize texels
-// a face (kLampFaces: each face's middle, right and up, world axes), depth as a perspective from the light, drawn from
-// the host's zone (HiFi XI's native zone data): it hides a lamp whether the thing between is on screen or not.
-static const uint kLampMap = kMotion + 9 + 8; // (after the farthest cascade's 8: kSunMapFar, below)
-static const uint kLampMapSize = 256;
-static const float3 kLampFaces[18] = {
-	float3(1, 0, 0), float3(0, 0, 1), float3(0, 1, 0),
-	float3(-1, 0, 0), float3(0, 0, -1), float3(0, 1, 0),
-	float3(0, 1, 0), float3(1, 0, 0), float3(0, 0, 1),
-	float3(0, -1, 0), float3(1, 0, 0), float3(0, 0, -1),
-	float3(0, 0, 1), float3(-1, 0, 0), float3(0, 1, 0),
-	float3(0, 0, -1), float3(1, 0, 0), float3(0, 1, 0) };
-
-// How much the lamp at L (view space) is hidden from P (n its facing) by what its map holds; false when L has no map
-// (marched then). The point moved off the surface by a texel and a half and the depth compared a few centimetres and
-// two texels short (each texel a little wider the further from the light); a 3 x 3 of texels around it, each hidden or
-// not, gives the share. A texel nothing was drawn in (the reach and beyond) hides nothing.
-bool lamp_from_map(float3 P, float3 n, float3 L, out float blocked)
-{
-	blocked = 0.0;
-	const float4 head = actors[kLampMap + 3];
-	int k = -1;
-	float far_plane = 0.0;
-	[unroll] for (int i = 0; i < 4; ++i)
-	{
-		const float4 a = actors[kLampMap + 4 + i];
-		const float3 d = a.xyz - L;
-		const bool here = k < 0 && a.w > 0.0 && dot(d, d) < 1e-4;
-		k = here ? i : k;
-		far_plane = here ? a.w : far_plane;
-	}
-	[branch] if (head.x < 0.5 || k < 0)
-		return false;
-	const float near_plane = head.z, scale = head.w;
-	const float3x3 to_world = float3x3(actors[kLampMap].xyz, actors[kLampMap + 1].xyz, actors[kLampMap + 2].xyz);
-	float3 d = mul(to_world, P - L);
-	const float reach = max(abs(d.x), max(abs(d.y), abs(d.z)));
-	const float texel = 2.0 * reach / (scale * kLampMapSize);
-	d = mul(to_world, P + n * (1.5 * texel) - L);
-	const float3 ad = abs(d);
-	const uint face = ad.x >= ad.y && ad.x >= ad.z ? (d.x > 0.0 ? 0 : 1) : ad.y >= ad.z ? (d.y > 0.0 ? 2 : 3) : (d.z > 0.0 ? 4 : 5);
-	const float3 middle = kLampFaces[face * 3], right = kLampFaces[face * 3 + 1], up = kLampFaces[face * 3 + 2];
-	const float w = max(dot(d, middle), 1e-3);
-	const float2 c = float2(scale * dot(d, right) / w * 0.5 + 0.5, 0.5 - scale * dot(d, up) / w * 0.5) * kLampMapSize;
-	const float compared = w - (0.04 + 2.0 * texel);
-	const uint base = asuint(head.y) + uint(k * 6 + face) * kLampMapSize * kLampMapSize * 4;
-	float hidden = 0.0;
-	[unroll] for (int y = -1; y <= 1; ++y)
-		[unroll] for (int x = -1; x <= 1; ++x)
-		{
-			const int2 q = clamp(int2(c) + int2(x, y), int2(0, 0), int2(kLampMapSize - 1, kLampMapSize - 1));
-			const float z = asfloat(zbuf.Load(base + uint(q.y * kLampMapSize + q.x) * 4));
-			// (the depth back to the distance along the face's middle: z = f / (f - n) x (1 - n / w))
-			const float drawn = near_plane * far_plane / max(far_plane - z * (far_plane - near_plane), 1e-4);
-			hidden += z < 1.0 && drawn < compared ? 1.0 : 0.0;
-		}
-	blocked = hidden / 9.0;
-	return true;
-}
-
-// How much a lamp at L (view space) is hidden from the surface at P (n its facing). Only the world hides a lamp here:
-// - Its own lantern, bowl or bracket is around the light: the march stops kLampFixture short of it, and a surface
-//   within kLampNear of the light isn't shaded by it at all, fading in over the next yalm. (Marching to 85% of the way,
-//   the wall behind a lantern found the lantern itself: a dark disc in a ring of glow, in game on 2026-10-18.)
-// - Characters and monsters don't hide one: the game casts a character's own shadow from a lamp near it, and from here
-//   the steps each found the character at another distance and laid a copy of its shadow on the ground, a row of them
-//   toward the lamp (in game the same evening; a name's icon the same). So a hit inside either of the two characters
-//   whose capsules come nearest the path doesn't count, nor one on a name facelift drew into the world. The march runs
-//   once as it is; only where it hit something is it run again with those left out (the characters are looked at only
-//   there: most pixels have no hit).
-static const float kLampFixture = 0.75, kLampNear = 1.25;
-float lamp_blocked(float3 P, float3 n, float3 L)
-{
-	float3 from = P + n * (2.0 * pixel_width(abs(P.z)));
-	float3 path = L - from;
-	float len = length(path);
-	float last = (len - kLampFixture) / max(len, 1e-3);
-	float away = smoothstep(kLampNear, kLampNear + 1.0, len);
-	float blocked = 0.0;
-	[branch] if (last > 0.15 && away > 0.0)
-	{
-		// (the lamp's shadow map, when it has one: what's off screen hides it too, and no march)
-		float mapped = 0.0;
-		[branch] if (lamp_from_map(from, n, L, mapped))
-			return mapped * away;
-		blocked = lamp_march(from, path, last, L, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-		uint count = min(crowd.x & 0xFFFF, 32u);
-		[branch] if (blocked > 0.0 && count > 0)
-		{
-			float3 up = -up_row.xyz;
-			float3 f0 = 0.0, f1 = 0.0;
-			float h0 = 0.0, h1 = 0.0, r0 = 0.0, r1 = 0.0, best0 = 1e9, best1 = 1e9;
-			[unroll] for (uint i = 0; i < 32; ++i)
-			{
-				float3 feet;
-				float height, radius;
-				lamp_body(i, feet, height, radius);
-				float3 centre = feet + up * (0.5 * height);
-				float k = saturate(dot(centre - from, path) / max(len * len, 1e-6));
-				float apart = length(from + path * k - centre) - (0.5 * height + radius);
-				bool first = i < count && apart < best0;
-				bool second = i < count && !first && apart < best1;
-				f1 = first ? f0 : second ? feet : f1;
-				h1 = first ? h0 : second ? height : h1;
-				r1 = first ? r0 : second ? radius : r1;
-				best1 = first ? best0 : second ? apart : best1;
-				f0 = first ? feet : f0;
-				h0 = first ? height : h0;
-				r0 = first ? radius : r0;
-				best0 = first ? apart : best0;
-			}
-			blocked = lamp_march(from, path, last, L, f0, h0, r0, f1, h1, r1);
-		}
-	}
-	return blocked * away;
-}
-
-// The lamps' light on the surface at P (view space; n its facing, steep as surface_normal gives it, col what the
-// game drew there), to add to it. The game lights only the meshes that name a lamp, fully within its range and not
-// at all past it; this lights every surface near a lamp, falling off smoothly to nothing at the edge of its glow's
-// reach ((1 - d^2 / R^2)^2), a little more on what faces it (wrapped: a surface turned away still gets 30%, one whose
-// facing the depth can't tell 65%). The light adds in proportion to the surface's colour (as light on it would),
-// with a little on top so a near-black surface still warms, and less on what's bright already (lit by the game's own
-// lamp light, or a light texture). With lamp shadows on, the strongest lamp at the pixel is marched toward
-// (lamp_blocked) and its light taken away as far as it's hidden; the others are left as they are. Only the zone's
-// own lights cast them (c.w 1): a Home Point's or an effect's glow (c.w 0) has its light inside a crystal or a
-// spell's own shape, which the march's fixed steps found again and again and laid down as a row of shadows that slid
-// with the camera (in game, 2026-10-20), so those light without a shadow.
-float3 lamp_light(float3 P, float3 n, float steep, float3 col)
-{
-	float4 head = actors[kLamps];
-	uint count = min(uint(head.x), kMaxLamps);
-	bool sure = steep < 4.0;
-	float3 sum = 0.0, strongest = 0.0, strongest_at = 0.0;
-	float most = 0.0;
-	[unroll] for (uint i = 0; i < kMaxLamps; ++i)
-	{
-		float4 a = actors[kLamps + 1 + 2 * i], c = actors[kLamps + 2 + 2 * i];
-		float3 v = a.xyz - P;
-		float d2 = dot(v, v);
-		float k = saturate(1.0 - d2 / (a.w * a.w));
-		float facing = sure ? 0.3 + 0.7 * saturate(dot(n, v) * rsqrt(d2 + 1e-4)) : 0.65;
-		float3 add = (i < count ? k * k * facing : 0.0) * c.rgb;
-		sum += add;
-		float amount = c.w > 0.5 ? luma(add) : 0.0;
-		strongest = amount > most ? add : strongest;
-		strongest_at = amount > most ? a.xyz : strongest_at;
-		most = max(most, amount);
-	}
-	[branch] if (head.y > 0.0 && most > 0.002)
-		sum -= strongest * head.y * lamp_blocked(P, n, strongest_at);
-	return sum * (2.5 * col + 0.03) * saturate(1.2 - luma(col));
-}
-
-// lamp_light where the light split knows the pixel (light_at): the native zone and characters lit it with the zone's
-// lamps already (every lamp in reach, as this would: HiFi XI's src/zone/draw.cpp near_lamp_light), so their glow isn't
-// added again here. What's left of it: the effects' glows (c.w 0: a Home Point's, a spell's), added as lamp_light adds
-// them; and the strongest zone lamp's shadow, its light (as lamp_light would have put it there) taken away as far as
-// lamp_blocked says it's hidden, never more than the light the native passes drew without the sun (share: the sun's
-// share of it, light_at's). Returns the glow to add; hidden what to take from the colour drawn.
-float3 lamp_light_known(float3 P, float3 n, float3 col, float share, out float3 hidden)
-{
-	float4 head = actors[kLamps];
-	uint count = min(uint(head.x), kMaxLamps);
-	float3 glow = 0.0, strongest = 0.0, strongest_at = 0.0;
-	float most = 0.0;
-	[unroll] for (uint i = 0; i < kMaxLamps; ++i)
-	{
-		float4 a = actors[kLamps + 1 + 2 * i], c = actors[kLamps + 2 + 2 * i];
-		float3 v = a.xyz - P;
-		float d2 = dot(v, v);
-		float k = saturate(1.0 - d2 / (a.w * a.w));
-		float3 add = (i < count ? k * k * (0.3 + 0.7 * saturate(dot(n, v) * rsqrt(d2 + 1e-4))) : 0.0) * c.rgb;
-		bool zones = c.w > 0.5;
-		glow += zones ? 0.0 : add;
-		float amount = zones ? luma(add) : 0.0;
-		strongest = amount > most ? add : strongest;
-		strongest_at = amount > most ? a.xyz : strongest_at;
-		most = max(most, amount);
-	}
-	hidden = 0.0;
-	[branch] if (head.y > 0.0 && most > 0.002)
-		hidden = min(strongest * head.y * lamp_blocked(P, n, strongest_at) * (2.5 * col + 0.03), col * (1.0 - share));
-	return glow * (2.5 * col + 0.03) * saturate(1.2 - luma(col));
 }
 
 // Wet ground in rain (crowd.x rule bit 64; t2 after the fog: [kWet] the view's first row (a view-space point's world x
@@ -2138,22 +1726,16 @@ float3 shimmered(int2 p, float3 P, float z, float3 col)
 	return col;
 }
 
-// Sun shadows: worked out for one pixel in four (sun_ps, below), each starting its march at its own one of
+// Contact shadows: worked out for one pixel in four (sun_ps, below), each starting its march at its own one of
 // sixteen points within the first step; here the 4 x 4 of those around this pixel are averaged, so every
 // pixel sees all sixteen starts and the shadow comes out soft and whole rather than in a pattern (one
 // march a pixel, all or nothing, showed as hatching). Only those on this pixel's surface count (a similar
-// depth), so a shadow doesn't bleed across an edge. Each holds two amounts: the shadow (the march's and the
-// map's), which takes the sun's share of this surface's light (sun_share: none on a surface turned away, which the
-// game's own lighting already leaves to the ambient light); and the map's shadow from something well above (over
-// 2 yalms toward the sun: a canopy, a crown, a cliff) on a surface seen too nearly edge on for its facing to be
-// told from the depth, already at the share a surface facing up would lose (a ledge's steep face seen edge on
-// under trees stayed bright, and came and went with the camera's angle), and a character's (sun_ps), both taken
-// as they are.
-// The clouds' shadows too, with cloud_shade. (The shading pass's, and the snow layer's: snow_layer_ps.)
-// known: the sun's share of the light drawn here as the light split has it (light_at; below 0: not known, sun_share by
-// the facing, as the game lights by day). in_sun: how much of the light drawn here is the sun's and still reaches it
-// (its share, scaled as sun_share's, less the shadows): what the ambient occlusion spares (shade_ps).
-float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float known, out float in_sun, bool done)
+// depth), so a shadow doesn't bleed across an edge. What the march found takes the sun's share of this surface's
+// light: what the light split says is left of it after the native pass's own shadows (known), or, where the split
+// has no word (below 0: what the game drew itself), sun_share by the facing told from the depth, as the game lights
+// by day. in_sun: how much of the light drawn here is the sun's and still reaches it: what the ambient occlusion
+// spares (shade_ps).
+float sun_lit_at(int2 p, float z, float3 n, float known, out float in_sun)
 {
 	float sunlit = 1.0;
 	const float share = known >= 0.0 ? min(known * kShareScale, 1.0) : sun_share(dot(n, sun_in_view()));
@@ -2162,13 +1744,13 @@ float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float kn
 	{
 		int2 size = sun_mask_size();
 		int2 first = (p - 3) >> 1;
-		float2 sum = 0.0, nearest_shadow = 0.0;
+		float sum = 0.0, nearest_shadow = 0.0;
 		float weight = 0.0, nearest = 1e9;
 		[unroll] for (int j = 0; j < 16; ++j)
 		{
 			int2 h = clamp(first + int2(j & 3, j >> 2), int2(0, 0), size - 1);
 			uint m = sun_mask.Load((h.y * size.x + h.x) * 4);
-			float2 s = float2(m & 0xFF, (m >> 8) & 0xFF) / 255.0;
+			float s = float(m & 0xFF) / 255.0;
 			float apart = abs(f16tof32(m >> 16) - z);
 			float same = apart < 0.03 * z + 0.1 ? 1.0 : 0.0;
 			sum += same * s;
@@ -2179,23 +1761,11 @@ float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float kn
 		// (none at this depth: ground seen at a grazing angle far off, where each row of pixels is a yalm or more
 		// further than the last and the pass's rows skip every other one: the nearest in depth, rather than none,
 		// which left every other row there unshaded)
-		float2 s = weight > 0.0 ? sum / weight : nearest_shadow;
-		sunlit = 1.0 - shade.w * max(s.x * share, s.y);
-		in_sun *= 1.0 - max(s.x, s.y);
-	}
-	// The clouds' shadows (cloud_shadow_at): what they keep off the sun's share of this surface's light, as strong as
-	// [kCloud + 9].y says (none where the native passes applied them: done)
-	[branch] if (cloud_shade && !done)
-	{
-		const float cloud = actors[kCloud + 9].y * (1.0 - cloud_shadow_at(P));
-		sunlit *= 1.0 - cloud * share;
-		in_sun *= 1.0 - cloud;
+		float s = weight > 0.0 ? sum / weight : nearest_shadow;
+		sunlit = 1.0 - shade.w * s * share;
+		in_sun *= 1.0 - s;
 	}
 	return sunlit;
-}
-float sun_lit_at(int2 p, float z, float3 n, float3 P, bool cloud_shade, float known, out float in_sun)
-{
-	return sun_lit_at(p, z, n, P, cloud_shade, known, in_sun, false);
 }
 
 float4 shade_ps(float4 pos : SV_Position) : SV_Target
@@ -2209,26 +1779,22 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		return float4(col, 1.0); // (the sky; a name facelift drew into the world)
 	float px_per_yalm = lin.z * 0.5 * ground.y / z;
 
-	// The surface's point and facing, from the depth around it (for the ambient occlusion, the sun and the lamps)
+	// The surface's point and facing, from the depth around it (for the ambient occlusion and the contact shadows)
 	float3 P = view_at(p);
 	[branch] if (weather_fx())
 		col = shimmered(p, P, z, col);
 	float3 n = float3(0.0, 0.0, 1.0);
 	float steep = 1.0;
-	bool lamps = ((crowd.x >> 16) & 16) != 0;
 	bool wetting = wet();
-	bool cloud_shade = cloud_shadows();
 	bool snowing = snowy();
-	// (what the native zone and characters drew here, when the light split has it: their own facing for the sun, the lamps,
-	// the wet and the snow, and the sun's share of the light as they lit it; the ambient occlusion keeps the depth's facing,
-	// what it was made for)
+	// (what the native zone, characters and blades drew here, when the light split has it: their own facing for the
+	// contact shadows, the wet and the snow, and what's left of the sun's share of the light as they lit it; the ambient
+	// occlusion keeps the depth's facing, what it was made for)
 	float3 n_known;
 	float known_share;
 	bool pack_relief; // (the texture pack's relief lit this pixel: the light split's mark)
-	bool shadows_done; // (the native passes applied the sun's and clouds' shadows here: light_at's done)
-	bool lamps_native; // (... and added the lamps' glow here themselves: light_at's lamps_done)
-	const bool known = light_at(p, z, P, n_known, known_share, pack_relief, shadows_done, lamps_native);
-	if (shade.x > 0.0 || (!known && (shade.w > 0.0 || lamps || wetting || cloud_shade || snowing)))
+	const bool known = light_at(p, z, P, n_known, known_share, pack_relief);
+	if (shade.x > 0.0 || (!known && (shade.w > 0.0 || wetting || snowing)))
 		n = surface_normal(p, P, steep);
 	const float3 n_depth = n;
 	if (known)
@@ -2288,7 +1854,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		}
 	}
 	float in_sun;
-	float sunlit = sun_lit_at(p, z, n, P, cloud_shade, known ? known_share : -1.0, in_sun, known && shadows_done);
+	float sunlit = sun_lit_at(p, z, n, known ? known_share : -1.0, in_sun);
 	// The ambient occlusion darkens the light from all round, not the sun's straight in: where the light split says how much
 	// of a pixel's light is the sun's still reaching it, that much is spared kAoSunSpared of it (a crease in full sun stays
 	// half as dark as in the shade; under a shadow, all of it)
@@ -2297,10 +1863,10 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		ao = lerp(ao, 1.0, kAoSunSpared * saturate(in_sun));
 	// Settled snow (snow_open, the cover [kSnow].w): on what faces up under open sky, in patches across the world that join
 	// up as it deepens (a whole layer at 1), lit as the scene around it is (its brightness on this surface read as a
-	// mid-grey ground's light: sun, shade, night and the game's own lamps carry over), in the game's fog as the rest; the
-	// surface's relief mostly buried under it. A surface seen too nearly edge on for its facing to be told is taken as
-	// facing up. World FX's own shadows, occlusion and lamps then fall on it as on the rest.
-	float snowed = 0.0; // (how much of the colour drawn here the snow took the place of)
+	// mid-grey ground's light: sun, shade, night and the lamps carry over, the native passes' shadows and glow with them:
+	// they're in the colour drawn), in the game's fog as the rest; the surface's relief mostly buried under it. A surface
+	// seen too nearly edge on for its facing to be told is taken as facing up. The contact shadows and the occlusion
+	// then fall on it as on the rest.
 	[branch] if (snowing)
 	{
 		const float3 world_up = -up_row.xyz; // (the world's up in view space: its y is down)
@@ -2323,31 +1889,9 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 				[branch] if (hazy())
 					snow = lerp(haze_colour(), snow, clear_at(z));
 				col = lerp(col, snow, 0.98 * amount);
-				snowed = 0.98 * amount;
 				relief = lerp(relief, 1.0, 0.9 * amount);
 			}
 		}
-	}
-	// Lamps lit near (lamp_light): their glow on top, darkened by the ambient occlusion like the rest
-	float3 glow = 0.0;
-	// (where the light split knows the pixel the native passes lit it with the zone's lamps: lamp_light_known)
-	// (off: with the native zone lit by the game's own lamps again, World FX adds its glow as it always has; taking the
-	// lamp's light out of what was drawn blacked out characters at the login screen and in a Mog House, 2026-10-29)
-	static const bool kLampsKnown = false;
-	[branch] if (lamps && known && kLampsKnown)
-	{
-		float3 hidden;
-		glow = lamp_light_known(P, n, col, known_share, hidden) * ao;
-		col -= hidden;
-	}
-	else
-	{
-		// (where the native zone or characters added the lamps' glow themselves, light_at's lamps_done with zinfo.w bit
-		// 256: HiFi XI's sun_shadows.hpp, [zone] nativelamps, it's in the colour already and none is added; but for the
-		// part of the colour settled snow took the place of just now, lit here as before)
-		const float lamp_part = known && lamps_native ? snowed : 1.0;
-		[branch] if (lamps && lamp_part > 0.0)
-			glow = lamp_light(P, n, steep, col) * (ao * lamp_part);
 	}
 	// Wet path and stone in rain (wet_here), on what faces up: darker (soaked), the overcast sky mirrored more the more
 	// grazing the view (water's own reflectance on the film), and a little highlight toward the game's light. A surface
@@ -2370,8 +1914,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 	}
 	// The game's fog over what's drawn here (its colour times how much of it there is at this depth) isn't the scene:
 	// what's darkened is the scene under it, so a shadow or a crevice far off in mist fades into the haze as the rest
-	// of the scene there does (darkened whole, the fog over them went dark too); a lamp's glow is seen through it as
-	// the surface is
+	// of the scene there does (darkened whole, the fog over them went dark too)
 	float3 haze = 0.0;
 	float clear = 1.0;
 	[branch] if (hazy())
@@ -2379,7 +1922,7 @@ float4 shade_ps(float4 pos : SV_Position) : SV_Target
 		clear = clear_at(z);
 		haze = haze_colour() * (1.0 - clear);
 	}
-	return float4(haze + (col - haze) * (ao * relief * sunlit * wet_dark) + (glow + wet_add) * clear, 1.0);
+	return float4(haze + (col - haze) * (ao * relief * sunlit * wet_dark) + wet_add * clear, 1.0);
 }
 
 // Characters and monsters near (t2, from the Ashita addon: their feet, the game's world, and their size):
@@ -2408,178 +1951,6 @@ bool inside(body b, float3 x, float3 up)
 	return dot(r, r) < b.radius * b.radius;
 }
 
-// How near the ray o + d t (t >= 0, d of unit length) comes to the segment from a to b, and the ray's t there
-// (the closest points of two segments, Ericson's, the ray taken as one 100 yalms long)
-float ray_to_segment(float3 o, float3 d, float3 a, float3 b, out float t)
-{
-	static const float kLong = 100.0;
-	float3 ab = b - a, r = o - a;
-	float aa = kLong * kLong, e = dot(ab, ab), f = dot(ab, r), c = kLong * dot(d, r), bb = kLong * dot(d, ab);
-	float denom = aa * e - bb * bb;
-	float s = denom > 1e-6 * aa * e ? saturate((bb * f - c * e) / denom) : 0.0;
-	float u = (bb * s + f) / e;
-	s = u < 0.0 ? saturate(-c / aa) : u > 1.0 ? saturate((bb - c) / aa) : s;
-	t = s * kLong;
-	return length(o + d * t - (a + ab * saturate(u)));
-}
-
-// Where the ray o + d t (d of unit length) is inside the capsule of radius r around the segment from a to b: from t0
-// to t1 (t1 < t0: nowhere). The capsule is the two balls at the ends and the cylinder between them; it's convex, so
-// the ray is inside it from the first of their entries to the last of their exits.
-void capsule_chord(float3 o, float3 d, float3 a, float3 b, float r, out float t0, out float t1)
-{
-	float3 ab = b - a, oa = o - a, ob = o - b;
-	float ha = dot(d, oa), ka = ha * ha - dot(oa, oa) + r * r;
-	float hb = dot(d, ob), kb = hb * hb - dot(ob, ob) + r * r;
-	t0 = min(ka >= 0.0 ? -ha - sqrt(max(ka, 0.0)) : 1e9, kb >= 0.0 ? -hb - sqrt(max(kb, 0.0)) : 1e9);
-	t1 = max(ka >= 0.0 ? -ha + sqrt(max(ka, 0.0)) : -1e9, kb >= 0.0 ? -hb + sqrt(max(kb, 0.0)) : -1e9);
-	// (the cylinder: none apart from the balls when the ray runs along the axis)
-	float abab = dot(ab, ab), abd = dot(ab, d), aboa = dot(ab, oa);
-	float k = abab - abd * abd, m = abab * ha - aboa * abd, n = abab * dot(oa, oa) - aboa * aboa - r * r * abab;
-	float h = m * m - k * n;
-	if (k > 1e-6 * abab && h >= 0.0)
-	{
-		float c0 = (-m - sqrt(h)) / k, c1 = (-m + sqrt(h)) / k;
-		// (between the ends: 0 <= aboa + t abd <= abab)
-		bool across = abs(abd) < 1e-6;
-		float e0 = across ? (aboa >= 0.0 && aboa <= abab ? -1e9 : 1e9) : min(-aboa / abd, (abab - aboa) / abd);
-		float e1 = across ? (aboa >= 0.0 && aboa <= abab ? 1e9 : -1e9) : max(-aboa / abd, (abab - aboa) / abd);
-		float lo = max(c0, e0), hi = min(c1, e1);
-		t0 = lo <= hi ? min(t0, lo) : t0;
-		t1 = lo <= hi ? max(t1, hi) : t1;
-	}
-}
-
-// A character's or monster's shadow is worked out from them as they stand, not by the march (sun_ps, below):
-// - The body as a smooth slim capsule (body_shape): from the feet, a ball of kSlim times its size and a bit across
-//   resting on the ground, up kTall times its size; how near the ray toward the sun comes to it gives the shadow, whole
-//   within its radius and fading to none over a soft edge that grows a little with the distance along the ray (a
-//   penumbra). It's worked out at once for the whole ray: as dark at the head's end of the shadow as at the feet.
-// - Their real shape where it's on screen (silhouette): along the stretch of the ray inside the body's capsule (the
-//   larger one, body_in_view's), 2 x kSilhouetteSteps points evenly spaced (a twelfth of a yalm apart or less at
-//   size 2: a thin arm, a tail or a staff isn't stepped over) are looked at in the depth. Where what's drawn in front of one
-//   is them (a point inside that capsule, above the ground at their feet) and the point is just behind it (at most
-//   kThick times their size and a bit: a body's depth), the ray passes through them; where what's drawn is further
-//   than the point, it passes beside them. Only where the point can't be seen (off screen, behind something else in
-//   front, behind a name facelift drew) does the slim capsule answer for it. Walls and other things never cast here:
-//   they aren't inside the capsule (and what is, the ground at their feet aside, is taken as them).
-// The march leaves characters and monsters out (it found them only where a step happened to land inside them: the
-// shadow came out whole at the feet but dotted and lighter toward the head, and as the march's step grows, a thin
-// limb or the neck went missing for some start phases).
-static const int kSilhouetteSteps = 16;
-static const float kSlim = 0.2, kTall = 1.9, kThick = 0.35;
-
-// The slim capsule's segment (view space) and radius for actor i
-void body_shape(uint i, body b, float3 up, out float3 a, out float3 c, out float r)
-{
-	float size = actors[i].w;
-	r = kSlim * size + 0.06;
-	a = b.feet + up * r;
-	c = b.feet + up * max(kTall * size - r, r + 0.01);
-}
-
-// How much of the slim capsule a ray's point at distance `apart` from its segment, t along the ray, is in
-float body_cover(float apart, float r, float t)
-{
-	float soft = 0.3 * r + 0.02 * t;
-	return 1.0 - smoothstep(r - soft, r + soft, apart);
-}
-
-// The shadow of actor i on the ray o + d t (from t_start on) by their shape on screen, the slim capsule where
-// that isn't seen (above): half of the 2 x kSilhouetteSteps points along it (half 0 or 1: every other one)
-float silhouette(float3 o, float3 d, uint i, float t_start, float3 up, uint half)
-{
-	body b = body_in_view(i);
-	float3 sa, sb;
-	float sr;
-	body_shape(i, b, up, sa, sb, sr);
-	float thick = kThick * actors[i].w + 0.15;
-	float t0, t1;
-	capsule_chord(o, d, b.feet, b.feet + up * b.height, b.radius, t0, t1);
-	t0 = max(t0, t_start);
-	float shadow = 0.0;
-	[branch] if (t1 > t0)
-	{
-		[unroll] for (int k = 0; k < kSilhouetteSteps; ++k)
-		{
-			float t = lerp(t0, t1, (2 * k + half + 0.5) / (2 * kSilhouetteSteps));
-			float3 S = o + d * t;
-			float w = S.z * up_row.w;
-			float2 s = screen_of(S);
-			int2 q = clamp(int2(s), int2(0, 0), int2(ground.yz) - 1);
-			bool seen = w > 0.2 && all(s >= 0.0) && all(s < float2(ground.yz)) && !name_at(q);
-			float drawn = drawn_depth(q);
-			float in_front = w - drawn; // (how far behind what's drawn there the point is)
-			// What's drawn there, put back in view space: them if inside their capsule and above the ground at their
-			// feet (more so the further out from the middle: on a slope the ground within the capsule rises)
-			float3 x = float3(S.xy * drawn / max(w, 0.2), drawn * up_row.w) - b.feet;
-			float height = dot(x, up);
-			float3 out_from_middle = x - up * height;
-			float3 off_axis = x - up * clamp(height, 0.0, b.height);
-			bool theirs = dot(off_axis, off_axis) < b.radius * b.radius && height > 0.15 + 0.5 * length(out_from_middle);
-			// (just behind their surface: past the depth's precision, within a body's depth)
-			float bias = 0.01 + 0.001 * w;
-			float through = smoothstep(bias, 2.0 * bias, in_front) * (1.0 - smoothstep(0.75 * thick, thick, in_front));
-			// (hidden: off screen, under a name, or behind something else in front of the point)
-			bool hidden = !seen || (!theirs && in_front > 0.05 + 0.005 * w);
-			float3 sx = S - sa, sab = sb - sa;
-			float guess = body_cover(length(sx - sab * saturate(dot(sx, sab) / dot(sab, sab))), sr, t);
-			shadow = max(shadow, hidden ? guess : theirs ? through : 0.0);
-		}
-	}
-	return shadow;
-}
-
-// The shadow of the characters and monsters near (t2) on the ray o + d t (from t_start on), but `self`'s (the one
-// the point is on: none for 32 and over): the two whose capsules the ray passes deepest through by their shape
-// (silhouette), the rest by their slim capsules (body_cover)
-float actor_shadow(float3 o, float3 d, uint self, float t_start)
-{
-	float3 up = -up_row.xyz; // (the world's up in view space: its y is down)
-	uint count = min(crowd.x & 0xFFFF, 32u);
-	float shadow = 0.0;
-	uint k0 = 32u, k1 = 32u;
-	float best0 = 1.0, best1 = 1.0, cover0 = 0.0, cover1 = 0.0;
-	// (as many as were sent, the same for every pixel, 32 at most: no pixel's own reads decide how long it runs. Not
-	// unrolled: 32 copies of this made the shaders take five times as long to compile, and the add-on compiles them
-	// as the game starts)
-	[loop] for (uint i = 0; i < count; ++i)
-	{
-		if (i != self)
-		{
-			body b = body_in_view(i);
-			// (a ray passing well clear of the capsule's middle can't touch it)
-			float3 m = b.feet + up * (0.5 * b.height) - o;
-			float along = max(dot(m, d), 0.0), reach = 0.5 * b.height + b.radius;
-			[branch] if (dot(m, m) - along * along < reach * reach)
-			{
-				float3 sa, sb;
-				float sr, t, unused;
-				body_shape(i, b, up, sa, sb, sr);
-				float cover = body_cover(ray_to_segment(o, d, sa, sb, t), sr, t);
-				float deep = ray_to_segment(o, d, b.feet, b.feet + up * b.height, unused) / b.radius;
-				bool first = deep < best0, second = !first && deep < best1;
-				// (one pushed out of the two by a deeper one, or never in them, by its slim capsule)
-				shadow = max(shadow, first ? cover1 : second ? cover1 : cover);
-				k1 = first ? k0 : second ? i : k1;
-				best1 = first ? best0 : second ? deep : best1;
-				cover1 = first ? cover0 : second ? cover : cover1;
-				k0 = first ? i : k0;
-				best0 = first ? deep : best0;
-				cover0 = first ? cover : cover0;
-			}
-		}
-	}
-	// (each of the two in two halves: a fixed run of four, one copy of the steps; a half isn't looked at once the
-	// shadow is whole)
-	[loop] for (uint j = 0; j < 4; ++j)
-	{
-		uint k = j < 2 ? k0 : k1;
-		[branch] if (k < 32u && shadow < 1.0)
-			shadow = max(shadow, silhouette(o, d, k, t_start, up, j & 1));
-	}
-	return shadow;
-}
 
 // The sun's shadow map (grass_render.cpp, draw_sun_map): the zone's own meshes seen down the sun's rays, in two
 // cascades around the camera (40 and 160 yalms each way across the rays), each texel how far from the sun the
@@ -2601,254 +1972,22 @@ static const uint kSunMap = 32;
 static const uint kSunMapPrev = kWear + 2 + 2 * kMaxCuts;
 static const uint kSunMapFar = kMotion + 9;
 
-// kSunMapEdge: 0 leaves the filtered edge as it is (10 to 90 % across about 2.5 texels: 10 cm near, and as 1 / sin
-// of the light's height more where the edge runs across its rays); over 0, smoothstep(kSunMapEdge, 1 - kSunMapEdge)
-// of it: at 0.15 about half as wide, still placed between texels (no stair steps), for no measurable time. The
-// shadow of something a texel or less across (4 cm near, 16 cm far) comes out lighter then (a 4 cm pole's: 17 % of
-// a whole shadow's darkness, 33 % at 0), of one two texels across darker (66 to 82 %). On at 0.15 since 2026-10-21:
-// the shadows near the camera looked soft in game. (Only where the edge is the map's own: a penumbra wider than that,
-// below, is left as wide as it is.)
-static const float kSunMapEdge = 0.15;
 
-// Contact hardening: the sun is a disc about three quarters of a degree across (a little over the real one's half a
-// degree: the bright sky around it softens shadows too), not a point, so a shadow's edge is as soft as what casts it is
-// far above what it falls on: kSunSpread yalms of penumbra each way for every yalm between them (a post's foot sharp,
-// a canopy 10 yalms up 6.5 cm each way, a cliff 50 yalms up a third of a yalm). Below kPenumbraMin texels each way the
-// map's own 4 x 4 filter is as soft (and steadier: leaf dapples, a character's feet); past it a disc of taps that wide
-// takes over over a texel, up to kPenumbraMax texels (60 cm near, 2.5 yalms far). So only what's well above shows it:
-// over 12 yalms in the near cascade, 48 in the far one (whose texels are that coarse anyway). (2026-10-29, offline: a
-// plate 80 yalms up casts an edge 0.78 yalms wide from 10 to 90 % at 640 x 360, 0.45 before; one a yalm up as sharp as
-// before: grass_test 1o4.)
-static const float kSunSpread = 0.006545; // (tan of 0.375 degrees)
-static const float kPenumbraMin = 2.0, kPenumbraMax = 16.0;
-// The wide taps are tested against the surface's own plane through P (its facing; a flat ground at a low sun is a yalm
-// nearer the sun 16 texels on), so it doesn't shade itself; less what a facing kPlaneSlack off (3 degrees, more as the
-// sun grazes it: the plane's slope then turns fast with its facing) would make of it, so a curved one doesn't either
-static const float kPlaneSlack = 0.05;
-
-// One drawing of a cascade at q (its rows from actors[rows]; per_yalm its depth a yalm, base where it starts in the
-// copy; n the surface's facing, view space): (blocked, blocked from well above: by something over 2 yalms nearer the
-// sun than P, not the surface's own other side). First the 4 x 4 texels around, weighted as three bilinear taps a side
-// (a soft edge a texel or two wide), its middle stretched by kSunMapEdge; and, wide over 0 (the facing known well enough
-// to test the plane; how much more slack it takes: 1 for a facing known, more for one told from a depth seen at a slant),
-// 8 more taps out to kPenumbraMax texels, spun by spin (radians: each of a 4 x 4 block of the sun pass's pixels its own
-// sixteenth of a turn, which shade_ps's 4 x 4 average puts together). Whatever of those 24 blocks
-// says how far above P the casters are, on average; where that makes a penumbra wider than kPenumbraMin texels each way,
-// 16 taps over a disc that wide (spun as well) are its answer instead. Lit all round or blocked all round: the 4 x 4.
-float2 map_drawing(float4 q, float3 n, uint rows, float per_yalm, uint base, float texel, float size, uint pitch, float spin, float wide)
-{
-	float2 t = float2(dot(q, actors[rows]), dot(q, actors[rows + 1]));
-	float depth = dot(q, actors[rows + 2]) - (0.03 + texel) * per_yalm;
-	float well_above = depth - 2.0 * per_yalm; // (2 yalms nearer the sun)
-	float2 f = t - 0.5;
-	int2 corner = int2(floor(f)) - 1;
-	float2 w = f - floor(f);
-	float wx[4] = { 1.0 - w.x, 1.0, 1.0, w.x }, wy[4] = { 1.0 - w.y, 1.0, 1.0, w.y };
-	float2 r = 0.0;
-	float found = 0.0, between = 0.0; // (taps blocked, and how much depth between P and what blocks them, all told)
-	[unroll] for (int j = 0; j < 16; ++j)
-	{
-		int2 at = clamp(corner + int2(j & 3, j >> 2), int2(0, 0), int2(size, size) - 1);
-		// (a texel nothing was drawn into keeps the clear's 1: never in the way, even of a point further
-		// from the sun than anything in the zone, past the map's depth)
-		float d = asfloat(sun_map.Load((base + at.y * pitch + at.x) * 4));
-		float k = wx[j & 3] * wy[j >> 2];
-		bool blocked = d < depth && d < 1.0;
-		r.x += blocked ? k : 0.0;
-		r.y += (d < well_above && d < 1.0 ? 1.0 : 0.0) * k;
-		found += blocked ? 1.0 : 0.0;
-		between += blocked ? depth - d : 0.0;
-	}
-	r /= 9.0;
-	if (kSunMapEdge > 0.0)
-		r = smoothstep(kSunMapEdge, 1.0 - kSunMapEdge, r);
-	[branch] if (wide <= 0.0)
-		return r;
-	// The surface's plane in the map: its depth a texel on across each way (as a texel's depth, at most 8: the sun
-	// within 7 degrees of grazing it), from its facing through the rows (the plane's normal by the rows' cofactors)
-	const float3 r0 = actors[rows].xyz, r1 = actors[rows + 1].xyz, r2 = actors[rows + 2].xyz;
-	const float3 m = float3(dot(cross(r1, r2), n), dot(cross(r2, r0), n), dot(cross(r0, r1), n));
-	const float unit = texel * per_yalm;
-	const float den = m.z * unit;
-	const float2 slope = -m.xy / ((den < 0.0 ? -1.0 : 1.0) * max(abs(den), length(m.xy) / 8.0 + 1e-30));
-	const float slack = kPlaneSlack * wide * (1.0 + dot(slope, slope));
-	static const float kGolden = 2.3999632; // (radians: the golden angle, taps spread evenly over a disc)
-	[unroll] for (int i = 0; i < 8; ++i)
-	{
-		const float a = spin + kGolden * i, reach = kPenumbraMax * sqrt((i + 0.5) / 8.0);
-		const int2 at = clamp(int2(floor(t + reach * float2(cos(a), sin(a)))), int2(0, 0), int2(size, size) - 1);
-		const float d = asfloat(sun_map.Load((base + at.y * pitch + at.x) * 4));
-		// (against the plane at the texel's middle, less the slack that far out)
-		const float2 o = float2(at) + 0.5 - t;
-		const float expect = depth + (dot(slope, o) - slack * length(o)) * unit;
-		const bool blocked = d < expect && d < 1.0;
-		found += blocked ? 1.0 : 0.0;
-		between += blocked ? expect - d : 0.0;
-	}
-	const float radius = found > 0.0 ? min(between / (found * per_yalm) * kSunSpread / texel, kPenumbraMax) : 0.0;
-	const float wider = saturate(radius - kPenumbraMin);
-	[branch] if (wider <= 0.0 || found >= 24.0)
-		return r;
-	float2 disc = 0.0;
-	[unroll] for (int i2 = 0; i2 < 16; ++i2)
-	{
-		const float a = spin + 1.3 + kGolden * i2, reach = radius * sqrt((i2 + 0.5) / 16.0);
-		const int2 at = clamp(int2(floor(t + reach * float2(cos(a), sin(a)))), int2(0, 0), int2(size, size) - 1);
-		const float d = asfloat(sun_map.Load((base + at.y * pitch + at.x) * 4));
-		const float2 o = float2(at) + 0.5 - t;
-		const float expect = depth + (dot(slope, o) - slack * length(o)) * unit;
-		disc.x += d < expect && d < 1.0 ? 1.0 : 0.0;
-		disc.y += d < expect - 2.0 * per_yalm && d < 1.0 ? 1.0 : 0.0;
-	}
-	return lerp(r, disc / 16.0, wider);
-}
-
-// One cascade of the map: near (0), far (1) or farthest (2): where its rows are (and its drawing before's), where it
-// starts in the copy (and the one before), its row pitch, depth a yalm (and the one before's), a texel's size (yalms),
-// texels a side (0: the farthest not drawn), how far its last drawing has faded in over the one before
-struct sun_cascade
-{
-	uint rows, prev_rows, base, prev_base, pitch;
-	float per_yalm, prev_per_yalm, texel, size, faded;
-};
-
-sun_cascade cascade_of(uint k)
-{
-	sun_cascade c;
-	if (k < 2)
-	{
-		const float4 info = actors[kSunMap + 6], info2 = actors[kSunMap + 7], fade = actors[kSunMapPrev + 6], prev = actors[kSunMapPrev + 7];
-		const bool near = k == 0;
-		c.rows = kSunMap + 3 * k;
-		c.prev_rows = kSunMapPrev + 3 * k;
-		c.base = asuint(near ? info2.w : info2.z);
-		c.prev_base = asuint(near ? fade.z : fade.w);
-		c.pitch = uint(info.w);
-		c.per_yalm = near ? info.y : info.z;
-		c.prev_per_yalm = near ? prev.x : prev.y;
-		c.texel = near ? info2.x : info2.y;
-		c.size = info.x;
-		c.faded = near ? fade.x : fade.y;
-	}
-	else
-	{
-		const float4 a = actors[kSunMapFar + 6], b = actors[kSunMapFar + 7];
-		c.rows = kSunMapFar;
-		c.prev_rows = kSunMapFar + 3;
-		c.per_yalm = a.x;
-		c.base = asuint(a.y);
-		c.texel = a.z;
-		c.faded = a.w;
-		c.prev_per_yalm = b.x;
-		c.prev_base = asuint(b.y);
-		c.size = b.z;
-		c.pitch = uint(b.w);
-	}
-	return c;
-}
-
-// How far inside cascade c P is (texels in from its nearest edge; under 0 outside it), and q: P moved off its surface
-// by a texel and a half of it and toward the sun by one, and a texel and 3 cm more is allowed in depth (map_drawing),
-// so a surface doesn't shade itself
-float cascade_inside(sun_cascade c, float3 P, float3 n, float3 to_sun, out float4 q)
-{
-	q = float4(P + n * (1.5 * c.texel) + to_sun * c.texel, 1.0);
-	const float2 t = float2(dot(q, actors[c.rows]), dot(q, actors[c.rows + 1]));
-	return min(min(t.x, t.y), c.size - max(t.x, t.y));
-}
-
-// The cascade's last drawing at q, faded in over the one before as far as it says (where the one before covers the
-// point, two texels in from its edge; else the last alone)
-float2 cascade_shadow(sun_cascade c, float4 q, float3 n, float spin, float wide)
-{
-	float2 r = map_drawing(q, n, c.rows, c.per_yalm, c.base, c.texel, c.size, c.pitch, spin, wide);
-	[branch] if (c.faded < 1.0)
-	{
-		const float2 tp = float2(dot(q, actors[c.prev_rows]), dot(q, actors[c.prev_rows + 1]));
-		if (min(min(tp.x, tp.y), c.size - max(tp.x, tp.y)) > 2.0)
-			r = lerp(map_drawing(q, n, c.prev_rows, c.prev_per_yalm, c.prev_base, c.texel, c.size, c.pitch, spin, wide), r, c.faded);
-	}
-	return r;
-}
-
-// How much of the sun the map says is blocked at P (view space, n its facing; spin and wide as map_drawing's), from the
-// near cascade where P is well inside it (the widest taps' reach and two texels more), else the far one, handing over to
-// the farthest over the far one's last tenth; covered: 1 inside them, fading out over the farthest's last twentieth
-// (the far one's without it), 0 beyond (nothing read then). above: the part of it blocked from well above
-float sun_from_map(float3 P, float3 n, float3 to_sun, float spin, float wide, out float covered, out float above)
-{
-	static const float kMargin = kPenumbraMax + 2.0;
-	float4 q;
-	float2 r = 0.0;
-	const sun_cascade c0 = cascade_of(0);
-	[branch] if (cascade_inside(c0, P, n, to_sun, q) > kMargin)
-	{
-		r = cascade_shadow(c0, q, n, spin, wide);
-		covered = 1.0;
-	}
-	else
-	{
-		const sun_cascade c1 = cascade_of(1), c2 = cascade_of(2);
-		float4 q2 = q;
-		const float in1 = cascade_inside(c1, P, n, to_sun, q);
-		const bool farthest = c2.size > 0.0;
-		const float in2 = farthest ? cascade_inside(c2, P, n, to_sun, q2) : -1.0;
-		const float handed = farthest ? saturate(1.0 - (in1 - kMargin) / (0.1 * c1.size)) : 0.0;
-		covered = farthest ? (handed < 1.0 ? 1.0 : saturate(in2 / (0.05 * c2.size))) : saturate(in1 / (0.05 * c1.size));
-		[branch] if (handed < 1.0 && in1 > 0.0)
-			r = cascade_shadow(c1, q, n, spin, wide);
-		[branch] if (handed > 0.0 && in2 > 0.0)
-			r = lerp(r, cascade_shadow(c2, q2, n, spin, wide), handed);
-	}
-	above = r.y;
-	return r.x;
-}
-
-// The host's casters' map (rule bit 4096; grass_render.cpp draw_casters: HiFi XI's characters and monsters drawn from
-// their own meshes, each frame): one more drawing in the shadow map's copy, as a cascade's, kCasterReach yalms each way
-// around the camera. [kCaster..+2] its rows for a view-space point, [kCaster + 3] its depth a yalm, where it starts
-// (uints, as bits), a texel's size (yalms). Where it covers a point, the characters' shadows come from it, not from
-// actor_shadow's capsules and silhouettes.
-static const uint kCaster = kCloud + 10;
-bool casters_mapped() { return ((crowd.x >> 16) & 4096) != 0; }
-
-// How much of the sun the casters block at P (n its facing; spin and wide as map_drawing's: a body casts within a
-// yalm or two of what it shades, so its shadow is the 4 x 4's but for something standing high over it); covered: 1 well
-// inside the map, fading out over its last twentieth
-float casters_from_map(float3 P, float3 n, float3 to_sun, float spin, float wide, out float covered)
-{
-	float4 info = actors[kCaster + 3];
-	float size = actors[kSunMap + 6].x;
-	uint pitch = uint(actors[kSunMap + 6].w);
-	float texel = info.z;
-	float4 q = float4(P + n * (1.5 * texel) + to_sun * texel, 1.0);
-	float2 t = float2(dot(q, actors[kCaster]), dot(q, actors[kCaster + 1]));
-	covered = saturate(min(min(t.x, t.y), size - max(t.x, t.y)) / (0.05 * size));
-	float shadow = 0.0;
-	[branch] if (covered > 0.0)
-		shadow = map_drawing(q, n, kCaster, info.x, asuint(info.y), texel, size, pitch, spin, wide).x;
-	return shadow;
-}
-
-// Sun shadows, for the world's even rows and columns (a pixel in four), into u1 for shade_ps to blur, a uint each:
-// how much of the sun is blocked (8 bits, 0..1: the march's and the map's, to be taken by the surface's sun share)
-// | the map's shadow from well above on a surface seen too nearly edge on to tell its facing (8 bits, taken whole)
-// << 8 | f16 how far the pixel is (view depth) << 16.
-// With the shadow map (above), what the zone's meshes cast comes from it, on screen or off it; the march below
-// then only looks for contact shadows where the map covers the point: its first 16 steps (to 1.7 yalms), which
-// the map can't draw finely enough (its texels and bias are a few centimetres) and which come from what isn't in
-// it (the grass, objects the zone's object list doesn't place). The two are put together by the larger.
-// From the surface toward the sun in 32 steps, each 1.25 times the last, from 0.06 yalms to about 60 (16
-// steps to 9 yalms never reached a tree's trunk past head height, let alone its crown); where a step is just
-// behind what's drawn there (a crown, a trunk, a wall, a rock), the sun is blocked. Just behind: within 0.4
-// yalms, 1% of the distance and 0.6 of the step's own length; further behind, the march passes behind the
-// thing, not through it. A hit fades in and out at both ends of that window and the march's last 30% fades
-// out, so no one step turns a shadow on or off outright. What's off screen can't cast.
-// Characters and monsters never cast in the march: from here they cast a ghost on their far side (the march passing
-// behind them) and came out dotted (above actor_shadow). So a step that lands on one of them doesn't count: the two
-// whose outline on screen comes nearest the march's path are checked at every step. Their own shadows come from
-// actor_shadow, when asked for (crowd.x rule bit 4: the game draws its own otherwise, a silhouette under the player
-// and blobs under the rest, which is why it's off unless asked).
+// Contact shadows, for the world's even rows and columns (a pixel in four), into u1 for shade_ps to blur, a uint each:
+// how much of the sun is blocked close by (8 bits, 0..1: to be taken by what's left of the surface's sun share)
+// | f16 how far the pixel is (view depth) << 16.
+// The sun's and the clouds' shadows themselves are the native passes' (HiFi XI's src/render/sun_shadows.hpp: the zone,
+// the characters and the blades look the cascades up as they light each pixel). What's left for here is what the
+// cascades can't draw finely enough (their texels and bias are a few centimetres) and what isn't in them (the grass,
+// objects the zone's list doesn't place): from the surface toward the sun in 16 steps, each 1.25 times the last, from
+// 0.06 yalms to 1.7; where a step is just behind what's drawn there, the sun is blocked. Just behind: within 0.4
+// yalms, 1% of the distance and 0.6 of the step's own length; further behind, the march passes behind the thing, not
+// through it. A hit fades in and out at both ends of that window and the march's last 30% fades out, so no one step
+// turns a shadow on or off outright. What's off screen can't cast.
+// Characters and monsters never cast in the march (from here they cast a ghost on their far side, the march passing
+// behind them): a step that lands on one of them doesn't count, the two whose outline on screen comes nearest the
+// march's path checked at every step; and a pixel of one of them (inside its capsule, t2) takes none: the facets of
+// the game's low-poly models split every limb into a shaded half and a lit one.
 // The steps are a fixed run, each read on its own and the results put together after: no loop that waits on a
 // read to decide whether to go on.
 void sun_ps(float4 pos : SV_Position)
@@ -2859,97 +1998,49 @@ void sun_ps(float4 pos : SV_Position)
 		return;
 	int2 p = h * 2;
 	float z = drawn_depth(p);
-	float shadow = 0.0, whole = 0.0;
+	float shadow = 0.0;
 	float3 to_sun = sun_in_view();
 	float3 P = view_at(p);
 	// (the native zone's and characters' own facing where the light split has it: never too edge on to tell)
 	float steep = 1.0;
 	float3 n;
 	float known_share;
-	bool relief_mark, done; // (done: the native passes applied the map's and the casters' shadows here, light_at's)
-	const bool known = light_at(p, z, P, n, known_share, relief_mark, done);
-	done = known && done;
-	if (!known)
+	bool relief_mark;
+	if (!light_at(p, z, P, n, known_share, relief_mark))
 		n = surface_normal(p, P, steep);
-	// A character or monster here (inside one of their capsules, t2): its shadow is worked out once, from its
-	// chest, as if facing the sun, and taken whole at kActorShare of its light (below, and shade_ps). The facing
-	// built from the depth is a facet's on the game's low-poly models: under a canopy it split every face, limb
-	// and knee pad down the middle into a shaded half and a lit one. (The march from the chest leaves out the
-	// character's own body, as for any.)
-	static const float kActorShare = 0.6;
-	const float3 world_up = -up_row.xyz; // (the world's up in view space: its y is down)
+	const float3 up = -up_row.xyz; // (the world's up in view space: its y is down)
+	const uint count = min(crowd.x & 0xFFFF, 32u);
 	bool on_actor = false;
-	float3 chest = P;
-	uint self = 32u; // (which one: none)
-	float self_radius = 0.0;
 	[unroll] for (uint k = 0; k < 32; ++k)
 	{
-		if (k < min(crowd.x & 0xFFFF, 32u))
+		if (k < count)
 		{
 			body b = body_in_view(k);
-			// (above its feet: the ground around them is ground, with its own shadow, the character's included)
-			bool here = !on_actor && z < 1e8 && inside(b, P, world_up) && dot(P - b.feet, world_up) > 0.15;
-			chest = here ? b.feet + world_up * (0.6 * b.height) : chest;
-			self = here ? k : self;
-			self_radius = here ? b.radius : self_radius;
-			on_actor = on_actor || here;
+			// (above its feet: the ground around them is ground)
+			on_actor = on_actor || (z < 1e8 && inside(b, P, up) && dot(P - b.feet, up) > 0.15);
 		}
 	}
-	if (on_actor)
-	{
-		P = chest;
-		n = to_sun;
-		steep = 1.0;
-	}
-	float facing = dot(n, to_sun);
-	const bool unsure = steep > 4.0; // (seen too nearly edge on for its facing to be told)
 	// (each of a 4 x 4 block of these pixels its own sixteenth, which shade_ps's 4 x 4 average puts together: the march's
-	// start within its first step, the map's taps' turn)
+	// start within its first step)
 	static const float bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 	const float sixteenth = (bayer[(h.y & 3) * 4 + (h.x & 3)] + 0.5) / 16.0;
-	const float spin = 6.2831853 * sixteenth;
-	// (the map's wide taps: on a surface facing the sun whose facing is known, or told from the depth even at a slant, as
-	// flat ground a few yalms off a low camera is (it isn't edge on: unsure only for its sign), with more slack the more
-	// slanted; not along an edge, where the depth's facing is anyone's)
-	const float wide = facing > 0.0 && steep < 16.0 ? max(steep / 4.0, 1.0) : 0.0;
-	float covered = 0.0, mapped = 0.0, above = 0.0;
-	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && ((crowd.x >> 16) & 8) != 0 && !done)
-		mapped = sun_from_map(P, n, to_sun, spin, wide, covered, above);
-	// The characters and monsters from their meshes (casters_from_map): on one of them, from just past their own body
-	// toward the sun (their chest outward by their capsule's radius and a bit: the map has their own body too, and it
-	// was never meant to shade itself here, as the march from the chest leaves it out); elsewhere at the surface
-	float cast = 0.0, cast_covered = 0.0;
-	[branch] if (z < 1e8 && (facing > 0.0 || unsure) && casters_mapped() && !done)
-		cast = casters_from_map(on_actor ? P + to_sun * (self_radius + 0.3) : P, n, to_sun, spin, wide, cast_covered);
-	// (at the share a surface facing up would lose: not all of it. Ground seen at a grazing angle is "unsure" from
-	// about 10 yalms off when the camera is low, so taken whole it was shaded twice as dark as the same ground nearer
-	// at a low sun, along a line that moved with the camera)
-	whole = unsure ? max(above * covered, cast * cast_covered) * sun_share(dot(world_up, to_sun)) : 0.0;
 	// (any surface the sun reaches at all: what a shadow takes from it comes down to nothing as the sun grazes it)
-	if (z < 1e8 && facing > 0.0)
+	if (z < 1e8 && dot(n, to_sun) > 0.0 && !on_actor)
 	{
 		static const float kGrow = 1.25;
-		static const float kLast = 60.58; // (the 32nd step's t: 0.06 x 1.25^31)
-		// (the start within the first step: this pixel's sixteenth, above)
+		static const float kLast = 1.705; // (the 16th step's t: 0.06 x 1.25^15)
 		float t = 0.06 * pow(kGrow, sixteenth);
-		static const float kContact = 1.705; // (the 16th step's t: 0.06 x 1.25^15)
 		// The march starts two pixel widths off the surface along its facing, and takes no hit nearer than two
 		// pixel widths times how steeply the surface is seen: on a rough wall seen at an angle, the first steps
 		// caught the wall's own bumps (dark slabs that slid about with the camera)
 		const float width = pixel_width(z);
 		const float3 from = P + n * (2.0 * width);
 		const float t_min = 2.0 * width * clamp(steep, 1.0, 20.0);
-		const bool contact = covered >= 1.0 || done; // (done: the map's shadows are in the colour already, the march only for contact)
-		const float last = contact ? kContact : kLast;
-		const int steps = contact ? 16 : 32;
-
 		// The two characters or monsters whose outline comes nearest the march's path on screen (from here to
 		// its last step, or to where it'd reach the camera)
-		float3 up = -up_row.xyz; // (the world's up in view space: its y is down)
-		uint count = min(crowd.x & 0xFFFF, 32u);
 		float w0 = P.z * up_row.w, dw = to_sun.z * up_row.w;
-		float t_end = dw < 0.0 ? min(last, max(w0 - 0.3, 0.0) / -dw) : last;
-		float2 a = on_actor ? screen_of(P) : float2(p) + 0.5, ab = screen_of(P + to_sun * t_end) - a;
+		float t_end = dw < 0.0 ? min(kLast, max(w0 - 0.3, 0.0) / -dw) : kLast;
+		float2 a = float2(p) + 0.5, ab = screen_of(P + to_sun * t_end) - a;
 		body b0 = (body)0, b1 = (body)0; // (radius 0: nothing is inside)
 		float best0 = 0.0, best1 = 0.0;
 		[unroll] for (uint i = 0; i < 32; ++i)
@@ -2976,16 +2067,12 @@ void sun_ps(float4 pos : SV_Position)
 				}
 			}
 		}
-
 		const bool any_body = b0.radius > 0.0;
-
 		// (the march ends where it leaves the screen, goes behind the camera, or crosses half the screen)
 		int reach = int(ground.y / 2);
 		bool going = true;
-		[unroll] for (int s = 0; s < 32; ++s)
+		[unroll] for (int s = 0; s < 16; ++s)
 		{
-			[branch] if (s >= steps)
-				break;
 			float3 S = from + to_sun * t;
 			float w = S.z * up_row.w;
 			float2 ndc = float2(S.x * lin.z, S.y * lin.w) / max(w, 0.2);
@@ -3002,26 +2089,11 @@ void sun_ps(float4 pos : SV_Position)
 				float3 there = float3(S.xy * drawn / max(w, 0.2), drawn * up_row.w);
 				on_body = inside(b0, there, up) || inside(b1, there, up);
 			}
-			shadow = max(shadow, going && !on_body ? hit * (1.0 - smoothstep(0.7 * last, last, t)) : 0.0);
+			shadow = max(shadow, going && !on_body ? hit * (1.0 - smoothstep(0.7 * kLast, kLast, t)) : 0.0);
 			t *= kGrow;
 		}
-		shadow = max(shadow, mapped * covered);
-		shadow = max(shadow, cast * cast_covered);
-		// The characters' and monsters' own shadows, when asked for (actor_shadow): from where the march starts, past
-		// the surface's own bumps; on someone, from their chest, all but their own. Where the casters' map covers the
-		// point, from it instead (above), faded over its edge.
-		[branch] if (((crowd.x >> 16) & 4) != 0 && count > 0 && cast_covered < 1.0 && !done)
-			shadow = max(shadow, actor_shadow(from, to_sun, self, t_min) * (1.0 - cast_covered));
 	}
-	if (on_actor)
-	{
-		// (taken whole: not by the facet's facing; by the sun's share of their light where the light split has it, so the
-		// side turned from the sun, lit by the rest already, isn't darkened again)
-		whole = done ? 0.0 : saturate(shadow) * (known ? min(known_share * kShareScale, 1.0) : kActorShare);
-		shadow = 0.0;
-	}
-	sun_mask.Store((h.y * size.x + h.x) * 4, uint(saturate(shadow) * 255.0 + 0.5) | (uint(saturate(whole) * 255.0 + 0.5) << 8) |
-		(f32tof16(min(z, 60000.0)) << 16));
+	sun_mask.Store((h.y * size.x + h.x) * 4, uint(saturate(shadow) * 255.0 + 0.5) | (f32tof16(min(z, 60000.0)) << 16));
 }
 
 // The blades' depth test against the world is here, on the copy of its depth (the game's depth buffer isn't
@@ -3464,13 +2536,12 @@ blade_out ps_motion(v2p i)
 // The blades with the light split's word (drawn at the zone's end into the world, lit from the native passes' block:
 // "The blades' own light" above; HiFi XI's light_split.hpp and sun_shadows.hpp): the host's light split is a target
 // beside the world's, and a blade writes its own word over the ground's on its pixels: its view depth, a facing up, the
-// sun's share of its light and, where it was lit from the block, the mark, so the shading pass after takes the blade
-// as it takes the zone's own pixels (light_at: no sun or cloud shadow and no lamp glow a second time); with no block
-// to light by, an unmarked word, the blade shaded as a ground facing up. (Before, a blade's pixels kept the ground's
-// word behind them, which light_at took for the blade's wherever their depths came within its 1.4%.)
+// sun's share left of its light and, where it was lit from the block, the mark, so the shading pass after takes the
+// blade as it takes the zone's own pixels (light_at: its facing and share for the contact shadows, the occlusion, the
+// snow and the wet). (Before, a blade's pixels kept the ground's word behind them, which light_at took for the blade's
+// wherever their depths came within its 1.4%.)
 uint blade_word(v2p i)
 {
-	ss_mode = uint4(i.lit.w > 0.5 ? 1u : 0u, 0u, 0u, 0u);
 	return light_word_ss(i.lit.x, i.facing, i.lit.y, i.lit.z > 0.5);
 }
 struct blade_light_out
@@ -4244,21 +3315,11 @@ float4 snow_layer_ps(layer_v2p i) : SV_Target
 	const float3 L = sun_in_view(), world_up = -up_row.xyz;
 	float facing = (0.49 + 1.25 * saturate(dot(n, L))) / (0.49 + 1.25 * saturate(dot(world_up, L)));
 	snow = lerp(texel(p), min(snow * clamp(facing, 0.6, 1.35), 1.0), 0.98 * (1.0 - 0.3 * saturate(trodden)));
-	// World FX's shadows and lamps on it, in the game's fog, as the shading pass's on the rest
-	float in_sun;
-	float sunlit = sun_lit_at(p, z, n, i.P, cloud_shadows(), -1.0, in_sun);
-	float3 glow = 0.0;
-	[branch] if (((crowd.x >> 16) & 16) != 0)
-		glow = lamp_light(i.P, n, 1.0, snow);
-	float3 haze = 0.0;
-	float clear = 1.0;
+	// (its shadows and the lamps' glow are in that light already: snow_white reads the scene under it as the native
+	// passes drew it, shadowed and lit), in the game's fog as the rest
 	[branch] if (hazy())
-	{
-		clear = clear_at(depth);
-		snow = lerp(haze_colour(), snow, clear);
-		haze = haze_colour() * (1.0 - clear);
-	}
-	return float4(haze + (snow - haze) * sunlit + glow * clear, 1.0);
+		snow = lerp(haze_colour(), snow, clear_at(depth));
+	return float4(snow, 1.0);
 }
 
 // Leaves in wind and gales (leaf_vs, leaf_ps): in the rain's columns (its constants as the snow's), falling slowly

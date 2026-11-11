@@ -113,8 +113,8 @@ The +2 rule (src/host/retire.hpp)
   reference (`publish`, :142, the next publish or `release()` lets it go), and `latest` (:188) hands each pass one more,
   which the pass gives to `retire::later` right after binding it (`src/zone/draw.cpp:999`, `src/chars/chardraw.cpp:1832`):
   a renderer World FX remakes, a device change or a stale block let go never frees the copy under a recorded list. The
-  plugin's unload lets the block's own go before `retire::release_all` (`src/plugin/main.cpp`). With the lamps ([zone]
-  nativelamps) the block's buffer is whichever holds the lamps' cubes: World FX's shadow map copy, or the cubes' own
+  plugin's unload lets the block's own go before `retire::release_all` (`src/plugin/main.cpp`). With the lamps
+  the block's buffer is whichever holds the lamps' cubes: World FX's shadow map copy, or the cubes' own
   buffer (`_lamp_native`) while there's no such copy, held and handed on the same way; a block with lamps and no cube
   has no buffer (`latest` then hands none, `retire::later(nullptr)` does nothing). World FX's own blades take the block
   the same way (`latest` in `renderer::draw` at "worldfx: grass") and hand their reference to the renderer's `keep_old`

@@ -751,7 +751,6 @@ int main(int argc, char **argv)
 			for (size_t i = 0; i < size_t(cube_bytes / 4); ++i)
 				texels[i] = 1.0f;
 			bench_cubes->Unmap(0, nullptr);
-			hifi::sun::set_native_lamps(true);
 		}
 		for (uint32_t pass = 0; pass < 20 && alive; ++pass)
 		{
@@ -842,7 +841,6 @@ int main(int argc, char **argv)
 			native_lamps ? (inj::status()[0].find("the lamps' glow added") != std::string::npos ? ", World FX's glow of 16 lamps (4 cubes, 4 capsules) added by the pass" :
 				", World FX's glow NOT added (no block taken)") : "",
 			drawn, drawn != 0 ? sum / drawn : 0.0, worst, alive ? "still there" : "LOST", big_messages);
-		hifi::sun::set_native_lamps(false);
 		hifi::sun::release();
 		if (bench_cubes != nullptr)
 			bench_cubes->Release();
@@ -913,7 +911,7 @@ int main(int argc, char **argv)
 				n[0] += n[0] >= 0 ? -t : t;
 				n[1] += n[1] >= 0 ? -t : t;
 				const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-				const float share = float(v >> 25) / 127.0f;
+				const float share = float((v >> 25) & 63) / 63.0f; // (6 bits, bit 31 the mark: sun_shadows.hpp)
 				if (n[1] / l < -0.9f)
 				{
 					up++;
@@ -1171,13 +1169,15 @@ int main(int argc, char **argv)
 		check(!first_per_vertex || std::fabs(lumas[2] - first_luma) < 0.5, "  per vertex, as the game lights: only the lamps an object names (none here)");
 		check(lumas[3] > first_luma + 5.0, "  ... and named by every object, per vertex it lights them: " + std::to_string(lumas[3]));
 
-		// World FX's lamp glow added by the pass itself ([zone] nativelamps: src/render/sun_shadows.hpp's lamps). A block
-		// published as World FX publishes it, with one lamp 3 yalms over that point of the street (reach 9), no lamp in the
-		// frame itself. Per pixel with the option on the street under it gets brighter and every word of the light split
-		// is marked (bit 31); with the option off, per vertex, or the block gone stale, the picture is the one without
-		// any block, byte for byte, and no word is marked. A zone's lamp (it casts) loses light behind a character's
-		// capsule standing under it, and behind what its cube holds (a cube that hides everything: no glow left; an
-		// empty one: all of it).
+		// World FX's lamp glow added by the pass itself (src/render/sun_shadows.hpp's lamps). A block published as World FX
+		// publishes it, with one lamp 3 yalms over that point of the street (reach 9), no lamp in the frame itself. The
+		// street under it gets brighter and every word of the light split is marked (bit 31), lit per pixel or per vertex
+		// (the block is looked up per pixel either way); with the block gone stale the picture is the one without any
+		// block, byte for byte, and no word is marked. A zone's lamp (it casts) loses light behind a character's capsule
+		// standing under it, and behind what its cube holds (a cube that hides everything: no glow left; an empty one: all
+		// of it). The faithful look (the block's small-room word, lamp_map.w 1: what a Mog House gets) for the measures;
+		// then the tuned one. (The cases "[zone] nativelamps off: the picture as with no block" and "per vertex: the block
+		// not applied" went with the switch and with World FX's own glow, which lit what the pass didn't.)
 		{
 			namespace sun = hifi::sun;
 			D3D12_HEAP_PROPERTIES up_heap = {};
@@ -1195,7 +1195,7 @@ int main(int argc, char **argv)
 				cubes[k]->Unmap(0, nullptr);
 			}
 			// (kind: 0 a glow, 1 a zone's lamp, 2 one with its cube; body: a character standing on the point)
-			auto publish_lamp = [&](float kind, bool body, ID3D12Resource *cube, bool stale) {
+			auto publish_lamp = [&](float kind, bool body, ID3D12Resource *cube, bool stale, bool tuned) {
 				sun::block b;
 				b.device = device;
 				b.buffer = cube;
@@ -1211,6 +1211,7 @@ int main(int argc, char **argv)
 				g.lamp_map[0] = 1.0f;
 				g.lamp_map[1] = 0.95f;
 				g.lamp_map[2] = 1.0f;
+				g.lamp_map[3] = tuned ? 0.0f : 1.0f;
 				const float feet[4] = { P[0], P[1], P[2], 1.0f };
 				std::memcpy(g.body[0], feet, 16);
 				sun::publish(b);
@@ -1229,10 +1230,53 @@ int main(int argc, char **argv)
 				int cube; // (-1: no buffer)
 				bool stale;
 				bool tuned = false; // (the tuned look, the default: sun_shadows.hpp; else the faithful port)
+				int sun = 0;        // (the sun's shadows in the block instead: 1 a cascade with nothing in it, 2 all of it in shadow)
+			};
+			// The sun's shadows from the block (a cascade made by hand, 128 yalms across round that point of the street, a
+			// texel 2 yalms: every texel nearer the sun than anything, or none): under the empty one the picture is the one
+			// without a block, byte for byte; under the full one the sunlit street loses the sun's part of its light, lit
+			// per pixel or per vertex.
+			const UINT kCascade = 64;
+			ID3D12Resource *cascade_map = nullptr;
+			bd.Width = UINT64(kCascade) * kCascade * 4 * 2;
+			device->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&cascade_map));
+			{
+				float *texels = nullptr;
+				cascade_map->Map(0, nullptr, reinterpret_cast<void **>(&texels));
+				for (size_t i = 0; i < size_t(kCascade) * kCascade; ++i)
+				{
+					texels[i] = 0.0f;
+					texels[size_t(kCascade) * kCascade + i] = 1.0f;
+				}
+				cascade_map->Unmap(0, nullptr);
+			}
+			auto publish_sun = [&](bool full) {
+				sun::block b;
+				b.device = device;
+				b.buffer = cascade_map;
+				sun::gpu_block &g = b.gpu;
+				g.mode[2] = sun::kHasSun;
+				const float texel = 2.0f;
+				for (int d = 0; d < 2; ++d)
+				{
+					g.rows[3 * d][0] = 1.0f / texel;
+					g.rows[3 * d][3] = -(P[0] - 64.0f) / texel;
+					g.rows[3 * d + 1][2] = 1.0f / texel;
+					g.rows[3 * d + 1][3] = -(P[2] - 64.0f) / texel;
+					g.rows[3 * d + 2][3] = 0.5f;
+				}
+				g.cascade[0][0] = g.cascade[0][1] = 0.001f;
+				g.cascade[0][2] = texel;
+				g.cascade[0][3] = 1.0f;
+				g.where[0][0] = g.where[0][1] = full ? 0u : kCascade * kCascade;
+				g.where[0][2] = g.where[0][3] = kCascade;
+				g.sun[1] = -1.0f;
+				g.sun[3] = 0.8f;
+				sun::publish(b);
 			};
 			const pass_t passes[] = {
 				{ "no block", true, false, 0.0f, false, -1, false },
-				{ "the option off", true, false, 0.0f, false, -1, false },
+				{ "a glow, again", true, true, 0.0f, false, -1, false },
 				{ "a glow", true, true, 0.0f, false, -1, false },
 				{ "per vertex, no block", false, false, 0.0f, false, -1, false },
 				{ "per vertex", false, true, 0.0f, false, -1, false },
@@ -1244,6 +1288,9 @@ int main(int argc, char **argv)
 				{ "the tuned look: a zone's lamp", true, true, 1.0f, false, -1, false, true },
 				{ "the tuned look: a character under it", true, true, 1.0f, true, -1, false, true },
 				{ "the tuned look: its cube hiding everything", true, true, 2.0f, false, 0, false, true },
+				{ "the sun: a cascade with nothing in it", true, true, 0.0f, false, -1, false, false, 1 },        // 13
+				{ "the sun: a cascade all in shadow", true, true, 0.0f, false, -1, false, false, 2 },             // 14
+				{ "the sun, per vertex: a cascade all in shadow", false, true, 0.0f, false, -1, false, false, 2 }, // 15
 			};
 			constexpr int kPasses = int(sizeof(passes) / sizeof(passes[0]));
 			ID3D12Resource *shots[kPasses] = {}, *words[kPasses] = {};
@@ -1265,12 +1312,12 @@ int main(int argc, char **argv)
 				const uint32_t seq = 40 + uint32_t(k);
 				fill(seq, true);
 				inj::set_options(ps.per_pixel);
-				sun::set_native_lamps(ps.option);
-				sun::set_lamp_look(ps.tuned ? sun::kLookTuned : sun::kLookFaithful);
 				if (k == 0 || k == 3)
 					sun::publish_none();
+				else if (ps.sun != 0)
+					publish_sun(ps.sun == 2);
 				else
-					publish_lamp(ps.kind, ps.body, ps.cube >= 0 ? cubes[ps.cube] : nullptr, ps.stale);
+					publish_lamp(ps.kind, ps.body, ps.cube >= 0 ? cubes[ps.cube] : nullptr, ps.stale, ps.tuned);
 				hifi::light::take(); // (the light split wanted, as World FX asks each frame)
 				list->ClearRenderTargetView(rtv, sky, 0, nullptr);
 				list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
@@ -1297,9 +1344,7 @@ int main(int argc, char **argv)
 				}
 			}
 			inj::set_options(false);
-			sun::set_native_lamps(false);
 			sun::release();
-			sun::set_lamp_look(sun::kLookTuned);
 			barrier(list, A, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			barrier(list, Az, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			list->Close();
@@ -1340,6 +1385,16 @@ int main(int argc, char **argv)
 			}
 			for (ID3D12Resource *c : cubes)
 				c->Release();
+			cascade_map->Release();
+			{
+				const double vertex_lit = luma_at(img[3].data()), vertex_shade = luma_at(img[15].data());
+				std::snprintf(line, sizeof(line), "the sun's shadows by the zone pass (a cascade made by hand): the sunlit street %.1f; under an empty cascade %s; all in "
+					"shadow %.1f (%u of %u words marked); per vertex %.1f -> %.1f", spot[0], img[13] == img[0] ? "the same picture, byte for byte" : "ANOTHER PICTURE",
+					spot[14], marked[14], coded[14], vertex_lit, vertex_shade);
+				check(img[13] == img[0] && marked[13] == coded[13] && coded[13] > size_t(W) * H / 2, "  " + std::string(line));
+				check(spot[14] < 0.9 * spot[0] && spot[14] > 0.3 * spot[0] && marked[14] == coded[14], "  a cascade all in shadow: the street loses the sun's part of its light, the rest stays");
+				check(vertex_shade < 0.9 * vertex_lit && vertex_shade > 0.3 * vertex_lit && marked[15] == coded[15], "  and lit per vertex the same: the shadow looked up per pixel");
+			}
 			size_t changed = 0;
 			for (size_t i = 0; i < size_t(W) * H; ++i)
 				changed += std::memcmp(&img[2][i * 4], &img[0][i * 4], 3) != 0 ? 1 : 0;
@@ -1347,10 +1402,13 @@ int main(int argc, char **argv)
 				"(%zu pixels changed), %u of %u words marked; the pass says so: %s", spot[0], spot[2], changed, marked[2], coded[2], lamps_added[2] ? "yes" : "no");
 			check(spot[2] > spot[0] + 5.0 && changed > 1000 && coded[2] > size_t(W) * H / 2 && marked[2] == coded[2] && lamps_added[2], line);
 			check(img[0] == pictures[0], "  no block: the per-pixel picture as the lamp part's first (the same pass again)");
-			std::snprintf(line, sizeof(line), "  the option off, the block there: the picture as with no block, byte for byte (the pass says %s)", lamps_added[1] ? "added" : "not added");
-			check(img[1] == img[0] && !lamps_added[1], line);
-			std::snprintf(line, sizeof(line), "  per vertex with the block: the per-vertex picture, byte for byte, %u of %u words marked", marked[4], coded[4]);
-			check(img[4] == img[3] && img[3] != img[0] && coded[4] > size_t(W) * H / 2 && marked[4] == 0 && !lamps_added[4], line);
+			check(img[1] == img[2] && lamps_added[1], "  the same block again: the same picture, byte for byte");
+			double vertex_spot[2] = {};
+			for (int k = 0; k < 2; ++k)
+				vertex_spot[k] = luma_at(img[3 + k].data());
+			std::snprintf(line, sizeof(line), "  per vertex with the block: the street under the lamp %.1f -> %.1f, %u of %u words marked (the pass says %s)", vertex_spot[0],
+				vertex_spot[1], marked[4], coded[4], lamps_added[4] ? "added" : "not added");
+			check(img[3] != img[0] && vertex_spot[1] > vertex_spot[0] + 5.0 && coded[4] > size_t(W) * H / 2 && marked[4] == coded[4] && lamps_added[4], line);
 			std::snprintf(line, sizeof(line), "  a stale block: the picture as with no block, byte for byte, %u of %u words marked", marked[5], coded[5]);
 			check(img[5] == img[0] && coded[5] > size_t(W) * H / 2 && marked[5] == 0 && !lamps_added[5], line);
 			std::snprintf(line, sizeof(line), "  a zone's lamp %.1f; a character standing under it %.1f; its cube hiding everything %.1f (no lamp %.1f), empty %.1f",

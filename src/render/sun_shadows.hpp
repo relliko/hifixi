@@ -17,41 +17,32 @@
 // recorded (the +2 rule: docs/d3d12/sync.md), so a renderer World FX remakes or a stale block let go never frees the
 // copy under a list in flight. A block older than kFreshMs isn't used; one older than kDropMs is let go.
 //
-// The light split's mark (light_split.hpp "Marks"): while native() is on, every word the native passes write has the
-// sun's share in 6 bits (25-30) and bit 31 set where the sun's and clouds' shadows were applied already; World FX (told
-// by zinfo.w bit 128) then leaves those pixels' sun and cloud shadows alone (only its short contact march stays) and
-// reads the share as what's left of the sun's light after them. The pixels the game still draws itself and anything
-// not marked keep World FX's old path (World FX's own blades mark theirs: "The grass" below). native() and
-// native_lamps() both off: every word as before, bit for bit, and nothing applied. (With the lamps the mark says a
-// little more: "The mark, with lamps" below.)
+// This is the one lighting path (since the cleanup, 2026-11-11: World FX's own darkening of the finished picture by its
+// maps, its capsule shadows and its lamp glow are gone, and so are the switches that chose, [zone] nativeshadows and
+// nativelamps). With no fresh block (the first frames, World FX off or not shading, a zone with no open sky and no lamp
+// lit) the native passes apply no shadow and add no glow: the game's own light alone.
 //
-// The lamps (notes-lighting-improvements.md "2. One lamp system"; [zone] nativelamps, native_lamps()): the same block
-// carries World FX's lamp list in world space as grass::look hands it (up to 16: the zone's lit lamps and the effects'
-// glows), the lamps' shadow cubes (their depth copied into the published buffer: the sun's copy's end, or a buffer of
-// their own when there's no sun map: at night, indoors) and up to 4 characters' capsules. The native passes then add
-// World FX's tuned glow themselves (kHlsl's sl_glow, grass.hlsl's lamp_light ported): by the pixel's real facing, every
-// lamp that has a cube shadowed by it, the characters' capsules shadowing a lamp in closed form. The block's flags
-// (mode.z) say what it holds: kHasSun the sun's and clouds' shadows, kHasLamps the lamps; either may be there without
-// the other, and a block with lamps and no cube has no buffer at all (nothing is read then).
+// The lamps (notes-lighting-improvements.md "2. One lamp system"): the same block carries World FX's lamp list in world
+// space as grass::look hands it (up to 16: the zone's lit lamps and the effects' glows), the lamps' shadow cubes (their
+// depth copied into the published buffer: the sun's copy's end, or a buffer of their own when there's no sun map: at
+// night, indoors) and up to 4 characters' capsules. The native passes add the tuned glow themselves (kHlslLamps'
+// sl_glow): by the pixel's real facing, every lamp that has a cube shadowed by it, the characters' capsules shadowing a
+// lamp in closed form. The block's flags (mode.z) say what it holds: kHasSun the sun's and clouds' shadows, kHasLamps
+// the lamps; either may be there without the other, and a block with lamps and no cube has no buffer at all.
 //
-// The mark, with lamps: while native() or native_lamps() is on the words are written marked (the share in 6 bits), and
-// bit 31 means "this pixel was lit from the published block", whatever it held: a native pass sets it only where it
-// applied all the block holds (after its options: constants_for). World FX, the block's producer, knows what the block
-// the native passes read held (published(), asked before it publishes this frame's) and tells its shaders in zinfo.w:
-// bit 512 the words are marked, 128 the block had the sun's shadows, 256 it had the lamps. On a marked pixel it leaves
-// the sun's and clouds' shadows alone only with 128, and adds no lamp glow only with 256.
+// The light split's words (light_split.hpp): the native passes write the sun's share in 6 bits (25-30: what's left of
+// the sun's light after the shadows they applied) and set bit 31 where they lit the pixel from the block. World FX's
+// shading pass reads the share (its contact shadows take it, its ambient occlusion spares it); nothing reads bit 31 any
+// more (it told World FX not to shade the pixel a second time), it's kept as the word's record of who lit the pixel.
 //
-// The grass (World FX's own blades, grass.hlsl vs_main) is a native pass too: while marked() the renderer takes the
-// latest block for its blades as the zone does (latest, constants_for), hands it to their vertex shader after the
-// actors (grass.hlsl kNative, the copy in t1) and compiles kHlsl and kHlslLamps into grass.hlsl in the place it marks
-// (grass_render.cpp compile: one copy of the lookups and of the lamps' tuning for the zone, the characters and the
-// blades). Each blade then takes its sun and cloud shadow at its root (off the sun's part of the ground's light:
-// ground_light below) and the lamps' glow there, and, drawn at the zone's end into the world, writes the light split's
-// word on its pixels with the mark, so World FX's shading pass leaves them as it leaves the zone's. Drawn after the
-// shading pass (no marker: zone_view, the tests) nothing shades them again and they write no word.
+// The grass (World FX's own blades, grass.hlsl vs_main) is a native pass too: the renderer takes the latest block for
+// its blades as the zone does (latest, constants_for), hands it to their vertex shader after the actors (grass.hlsl
+// kNative, the copy in t1) and compiles kHlsl and kHlslLamps into grass.hlsl in the place it marks (grass_render.cpp
+// with_native: one copy of the lookups and of the lamps' tuning for the zone, the characters and the blades). Each
+// blade then takes its sun and cloud shadow at its root (off the sun's part of the ground's light: ground_light below)
+// and the lamps' glow there, and, drawn at the zone's end into the world, writes the light split's word on its pixels.
 //
-// Header only: World FX's renderer (the engine) publishes, the zone's and characters' renderers read, main.cpp sets
-// native() from [zone] nativeshadows and native_lamps() from [zone] nativelamps.
+// Header only: World FX's renderer (the engine) publishes, the zone's and characters' renderers read.
 #include <windows.h>
 #include <d3d12.h>
 #include <atomic>
@@ -62,7 +53,10 @@
 
 namespace hifi::sun
 {
-	constexpr ULONGLONG kFreshMs = 250, kDropMs = 2000;
+	// (fresh for a second: the block is the only source of the sun's shadows and the lamps' glow, so a frame after a
+	// hitch of a quarter second, the old limit, came out with neither, a flash; the cascades are in world space and
+	// drawn about once a second anyway. A zone's change lets the block go at once: worldfx_core's check_zone.)
+	constexpr ULONGLONG kFreshMs = 1000, kDropMs = 2000;
 
 	// The constants the native passes read (b2 in both: the HLSL's cbuffer sun_shadow below, the same layout).
 	// Cascade k (0 near, 1 far, 2 farthest): rows[6k..6k+2] its last drawing's rows taking a world point (x, y, z, 1) to
@@ -80,7 +74,7 @@ namespace hifi::sun
 	// zone's lamp with cube k; lamp_where: x where the cubes start in the buffer (uints), y texels a face (cube k's face f
 	// at x + (6k + f) y y; grass.hlsl kLampFaces' order); lamp_map: x the cubes' near plane, y their faces' scale, z how
 	// many times its lamp's reach a cube's far plane is (kLampCubeReach; under 1 read as 1), w the look (0 tuned, 1
-	// faithful: a small room's, or lamp_look()'s); body[j]: a character's feet (world) and size (grass::look's actors).
+	// faithful: a small room's); body[j]: a character's feet (world) and size (grass::look's actors).
 	constexpr uint32_t kHasSun = 1, kHasLamps = 2;
 	constexpr uint32_t kMaxLamps = 16, kMaxLampCubes = 4, kMaxBodies = 4;
 	struct gpu_block
@@ -124,28 +118,10 @@ namespace hifi::sun
 			uint64_t published = 0, taken = 0; // (status)
 		};
 		inline state g;
-		inline std::atomic<bool> g_native { false };
-		inline std::atomic<bool> g_native_lamps { false };
 	}
 
-	// [zone] nativeshadows (main.cpp, each present): the native passes apply the shadows and mark the light split
-	inline void set_native(bool on) { detail::g_native.store(on, std::memory_order_relaxed); }
-	inline bool native() { return detail::g_native.load(std::memory_order_relaxed); }
-	// [zone] nativelamps (the same): the native passes add the lamps' glow and mark the light split
-	inline void set_native_lamps(bool on) { detail::g_native_lamps.store(on, std::memory_order_relaxed); }
-	inline bool native_lamps() { return detail::g_native_lamps.load(std::memory_order_relaxed); }
-	// The native lamps' look (kHlslLamps): tuned, the default; faithful: World FX's glow as it is, ported (the tests hold
-	// the port to World FX's with it, and zone_view draws either). Not a setting: nothing in the plugin sets it.
-	constexpr int kLookTuned = 0, kLookFaithful = 1;
-	inline std::atomic<int> g_lamp_look { kLookTuned };
-	inline void set_lamp_look(int look) { g_lamp_look.store(look, std::memory_order_relaxed); }
-	inline int lamp_look() { return g_lamp_look.load(std::memory_order_relaxed); }
 	// (how far past a lamp's reach, as World FX has it, its cube is drawn: the tuned look's pool, kHlslLamps' kSlReach)
 	constexpr float kLampCubeReach = 1.6f;
-	// (the light split's words written marked: either is on)
-	inline bool marked() { return native() || native_lamps(); }
-	// (what the options leave of a block's flags)
-	inline uint32_t allowed(uint32_t flags) { return flags & ((native() ? kHasSun : 0u) | (native_lamps() ? kHasLamps : 0u)); }
 
 	// World FX, each frame it shades with the cascades or the lamps (b.gpu.mode[2] says which; b.buffer, when there is
 	// one, AddRef'd here; the last one let go)
@@ -184,29 +160,20 @@ namespace hifi::sun
 			old->Release();
 	}
 
-	// World FX, before it publishes this frame's: what the block the native passes of this frame read held, as far as the
-	// options let them apply it (kHasSun, kHasLamps): what bit 31 of the words they wrote means (above)
-	inline uint32_t published()
-	{
-		using namespace detail;
-		std::lock_guard<std::mutex> lock(g.mutex);
-		return g.has ? allowed(g.latest.gpu.mode[2]) : 0u;
-	}
-
 	// A native pass on device: the latest block if fresh and its device's (out.buffer, when it has one, AddRef'd: hand it
 	// to retire::later once the list is recorded). False: none to apply.
 	inline bool latest(ID3D12Device *device, block &out)
 	{
 		using namespace detail;
 		out = block();
-		if (!marked() || device == nullptr)
+		if (device == nullptr)
 			return false;
 		ID3D12Resource *stale = nullptr;
 		bool ok = false;
 		{
 			std::lock_guard<std::mutex> lock(g.mutex);
 			const ULONGLONG age = GetTickCount64() - g.at;
-			if (g.has && age <= kFreshMs && g.latest.device == device && allowed(g.latest.gpu.mode[2]) != 0)
+			if (g.has && age <= kFreshMs && g.latest.device == device)
 			{
 				out = g.latest;
 				if (out.buffer != nullptr)
@@ -314,12 +281,10 @@ cbuffer sun_shadow : register(b2)
 )";
 
 	inline const char *kHlsl = R"(
-// (sun_shadows.hpp) The light split's word as the mode says: marked (6-bit share, bit 31 where the pass applied what the
-// block holds: the sun's shadows, the lamps' glow, both; `shadowed`) or as before
+// (sun_shadows.hpp) The light split's word: the share in 6 bits, bit 31 where the pass applied what the block holds
+// (the sun's shadows, the lamps' glow, both: `shadowed`)
 uint light_word_ss(float depth, float3 n, float share, bool shadowed)
 {
-	if (ss_mode.x == 0)
-		return light_word(depth, n, share);
 	const uint w = light_word(depth, n, 0);
 	return w | (uint)round(saturate(share) * 63.0) << 25 | (shadowed ? 1u << 31 : 0u);
 }
@@ -509,14 +474,13 @@ float ss_sun_seen(float3 P, float3 n, float bias)
 }
 )";
 
-	// The lamps' glow for the native passes ([zone] nativelamps): grass.hlsl's lamp_light, lamp_blocked and lamp_from_map
-	// in world space, for a facing that's known. Keep the two alike: the falloff, the wrapped facing, the fixture and
-	// near distances (kLampFixture, kLampNear), the cube's compare, offsets and bias, and how the glow goes onto the
-	// colour (sl_lit). What differs, on purpose: every lamp with a cube is shadowed by it (there, only the strongest at
-	// the pixel), a lamp without one isn't marched toward (nothing of the screen is read here), and a character's capsule
-	// hides a zone's lamp (there the march left characters out: it found them at another depth each step).
+	// The lamps' glow for the native passes: what World FX's shading pass added to the finished picture until the cleanup
+	// (grass.hlsl's lamp_light, lamp_blocked and lamp_from_map, gone since), in world space, for a facing that's known:
+	// every lamp with a cube shadowed by it, a lamp without one not shadowed by the zone (nothing of the screen is read
+	// here), a character's capsule hiding a zone's lamp.
 	//
-	// Two looks (ss_lamp_map.w: lamp_look()). kLookFaithful is that port, World FX's glow as it is. kLookTuned, the
+	// Two looks (ss_lamp_map.w). The faithful one (1) is that old glow as it was, kept for a small room alone. The tuned,
+	// the
 	// default (Alex, 2026-11-10: "the lights do not have to match today's size or look; the best-looking result"), uses
 	// what the native pass has that World FX lacked:
 	// - the pool: a lamp reaches kSlReach (1.6) x as far as World FX's glow, still falling to nothing at its edge with
@@ -738,17 +702,14 @@ float sl_share(float share, float3 c, float3 glow)
 	}
 
 	// The block's constants for a native pass, as it'll apply them: have (a fresh block: latest) or not (nothing applied,
-	// never read); the words marked while native() is on; turn: the frame's turn of the taps (0..1)
-	// What the pass then applies is c.mode[2]: the block's flags as far as the options allow (kHasSun only with native(),
-	// kHasLamps only with native_lamps(); the part not allowed is zeroed, so nothing of it is applied or read). A pass
-	// that can't apply all of that (the characters while the zone's sun isn't known) takes no block at all: a marked
-	// pixel says all of it was applied.
+	// never read); turn: the frame's turn of the taps (0..1). What the pass then applies is c.mode[2], the block's flags;
+	// what the block doesn't hold is zeroed, so nothing of it is applied or read.
 	inline gpu_block constants_for(bool have, const block &b, float turn)
 	{
 		gpu_block c = have ? b.gpu : gpu_block();
 		if (!have)
 			std::memset(&c, 0, sizeof(c));
-		c.mode[2] = have ? allowed(c.mode[2]) : 0u;
+		c.mode[2] = have ? c.mode[2] & (kHasSun | kHasLamps) : 0u;
 		if ((c.mode[2] & kHasSun) == 0)
 		{
 			c.sun[3] = 0.0f;
@@ -759,10 +720,7 @@ float sl_share(float share, float3 c, float3 glow)
 		{
 			c.lamp_head[0] = c.lamp_head[1] = c.lamp_head[2] = 0.0f;
 		}
-		// (the look: the block's own word, 1 a small room's, else as lamp_look() says)
-		if (lamp_look() == kLookFaithful)
-			c.lamp_map[3] = 1.0f;
-		c.mode[0] = marked() ? 1u : 0u;
+		c.mode[0] = 1u; // (the light split's words: the share in 6 bits, bit 31 the mark)
 		c.mode[3] = 0;
 		std::memcpy(&c.mode[1], &turn, 4);
 		return c;

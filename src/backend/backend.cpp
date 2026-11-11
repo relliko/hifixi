@@ -543,7 +543,7 @@ namespace hifi::backend
 				// on their pixels, as the zone just did: src/render/sun_shadows.hpp "The grass")
 				worldfx::world_mark wm = world_of(fm);
 				D3D12_CPU_DESCRIPTOR_HANDLE split = {};
-				const bool lit = sun::marked() && zone_rt != nullptr && wm.rt == zone_rt &&
+				const bool lit = zone_rt != nullptr && wm.rt == zone_rt &&
 					light::begin(list, g_device.load(std::memory_order_acquire), zone_rt, split);
 				if (lit)
 					wm.light_rtv = uint64_t(split.ptr);

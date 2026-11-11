@@ -135,15 +135,17 @@ Our own resources:
 - `src/render/grass_render.cpp:4692,5295`, `src/fx/fxrender.cpp:596`: our private depths (floor map, blade depth, fx)
   are DENY_SHADER_RESOURCE on purpose: nothing samples them. Keep it that way, or drop the flag first.
 - `src/render/grass_render.cpp:3564,6120`: UAV barriers between World FX's passes over the same buffer.
-- World FX's shadow map copy read by the native zone and characters (`src/render/sun_shadows.hpp`, [zone]
-  nativeshadows): a buffer World FX writes only with copies (COPY_DEST) and leaves in NON_PIXEL | PIXEL_SHADER_RESOURCE
+- World FX's shadow map copy read by the native zone, characters and blades (`src/render/sun_shadows.hpp`; the one
+  lighting path since the cleanup of 2026-11-11, no switch): a buffer World FX writes only with copies (COPY_DEST) and leaves in NON_PIXEL | PIXEL_SHADER_RESOURCE
   at the end of each of them (`draw_sun_map`, `draw_casters`, and the clouds' shadows' map copied to its end from the sun
   mask, `grass_render.cpp:6433`: the mask UNORDERED_ACCESS -> COPY_SOURCE -> back, the copy readable -> COPY_DEST ->
   back, both in the same section). The native passes read it through a root SRV with **no barrier of their own**: it is
   in that read state between World FX's frames, or decayed to COMMON after an `ExecuteCommandLists` (a buffer), which
   promotes to a shader read. They read the frame before's drawing: their lists come before World FX's in a frame on the
   one queue, so no copy of this frame's runs under their reads (sun_shadows.hpp "Frame order").
-- The lamps' shadow cubes for the native passes ([zone] nativelamps, sun_shadows.hpp's lamps) ride in the same buffer:
+- The lamps' shadow cubes for the native passes (sun_shadows.hpp's lamps) ride in the same buffer (and only there: the
+  second copy World FX kept at the depth copy's end for its own lamp shadows, with the room `copy_out` left for it,
+  went with those in the cleanup):
   `draw_lamp_maps` (`grass_render.cpp:5240`) copies a cube's six faces from the lamps' depth array (DEPTH_WRITE ->
   COPY_SOURCE -> back) to that copy's end (`_lamp_copy_at`, after the clouds' map; the copy readable -> COPY_DEST ->
   readable again), only when a cube was just drawn or the buffer is another than it was last copied to. While there is no
@@ -159,8 +161,9 @@ Our own resources:
   pass in one draw (no marker), this frame's, which the same list left readable (NON_PIXEL | PIXEL_SHADER_RESOURCE)
   after its last copy. And they write the light split: at the zone's end the backend (`backend.cpp`, the zone_end
   mark) calls `light::begin` (kRead -> RENDER_TARGET) before `worldfx::on_zone_end` and `light::end` (back to kRead)
-  after it, only while `sun::marked()`; the renderer binds it as the blades' last target and unbinds it before
-  returning. grass_test 1b3 runs both ways with the debug layer on, 0 messages.
+  after it; the renderer binds it as the blades' last target and unbinds it before returning (no split to be had, a
+  multisampled world: the blades are lit the same and write no word). grass_test 1b3 runs both ways with the debug
+  layer on, 0 messages.
 - The texture pack's textures (`src/pack/stream.cpp:1007`): committed, made in COMMON, written once on the streamer's
   copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
   queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.

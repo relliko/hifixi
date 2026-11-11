@@ -1627,214 +1627,6 @@ namespace grass
 		return true;
 	}
 
-	// The compact file ('SHD2', tools/bake_shadow_geo.py write_compact): each placed model's casting triangles once,
-	// in its own space, and the zone's placements, packed; expanded here into what an SHD1 file holds (the same cells,
-	// the triangles in the same order, cut-out words kept only on alpha-tested placements). f is past the first 32
-	// bytes of its 64-byte header (in head); this closes it
-	static bool read_compact_shadow(FILE *f, const void *head, shadow_file &out, std::string &error)
-	{
-		struct header
-		{
-			char magic[4];
-			uint32_t zone;
-			float cell_size;
-			uint32_t models, model_triangles, placements, masks, words, packing, packed, raw, expanded, reserved[4];
-		} h = {};
-		static_assert(sizeof(header) == 64, "the compact shadow file's header is 64 bytes");
-		std::memcpy(&h, head, 32);
-		bool ok = fread(reinterpret_cast<char *>(&h) + 32, 32, 1, f) == 1 && h.models < 1000000 && h.model_triangles < 8000000 &&
-			h.placements < 2000000 && h.masks < 256 && h.words < 16000000 && (h.packing == 0 || h.packing == 4) && h.packed < 0x40000000u &&
-			h.expanded < 8000000 && std::isfinite(h.cell_size) && h.cell_size > 0.0f &&
-			uint64_t(h.raw) == uint64_t(h.models) * 8 + uint64_t(h.model_triangles) * 48 + uint64_t(h.placements) * 56 + uint64_t(h.masks) * 16 + uint64_t(h.words) * 4;
-		std::vector<uint8_t> packed, body;
-		if (ok)
-		{
-			packed.resize(h.packed);
-			ok = h.packed == 0 || fread(packed.data(), 1, packed.size(), f) == packed.size();
-		}
-		fclose(f);
-		if (ok && h.packing == 0)
-		{
-			ok = packed.size() == h.raw;
-			body.swap(packed);
-		}
-		else if (ok)
-		{
-			std::string why;
-			if (!xpress_unpack(packed, h.raw, body, why))
-			{
-				error = why;
-				return false;
-			}
-		}
-		if (!ok)
-		{
-			error = "the file is damaged";
-			return false;
-		}
-		const uint8_t *p = body.data();
-		const uint32_t *ranges = reinterpret_cast<const uint32_t *>(p);
-		const uint32_t *model_tris = ranges + size_t(h.models) * 2;
-		const uint8_t *placements = reinterpret_cast<const uint8_t *>(model_tris + size_t(h.model_triangles) * 12);
-		const uint32_t *masks = reinterpret_cast<const uint32_t *>(placements + size_t(h.placements) * 56);
-		const uint32_t *words = masks + size_t(h.masks) * 4;
-		for (uint32_t m = 0; m < h.models && ok; ++m)
-			ok = uint64_t(ranges[m * 2]) + ranges[m * 2 + 1] <= h.model_triangles;
-		for (size_t i = 0; i < size_t(h.model_triangles) * 12 && ok; i += 4) // (no corner names a mask that isn't there)
-			ok = (model_tris[i + 3] >> 24) <= h.masks;
-		uint64_t expanded = 0;
-		for (uint32_t i = 0; i < h.placements && ok; ++i)
-		{
-			uint32_t model;
-			std::memcpy(&model, placements + size_t(i) * 56, 4);
-			ok = model < h.models;
-			if (ok)
-				expanded += ranges[model * 2 + 1];
-		}
-		ok = ok && expanded == h.expanded;
-		for (uint32_t m = 0; m < h.masks && ok; ++m) // (each mask's bits within the words)
-		{
-			const uint32_t *t = masks + m * 4;
-			ok = uint64_t(t[2]) + uint64_t(t[1]) * t[3] <= h.words && t[3] >= (t[0] + 31) / 32 && t[0] != 0 && t[1] != 0;
-		}
-		if (!ok)
-		{
-			error = "the file is damaged";
-			return false;
-		}
-
-		// Every placement's triangles into the world (row vectors: corner x m + t, in double as the bake's check does);
-		// what isn't finite is left out, as the bake leaves it out
-		std::vector<uint32_t> soup;
-		soup.reserve(size_t(h.expanded) * 12);
-		for (uint32_t i = 0; i < h.placements; ++i)
-		{
-			const uint8_t *rec = placements + size_t(i) * 56;
-			uint32_t model, flags;
-			float mt[12];
-			std::memcpy(&model, rec, 4);
-			std::memcpy(&flags, rec + 4, 4);
-			std::memcpy(mt, rec + 8, sizeof(mt));
-			const bool tested = (flags & 1) != 0;
-			const uint32_t first = ranges[model * 2], count = ranges[model * 2 + 1];
-			for (uint32_t k = 0; k < count; ++k)
-			{
-				const uint32_t *src = model_tris + size_t(first + k) * 12;
-				uint32_t dst[12];
-				bool finite = true;
-				for (int c = 0; c < 3; ++c)
-				{
-					float v[3];
-					std::memcpy(v, src + c * 4, sizeof(v));
-					for (int a = 0; a < 3; ++a)
-					{
-						const double w = double(v[0]) * mt[a] + double(v[1]) * mt[3 + a] + double(v[2]) * mt[6 + a] + mt[9 + a];
-						const float wf = static_cast<float>(w);
-						finite = finite && std::isfinite(wf);
-						std::memcpy(dst + c * 4 + a, &wf, 4);
-					}
-					dst[c * 4 + 3] = tested ? src[c * 4 + 3] : 0u;
-				}
-				if (finite)
-					soup.insert(soup.end(), dst, dst + 12);
-			}
-		}
-
-		// Into square cells by each triangle's centre, cells in rows (z, then x), each cell's triangles in the order
-		// above: what SHD1 holds
-		const size_t n = soup.size() / 12;
-		std::vector<int64_t> key(n);
-		for (size_t i = 0; i < n; ++i)
-		{
-			float c[9];
-			std::memcpy(c, soup.data() + i * 12, 12);
-			std::memcpy(c + 3, soup.data() + i * 12 + 4, 12);
-			std::memcpy(c + 6, soup.data() + i * 12 + 8, 12);
-			const float cx = (c[0] + c[3] + c[6]) / 3.0f, cz = (c[2] + c[5] + c[8]) / 3.0f;
-			const int32_t ix = static_cast<int32_t>(std::floor(cx / h.cell_size)), iz = static_cast<int32_t>(std::floor(cz / h.cell_size));
-			key[i] = (int64_t(iz) << 32) | int64_t(uint32_t(ix) ^ 0x80000000u); // (sorts by z, then x, both signed)
-		}
-		std::vector<int64_t> cells(key);
-		std::sort(cells.begin(), cells.end());
-		cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-		std::vector<uint32_t> at(cells.size() + 1, 0), cell_of(n);
-		for (size_t i = 0; i < n; ++i)
-		{
-			cell_of[i] = static_cast<uint32_t>(std::lower_bound(cells.begin(), cells.end(), key[i]) - cells.begin());
-			++at[cell_of[i] + 1];
-		}
-		for (size_t c = 0; c < cells.size(); ++c)
-			at[c + 1] += at[c];
-		out = {};
-		out.zone = h.zone;
-		out.cell_size = h.cell_size;
-		out.cells.resize(cells.size());
-		for (size_t c = 0; c < cells.size(); ++c)
-			out.cells[c] = { int32_t(uint32_t(cells[c]) ^ 0x80000000u), int32_t(cells[c] >> 32), at[c], at[c + 1] - at[c] };
-		out.triangles.resize(soup.size());
-		std::vector<uint32_t> next(at.begin(), at.end() - 1);
-		for (size_t i = 0; i < n; ++i)
-			std::memcpy(out.triangles.data() + size_t(next[cell_of[i]]++) * 12, soup.data() + i * 12, 48);
-		out.masks.assign(masks, masks + size_t(h.masks) * 4);
-		out.words.assign(words, words + h.words);
-		return true;
-	}
-
-	bool read_shadow_file(const wchar_t *path, shadow_file &out, std::string &error)
-	{
-		FILE *f = nullptr;
-		if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr)
-		{
-			error = "no file for this zone";
-			return false;
-		}
-		struct header
-		{
-			char magic[4];
-			uint32_t zone;
-			float cell_size;
-			uint32_t cells, triangles, masks, words, reserved;
-		} h = {};
-		bool ok = fread(&h, sizeof(h), 1, f) == 1;
-		if (ok && std::memcmp(h.magic, "SHD2", 4) == 0)
-			return read_compact_shadow(f, &h, out, error);
-		ok = ok && std::memcmp(h.magic, "SHD1", 4) == 0 && h.cells < 1000000 &&
-			h.triangles < 8000000 && h.masks < 256 && h.words < 16000000 && h.cell_size > 0.0f;
-		if (ok)
-		{
-			out.zone = h.zone;
-			out.cell_size = h.cell_size;
-			out.cells.resize(h.cells);
-			out.triangles.resize(size_t(h.triangles) * 12);
-			out.masks.resize(size_t(h.masks) * 4);
-			out.words.resize(h.words);
-			ok = (h.cells == 0 || fread(out.cells.data(), sizeof(blade_file::cell), h.cells, f) == h.cells) &&
-				(h.triangles == 0 || fread(out.triangles.data(), 48, h.triangles, f) == h.triangles) &&
-				(h.masks == 0 || fread(out.masks.data(), 16, h.masks, f) == h.masks) &&
-				(h.words == 0 || fread(out.words.data(), 4, h.words, f) == h.words);
-		}
-		fclose(f);
-		if (ok)
-			for (const blade_file::cell &c : out.cells)
-				if (uint64_t(c.first) + c.count > out.triangle_count())
-					ok = false;
-		if (ok)
-			for (size_t m = 0; m < out.masks.size(); m += 4) // (each mask's bits within the words)
-				if (uint64_t(out.masks[m + 2]) + uint64_t(out.masks[m + 1]) * out.masks[m + 3] > out.words.size() ||
-					out.masks[m + 3] < (out.masks[m] + 31) / 32 || out.masks[m] == 0 || out.masks[m + 1] == 0)
-					ok = false;
-		if (ok)
-			for (size_t i = 0; i < out.triangles.size(); i += 4) // (no corner names a mask that isn't there)
-				if ((out.triangles[i + 3] >> 24) > h.masks)
-					ok = false;
-		if (!ok)
-		{
-			error = "the file is damaged";
-			out = {};
-		}
-		return ok;
-	}
-
 	// list_state
 
 	void list_state::clear()
@@ -1978,7 +1770,6 @@ namespace grass
 		_lamp_native_state = D3D12_RESOURCE_STATE_COMMON;
 		for (lamp_cube &c : _lamp_cubes)
 			c = lamp_cube();
-		_lamp_tail = 0;
 		release(_shadow_pso);
 		release(_queries);
 		release(_times);
@@ -5094,36 +4885,6 @@ namespace grass
 		return drawn;
 	}
 
-	// The sun pass's parameters for the casters' map (kCasterParams floats, after the clouds'): three float4s taking a
-	// view-space point (x, y, z, 1) to its texel's column and row and its depth there, as a cascade's; then its depth a
-	// yalm, where it starts in the copy (uints, as bits), a texel's size (yalms)
-	void renderer::caster_params(const camera &cam, float out[16]) const
-	{
-		const float *v = cam.view;
-		float inv[16] = {};
-		for (int i = 0; i < 3; ++i)
-			for (int j = 0; j < 3; ++j)
-				inv[i * 4 + j] = v[j * 4 + i];
-		for (int j = 0; j < 3; ++j)
-			inv[12 + j] = -(v[12] * v[j * 4 + 0] + v[13] * v[j * 4 + 1] + v[14] * v[j * 4 + 2]);
-		inv[15] = 1.0f;
-		const float n = float(kSunMapSize);
-		float s[16];
-		multiply(inv, _caster_world_to_clip, s);
-		for (int i = 0; i < 4; ++i)
-		{
-			out[i] = s[i * 4 + 0] * 0.5f * n + (i == 3 ? 0.5f * n : 0.0f);
-			out[4 + i] = -s[i * 4 + 1] * 0.5f * n + (i == 3 ? 0.5f * n : 0.0f);
-			out[8 + i] = s[i * 4 + 2];
-		}
-		const float *m = _caster_world_to_clip;
-		out[12] = std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
-		const uint32_t start = uint32_t(2 * _sun_map_half / 4);
-		std::memcpy(&out[13], &start, 4);
-		out[14] = 2.0f * kCasterReach / n;
-		out[15] = 0.0f;
-	}
-
 	// The lamps' shadow maps' depth array (kLampMaps x 6 faces of kLampMapSize, D32) and its views, made once
 	bool renderer::lamp_maps_for(std::string &error)
 	{
@@ -5179,17 +4940,17 @@ namespace grass
 	}
 
 	// The lamps' shadow maps, from the host's zone (set_zone_casters: its casters through each cube face, as into a
-	// cascade; nothing without it, and the lamps are marched as before). The kLampMaps lamps nearest the camera that cast
-	// lamp shadows each keep a cube while they stay among them and the zone's data is the same; a lamp coming in has its
-	// six faces drawn one a frame from the frame it's first seen, one lamp at a time (marched until all six are). So a
+	// cascade; nothing without it: the lamps then cast no shadow of the zone's). The kLampMaps lamps nearest the camera
+	// that cast lamp shadows each keep a cube while they stay among them and the zone's data is the same; a lamp coming in
+	// has its six faces drawn one a frame from the frame it's first seen, one lamp at a time (unshadowed till then). So a
 	// frame draws at most one face, and none while the lamps around stay as they are: what's drawn into them is the zone
 	// at rest, which doesn't move (doors and swaying plants at rest; characters don't hide a lamp here, as in the march).
-	// Copied to the depth copy's end (its last _lamp_tail bytes, which copy_out keeps free: kept there across frames),
-	// again whenever that buffer is made again. Their parameters for lamp_blocked (kLampMapParams floats): the view's
-	// three rows (a view-space direction's world x, y and z), how many maps, where they start in the depth copy (bytes, as
-	// bits), the near plane and the faces' scale; then each map's lamp in view space and its far plane (0: none there).
+	// Copied to where the native passes read them (lamp_dest), again whenever that buffer is another. (The shading pass
+	// read them from the depth copy's end until it stopped adding lamp light itself; their parameters' place in t2,
+	// kLampMapParams at `out`, is zeroed and unused.)
 	void renderer::draw_lamp_maps(ID3D12GraphicsCommandList *list, const camera &cam, const look &l, const float eye[3], float out[32], draw_stats &stats)
 	{
+		(void)cam;
 		std::memset(out, 0, 32 * sizeof(float));
 		float lo[3], hi[3];
 		uint64_t source = 0;
@@ -5197,15 +4958,6 @@ namespace grass
 		if (_zone_bounds == nullptr || _zone_draw == nullptr || l.lamps == nullptr || !_zone_bounds(_zone_casters_context, lo, hi, &source) || !lamp_maps_for(error))
 			return;
 		const UINT64 face_bytes = UINT64(kLampMapSize) * kLampMapSize * 4;
-		if (_lamp_tail == 0)
-		{
-			// (kept free from the next depth copy on)
-			_lamp_tail = face_bytes * 6 * kLampMaps + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
-			return;
-		}
-		if (_depth.buffer == nullptr || _depth.size < _lamp_tail)
-			return;
-		const UINT64 at = (_depth.size - _lamp_tail + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
 
 		// The lamps wanted: the zone's lit ones (their glow reaching past the near plane), nearest the camera first
 		const uint32_t count = std::min<uint32_t>(l.lamp_count, kMaxLamps);
@@ -5300,50 +5052,15 @@ namespace grass
 			if (c.faces++ == 0)
 				c.source = source;
 			c.drawn = c.faces == 6;
-			c.copied_to = nullptr;
 			c.native_to = nullptr;
 			break;
 		}
 
-		// Into the depth copy's end, where they aren't yet
 		const D3D12_RESOURCE_DESC desc = _lamp_map->GetDesc();
-		bool copying = false;
-		for (uint32_t slot = 0; slot < kLampMaps; ++slot)
-		{
-			lamp_cube &c = _lamp_cubes[slot];
-			if (!c.drawn || (c.copied_to == _depth.buffer && c.copied_at == at))
-				continue;
-			if (!copying)
-			{
-				transition(list, _lamp_map, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-				transition(list, _depth.buffer, _depth.state, D3D12_RESOURCE_STATE_COPY_DEST);
-				copying = true;
-			}
-			for (uint32_t f = 0; f < 6; ++f)
-			{
-				const UINT sub = slot * 6 + f;
-				D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-				dst.pResource = _depth.buffer;
-				dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-				_device->GetCopyableFootprints(&desc, sub, 1, at + UINT64(sub) * face_bytes, &dst.PlacedFootprint, nullptr, nullptr, nullptr);
-				src.pResource = _lamp_map;
-				src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-				src.SubresourceIndex = sub;
-				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-			}
-			c.copied_to = _depth.buffer;
-			c.copied_at = at;
-		}
-		if (copying)
-		{
-			transition(list, _lamp_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-			transition(list, _depth.buffer, D3D12_RESOURCE_STATE_COPY_DEST, _depth.state);
-		}
-		// ... and where HiFi XI's native passes read them ([zone] nativelamps, sun_shadows.hpp's lamps: lamp_dest), where
-		// they aren't yet: only a cube just drawn, or all of them once after the buffer changed (the sun's copy made, or
-		// made again). Written only by these copies and left readable, as the sun's copy is (docs/d3d12/barriers.md): the
-		// native passes of the next frame read it with no barrier, and this frame's ran before this list.
-		if (hifi::sun::native_lamps())
+		// ... and where HiFi XI's native passes read them (sun_shadows.hpp's lamps: lamp_dest), where they aren't yet: only
+		// a cube just drawn, or all of them once after the buffer changed (the sun's copy made, or made again). Written
+		// only by these copies and left readable, as the sun's copy is (docs/d3d12/barriers.md): the native passes of the
+		// next frame read it with no barrier, and this frame's ran before this list.
 		{
 			if (_sun_map_copy != nullptr)
 			{
@@ -5411,27 +5128,10 @@ namespace grass
 			}
 		}
 
-		// The parameters
-		for (int i = 0; i < 3; ++i)
-			for (int k = 0; k < 3; ++k)
-				out[i * 4 + k] = cam.view[i * 4 + k];
+		// (how many are drawn and where the native passes read them)
 		uint32_t mapped = 0;
-		for (uint32_t slot = 0; slot < kLampMaps; ++slot)
-		{
-			const lamp_cube &c = _lamp_cubes[slot];
-			if (!c.drawn || c.copied_to != _depth.buffer)
-				continue;
-			float *q = out + 16 + slot * 4;
-			for (int k = 0; k < 3; ++k)
-				q[k] = c.pos[0] * cam.view[0 * 4 + k] + c.pos[1] * cam.view[1 * 4 + k] + c.pos[2] * cam.view[2 * 4 + k] + cam.view[3 * 4 + k];
-			q[3] = c.range * hifi::sun::kLampCubeReach; // (the cube's far plane: as it was drawn, above)
-			mapped++;
-		}
-		const uint32_t start = uint32_t(at);
-		out[12] = float(mapped);
-		std::memcpy(&out[13], &start, 4);
-		out[14] = kLampMapNear;
-		out[15] = kLampMapScale;
+		for (const lamp_cube &c : _lamp_cubes)
+			mapped += c.drawn && c.native_to != nullptr ? 1 : 0;
 		stats.lamp_maps = mapped;
 	}
 
@@ -5630,8 +5330,7 @@ namespace grass
 			}
 		}
 		std::string ignored; // without the copy, grass goes on without what it gives rather than not at all
-		// (the depth copy with room at its end for the lamps' shadow maps, once they're wanted: draw_lamp_maps)
-		if (size == 0 || size == UINT64(-1) || !copy_buffer(c, size + (&c == &_depth ? _lamp_tail : 0), ignored))
+		if (size == 0 || size == UINT64(-1) || !copy_buffer(c, size, ignored))
 			return 0;
 		transition(list, res, state, D3D12_RESOURCE_STATE_COPY_SOURCE, 0);
 		transition(list, c.buffer, c.state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -5986,13 +5685,7 @@ namespace grass
 			if ((depth_pitch = copy_out(list, _depth, t.ds, t.ds_state, light, &light_copied)) != 0)
 			{
 				// (bit 64: the light split's facings marked, light_marks: asked with this frame's texture)
-				// (sun_shadows.hpp: 512 the words marked; what a marked word says was applied, as the block the native passes
-				// read this frame held it, asked before this frame's is published: 128 the sun's and clouds' shadows, 256 the
-				// lamps' glow)
-				const bool words_marked = light_copied && hifi::sun::marked();
-				const uint32_t held = words_marked ? hifi::sun::published() : 0u;
-				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u) | (light_copied && _light_marks != nullptr && _light_marks(_light_context) ? 64u : 0u) |
-					(words_marked ? 512u : 0u) | ((held & hifi::sun::kHasSun) != 0 ? 128u : 0u) | ((held & hifi::sun::kHasLamps) != 0 ? 256u : 0u);
+				depth_kind = (d24 ? 1 : 2) | (light_copied ? 16u : 0u) | (light_copied && _light_marks != nullptr && _light_marks(_light_context) ? 64u : 0u);
 				stats.light_split = light_copied;
 				transition(list, t.ds, D3D12_RESOURCE_STATE_COPY_SOURCE, t.ds_state, 0);
 			}
@@ -6021,10 +5714,9 @@ namespace grass
 		// (the blades' motion: drawn with them, into a second target, from the last frame's camera; the rest of the frame
 		// as without it)
 		const bool motion_wanted = l.blade_motion && grass && !_ps_motion.empty() && rt_desc.SampleDesc.Count == 1;
-		// The blades' own light (sun_shadows.hpp "The grass"), while the native passes' block is in use: the block goes to
-		// them after the actors (below, where they're drawn). At the zone's end only with the light split to write their
-		// words into (target::light_rtv): the shading pass comes after, and would shade unmarked blades a second time.
-		const bool blade_light = grass && hifi::sun::marked() && (!only_blades || (t.light_rtv.ptr != 0 && rt_desc.SampleDesc.Count == 1));
+		// The blades' own light (sun_shadows.hpp "The grass"): the native passes' block goes to them after the actors
+		// (below, where they're drawn)
+		const bool blade_light = grass;
 		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies || motion_wanted ||
 			blade_light)
 		{
@@ -6079,37 +5771,16 @@ namespace grass
 			q[33] = 1.0f;
 			q[34] = q[35] = 0.0f;
 		}
-		// The lamps after the shadow map's parameters, in view space (as the shading pass rebuilds each pixel's
-		// point), all kMaxLamps of them: the ones not lit far off with no glow (crowd's rule bit 16 says they're there)
+		// The lamps this frame lights with: how many of the look's make sense (they go to the native passes in the block,
+		// lamps_block, their cubes drawn by draw_lamp_maps; the shading pass itself adds no lamp light any more, and their
+		// old place in t2 after the shadow map's parameters, kLampParams, is left unused)
 		uint32_t lamps_written = 0;
-		if (lamp_count != 0 && actor_data != nullptr && shading)
+		for (uint32_t i = 0; i < lamp_count && actor_data != nullptr && shading; ++i)
 		{
-			float *o = actor_data + kMaxActors * 4 + kSunMapParams;
-			o[0] = float(lamp_count);
-			o[1] = std::clamp(l.lamp_shadows, 0.0f, 1.0f);
-			o[2] = o[3] = 0.0f;
-			actor_data[kLampMapOffset + 12] = 0.0f; // (no shadow maps unless draw_lamp_maps has them)
-			for (uint32_t i = 0; i < kMaxLamps; ++i)
-			{
-				float *q = o + 4 + i * 8;
-				const float *s = i < lamp_count ? l.lamps + size_t(i) * 8 : nullptr;
-				for (int k = 0; s != nullptr && k < 7; ++k)
-					if (!std::isfinite(s[k]))
-						s = nullptr;
-				if (s == nullptr)
-				{
-					const float unused[8] = { 0.0f, 0.0f, 1e6f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-					std::memcpy(q, unused, sizeof(unused));
-					continue;
-				}
-				for (int k = 0; k < 3; ++k)
-					q[k] = s[0] * cam.view[0 * 4 + k] + s[1] * cam.view[1 * 4 + k] + s[2] * cam.view[2 * 4 + k] + cam.view[3 * 4 + k];
-				q[3] = std::max(s[3], 0.25f);
-				for (int k = 4; k < 7; ++k)
-					q[k] = std::clamp(s[k], 0.0f, 4.0f);
-				q[7] = std::isfinite(s[7]) && s[7] > 0.5f ? 1.0f : 0.0f; // (casts lamp shadows)
-				lamps_written++;
-			}
+			bool ok = true;
+			for (int k = 0; k < 7; ++k)
+				ok = ok && std::isfinite(l.lamps[size_t(i) * 8 + k]);
+			lamps_written += ok ? 1 : 0;
 		}
 		// The game's fog after the lamps (crowd's rule bit 32 says it's there)
 		const bool haze_written = haze && actor_data != nullptr;
@@ -6359,8 +6030,8 @@ namespace grass
 			c[37] = cloud_shade ? shadow_strength : 0.0f;
 			c[38] = c[39] = 0.0f;
 		}
-		const uint32_t rules = (l.rule_in_front ? 1u : 0u) | (l.rule_outliers ? 2u : 0u) | (l.sun_characters ? 4u : 0u) | (lamps_written != 0 ? 16u : 0u) |
-			(haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u) |
+		// (bits 1, 2, 4 and 16 were the colour rules', the capsule shadows' and the shading pass's lamps': not set any more)
+		const uint32_t rules = (haze_written ? 32u : 0u) | (wet_written ? 64u : 0u) | (sky_written ? 128u : 0u) | (wear_written ? 256u : 0u) | (wx_written ? 512u : 0u) |
 			(clouds ? 1024u : 0u) | (cloud_shade ? 2048u : 0u) | (snow_written ? 8192u : 0u) | (motion_on ? 32768u : 0u);
 		const uint32_t crowd = actor_count | (rules << 16);
 		std::memcpy(&constants[32], &crowd, 4);
@@ -6477,20 +6148,16 @@ namespace grass
 					stats.sun_map_fade[1] = prev[25];
 					stats.sun_map_fade[2] = _cascades[2].valid ? actor_data[kFarMapOffset + 27] : 1.0f;
 					uint32_t with_map = crowd | (8u << 16);
-					// (the host's casters: drawn into their own map now, read with the cascades; only when the characters'
-					// shadows are asked for, rule bit 4, as actor_shadow's)
-					if (((crowd >> 16) & 4u) != 0 && draw_casters(list, eye, l.sun))
-					{
-						caster_params(cam, actor_data + kCasterOffset);
-						with_map |= 4096u << 16;
+					// (the host's casters, the characters' and monsters' own meshes: drawn into their own map now, for the native
+					// passes with the cascades; only when their shadows are asked for, look::sun_characters)
+					if (l.sun_characters && draw_casters(list, eye, l.sun))
 						stats.casters = true;
-					}
 					std::memcpy(&constants[32], &with_map, 4);
 					stats.sun_map = true;
 				}
 			}
-			// The lamps' shadow maps (drawn when a lamp comes near, read by lamp_blocked in place of its march), when lamp
-			// shadows are on
+			// The lamps' shadow maps (drawn when a lamp comes near, for the native passes: sun_shadows.hpp's lamps), when
+			// lamp shadows are on
 			if (lamps_written != 0 && l.lamp_shadows > 0.0f && actor_data != nullptr)
 				draw_lamp_maps(list, cam, l, eye, actor_data + kLampMapOffset, stats);
 			list->SetGraphicsRootSignature(_root);
@@ -6536,7 +6203,7 @@ namespace grass
 				list->ResourceBarrier(1, &written);
 				// (their shadows' map for HiFi XI's native passes, the next frame's: after the shadow map's in its copy,
 				// sun_shadows.hpp; the mask back to UNORDERED_ACCESS and the copy to its readable state for the passes after)
-				if (cloud_shade && stats.sun_map && hifi::sun::native() && _sun_map_copy != nullptr)
+				if (cloud_shade && stats.sun_map && _sun_map_copy != nullptr)
 				{
 					const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 					transition(list, _sun_mask, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -6562,18 +6229,18 @@ namespace grass
 				std::memcpy(_cloud_key, cloud_key, sizeof(_cloud_key));
 			}
 			// (the cascades, casters and clouds, and the lamps, to HiFi XI's native passes, the next frame's: sun_shadows.hpp;
-			// each when its option is on and there's something of it this frame, the block's flags saying which)
-			if (hifi::sun::marked())
+			// each when there's something of it this frame, the block's flags saying which; with neither, none: the native
+			// passes then apply no shadow and add no glow)
 			{
 				hifi::sun::block b;
 				b.device = _device;
-				if (hifi::sun::native() && stats.sun_map && constants[51] > 0.0f)
+				if (stats.sun_map && constants[51] > 0.0f)
 				{
 					const float *const c = actor_data + kWxOffset + kWxParams;
 					const float cloud[8] = { c[32], c[33], c[34], c[37], c[24], c[25], c[26], actor_data[kWxOffset + 7] };
 					sun_shadows_block(b, l.clock, stats.casters, cloud_copied ? cloud : nullptr, constants[51], l.sun);
 				}
-				if (hifi::sun::native_lamps() && lamps_written != 0)
+				if (lamps_written != 0)
 					lamps_block(b, l, eye);
 				if (b.gpu.mode[2] != 0)
 					hifi::sun::publish(b);
@@ -6583,8 +6250,8 @@ namespace grass
 			if (sun_pso != nullptr)
 			{
 				section(list, L"worldfx: sun shadows");
-				// (t0: the shadow map's copy; without it, still a valid address, the depth copy's, never read)
-				list->SetGraphicsRootShaderResourceView(1, (stats.sun_map ? _sun_map_copy : _depth.buffer)->GetGPUVirtualAddress());
+				// (the contact shadows: t0 isn't read; a valid address, the depth copy's)
+				list->SetGraphicsRootShaderResourceView(1, _depth.buffer->GetGPUVirtualAddress());
 				const UINT half_w = UINT((rt_desc.Width + 1) / 2), half_h = (rt_desc.Height + 1) / 2;
 				const D3D12_VIEWPORT half_viewport = { 0.0f, 0.0f, static_cast<float>(half_w), static_cast<float>(half_h), 0.0f, 1.0f };
 				const D3D12_RECT half_scissor = { 0, 0, static_cast<LONG>(half_w), static_cast<LONG>(half_h) };
@@ -6924,11 +6591,13 @@ namespace grass
 			// in t1 (a reference of the block's, let go behind this list: keep_old), and the pass told in its constants
 			// (shade.x, nothing else of the shading pass's is read by the blades). The taps' turn stays 0: a blade's are
 			// spun by where its root is alone, the same every frame, so a blade in a penumbra doesn't flicker. At the
-			// zone's end with the light split as their last target, each blade's word written over the ground's.
+			// zone's end with the light split as their last target (target::light_rtv; none on a multisampled world), each
+			// blade's word written over the ground's: its facing and what's left of its sun share, for the shading pass's
+			// contact shadows, occlusion, snow and wet.
 			ID3D12PipelineState *light_pso = nullptr;
-			if (blade_light && actor_data != nullptr && only_blades)
-				light_pso = light_pipeline_for(t, motion_pso != nullptr, motion_error); // (not to be had: the blades as before)
-			const bool blade_block = blade_light && actor_data != nullptr && (!only_blades || light_pso != nullptr);
+			if (blade_light && actor_data != nullptr && only_blades && t.light_rtv.ptr != 0 && rt_desc.SampleDesc.Count == 1)
+				light_pso = light_pipeline_for(t, motion_pso != nullptr, motion_error); // (not to be had: no words, the blades lit all the same)
+			const bool blade_block = blade_light && actor_data != nullptr;
 			float blade_constants[kConstants];
 			std::memcpy(blade_constants, constants, sizeof(constants));
 			for (int i = 48; i < 52; ++i)
