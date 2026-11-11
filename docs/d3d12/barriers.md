@@ -153,6 +153,14 @@ Our own resources:
   before World FX's N + 1). Once the sun's copy exists the cubes move to it and `_lamp_native` goes to `keep_old`
   (the lists that copied into it may still be queued). zoneinject_test's and charinject_test's native-lamp parts read
   a block's cubes through the root SRV with the debug layer on, 0 messages.
+- World FX's blades read the same block's buffer themselves (sun_shadows.hpp "The grass"; `grass_render.cpp` at
+  "worldfx: grass", t1 of the blades' draws, the vertex shader): at the zone's end the frame before's, in the read
+  state World FX left it in or decayed, **no barrier**, as the zone's pass just before them; drawn after the shading
+  pass in one draw (no marker), this frame's, which the same list left readable (NON_PIXEL | PIXEL_SHADER_RESOURCE)
+  after its last copy. And they write the light split: at the zone's end the backend (`backend.cpp`, the zone_end
+  mark) calls `light::begin` (kRead -> RENDER_TARGET) before `worldfx::on_zone_end` and `light::end` (back to kRead)
+  after it, only while `sun::marked()`; the renderer binds it as the blades' last target and unbinds it before
+  returning. grass_test 1b3 runs both ways with the debug layer on, 0 messages.
 - The texture pack's textures (`src/pack/stream.cpp:1007`): committed, made in COMMON, written once on the streamer's
   copy queue (promoted to COPY_DEST there, decayed when that `ExecuteCommandLists` ends), then only read on the direct
   queue by implicit promotion (a shader read, or COPY_SOURCE for a copy), decaying after each `ExecuteCommandLists`.

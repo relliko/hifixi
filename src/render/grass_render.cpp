@@ -5,6 +5,7 @@
 #include "grass_render.hpp"
 #include "gpu_crash.hpp"
 #include "sun_shadows.hpp"
+#include "../zone/light_split.hpp" // (its word's HLSL and format alone: the blades write it, grass.hlsl ps_light)
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <atomic>
@@ -140,7 +141,11 @@ namespace grass
 		// rows, how many maps, where they start in the depth copy, the near plane and the faces' scale, then each map's lamp
 		constexpr UINT kLampMapParams = 32;
 		constexpr UINT kLampMapOffset = kFarMapOffset + kFarMapParams;
-		constexpr UINT kActorBytes = (kLampMapOffset + kLampMapParams) * 4;
+		// ... and after the lamps' shadow maps' the native passes' block for the blades (grass.hlsl kNative; sun_shadows.hpp
+		// "The grass"): sun::gpu_block as it is, 73 float4 (read only with the blades' pass's shade.x 1)
+		constexpr UINT kNativeParams = sizeof(hifi::sun::gpu_block) / 4;
+		constexpr UINT kNativeOffset = kLampMapOffset + kLampMapParams;
+		constexpr UINT kActorBytes = (kNativeOffset + kNativeParams) * 4;
 		constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 		constexpr D3D12_RESOURCE_STATES kMotionRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		// (how far its march reaches, yalms; past that the game's own fog is the air; how high the air thins to 1/e)
@@ -230,7 +235,8 @@ namespace grass
 			{ "snow_vs", "vs_5_0" }, { "snow_ps", "ps_5_0" }, { "vis_ps", "ps_5_0" }, { "leaf_vs", "vs_5_0" }, { "leaf_ps", "ps_5_0" },
 			{ "air_ps", "ps_5_0" }, { "flash_ps", "ps_5_0" }, { "cloud_ps", "ps_5_0" }, { "cloud_shadow_ps", "ps_5_0" },
 			{ "look_first_ps", "ps_5_0" }, { "look_down_ps", "ps_5_0" }, { "look_exposure_ps", "ps_5_0" }, { "look_up_ps", "ps_5_0" }, { "look_ps", "ps_5_0" },
-			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" }, { "vol_ps", "ps_5_0" }, { "ps_motion", "ps_5_0" } };
+			{ "trail_ps", "ps_5_0" }, { "snow_layer_vs", "vs_5_0" }, { "snow_layer_ps", "ps_5_0" }, { "vol_ps", "ps_5_0" }, { "ps_motion", "ps_5_0" },
+			{ "ps_light", "ps_5_0" }, { "ps_motion_light", "ps_5_0" } };
 		constexpr size_t kShaderEntryCount = sizeof(kShaderEntries) / sizeof(kShaderEntries[0]);
 		constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
@@ -398,6 +404,25 @@ namespace grass
 			prune_shader_cache(folder);
 		}
 
+		// The native passes' HLSL the blades use (sun_shadows.hpp "The grass": light_split.hpp's word, the sun's lookups,
+		// the lamps' glow), put into a source where its line kNativeMarker stands (grass.hlsl, after the globals they read
+		// are declared): one copy of it for the zone, the characters and the blades. A source without the line (an older
+		// worldfx.hlsl) is compiled as it is.
+		constexpr char kNativeMarker[] = "//#native_light";
+		const std::string &native_hlsl()
+		{
+			static const std::string text = std::string(hifi::light::kHlsl) + hifi::sun::kHlsl + hifi::sun::kHlslLamps;
+			return text;
+		}
+		std::string with_native(const std::string &source)
+		{
+			const size_t at = source.find(kNativeMarker);
+			if (at == std::string::npos)
+				return source;
+			return source.substr(0, at) + native_hlsl() + source.substr(at + sizeof(kNativeMarker) - 1);
+		}
+
+		// (source: with_native's)
 		bool compile(const std::string &source, const char *entry, const char *target, std::vector<uint8_t> &out, std::string &error)
 		{
 			const pD3DCompile compile_fn = compiler().compile;
@@ -1966,9 +1991,12 @@ namespace grass
 		for (pso_entry &e : _psos)
 			release(e.pso);
 		_psos.clear();
-		for (pso_entry &e : _motion_psos)
-			release(e.pso);
-		_motion_psos.clear();
+		for (std::vector<pso_entry> *v : { &_motion_psos, &_light_psos, &_motion_light_psos })
+		{
+			for (pso_entry &e : *v)
+				release(e.pso);
+			v->clear();
+		}
 		release(_motion);
 		release(_motion_rtv_heap);
 		_motion_w = _motion_h = 0;
@@ -2036,6 +2064,9 @@ namespace grass
 			h = fnv(e.entry, std::strlen(e.entry) + 1, h);
 			h = fnv(e.target, std::strlen(e.target) + 1, h);
 		}
+		// (the native passes' HLSL compiled into it, with_native: sun_shadows.hpp's and light_split.hpp's, not in the source)
+		if (source.find(kNativeMarker) != std::string::npos)
+			h = fnv(native_hlsl().data(), native_hlsl().size(), h);
 		// (line ends don't count: the built-in copy is embedded with "\n" ones, a file on disk may have "\r\n" ones, and
 		// the same shaders keep the same key; a source without "\r" hashes as before)
 		if (source.find('\r') == std::string::npos)
@@ -2062,6 +2093,7 @@ namespace grass
 		shader_code code;
 		code.key = key;
 		code.blobs.resize(kShaderEntryCount);
+		const std::string whole = with_native(source);
 		// Each entry on a thread of its own, as many at once as the CPU has cores but two (one after the other, the
 		// built-in ones took 27 s at the game's start, 2026-10-29): the first that fails, in kShaderEntries' order, is
 		// the one reported, as before
@@ -2073,7 +2105,7 @@ namespace grass
 				for (size_t i; (i = next.fetch_add(1)) < kShaderEntryCount;)
 					try // (an exception leaving a thread ends the game)
 					{
-						failed[i] = !compile(source, kShaderEntries[i].entry, kShaderEntries[i].target, code.blobs[i], errors[i]);
+						failed[i] = !compile(whole, kShaderEntries[i].entry, kShaderEntries[i].target, code.blobs[i], errors[i]);
 					}
 					catch (...)
 					{
@@ -2509,6 +2541,55 @@ namespace grass
 		return pso;
 	}
 
+	// (the light split's word a whole uint: no blending, written as it is; the world's alpha and the motion as without it)
+	ID3D12PipelineState *renderer::light_pipeline_for(const target &t, bool motion, std::string &error)
+	{
+		const D3D12_RESOURCE_DESC rt_desc = t.rt->GetDesc();
+		std::vector<pso_entry> &psos = motion ? _motion_light_psos : _light_psos;
+		for (const pso_entry &e : psos)
+			if (e.rtv == t.rtv_format && same_samples(e.samples, rt_desc.SampleDesc))
+				return e.pso;
+		const std::vector<uint8_t> &ps = motion ? _ps_motion_light : _ps_light;
+		if (ps.empty() || rt_desc.SampleDesc.Count != 1)
+			return nullptr;
+		const UINT last = motion ? 2 : 1;
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.pRootSignature = _root;
+		desc.VS = { _vs.data(), _vs.size() };
+		desc.PS = { ps.data(), ps.size() };
+		desc.BlendState.IndependentBlendEnable = TRUE;
+		desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE; // the world's alpha is left alone
+		desc.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		desc.BlendState.RenderTarget[last].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		desc.SampleMask = UINT_MAX;
+		desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		desc.RasterizerState.DepthClipEnable = TRUE;
+		desc.DepthStencilState.DepthEnable = TRUE;
+		desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = last + 1;
+		desc.RTVFormats[0] = t.rtv_format;
+		if (motion)
+			desc.RTVFormats[1] = kMotionFormat;
+		desc.RTVFormats[last] = hifi::light::kFormat;
+		desc.DSVFormat = kBladeDepthFormat;
+		desc.SampleDesc = rt_desc.SampleDesc;
+		ID3D12PipelineState *pso = nullptr;
+		const HRESULT hr = _device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		if (FAILED(hr))
+		{
+			char text[96];
+			std::snprintf(text, sizeof(text), "the blades' light split pipeline failed (0x%08lX)", static_cast<unsigned long>(hr));
+			error = text;
+			return nullptr;
+		}
+		pso->SetName(motion ? L"worldfx: grass pipeline with motion and the light split" : L"worldfx: grass pipeline with the light split");
+		psos.push_back({ t.rtv_format, kBladeDepthFormat, rt_desc.SampleDesc, pso });
+		return pso;
+	}
+
 	bool renderer::motion_target_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error)
 	{
 		const UINT w = UINT(rt_desc.Width), h = rt_desc.Height;
@@ -2569,7 +2650,8 @@ namespace grass
 		std::vector<uint8_t> *const into[kShaderEntryCount] = { &_vs, &_ps, &_shade_vs, &_shade_ps, &_sun_ps, &_shadow_vs, &_shadow_ps,
 			&_water_vs, &_water_ps, &_water_debug_vs, &_water_debug_ps, &_firefly_vs, &_firefly_ps, &_rain_vs, &_rain_ps,
 			&_splash_vs, &_splash_ps, &_snow_vs, &_snow_ps, &_vis_ps, &_leaf_vs, &_leaf_ps, &_air_ps, &_flash_ps, &_cloud_ps, &_cloud_shadow_ps,
-			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps, &_vol_ps, &_ps_motion };
+			&_look_first_ps, &_look_down_ps, &_look_exposure_ps, &_look_up_ps, &_look_ps, &_trail_ps, &_layer_vs, &_layer_ps, &_vol_ps, &_ps_motion,
+			&_ps_light, &_ps_motion_light };
 		if (code.blobs.size() != kShaderEntryCount)
 			return;
 		for (size_t i = 0; i < kShaderEntryCount; ++i)
@@ -2613,9 +2695,12 @@ namespace grass
 			c.forget(); // (drawn again with the new shaders)
 		for (pso_entry &e : _psos)
 			keep_old(e.pso);
-		for (pso_entry &e : _motion_psos)
-			keep_old(e.pso);
-		_motion_psos.clear();
+		for (std::vector<pso_entry> *v : { &_motion_psos, &_light_psos, &_motion_light_psos })
+		{
+			for (pso_entry &e : *v)
+				keep_old(e.pso);
+			v->clear();
+		}
 		for (pso_entry &e : _shade_psos)
 			keep_old(e.pso);
 		for (pso_entry &e : _water_psos)
@@ -4958,20 +5043,41 @@ namespace grass
 			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 			transition(list, _floor_map, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			const float per = float(kFloorSize) / (2.0f * kFloorReach);
-			uint32_t words[6] = {};
+			// (and the light it was drawn with, when its drawer said: sun_shadows.hpp ground_light; what a ground facing up
+			// gets in all, the sun's part of it, and 1: said. grass.hlsl floor_light)
+			uint32_t words[13] = {};
 			std::memcpy(&words[0], &cx, 4);
 			std::memcpy(&words[1], &cz, 4);
 			std::memcpy(&words[2], &per, 4);
 			words[3] = kFloorSize;
 			words[4] = footprint.Footprint.RowPitch / 4;
 			words[5] = 1;
-			D3D12_WRITEBUFFERIMMEDIATE_PARAMETER w[6] = {};
-			for (int i = 0; i < 6; ++i)
+			if (float gl[9]; hifi::sun::take_ground_light(gl))
+			{
+				const float len = std::sqrt(gl[0] * gl[0] + gl[1] * gl[1] + gl[2] * gl[2]);
+				const float facing = len > 0.0f ? std::max(-gl[1] / len, 0.0f) : 0.0f; // (up: the world's y is down)
+				bool ok = std::isfinite(facing);
+				float all[3], suns[3];
+				for (int i = 0; i < 3; ++i)
+				{
+					suns[i] = std::max(gl[3 + i], 0.0f) * facing;
+					all[i] = std::max(gl[6 + i], 0.0f) + suns[i];
+					ok = ok && std::isfinite(all[i]) && std::isfinite(suns[i]) && all[i] > 0.0f;
+				}
+				if (ok)
+				{
+					std::memcpy(&words[6], all, 12);
+					std::memcpy(&words[9], suns, 12);
+					words[12] = 1;
+				}
+			}
+			D3D12_WRITEBUFFERIMMEDIATE_PARAMETER w[13] = {};
+			for (int i = 0; i < 13; ++i)
 			{
 				w[i].Dest = _memory->GetGPUVirtualAddress() + UINT64(i) * 4;
 				w[i].Value = words[i];
 			}
-			list2->WriteBufferImmediate(6, w, nullptr);
+			list2->WriteBufferImmediate(13, w, nullptr);
 		}
 		else
 		{
@@ -5915,7 +6021,12 @@ namespace grass
 		// (the blades' motion: drawn with them, into a second target, from the last frame's camera; the rest of the frame
 		// as without it)
 		const bool motion_wanted = l.blade_motion && grass && !_ps_motion.empty() && rt_desc.SampleDesc.Count == 1;
-		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies || motion_wanted)
+		// The blades' own light (sun_shadows.hpp "The grass"), while the native passes' block is in use: the block goes to
+		// them after the actors (below, where they're drawn). At the zone's end only with the light split to write their
+		// words into (target::light_rtv): the shading pass comes after, and would shade unmarked blades a second time.
+		const bool blade_light = grass && hifi::sun::marked() && (!only_blades || (t.light_rtv.ptr != 0 && rt_desc.SampleDesc.Count == 1));
+		if ((l.actors != nullptr && l.actor_count != 0) || sun_map || lamp_count != 0 || haze || wet || falling || dome || wearing || wx_any || snow_lies || motion_wanted ||
+			blade_light)
 		{
 			const uint32_t slot = _actor_slot++ % kActorSlots;
 			if (_actors[slot] == nullptr)
@@ -6808,25 +6919,65 @@ namespace grass
 			if (motion_on && motion_target_for(rt_desc, motion_error))
 				motion_pso = motion_pipeline_for(t, motion_error);
 			const D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = motion_pso != nullptr ? _motion_rtv_heap->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE {};
-			list->SetGraphicsRootSignature(_root);
-			list->SetPipelineState(motion_pso != nullptr ? motion_pso : pso);
-			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			if (motion_pso != nullptr)
+			// The blades' own light (sun_shadows.hpp "The grass"): the native passes' latest block, as the options leave it
+			// (constants_for: nothing of it when there's none fresh), after the actors for their vertex shader, its buffer
+			// in t1 (a reference of the block's, let go behind this list: keep_old), and the pass told in its constants
+			// (shade.x, nothing else of the shading pass's is read by the blades). The taps' turn stays 0: a blade's are
+			// spun by where its root is alone, the same every frame, so a blade in a penumbra doesn't flicker. At the
+			// zone's end with the light split as their last target, each blade's word written over the ground's.
+			ID3D12PipelineState *light_pso = nullptr;
+			if (blade_light && actor_data != nullptr && only_blades)
+				light_pso = light_pipeline_for(t, motion_pso != nullptr, motion_error); // (not to be had: the blades as before)
+			const bool blade_block = blade_light && actor_data != nullptr && (!only_blades || light_pso != nullptr);
+			float blade_constants[kConstants];
+			std::memcpy(blade_constants, constants, sizeof(constants));
+			for (int i = 48; i < 52; ++i)
+				blade_constants[i] = 0.0f;
+			ID3D12Resource *blade_map = nullptr;
+			if (blade_block)
 			{
-				transition(list, _motion, kMotionRead, D3D12_RESOURCE_STATE_RENDER_TARGET);
-				const float none[4] = {};
-				list->ClearRenderTargetView(motion_rtv, none, 0, nullptr);
-				const D3D12_CPU_DESCRIPTOR_HANDLE both[2] = { world_rtv, motion_rtv };
-				list->OMSetRenderTargets(2, both, FALSE, &grass_dsv);
+				hifi::sun::block nb;
+				const bool have = hifi::sun::latest(_device, nb);
+				const hifi::sun::gpu_block c = hifi::sun::constants_for(have, nb, 0.0f);
+				static_assert(sizeof(c) == kNativeParams * 4);
+				std::memcpy(actor_data + kNativeOffset, &c, sizeof(c));
+				blade_map = nb.buffer;
+				const uint32_t on = 1;
+				std::memcpy(&blade_constants[48], &on, 4);
+				stats.blade_native = c.mode[2];
+				stats.blade_words = light_pso != nullptr;
 			}
-			else
-				list->OMSetRenderTargets(1, &world_rtv, FALSE, &grass_dsv);
+			ID3D12PipelineState *const blade_pso = light_pso != nullptr ? light_pso : motion_pso != nullptr ? motion_pso : pso;
+			list->SetGraphicsRootSignature(_root);
+			list->SetPipelineState(blade_pso);
+			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			{
+				D3D12_CPU_DESCRIPTOR_HANDLE targets[3] = { world_rtv };
+				UINT target_count = 1;
+				if (motion_pso != nullptr)
+				{
+					transition(list, _motion, kMotionRead, D3D12_RESOURCE_STATE_RENDER_TARGET);
+					const float none[4] = {};
+					list->ClearRenderTargetView(motion_rtv, none, 0, nullptr);
+					targets[target_count++] = motion_rtv;
+				}
+				if (light_pso != nullptr)
+					targets[target_count++] = t.light_rtv;
+				list->OMSetRenderTargets(target_count, targets, FALSE, &grass_dsv);
+			}
 			list->RSSetViewports(1, &viewport);
 			list->RSSetScissorRects(1, &scissor);
-			list->SetGraphicsRoot32BitConstants(0, kConstants, constants, 0);
+			list->SetGraphicsRoot32BitConstants(0, kConstants, blade_constants, 0);
 			list->SetGraphicsRootShaderResourceView(1, _buffer->GetGPUVirtualAddress());
-			// (without a copy, t1 still gets a valid address, the blades', never read since ground.w is 0)
-			list->SetGraphicsRootShaderResourceView(2, ground_kind != 0 ? _ground.buffer->GetGPUVirtualAddress() : _buffer->GetGPUVirtualAddress());
+			// (without a copy, t1 still gets a valid address, the blades', never read since ground.w is 0; with the block's
+			// buffer, that: the blades don't read the world's copy)
+			if (blade_map != nullptr)
+			{
+				list->SetGraphicsRootShaderResourceView(2, blade_map->GetGPUVirtualAddress());
+				keep_old(blade_map);
+			}
+			else
+				list->SetGraphicsRootShaderResourceView(2, ground_kind != 0 ? _ground.buffer->GetGPUVirtualAddress() : _buffer->GetGPUVirtualAddress());
 			if (_memory_fresh)
 			{
 				transition(list, _memory, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -6864,6 +7015,8 @@ namespace grass
 				_motion_frames++;
 				stats.blade_motion = true;
 			}
+			else if (light_pso != nullptr)
+				list->OMSetRenderTargets(1, &world_rtv, FALSE, &grass_dsv); // (the light split let go: the caller's end is next)
 		}
 		// (this frame's camera and time for the next frame's motion, from the frame that draws its blades)
 		if (grass)

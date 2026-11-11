@@ -2670,6 +2670,7 @@ namespace worldfx
 		t.rt_state = m.rt_state;
 		t.ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 		t.blades_into_world_depth = true;
+		t.light_rtv = { static_cast<SIZE_T>(m.light_rtv) };
 		// Both planes DEPTH_WRITE while the blades write the depth (and test it), then back as dgVoodoo had them
 		D3D12_RESOURCE_BARRIER b[2] = {};
 		UINT n = 0;

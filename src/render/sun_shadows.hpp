@@ -20,9 +20,10 @@
 // The light split's mark (light_split.hpp "Marks"): while native() is on, every word the native passes write has the
 // sun's share in 6 bits (25-30) and bit 31 set where the sun's and clouds' shadows were applied already; World FX (told
 // by zinfo.w bit 128) then leaves those pixels' sun and cloud shadows alone (only its short contact march stays) and
-// reads the share as what's left of the sun's light after them. The pixels the game still draws itself, the blades and
-// anything not marked keep World FX's old path. native() and native_lamps() both off: every word as before, bit for
-// bit, and nothing applied. (With the lamps the mark says a little more: "The mark, with lamps" below.)
+// reads the share as what's left of the sun's light after them. The pixels the game still draws itself and anything
+// not marked keep World FX's old path (World FX's own blades mark theirs: "The grass" below). native() and
+// native_lamps() both off: every word as before, bit for bit, and nothing applied. (With the lamps the mark says a
+// little more: "The mark, with lamps" below.)
 //
 // The lamps (notes-lighting-improvements.md "2. One lamp system"; [zone] nativelamps, native_lamps()): the same block
 // carries World FX's lamp list in world space as grass::look hands it (up to 16: the zone's lit lamps and the effects'
@@ -39,6 +40,15 @@
 // the native passes read held (published(), asked before it publishes this frame's) and tells its shaders in zinfo.w:
 // bit 512 the words are marked, 128 the block had the sun's shadows, 256 it had the lamps. On a marked pixel it leaves
 // the sun's and clouds' shadows alone only with 128, and adds no lamp glow only with 256.
+//
+// The grass (World FX's own blades, grass.hlsl vs_main) is a native pass too: while marked() the renderer takes the
+// latest block for its blades as the zone does (latest, constants_for), hands it to their vertex shader after the
+// actors (grass.hlsl kNative, the copy in t1) and compiles kHlsl and kHlslLamps into grass.hlsl in the place it marks
+// (grass_render.cpp compile: one copy of the lookups and of the lamps' tuning for the zone, the characters and the
+// blades). Each blade then takes its sun and cloud shadow at its root (off the sun's part of the ground's light:
+// ground_light below) and the lamps' glow there, and, drawn at the zone's end into the world, writes the light split's
+// word on its pixels with the mark, so World FX's shading pass leaves them as it leaves the zone's. Drawn after the
+// shading pass (no marker: zone_view, the tests) nothing shades them again and they write no word.
 //
 // Header only: World FX's renderer (the engine) publishes, the zone's and characters' renderers read, main.cpp sets
 // native() from [zone] nativeshadows and native_lamps() from [zone] nativelamps.
@@ -214,6 +224,39 @@ namespace hifi::sun
 		if (stale != nullptr)
 			stale->Release();
 		return ok;
+	}
+
+	// The light the ground's colour map was drawn with (zoneshadow.cpp's ground pass: the zone's environment 0, toward
+	// the sun, its diffuse, the ambient), said by whoever draws the map as it's drawn and taken by World FX's draw_floor
+	// right after, for the map's header: the blades then know how much of their ground's light is the sun's (what a
+	// shadow takes) and how bright the ground is lit (what the lamps' glow fades by). Taken once: a map drawn by a host
+	// that doesn't say gets none, and the blades fall back on the game's usual daylight (grass.hlsl floor_light).
+	namespace detail
+	{
+		struct ground_state
+		{
+			std::mutex mutex;
+			float light[9] = {};
+			bool known = false;
+		};
+		inline ground_state ground;
+	}
+	inline void set_ground_light(const float sun_dir[3], const float sun[3], const float ambient[3])
+	{
+		std::lock_guard<std::mutex> lock(detail::ground.mutex);
+		std::memcpy(detail::ground.light, sun_dir, 12);
+		std::memcpy(detail::ground.light + 3, sun, 12);
+		std::memcpy(detail::ground.light + 6, ambient, 12);
+		detail::ground.known = true;
+	}
+	inline bool take_ground_light(float light[9])
+	{
+		std::lock_guard<std::mutex> lock(detail::ground.mutex);
+		if (!detail::ground.known)
+			return false;
+		std::memcpy(light, detail::ground.light, sizeof(detail::ground.light));
+		detail::ground.known = false;
+		return true;
 	}
 
 	// (status: blocks published, taken by the native passes)

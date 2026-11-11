@@ -18,6 +18,11 @@
 // World FX is told (zinfo.w bit 64) to read a facing written away as "the pack's relief is here" (its own screen-space
 // relief fades there, so the two don't double up). With marks off every word is as before M9, bit for bit.
 //
+// World FX's own blades write it too (grass.hlsl ps_light, drawn at the zone's end between the zone's pass and the
+// characters': the backend begins and ends it around them, src/backend/backend.cpp), only while the native passes light
+// from World FX's block (sun_shadows.hpp marked(), "The grass"): a blade's word over the ground's on its pixels, facing
+// up, marked where the blade was lit from the block.
+//
 // Cleared to 0 by the first native pass after World FX last took it (take): one frame's at a time, as dgVoodoo
 // records one frame after another on its one thread. Written only while World FX asks for it (take in the last second)
 // and the world has one sample. Header only: the zone's and the characters' injections and main.cpp share it.

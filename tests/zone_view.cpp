@@ -42,6 +42,11 @@
  *     both, the lamps' glow as World FX's own, ported (sun_shadows.hpp's kLookFaithful; "native" is the tuned look).
  *     ZONE_VIEW_BODY="x y z size": a character standing there (its capsule: the lamps' shadows); ZONE_VIEW_SMALLROOM=1:
  *     lit as a Mog House; ZONE_VIEW_FXLAMPS=0: World FX given no lamps; ZONE_VIEW_REPEAT=<n>: the zone pass n times over
+ *   ZONE_VIEW_GRASS=<folder> (with ZONE_VIEW_FX): the zone's baked grass (<map>.bin: bootloader\worldfx-grass) drawn by
+ *     World FX as in game, the blades at the zone's end and the rest after (their colour from the ground's map, drawn
+ *     from the zone with the frame's light); with a "native" mode they light themselves from World FX's block and write
+ *     the light split's words (sun_shadows.hpp "The grass"). ZONE_VIEW_GRASS_AFTER=1: the blades after the shading pass
+ *     in one draw; ZONE_VIEW_GRASS_DISTANCE=<yalms>. The blades' GPU time is printed with the passes'.
  */
 
 #include <d3d12.h>
@@ -724,7 +729,8 @@ int main(int argc, char **argv)
 	{
 		hifi::zone::gpu_zone *zone;
 		hifi::zone::zone_shadow *shadow;
-	} cc = { &gz, &casters };
+		float env[12];
+	} cc = { &gz, &casters, {} };
 	if (fx)
 	{
 		std::string error;
@@ -732,6 +738,24 @@ int main(int argc, char **argv)
 		{
 			std::printf("World FX: %s%s\n", error.c_str(), why.c_str());
 			return 1;
+		}
+		// (ZONE_VIEW_SHADER=<file>: World FX's shaders from that source instead of the built-in ones, for trying a change)
+		if (const char *sf = std::getenv("ZONE_VIEW_SHADER"); sf != nullptr)
+		{
+			std::string source;
+			if (FILE *file = nullptr; fopen_s(&file, sf, "rb") == 0 && file != nullptr)
+			{
+				char buffer[65536];
+				size_t n;
+				while ((n = fread(buffer, 1, sizeof(buffer), file)) != 0)
+					source.append(buffer, n);
+				fclose(file);
+			}
+			if (source.empty() || !wfx.set_shader_source(source, error))
+			{
+				std::printf("ZONE_VIEW_SHADER: %s\n", source.empty() ? "not read" : error.c_str());
+				return 1;
+			}
 		}
 		wfx.set_zone_casters(
 			[](void *c, float lo[3], float hi[3], uint64_t *generation) {
@@ -743,6 +767,19 @@ int main(int argc, char **argv)
 			},
 			&cc);
 		wfx.set_light_source([](void *) { return hifi::light::take(); }, nullptr);
+		// (the ground's colour map for the grass, from the zone as the plugin's floor_hook draws it: the frame's light)
+		for (int k = 0; k < 3; ++k)
+		{
+			cc.env[k] = f.sun_dir[k];
+			cc.env[4 + k] = f.sun[k];
+			cc.env[8 + k] = f.ambient[k];
+		}
+		wfx.set_floor_source(
+			[](void *c, ID3D12GraphicsCommandList *l, const float m[16], D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT size) {
+				caster_context *const x = static_cast<caster_context *>(c);
+				return x->shadow->record(l, *x->zone, m, dsv, size, false, x->env, rtv);
+			},
+			&cc);
 		hifi::sun::set_native(fx_mode == "native" || fx_mode == "native-shadows" || fx_mode == "native-faithful");
 		hifi::sun::set_native_lamps(fx_mode == "native" || fx_mode == "native-lamps" || fx_mode == "native-faithful");
 		// ("native-faithful": the lamps' glow as World FX's, ported; "native": the tuned look, the plugin's)
@@ -790,6 +827,58 @@ int main(int argc, char **argv)
 	fl.sun_map = true;
 	fl.sun_characters = true;
 	fl.night = night ? 0.5f : 0.0f;
+	// (ZONE_VIEW_GRASS=<folder>: the zone's baked grass from there, <map>.bin (GRS2: bootloader\worldfx-grass), drawn by
+	// World FX as in game: the blades at the zone's end into the world and its depth, with the light split for their
+	// words while the native passes' block is in use, then the rest of World FX over all of it. ZONE_VIEW_GRASS_AFTER=1:
+	// the blades after the shading pass instead, in the one draw (no marker). ZONE_VIEW_GRASS_DISTANCE=<yalms>, 40.)
+	bool grass_on = false, grass_after = GetEnvironmentVariableA("ZONE_VIEW_GRASS_AFTER", nullptr, 0) != 0;
+	if (wchar_t gf[MAX_PATH] = L""; fx && GetEnvironmentVariableW(L"ZONE_VIEW_GRASS", gf, MAX_PATH) != 0)
+	{
+		grass::blade_file file;
+		std::string grass_why;
+		const std::wstring path = std::wstring(gf) + L"\\" + std::to_wstring(map) + L".bin";
+		if (!grass::read_blade_file(path.c_str(), file, grass_why) || !wfx.upload(file, grass_why))
+		{
+			std::printf("ZONE_VIEW_GRASS: %s\n", grass_why.c_str());
+			return 1;
+		}
+		grass_on = true;
+		fl.grass = true;
+		fl.time = 3.0f;
+		if (const char *gd = std::getenv("ZONE_VIEW_GRASS_DISTANCE"); gd != nullptr)
+			fl.distance = std::strtof(gd, nullptr);
+		std::printf("ZONE_VIEW_GRASS: %u points baked\n", file.blade_count());
+	}
+	// The blades at the zone's end (after the zone pass, before World FX's own draw): grass::look::phase_t::blades
+	uint32_t blade_native = 0, blades_drawn = 0;
+	bool blade_words = false;
+	auto blades_at_zone_end = [&](ID3D12GraphicsCommandList *l) {
+		if (!grass_on || grass_after)
+			return;
+		grass::look bl = fl;
+		bl.phase = grass::look::phase_t::blades;
+		grass::target bt;
+		bt.rt = target;
+		bt.ds = depth;
+		bt.rtv = t.rtv;
+		bt.rtv_format = t.rtv_format;
+		bt.dsv_format = t.dsv_format;
+		bt.blades_into_world_depth = true;
+		const bool split = hifi::sun::marked() && hifi::light::begin(l, device, target, bt.light_rtv);
+		if (!split)
+			bt.light_rtv = {};
+		std::string error;
+		const grass::draw_stats bs = wfx.draw(l, bt, cam, bl, error);
+		if (split)
+			hifi::light::end(l);
+		if (!error.empty())
+			std::printf("the blades: %s\n", error.c_str());
+		blade_native = bs.blade_native;
+		blade_words = bs.blade_words;
+		blades_drawn = bs.blades;
+	};
+	if (grass_on && !grass_after)
+		fl.phase = grass::look::phase_t::rest;
 	grass::target gt;
 	gt.rt = target;
 	gt.ds = depth;
@@ -824,12 +913,12 @@ int main(int argc, char **argv)
 	{
 		D3D12_QUERY_HEAP_DESC qd = {};
 		qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-		qd.Count = 3;
+		qd.Count = 4;
 		D3D12_HEAP_PROPERTIES qh = {};
 		qh.Type = D3D12_HEAP_TYPE_READBACK;
 		D3D12_RESOURCE_DESC qb = {};
 		qb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		qb.Width = 3 * sizeof(UINT64);
+		qb.Width = 4 * sizeof(UINT64);
 		qb.Height = 1;
 		qb.DepthOrArraySize = 1;
 		qb.MipLevels = 1;
@@ -839,14 +928,15 @@ int main(int argc, char **argv)
 			FAILED(device->CreateCommittedResource(&qh, D3D12_HEAP_FLAG_NONE, &qb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stamps_back))))
 			stamps = nullptr;
 	}
-	std::vector<double> zone_ms, fx_ms;
+	std::vector<double> zone_ms, blade_ms, fx_ms; // (the blades at the zone's end between the two: ZONE_VIEW_GRASS)
 	auto stamps_read = [&] {
 		UINT64 *v = nullptr;
-		const D3D12_RANGE all = { 0, 3 * sizeof(UINT64) };
+		const D3D12_RANGE all = { 0, 4 * sizeof(UINT64) };
 		if (stamps == nullptr || FAILED(stamps_back->Map(0, &all, reinterpret_cast<void **>(&v))))
 			return;
 		zone_ms.push_back(1000.0 * double(v[1] - v[0]) / double(stamp_hz));
-		fx_ms.push_back(1000.0 * double(v[2] - v[1]) / double(stamp_hz));
+		blade_ms.push_back(1000.0 * double(v[2] - v[1]) / double(stamp_hz));
+		fx_ms.push_back(1000.0 * double(v[3] - v[2]) / double(stamp_hz));
 		stamps_back->Unmap(0, nullptr);
 	};
 	for (uint64_t n = 1; fx && n < last; ++n)
@@ -862,12 +952,15 @@ int main(int argc, char **argv)
 			hifi::light::end(list);
 		if (stamps != nullptr)
 			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+		blades_at_zone_end(list);
+		if (stamps != nullptr)
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 		std::string error;
 		const grass::draw_stats fs = wfx.draw(list, gt, cam, fl, error);
 		if (stamps != nullptr)
 		{
-			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
-			list->ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, stamps_back, 0);
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+			list->ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, stamps_back, 0);
 		}
 		lamp_faces += fs.lamp_map_faces;
 		lamp_copies += fs.lamp_native_copies;
@@ -919,9 +1012,20 @@ int main(int argc, char **argv)
 		if (stamps != nullptr)
 			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
 		if (fx)
+			blades_at_zone_end(list);
+		if (stamps != nullptr)
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+		if (fx)
 		{
 			std::string error;
 			const grass::draw_stats fs = wfx.draw(list, gt, cam, fl, error);
+			if (grass_on)
+			{
+				const uint32_t lit = grass_after ? fs.blade_native : blade_native;
+				std::printf("  the grass: %u blades %s; lit from the native passes' block: %s%s%s; the light split's words %s\n", grass_after ? fs.blades : blades_drawn,
+					grass_after ? "after the shading pass" : "at the zone's end", (lit & hifi::sun::kHasSun) != 0 ? "the sun's shadows " : "",
+					(lit & hifi::sun::kHasLamps) != 0 ? "the lamps" : "", lit == 0 ? "nothing" : "", blade_words ? "written" : "not written");
+			}
 			std::printf("World FX frame %llu: %s%s, sun map %s, light split %s; the zone pass %s the sun's shadows itself, and %s the lamps' glow (%u lamps, %u cubes)\n",
 				(unsigned long long)last, fs.sun ? "shaded" : "not shaded", error.empty() ? "" : (" (" + error + ")").c_str(), fs.sun_map ? "read" : "not read",
 				split ? "drawn" : "not drawn", st.shadowed ? "applied" : "didn't apply", st.lamps ? "added" : "didn't add", fs.lamps, fs.lamp_maps);
@@ -943,8 +1047,8 @@ int main(int argc, char **argv)
 		}
 		if (stamps != nullptr)
 		{
-			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
-			list->ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, stamps_back, 0);
+			list->EndQuery(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+			list->ResolveQueryData(stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, stamps_back, 0);
 		}
 	}
 	D3D12_RESOURCE_BARRIER barrier = {};
@@ -977,6 +1081,12 @@ int main(int argc, char **argv)
 		std::sort(w.begin(), w.end());
 		std::printf("GPU time over the last %zu frames: the zone pass %.2f ms at least, %.2f the middle one; World FX after it %.2f at least, %.2f the middle one\n",
 			z.size(), z.front(), z[z.size() / 2], w.front(), w[w.size() / 2]);
+		if (grass_on && !grass_after)
+		{
+			std::vector<double> b(blade_ms.begin() + from, blade_ms.end());
+			std::sort(b.begin(), b.end());
+			std::printf("  the blades at the zone's end: %.3f ms at least, %.3f the middle one\n", b.front(), b[b.size() / 2]);
+		}
 	}
 	if (device->GetDeviceRemovedReason() != S_OK)
 	{

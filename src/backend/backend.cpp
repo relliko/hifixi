@@ -8,6 +8,8 @@
 #include "../zone/frame.hpp"
 #include "../zone/native.hpp"
 #include "../zone/zone_gpu.hpp"
+#include "../zone/light_split.hpp"
+#include "../render/sun_shadows.hpp"
 #include "../upscale/upscale.hpp"
 #include "../upscale/masks.hpp"
 #include "../framegen/framegen.hpp"
@@ -536,8 +538,18 @@ namespace hifi::backend
 				w.ds_format = fm.ds_format;
 				w.rt_state = world_rt_state();
 				zone::inject::on_zone_end(list, w, m.seq);
-				// (then World FX's blades, written into the world's depth before the characters and effects)
-				worldfx::on_zone_end(world_of(fm));
+				// (then World FX's blades, written into the world's depth before the characters and effects; while the native
+				// passes light from World FX's block, the blades do too and write the light split's words over the ground's
+				// on their pixels, as the zone just did: src/render/sun_shadows.hpp "The grass")
+				worldfx::world_mark wm = world_of(fm);
+				D3D12_CPU_DESCRIPTOR_HANDLE split = {};
+				const bool lit = sun::marked() && zone_rt != nullptr && wm.rt == zone_rt &&
+					light::begin(list, g_device.load(std::memory_order_acquire), zone_rt, split);
+				if (lit)
+					wm.light_rtv = uint64_t(split.ptr);
+				worldfx::on_zone_end(wm);
+				if (lit)
+					light::end(list);
 			}
 			// (native characters: the opaque models at their end marker, a see-through one at its own)
 			if ((m.kind == slotmark::chars_end || m.kind == slotmark::see_through) && depth != nullptr)

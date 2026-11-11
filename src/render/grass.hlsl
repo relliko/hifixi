@@ -17,6 +17,7 @@ cbuffer grass : register(b0)
 	               // w: projection _34 (view z = w * it: the game's is right-handed, -1)
 	float4 shade;  // the shading pass: x: ambient occlusion strength, y: its radius (yalms), z: surface relief strength,
 	               // w: sun shadow strength (0: none, the sun down or no sky)
+	               // (the blades' pass: x: 1 (uint bits) when the native passes' block is in t2, kNative; else 0)
 };
 StructuredBuffer<float4> blades : register(t0);
 StructuredBuffer<float4> actors : register(t2); // characters and monsters near: x, y, z (their feet), radius
@@ -137,7 +138,8 @@ float drawn_depth(int2 p)
 // is a pixel the zone lit with the texture pack's relief (light_at's marked; the facing is turned back either way).
 // light_at: the facing (view space, toward the camera) and the share at p, where the word is this frame's and still
 // what's drawn there (its depth the depth's own within 2.5 codes, about 1.4%: what the game drew over it later, an
-// effect's mesh, a model left to the game, a blade, isn't it); false elsewhere, and the old ways stand.
+// effect's mesh, a model left to the game, isn't it); false elsewhere, and the old ways stand. (World FX's own blades,
+// drawn at the zone's end, write their own words while the native passes' block is in use: ps_light.)
 static const float kShareScale = 1.39; // (sun_share's: the game's daylight share of a surface square to the sun is 0.72)
 bool light_split() { return (zinfo.w & 16) != 0; }
 float3 view_dir(float3 d)
@@ -474,11 +476,123 @@ float2 wear_of(uint point_index, float3 p, bool first_vertex)
 	return float2(saturate((until.x - now) / kWearHold), saturate((until.y - now) / kRegrow));
 }
 
+// The blades' own light (HiFi XI's src/render/sun_shadows.hpp, "The grass"; the blades' pass's shade.x 1): the block
+// World FX published for the native passes, as the zone and the characters get it in their b2, here in t2 after the
+// lamps' shadow maps' ([kNative .. + 72]: sun::gpu_block's 73 float4, its uints as bits), and the buffer it reads (the
+// sun's cascades, the casters' map, the clouds' and the lamps' cubes) in t1, the world's copy's place (the blades don't
+// read the world). The lookups and the lamps' glow are sun_shadows.hpp's own (kHlsl, kHlslLamps, with light_split.hpp's
+// word), put in by the renderer in the place of the marked line below (grass_render.cpp with_native): one copy for
+// the zone, the characters and the blades. They read their block as globals, loaded here from t2 (native_load: the
+// sun's part; native_load_lamps: the lamps', only when the block has them).
+// Each blade is lit at its root (blade_light): steady as the wind sways it, and the same down its whole length, so a
+// blade is in a shadow or out of it as the ground at its foot is. Read only behind a [branch] on blade_native().
+static const uint kNative = kMotion + 9 + 8 + 8; // (after the lamps' shadow maps' 8: kLampMap, below)
+bool blade_native() { return asuint(shade.x) == 1u; }
+static float4 ss_rows[18];
+static float4 ss_cascade[3];
+static uint4 ss_where[3];
+static float4 ss_caster_rows[3];
+static float4 ss_caster;
+static uint4 ss_caster_where;
+static float4 ss_sun;
+static float4 ss_cloud;
+static float4 ss_cloud_light;
+static uint4 ss_cloud_where;
+static uint4 ss_mode;
+static float4 ss_lamp_head;
+static float4 ss_lamp_pos[16];
+static float4 ss_lamp_col[16];
+static uint4 ss_lamp_where;
+static float4 ss_lamp_map;
+static float4 ss_body[4];
+ByteAddressBuffer ss_map : register(t1);
+//#native_light
+void native_load()
+{
+	uint i;
+	for (i = 0; i < 18; ++i)
+		ss_rows[i] = actors[kNative + i];
+	for (i = 0; i < 3; ++i)
+	{
+		ss_cascade[i] = actors[kNative + 18 + i];
+		ss_where[i] = asuint(actors[kNative + 21 + i]);
+		ss_caster_rows[i] = actors[kNative + 24 + i];
+	}
+	ss_caster = actors[kNative + 27];
+	ss_caster_where = asuint(actors[kNative + 28]);
+	ss_sun = actors[kNative + 29];
+	ss_cloud = actors[kNative + 30];
+	ss_cloud_light = actors[kNative + 31];
+	ss_cloud_where = asuint(actors[kNative + 32]);
+	ss_mode = asuint(actors[kNative + 33]);
+	ss_lamp_head = actors[kNative + 34];
+}
+// (only as many lamps and bodies as the block says it has: the rest is never read, sl_glow's and sl_bodies' counts)
+void native_load_lamps()
+{
+	const uint lamps = min(uint(ss_lamp_head.x), 16u), bodies = min(uint(ss_lamp_head.z), 4u);
+	uint i;
+	[loop] for (i = 0; i < lamps; ++i)
+	{
+		ss_lamp_pos[i] = actors[kNative + 35 + i];
+		ss_lamp_col[i] = actors[kNative + 51 + i];
+	}
+	ss_lamp_where = asuint(actors[kNative + 67]);
+	ss_lamp_map = actors[kNative + 68];
+	[loop] for (i = 0; i < bodies; ++i)
+		ss_body[i] = actors[kNative + 69 + i];
+}
+
+// The light the ground's colour map was drawn with (its header's words 6 to 12, grass_render.cpp draw_floor, from what
+// the map's drawer said: sun_shadows.hpp ground_light): what a ground facing up gets in all (the ambient and the sun's
+// by its height) and the sun's part of it, before the ground's own baked shade. Not said (a host that draws the map
+// without saying, no map): the game's usual daylight, the ambient 0.39 of the sun's (sun_share's), by the block's sun.
+void floor_light(out float3 all, out float3 suns)
+{
+	const uint4 a = memory.Load4(24);
+	const uint3 b = memory.Load3(40);
+	all = asfloat(a.xyz);
+	suns = float3(asfloat(a.w), asfloat(b.xy));
+	if (b.z != 1u || !finite4(float4(all, suns.x)) || !finite4(float4(suns, 0.0)) || any(all <= 0.0))
+	{
+		const float f = ss_sun.w > 0.0 ? saturate(-ss_sun.y) : 0.0; // (the world's y is down)
+		all = 0.5 * (0.39 + f);
+		suns = 0.5 * f;
+	}
+}
+
+// A blade's light at its root (world; the block loaded): kept, what's left of the ground's colour under the sun's and
+// the clouds' shadows there, a channel each (the shadow takes the sun's part of the ground's light, as the zone's own
+// pass takes it from the ground: the map's colour has no shadow in it, it's lit whole); light, what the ground there
+// is lit with after them; share, the sun's share of that; glow, the lamps' light there (to go on with sl_lit), on a
+// ground facing up.
+static const float kBladeBaked = 0.6; // (the ground's own baked shade, unknown here: a usual one, for sl_lit's fade)
+void blade_light(float3 at, out float3 kept, out float3 light, out float share, out float3 glow)
+{
+	const float3 up = float3(0.0, -1.0, 0.0);
+	float3 all, suns;
+	floor_light(all, suns);
+	const float seen = ss_sun_seen(at, up, 0.0);
+	light = max(all - suns * (1.0 - seen), 0.0);
+	kept = saturate(light / all);
+	share = saturate(dot(suns * seen, float3(0.2126, 0.7152, 0.0722)) / max(dot(light, float3(0.2126, 0.7152, 0.0722)), 1e-4));
+	glow = 0.0;
+	[branch] if (sl_on())
+	{
+		native_load_lamps();
+		glow = sl_glow(at, up, up, false);
+	}
+}
+
 struct v2p
 {
 	float4 pos : SV_Position;
 	float3 col : COLOR;
 	float3 motion : MOTION; // (FSR 2's: from here to where the blade was last frame, UV units; and its view depth)
+	// (the light split's word for the blade, ps_light: its view depth, the sun's share of its light, 1 when it was lit
+	// from the block (the mark), 1 when the words are written marked; and the facing written, world)
+	float4 lit : LIGHT;
+	float3 facing : FACING;
 };
 
 // The wind's sway of a blade at a time (seconds, color.w's clock): its tip's lean across (yalms a yalm of height, at the
@@ -510,6 +624,8 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 	v2p o;
 	o.col = 0.0;
 	o.motion = 0.0;
+	o.lit = 0.0;
+	o.facing = float3(0.0, -1.0, 0.0);
 	uint tuft = max(1, uint(blade.z));
 	float4 b = blades[iid / tuft + asuint(blade.w)];
 	uint k = iid % tuft;
@@ -554,6 +670,21 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 	{
 		float clear = max(clear_at(seen_from), 0.25);
 		g = max((g - (1.0 - clear) * haze_colour()) / clear, 0.0);
+	}
+	// The blade's own light (blade_light, above): the sun's and the clouds' shadows at its root off the ground's colour
+	// (a little over the baked point, where the blade stands: the ground under a tuft's edge may lie a little higher or
+	// lower), so everything made of it below is in the shade with it; the lamps' glow goes on once the colour is made
+	bool native = false;
+	float3 native_light = 1.0, native_glow = 0.0;
+	[branch] if (blade_native())
+	{
+		native_load();
+		native = true;
+		float3 kept;
+		float share;
+		blade_light(float3(root.x, b.y - 0.1, root.z), kept, native_light, share, native_glow);
+		g *= kept;
+		o.lit = float4(0.0, share, ss_mode.z != 0 ? 1.0 : 0.0, ss_mode.x != 0 ? 1.0 : 0.0);
 	}
 
 	// Trodden down and cut (wear_of): a cut blade is a stub kStub of its height, growing back slowly at first; a trodden
@@ -642,6 +773,24 @@ v2p vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 		float light = clamp(dot(g, float3(0.3, 0.59, 0.11)) / 0.3, 0.1, 1.8);
 		float frost = snowed * smoothstep(0.3, 1.0, t) * (0.6 + 0.4 * hash(seed * 8.7));
 		o.col = lerp(o.col, min(float3(0.88, 0.91, 0.96) * light, 1.0), 0.85 * frost);
+	}
+	// The lamps' glow on the blade (sun_shadows.hpp's sl_lit, as the zone's pass puts it on the ground: by the blade's
+	// colour, and its colour over the light it's lit with, faded by that light under a usual baked shade), none of it
+	// the sun's; and the word's parts that go with the vertex: its view depth, and the facing written, the world's up,
+	// leant toward the camera where that's above the camera's eye line (light_at turns a facing toward the camera)
+	[branch] if (native)
+	{
+		[branch] if (any(native_glow > 0.0))
+		{
+			// (the blade's colour over its light no more than 1: where the map has no ground for a blade its colour is the
+			// grass's own hue, as bright by night as by day, and would pass for a white one)
+			const float3 add = sl_lit(native_glow, o.col, min(o.col / max(native_light, 0.05), 1.0), saturate(kBladeBaked * native_light));
+			o.lit.y = sl_share(o.lit.y, o.col, add);
+			o.col += add;
+		}
+		o.lit.x = o.pos.w;
+		const float3 toward = normalize(eye.xyz - p);
+		o.facing = normalize(o.facing + toward * max(0.0, 0.15 - dot(o.facing, toward)));
 	}
 	// Into the game's fog as the ground around it is (o.pos.w: the view depth)
 	[branch] if (hazy())
@@ -3309,6 +3458,45 @@ blade_out ps_motion(v2p i)
 	blade_out o;
 	o.col = ps_main(i);
 	o.motion = float4(i.motion, 1.0);
+	return o;
+}
+
+// The blades with the light split's word (drawn at the zone's end into the world, lit from the native passes' block:
+// "The blades' own light" above; HiFi XI's light_split.hpp and sun_shadows.hpp): the host's light split is a target
+// beside the world's, and a blade writes its own word over the ground's on its pixels: its view depth, a facing up, the
+// sun's share of its light and, where it was lit from the block, the mark, so the shading pass after takes the blade
+// as it takes the zone's own pixels (light_at: no sun or cloud shadow and no lamp glow a second time); with no block
+// to light by, an unmarked word, the blade shaded as a ground facing up. (Before, a blade's pixels kept the ground's
+// word behind them, which light_at took for the blade's wherever their depths came within its 1.4%.)
+uint blade_word(v2p i)
+{
+	ss_mode = uint4(i.lit.w > 0.5 ? 1u : 0u, 0u, 0u, 0u);
+	return light_word_ss(i.lit.x, i.facing, i.lit.y, i.lit.z > 0.5);
+}
+struct blade_light_out
+{
+	float4 col : SV_Target0;
+	uint light : SV_Target1;
+};
+blade_light_out ps_light(v2p i)
+{
+	blade_light_out o;
+	o.col = ps_main(i);
+	o.light = blade_word(i);
+	return o;
+}
+struct blade_motion_light_out
+{
+	float4 col : SV_Target0;
+	float4 motion : SV_Target1;
+	uint light : SV_Target2;
+};
+blade_motion_light_out ps_motion_light(v2p i)
+{
+	blade_motion_light_out o;
+	o.col = ps_main(i);
+	o.motion = float4(i.motion, 1.0);
+	o.light = blade_word(i);
 	return o;
 }
 

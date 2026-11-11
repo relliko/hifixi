@@ -545,6 +545,10 @@ namespace grass
 		uint32_t draws = 0;
 		bool shaded = false; // the shading pass ran
 		bool blade_motion = false; // the blades wrote their motion (look::blade_motion)
+		// The blades' own light (sun_shadows.hpp "The grass"): what of the native passes' block they were lit with
+		// (hifi::sun::kHasSun, kHasLamps; 0 none), and whether they wrote the light split's words (target::light_rtv)
+		uint32_t blade_native = 0;
+		bool blade_words = false;
 		bool sun = false;    // with the sun's shadows (their half-size pass ran before it)
 		bool sun_map = false;           // ... and the shadow map read in it
 		uint32_t sun_map_cascades = 0;  // cascades of the shadow map drawn again this frame (bits: 1 near, 2 far, 4 farthest)
@@ -603,6 +607,11 @@ namespace grass
 		// look::phase_t::blades: the blades drawn with ds itself as their depth (both planes DEPTH_WRITE meanwhile: the
 		// caller's), through a view of the renderer's own
 		bool blades_into_world_depth = false;
+		// look::phase_t::blades: the host's light split as a target beside rt (HiFi XI's light_split.hpp: R32_UINT, rt's
+		// size, one sample, in RENDER_TARGET for this draw: the caller's begin and end around it); ptr 0: none. With it,
+		// and the native passes' block in use (sun_shadows.hpp marked()), the blades light themselves from that block
+		// and write their words there (grass.hlsl ps_light); without it they're drawn as before, for the shading pass.
+		D3D12_CPU_DESCRIPTOR_HANDLE light_rtv = {};
 	};
 
 	// The shaders compiled from a source: a blob for each of the renderer's entry points (vs_main, ps_main, shade_vs ...
@@ -798,6 +807,8 @@ namespace grass
 		ID3D12PipelineState *pipeline_for(const target &t, std::string &error);
 		// The blades with their motion into a second target (ps_motion), and that target for the world's size
 		ID3D12PipelineState *motion_pipeline_for(const target &t, std::string &error);
+		// The blades with the light split's word as their last target (ps_light; with their motion, ps_motion_light)
+		ID3D12PipelineState *light_pipeline_for(const target &t, bool motion, std::string &error);
 		bool motion_target_for(const D3D12_RESOURCE_DESC &rt_desc, std::string &error);
 		struct copy;
 		bool copy_buffer(copy &c, UINT64 size, std::string &error);
@@ -857,7 +868,7 @@ namespace grass
 
 		ID3D12Device *_device = nullptr;
 		ID3D12RootSignature *_root = nullptr;
-		std::vector<uint8_t> _vs, _ps, _ps_motion;
+		std::vector<uint8_t> _vs, _ps, _ps_motion, _ps_light, _ps_motion_light;
 		// The blades' motion (look::blade_motion): its target and view, the frames that wrote it, the last frame's camera
 		// (VIEW x PROJECTION without the jitter) and seconds
 		ID3D12Resource *_motion = nullptr;
@@ -875,7 +886,7 @@ namespace grass
 		};
 		std::vector<pso_entry> _psos, _shade_psos, _water_psos, _water_debug_psos, _firefly_psos, _rain_psos, _splash_psos, _snow_psos, _leaf_psos, _air_psos, _flash_psos;
 		std::vector<pso_entry> _water_whole_psos, _sea_psos, _water_fading_psos;
-		std::vector<pso_entry> _motion_psos;
+		std::vector<pso_entry> _motion_psos, _light_psos, _motion_light_psos;
 		std::vector<uint8_t> _shade_vs, _shade_ps, _water_vs, _water_ps, _water_debug_vs, _water_debug_ps, _sun_ps, _shadow_vs, _shadow_ps, _firefly_vs, _firefly_ps;
 		std::vector<uint8_t> _rain_vs, _rain_ps, _splash_vs, _splash_ps, _snow_vs, _snow_ps, _leaf_vs, _leaf_ps, _air_ps, _flash_ps, _cloud_ps, _cloud_shadow_ps;
 		// The look pass: its shaders, its pipelines (the small sizes' with no render target, made once; the world's by its

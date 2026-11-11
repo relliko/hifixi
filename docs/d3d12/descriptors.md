@@ -193,6 +193,13 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   shadow map is read through t0 with param 1 made ALL-visible; the snow trails live at the end of `_sun_mask` (u1,
   visibility changed to ALL for the vertex shader); the ground colour map is copied into the start of the blades'
   memory u0 (3db2a26, `kMemoryBase`). Adding a parameter means moving constants into a buffer or a table first.
+  The blades' own light (sun_shadows.hpp "The grass", 2026-11-10) rode in the same way: the native passes' block
+  (`sun::gpu_block`, 73 float4) goes after the actors in t2 (`kNativeOffset`, grass.hlsl `kNative`), read by the
+  blades' vertex shader into globals, and the block's buffer (the cascades, the clouds' map, the lamps' cubes) is bound
+  in t1 for the blades' draws, the world's copy's slot, which they don't read; a block with no buffer leaves t1 as it
+  was. Read only behind a `[branch]` on the pass's flag (`shade.x`, the blades' own copy of the constants): without the
+  block t2 may be the small blades' buffer. No root parameter added; the light split's word goes out as a render
+  target (`light_pipeline_for`: the world, the motion when FSR asks, the split last), not through the root signature.
 - **A stale descriptor someone else refilled.** World FX drew through dgVoodoo's RTV slot, which dgVoodoo filled again
   by a copied descriptor. A full-screen pass wrote into a smaller target, past its end. Fixed by making its own view at
   each draw (`grass_render.cpp:5314-5326`). Never keep another layer's descriptor handle across calls.

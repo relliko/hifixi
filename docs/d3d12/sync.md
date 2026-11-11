@@ -116,7 +116,9 @@ The +2 rule (src/host/retire.hpp)
   plugin's unload lets the block's own go before `retire::release_all` (`src/plugin/main.cpp`). With the lamps ([zone]
   nativelamps) the block's buffer is whichever holds the lamps' cubes: World FX's shadow map copy, or the cubes' own
   buffer (`_lamp_native`) while there's no such copy, held and handed on the same way; a block with lamps and no cube
-  has no buffer (`latest` then hands none, `retire::later(nullptr)` does nothing). World FX itself lets `_lamp_native`
+  has no buffer (`latest` then hands none, `retire::later(nullptr)` does nothing). World FX's own blades take the block
+  the same way (`latest` in `renderer::draw` at "worldfx: grass") and hand their reference to the renderer's `keep_old`
+  right after binding it (let go two presents on, as its other replaced buffers). World FX itself lets `_lamp_native`
   go through its own `keep_old` once the cubes have moved to the sun's copy (`grass_render.cpp:5240` on): its copy
   lists may still be queued.
 - retire.hpp covers the game's direct queue only. Anything that ran on another queue must already be finished (CPU

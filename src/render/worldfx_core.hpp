@@ -102,6 +102,9 @@ namespace worldfx
 		uint32_t width = 0, height = 0;
 		bool fog_known = false;
 		float fog[3] = {};
+		// on_zone_end: the host's light split as a target for the blades' words (grass::target::light_rtv: begun by the
+		// caller before the call, ended after it); 0: none
+		uint64_t light_rtv = 0;
 	};
 
 	// Before the game's Direct3D 12 device is made: the GPU crash record (GpuCrashReports) and, where the host can

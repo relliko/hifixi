@@ -1243,6 +1243,291 @@ int main(int argc, char **argv)
 				fclose(f);
 			}
 	}
+	// 1b3. The blades' own light (HiFi XI's src/render/sun_shadows.hpp "The grass"): while the native passes' block is in
+	// use ([zone] nativeshadows, nativelamps) the blades light themselves from it at their roots, and at the zone's end
+	// write the light split's words on their pixels, marked, so the shading pass after leaves them alone. The block here
+	// is made by hand, as World FX publishes it: a cascade 128 yalms across around the looked-at blade, a texel 2 yalms,
+	// every texel of it nearer the sun than anything (all in shadow) or empty (none); and a glow 1.5 yalms over the blade.
+	// - after the shading pass (no marker, nothing shading here): under the empty cascade the picture is the one without
+	//   the block, byte for byte; under the full one the blades keep what the ground keeps (the fallback light: the
+	//   ambient 0.39 of a sun overhead, a whole shadow 0.8 of the sun: 0.42); the glow lights them
+	// - both options off: whatever is published, and with the light split offered at the zone's end, the picture is the
+	//   old one byte for byte and no word is written
+	// - at the zone's end, with the split: every blade pixel gets a marked word (bit 31) at its own depth; World FX's
+	//   shading pass then adds no glow of its own there (the picture's blade pixels as with no World FX lamp at all),
+	//   while the ground, which has no word, gets it; with the words wiped before the shading pass the blades get it a
+	//   second time (brighter): the mark is what stops it
+	if (!shadows_only)
+	{
+		const UINT kN = 64;
+		const float kReach = 64.0f, kTexel = 2.0f * kReach / kN;
+		const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		const UINT64 map_bytes = UINT64(kN) * kN * 4 * 2;
+		ID3D12Resource *map = g.buffer(D3D12_HEAP_TYPE_DEFAULT, map_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+		{
+			ID3D12Resource *up = g.buffer(D3D12_HEAP_TYPE_UPLOAD, map_bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+			float *texels = nullptr;
+			up->Map(0, nullptr, reinterpret_cast<void **>(&texels));
+			for (size_t i = 0; i < size_t(kN) * kN; ++i)
+			{
+				texels[i] = 0.0f;                    // (the full one: something right at the sun in every texel)
+				texels[size_t(kN) * kN + i] = 1.0f; // (the empty one)
+			}
+			up->Unmap(0, nullptr);
+			g.list->CopyBufferRegion(map, 0, up, 0, map_bytes);
+			barrier(g.list, map, D3D12_RESOURCE_STATE_COPY_DEST, readable);
+			g.run();
+			release(up);
+		}
+		const float glow[8] = { at.x, at.y - 1.5f, at.z, 6.0f, 1.0f, 0.8f, 0.4f, 0.0f };
+		auto block_of = [&](bool sun, bool full, bool lamp) {
+			hifi::sun::block nb;
+			nb.device = g.device;
+			hifi::sun::gpu_block &q = nb.gpu;
+			if (sun)
+			{
+				nb.buffer = map;
+				q.mode[2] |= hifi::sun::kHasSun;
+				for (int d = 0; d < 2; ++d) // (the last drawing and the one before: the same)
+				{
+					q.rows[3 * d][0] = 1.0f / kTexel;
+					q.rows[3 * d][3] = -(at.x - kReach) / kTexel;
+					q.rows[3 * d + 1][2] = 1.0f / kTexel;
+					q.rows[3 * d + 1][3] = -(at.z - kReach) / kTexel;
+					q.rows[3 * d + 2][3] = 0.5f; // (every point at depth 0.5)
+				}
+				q.cascade[0][0] = q.cascade[0][1] = 0.001f;
+				q.cascade[0][2] = kTexel;
+				q.cascade[0][3] = 1.0f;
+				q.where[0][0] = q.where[0][1] = full ? 0u : kN * kN;
+				q.where[0][2] = q.where[0][3] = kN;
+				q.sun[1] = -1.0f; // (overhead: the world's y is down)
+				q.sun[3] = 0.8f;
+			}
+			if (lamp)
+			{
+				q.mode[2] |= hifi::sun::kHasLamps;
+				q.lamp_head[0] = 1.0f;
+				for (uint32_t k = 0; k < hifi::sun::kMaxLamps; ++k)
+				{
+					q.lamp_pos[k][2] = 1e6f;
+					q.lamp_pos[k][3] = 1.0f;
+				}
+				std::memcpy(q.lamp_pos[0], glow, 16);
+				std::memcpy(q.lamp_col[0], glow + 4, 12);
+				q.lamp_map[0] = 1.0f;
+				q.lamp_map[1] = 0.95f;
+				q.lamp_map[2] = hifi::sun::kLampCubeReach;
+			}
+			return nb;
+		};
+		auto options = [&](bool native_sun, bool native_lamps, const hifi::sun::block *nb) {
+			hifi::sun::set_native(native_sun);
+			hifi::sun::set_native_lamps(native_lamps);
+			if (nb != nullptr)
+				hifi::sun::publish(*nb);
+			else
+				hifi::sun::publish_none();
+		};
+		const float ground[4] = { 0.35f, 0.3f, 0.2f, 0.5f };
+		auto world_begin = [&] {
+			barrier(g.list, world, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			g.list->ClearRenderTargetView(world_rtv, ground, 0, nullptr);
+			g.list->ClearDepthStencilView(world_dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+			ground_depth(cam);
+		};
+		// (nothing of the shading pass's: the blades alone, within the cascade's middle)
+		look lq = l;
+		lq.ao_strength = 0.0f;
+		lq.relief = 0.0f;
+		lq.sun_shadow = 0.0f;
+		lq.time = 0.0f;
+		lq.distance = 20.0f;
+		draw_stats after_stats = {};
+		auto after = [&](bool native_sun, bool native_lamps, const hifi::sun::block *nb) {
+			options(native_sun, native_lamps, nb);
+			world_begin();
+			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			after_stats = r.draw(g.list, t, cam, lq, error);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			std::vector<uint8_t> out = g.read(world, 4);
+			r.release_old(0);
+			return out;
+		};
+		// (the blades' brightness around the looked-at one: the pixels greener than red, as the first test's; and how many)
+		auto blades_luma = [&](const std::vector<uint8_t> &img, const std::vector<uint8_t> &mask_of, uint32_t *count = nullptr) {
+			double sum = 0.0;
+			uint32_t n = 0;
+			for (size_t i = 0; i < size_t(W) * H; ++i)
+			{
+				const float x = float(i % W), y = float(i / W);
+				if (std::fabs(x - px) > 60.0f || y < py - 60.0f || y > py + 20.0f || mask_of[i * 4 + 1] <= mask_of[i * 4])
+					continue;
+				sum += 0.3 * img[i * 4] + 0.59 * img[i * 4 + 1] + 0.11 * img[i * 4 + 2];
+				n++;
+			}
+			if (count != nullptr)
+				*count = n;
+			return n != 0 ? sum / n : 0.0;
+		};
+		auto most = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+			int d = 0;
+			for (size_t i = 0; i < size_t(W) * H * 4; ++i)
+				d = std::max(d, std::abs(int(a[i]) - int(b[i])));
+			return d;
+		};
+		const hifi::sun::block full = block_of(true, true, false), empty = block_of(true, false, false), lamp_block = block_of(false, false, true),
+			both_blocks = block_of(true, true, true);
+		const std::vector<uint8_t> plain = after(false, false, nullptr);
+		const std::vector<uint8_t> off_published = after(false, false, &both_blocks);
+		const std::vector<uint8_t> in_sun = after(true, false, &empty);
+		const uint32_t in_sun_native = after_stats.blade_native;
+		const std::vector<uint8_t> in_shade = after(true, false, &full);
+		const std::vector<uint8_t> sun_off = after(false, true, &full); // (nativelamps alone: the block's sun not allowed)
+		const std::vector<uint8_t> by_lamp = after(false, true, &lamp_block);
+		const uint32_t by_lamp_native = after_stats.blade_native;
+		uint32_t blade_px = 0;
+		const double l_plain = blades_luma(plain, plain, &blade_px), l_shade = blades_luma(in_shade, plain), l_lamp = blades_luma(by_lamp, plain);
+		std::printf("  1b3 the blades' own light: %u blade pixels by the looked-at one, %.1f as before; under the full cascade %.1f (%.2f of it), "
+			"under the glow %.1f; off with a block published %d apart, under the empty cascade %d, with nativeshadows off %d\n",
+			blade_px, l_plain, l_shade, l_plain > 0.0 ? l_shade / l_plain : 0.0, l_lamp, most(off_published, plain), most(in_sun, plain), most(sun_off, plain));
+		check(blade_px > 300 && most(off_published, plain) == 0, "1b3: both options off, a block published changes nothing (byte for byte)");
+		check(in_sun_native == hifi::sun::kHasSun && most(in_sun, plain) == 0, "1b3: lit from the block, a blade the sun reaches is as before (byte for byte)");
+		check(l_shade > 0.36 * l_plain && l_shade < 0.5 * l_plain, "1b3: a blade under the cascade's shadow keeps what the ground keeps (the sun's part taken, the ambient left)");
+		check(most(sun_off, plain) == 0, "1b3: with nativeshadows off the block's shadows aren't taken (nativelamps alone)");
+		check(by_lamp_native == hifi::sun::kHasLamps && l_lamp > 1.15 * l_plain, "1b3: the block's lamps light the blades by them");
+		{
+			// (the ground is no one's here: nothing shades in these frames)
+			int ground_off = 0;
+			for (size_t i = 0; i < size_t(W) * H; ++i)
+				if (plain[i * 4 + 1] <= plain[i * 4])
+					for (int c = 0; c < 3; ++c)
+						ground_off = std::max(ground_off, std::abs(int(by_lamp[i * 4 + c]) - int(plain[i * 4 + c])));
+			check(ground_off == 0, "1b3: and nothing but the blades");
+		}
+
+		// At the zone's end, as in game: the blades into the world and its depth with the light split beside it, then the
+		// rest (World FX's shading pass, here with its own lamp glow alone, the split handed to it)
+		D3D12_CLEAR_VALUE split_clear = { DXGI_FORMAT_R32_UINT };
+		ID3D12Resource *split = g.texture(DXGI_FORMAT_R32_UINT, W, H, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, readable, &split_clear);
+		ID3D12DescriptorHeap *split_heap = nullptr;
+		const D3D12_DESCRIPTOR_HEAP_DESC shd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+		g.device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&split_heap));
+		const D3D12_CPU_DESCRIPTOR_HANDLE split_rtv = split_heap->GetCPUDescriptorHandleForHeapStart();
+		g.device->CreateRenderTargetView(split, nullptr, split_rtv);
+		draw_stats marker_stats = {};
+		bool with_motion = false; // (the blades' motion written beside them, FSR 2's: three targets then)
+		auto marker = [&](bool native_sun, bool native_lamps, const hifi::sun::block *nb, bool with_split, bool wipe, bool fx_lamp, std::vector<uint8_t> *words) {
+			options(native_sun, native_lamps, nb);
+			world_begin();
+			const float none[4] = {};
+			barrier(g.list, split, readable, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			g.list->ClearRenderTargetView(split_rtv, none, 0, nullptr);
+			target tz = t;
+			tz.rt_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			tz.ds_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+			tz.blades_into_world_depth = true;
+			if (with_split)
+				tz.light_rtv = split_rtv;
+			look lz = lq;
+			lz.phase = look::phase_t::blades;
+			lz.blade_motion = with_motion;
+			marker_stats = r.draw(g.list, tz, cam, lz, error);
+			if (words != nullptr)
+			{
+				barrier(g.list, split, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				*words = g.read(split, 4);
+				barrier(g.list, split, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}
+			if (wipe)
+				g.list->ClearRenderTargetView(split_rtv, none, 0, nullptr);
+			barrier(g.list, split, D3D12_RESOURCE_STATE_RENDER_TARGET, readable);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			look lw = lq;
+			lw.phase = look::phase_t::rest;
+			if (fx_lamp)
+			{
+				lw.lamps = glow;
+				lw.lamp_count = 1;
+				lw.lamp_shadows = 0.0f;
+			}
+			r.set_light_source([](void *c) { return static_cast<ID3D12Resource *>(c); }, split);
+			r.draw(g.list, t, cam, lw, error);
+			r.set_light_source(nullptr, nullptr);
+			barrier(g.list, world, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			std::vector<uint8_t> out = g.read(world, 4);
+			r.release_old(0);
+			return out;
+		};
+		std::vector<uint8_t> words_off, words_on, words_none;
+		const std::vector<uint8_t> old_way = marker(false, false, nullptr, false, false, true, nullptr);
+		const std::vector<uint8_t> off_split = marker(false, false, &both_blocks, true, false, true, &words_off);
+		const bool off_words = marker_stats.blade_words || marker_stats.blade_native != 0;
+		const std::vector<uint8_t> no_lamp = marker(false, false, nullptr, false, false, false, nullptr); // (no lamp anywhere)
+		const std::vector<uint8_t> lit_once = marker(false, true, &lamp_block, true, false, true, &words_on);
+		const bool on_words = marker_stats.blade_words && marker_stats.blade_native == hifi::sun::kHasLamps;
+		const std::vector<uint8_t> lit_alone = marker(false, true, &lamp_block, true, false, false, nullptr); // (no World FX glow at all)
+		const std::vector<uint8_t> lit_twice = marker(false, true, &lamp_block, true, true, true, nullptr);
+		const std::vector<uint8_t> unlit_words = marker(true, false, nullptr, true, false, false, &words_none); // (marked words, no block)
+		const bool none_words = marker_stats.blade_words && marker_stats.blade_native == 0;
+		const std::vector<uint8_t> shade_words = marker(true, false, &full, true, false, false, nullptr);
+		// (with the blades' motion as well: the world, the motion and the split, the same words and the same picture)
+		std::vector<uint8_t> words_motion;
+		with_motion = true;
+		marker(false, true, &lamp_block, true, false, false, nullptr);
+		const std::vector<uint8_t> lit_motion = marker(false, true, &lamp_block, true, false, false, &words_motion);
+		const bool motion_words = marker_stats.blade_words && marker_stats.blade_motion && marker_stats.blade_native == hifi::sun::kHasLamps;
+		with_motion = false;
+		check(motion_words && words_motion == words_on && most(lit_motion, lit_alone) == 0,
+			"1b3: with the blades' motion written beside them (three targets), the same words and the same picture");
+		options(false, false, nullptr);
+		auto word = [&](const std::vector<uint8_t> &w, size_t i) {
+			uint32_t v = 0;
+			std::memcpy(&v, &w[i * 4], 4);
+			return v;
+		};
+		uint32_t green = 0, marked = 0, marked_off_blade = 0, off_written = 0, unmarked_words = 0, bad_depth = 0;
+		int blade_apart = 0, ground_gain = 0;
+		for (size_t i = 0; i < size_t(W) * H; ++i)
+		{
+			const bool blade = no_lamp[i * 4 + 1] > no_lamp[i * 4];
+			const uint32_t v = word(words_on, i);
+			green += blade;
+			marked += (v >> 31) != 0;
+			marked_off_blade += (v >> 31) != 0 && !blade;
+			off_written += word(words_off, i) != 0;
+			const uint32_t u = word(words_none, i);
+			unmarked_words += u != 0 && (u >> 31) == 0;
+			bad_depth += v != 0 && ((v & 0x7FF) == 0 || (v & 0x7FF) > uint32_t((std::log2(60.0f) + 3.0f) * 128.0f));
+			if ((v >> 31) != 0)
+				for (int c = 0; c < 3; ++c)
+					blade_apart = std::max(blade_apart, std::abs(int(lit_once[i * 4 + c]) - int(lit_alone[i * 4 + c])));
+			else
+				ground_gain = std::max(ground_gain, int(lit_once[i * 4]) - int(lit_alone[i * 4]));
+		}
+		const double l_none = blades_luma(no_lamp, no_lamp), l_once = blades_luma(lit_once, no_lamp), l_twice = blades_luma(lit_twice, no_lamp),
+			l_old = blades_luma(old_way, no_lamp), l_shade_end = blades_luma(shade_words, no_lamp), l_unlit = blades_luma(unlit_words, no_lamp);
+		std::printf("  1b3 at the zone's end: %u blade pixels, %u marked words (%u off the blades, %u with a depth out of range); off: %d apart from the old way, "
+			"%u words written; the blades %.1f unlit, %.1f lit from the block (World FX's glow over it %d apart on them, the ground up to %d brighter), "
+			"%.1f with their words wiped, %.1f the old way; under the full cascade %.1f; marked words with no block: %u unmarked, the blades %.1f\n",
+			green, marked, marked_off_blade, bad_depth, most(off_split, old_way), off_written, l_none, l_once, blade_apart, ground_gain, l_twice, l_old, l_shade_end,
+			unmarked_words, l_unlit);
+		check(!off_words && off_written == 0 && most(off_split, old_way) == 0,
+			"1b3: both options off, the zone's end with the split offered and a block published: no word written, the picture the old one byte for byte");
+		check(on_words && green > 1000 && marked == green && marked_off_blade == 0 && bad_depth == 0, "1b3: at the zone's end every blade pixel gets a marked word, at its depth");
+		check(l_once > 1.15 * l_none, "1b3: the blades there are lit by the block's lamps");
+		check(blade_apart <= 1, "1b3: World FX's shading pass adds no glow of its own on the marked blades (not lit twice)");
+		check(ground_gain > 10, "1b3: while the ground beside them, with no word, gets World FX's glow");
+		check(l_twice > l_once + 3.0, "1b3: with their words wiped they'd get it a second time: the mark is what stops it");
+		check(none_words && unmarked_words == green && std::fabs(l_unlit - l_none) < 0.5, "1b3: with no block to light by, the blades write unmarked words and are as before");
+		check(l_shade_end > 0.36 * l_none && l_shade_end < 0.5 * l_none, "1b3: the cascade's shadow on the blades at the zone's end");
+		check(g.report_messages() == 0, "no debug-layer errors (the blades' own light)");
+		hifi::sun::release();
+		release(split_heap);
+		release(split);
+		release(map);
+	}
+
 	// 1c. Pushed aside: someone standing on the looked-at blade changes the picture there (the tufts around
 	// bend away and flatten), and only around there
 	if (!shadows_only)
@@ -1813,7 +2098,7 @@ int main(int argc, char **argv)
 				for (const char *vs : { "vs_main", "shade_vs", "shadow_vs", "water_vs", "water_debug_vs", "firefly_vs", "rain_vs", "splash_vs", "snow_vs", "leaf_vs", "snow_layer_vs" })
 					s += std::string("float4 ") + vs + "(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }\n";
 				for (const char *ps : { "ps_main", "shade_ps", "sun_ps", "shadow_ps", "water_ps", "water_debug_ps", "firefly_ps", "rain_ps", "splash_ps", "snow_ps", "vis_ps", "leaf_ps", "air_ps", "flash_ps", "cloud_ps", "cloud_shadow_ps", "look_first_ps",
-					"look_down_ps", "look_exposure_ps", "look_up_ps", "look_ps", "trail_ps", "snow_layer_ps", "vol_ps", "ps_motion" })
+					"look_down_ps", "look_exposure_ps", "look_up_ps", "look_ps", "trail_ps", "snow_layer_ps", "vol_ps", "ps_motion", "ps_light", "ps_motion_light" })
 					s += std::string("float4 ") + ps + "() : SV_Target { return float4(1, 0, 0, 1); }\n";
 				return s + "// " + std::to_string(n) + "\n";
 			};
@@ -1839,7 +2124,7 @@ int main(int argc, char **argv)
 			std::string cache_why;
 			const bool compiled = grass::compile_shaders(tiny(0), folder, first, from_first, cache_why);
 			const bool read_back = grass::compile_shaders(tiny(0), folder, again, from_again, cache_why);
-			check(compiled && !from_first && exists(file_of(tiny(0))) && first.blobs.size() == 36, "a source compiled is written to the cache");
+			check(compiled && !from_first && exists(file_of(tiny(0))) && first.blobs.size() == 38, "a source compiled is written to the cache");
 			check(read_back && from_again && again.blobs == first.blobs && again.key == first.key, "and read back from it the same");
 			grass::compile_shaders(tiny(0), std::wstring(), fresh, from_fresh, cache_why);
 			check(!from_fresh && fresh.blobs == first.blobs, "(the same as compiled without the cache)");

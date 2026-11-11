@@ -14,6 +14,7 @@
 #include "zoneshadow.hpp"
 #include "zone_gpu.hpp"
 #include "../host/shadercache.hpp"
+#include "../render/sun_shadows.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -469,6 +470,9 @@ float4 ps_ground(v2g i) : SV_Target
 		_ring_at = first + ((listed + 63u) & ~63u);
 		if (groups.empty())
 			return 0;
+		// (the ground map's light said for the grass, which lights its blades by it: sun_shadows.hpp ground_light)
+		if (ground != nullptr)
+			sun::set_ground_light(ground, ground + 4, ground + 8);
 		return draw_groups(list, z, world_to_clip, dsv, size, _places->GetGPUVirtualAddress(), _ring->GetGPUVirtualAddress() + UINT64(first) * 4,
 			uint32_t(d.placements.size()), groups, ground, rtv);
 	}
