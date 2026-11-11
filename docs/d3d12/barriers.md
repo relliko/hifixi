@@ -148,7 +148,9 @@ Our own resources:
   went with those in the cleanup):
   `draw_lamp_maps` (`grass_render.cpp:5240`) copies a cube's six faces from the lamps' depth array (DEPTH_WRITE ->
   COPY_SOURCE -> back) to that copy's end (`_lamp_copy_at`, after the clouds' map; the copy readable -> COPY_DEST ->
-  readable again), only when a cube was just drawn or the buffer is another than it was last copied to. While there is no
+  readable again), only when a cube was just drawn or the buffer is another than it was last copied to (sixteen cubes
+  since 2026-11-11, two faces drawn a frame at most; a cube is kept for a lamp that has left the list until its place
+  is needed, so the copies stay as rare as before). While there is no
   sun shadow map copy (none wanted yet: indoors, a night start) they go to a buffer of their own, `_lamp_native`: made
   in COMMON, written only by those copies, left in the same read state, and read by the native passes the same way,
   **no barrier**, by the same argument (World FX's list of frame N writes it, the native lists of frame N + 1 read it,

@@ -1400,6 +1400,40 @@ int main(int argc, char **argv)
 						ground_off = std::max(ground_off, std::abs(int(by_lamp[i * 4 + c]) - int(plain[i * 4 + c])));
 			check(ground_off == 0, "1b3: and nothing but the blades");
 		}
+		// The game's own lamps (the zone pass's, said each pass: sun_shadows.hpp set_zone_lamps): the ground's colour map
+		// has none of their light, so a blade by a campfire stood black on lit ground. A lamp 1.5 yalms over the
+		// looked-at blade (range 6, as the game's: 1 / (0.5 d^2)) lights the blades round it as it lights their ground;
+		// with World FX's glow of the same lamp in the block as well (the ground under it gets both too, the zone pass's
+		// lamp and the glow), the glow adds less to a blade the lamp already lights than it does alone (it fades by the
+		// light there: each counted once, never the lamp's own light a second time); a lamp whose range doesn't reach them, or
+		// none said, leaves them as they were, byte for byte (by day no lamp is lit: nothing changes).
+		{
+			const float fire[8] = { at.x, at.y - 1.5f, at.z, 6.0f, 1.0f, 0.8f, 0.4f, 0.5f };
+			const float far_fire[8] = { at.x + 14.0f, at.y - 1.5f, at.z + 6.0f, 6.0f, 1.0f, 0.8f, 0.4f, 0.5f };
+			hifi::sun::set_zone_lamps(fire, 1);
+			const std::vector<uint8_t> by_fire = after(nullptr);
+			const uint32_t fire_count = after_stats.blade_zone_lamps;
+			hifi::sun::set_zone_lamps(fire, 1);
+			const std::vector<uint8_t> by_both = after(&lamp_block);
+			hifi::sun::set_zone_lamps(far_fire, 1);
+			const std::vector<uint8_t> by_far = after(nullptr);
+			const uint32_t far_count = after_stats.blade_zone_lamps;
+			hifi::sun::set_zone_lamps(nullptr, 0);
+			const std::vector<uint8_t> by_none = after(nullptr);
+			const double l_fire = blades_luma(by_fire, plain), l_both = blades_luma(by_both, plain), l_far = blades_luma(by_far, plain);
+			int ground_fire = 0;
+			for (size_t i = 0; i < size_t(W) * H; ++i)
+				if (plain[i * 4 + 1] <= plain[i * 4])
+					for (int c = 0; c < 3; ++c)
+						ground_fire = std::max(ground_fire, std::abs(int(by_fire[i * 4 + c]) - int(plain[i * 4 + c])));
+			std::printf("  1b3 the game's own lamps: the blades %.1f with none, %.1f by a lamp 1.5 yalms over them (%u handed to them), %.1f with World FX's glow of it "
+				"as well (the glow alone %.1f); a lamp out of reach (%u handed): %.1f; none said: %d apart\n", l_plain, l_fire, fire_count, l_both, l_lamp, far_count, l_far,
+				most(by_none, plain));
+			check(fire_count == 1 && l_fire > 1.5 * l_plain && ground_fire == 0, "1b3: a blade by one of the game's own lamps is lit by it (and nothing but the blades)");
+			check(l_both >= l_fire - 0.5 && l_both - l_fire < 0.8 * (l_lamp - l_plain), "1b3: World FX's glow of the same lamp on top adds less than it does alone, as on the ground (each counted once)");
+			check(far_count == 1 && std::fabs(l_far - l_plain) < 0.5, "1b3: a lamp whose range doesn't reach the blades leaves them as they were");
+			check(most(by_none, plain) == 0, "1b3: no lamp said (by day): the picture as it was, byte for byte");
+		}
 
 		// At the zone's end, as in game: the blades into the world and its depth with the light split beside it, then the
 		// rest (World FX's shading pass, here with its own lamp glow alone, the split handed to it)
@@ -3981,12 +4015,103 @@ lamps:
 			std::printf("  its shadow cube: %u faces over %u frames (at most %u a frame; the plate in %u), copied for the native passes %u time(s), then %u faces and %u copies; "
 				"the block: flags %u, %u with a cube, faces of %u, a buffer of %llu bytes\n", faces, frames, most_faces, lh.hits, copies, kept_st.lamp_map_faces,
 				kept_st.lamp_native_copies, cube.flags, cube.cubes, cube.face, static_cast<unsigned long long>(cube.bytes));
-			check(drawn.lamp_maps == 1 && faces == 6 && frames == 6 && most_faces == 1 && lh.hits >= 1 && kept_st.lamp_maps == 1 && kept_st.lamp_map_faces == 0,
-				"the lamp's cube drawn a face a frame (six frames), then kept");
-			check(copies == 1 && kept_st.lamp_native_copies == 0 && cube.flags == hifi::sun::kHasLamps && cube.count == 1.0f && cube.cubes == 1 && cube.face == 256 &&
-				cube.bytes >= UINT64(256) * 256 * 4 * 6 * 4,
+			check(drawn.lamp_maps == 1 && faces == 6 && frames == 3 && most_faces == 2 && lh.hits >= 1 && kept_st.lamp_maps == 1 && kept_st.lamp_map_faces == 0,
+				"the lamp's cube drawn two faces a frame (three frames), then kept");
+			check(copies == 1 && kept_st.lamp_native_copies == 0 && cube.flags == hifi::sun::kHasLamps && cube.count == 1.0f && cube.cubes == 1 && cube.face == 192 &&
+				cube.bytes >= UINT64(192) * 192 * 4 * 6 * 16,
 				"and copied once to the native passes' buffer (the sun shadow map copy's end, or its own), published with the lamp");
 			check(kept_diff == 0, "the picture still as it went in (lamp shadows are the native passes' too)");
+			// A cube whatever the lamp shadows' setting (that's the characters' shadows now: a wall always hides a lamp),
+			// and fading in from the frame it's copied: the fraction of the lamp's word half of how far (0 at first, 0.49 after
+			// kLampFadeFrames, 20, never back)
+			{
+				frame(lamp, 1, 0.0f);
+				const said unset = block_said();
+				float last_fade = unset.col[3] - std::floor(unset.col[3]);
+				bool rising = true;
+				int fade_frames = 0;
+				for (; fade_frames < 40 && last_fade < 0.485f; ++fade_frames)
+				{
+					frame(lamp, 1, 0.0f);
+					const said s = block_said();
+					const float fade = s.col[3] - std::floor(s.col[3]);
+					rising = rising && fade >= last_fade && fade - last_fade < 0.03f && s.cubes == 1;
+					last_fade = fade;
+				}
+				std::printf("  ... with lamp shadows at 0: %u with a cube, the lamp's word %.3f; faded in over %d more frames to %.3f\n", unset.cubes, unset.col[3], fade_frames, last_fade);
+				check(unset.cubes == 1 && unset.col[3] >= 2.0f && unset.col[3] < 2.3f, "the cube is there with the lamp shadows' setting at 0 (a wall hides a lamp whatever the characters cast)");
+				check(rising && last_fade >= 0.485f && fade_frames >= 10 && fade_frames <= 20, "and fades in a twentieth a frame, never back: no pop");
+			}
+			// Sixteen lamps, a cube each (there were four): twelve round the looked-at point first, each its own cube, two
+			// faces a frame at most (no frame pays for more), each copied once. Two of them leave the list and two others
+			// come in: only the newcomers are drawn; the two come back: nothing is drawn (their cubes were kept). Then a
+			// list of sixteen with six new lamps: the two free cubes and the four whose lamps are out of the list go to them.
+			{
+				float many[20][8];
+				for (int i = 0; i < 20; ++i)
+				{
+					const float one[8] = { at.x + 0.7f + float(i % 5 - 2) * 3.0f, at.y - 1.5f, at.z + float(i / 5 - 2) * 3.0f, 6.0f, 1.469f, 1.0f, 0.219f, 1.0f };
+					std::memcpy(many[i], one, sizeof(one));
+				}
+				hifi::sun::release();
+				struct tally
+				{
+					uint32_t frames = 0, faces = 0, most = 0, copies = 0, maps = 0;
+				};
+				// (frames until every lamp of the list has its cube where the native passes read it, at most `limit`)
+				auto settle = [&](const float *list_of, uint32_t count, uint32_t limit) {
+					tally t2;
+					do
+					{
+						frame(list_of, count, 0.5f);
+						t2.faces += lamp_st.lamp_map_faces;
+						t2.most = std::max(t2.most, lamp_st.lamp_map_faces);
+						t2.copies += lamp_st.lamp_native_copies;
+						t2.frames++;
+					} while (t2.frames < limit && lamp_st.lamp_map_faces != 0);
+					t2.maps = lamp_st.lamp_maps;
+					return t2;
+				};
+				auto cubes_said = [&](uint32_t count, uint32_t &distinct) {
+					std::lock_guard<std::mutex> lock(hifi::sun::detail::g.mutex);
+					const hifi::sun::block &nb = hifi::sun::detail::g.latest;
+					uint32_t with = 0, seen = 0;
+					for (uint32_t k = 0; k < count && hifi::sun::detail::g.has; ++k)
+						if (nb.gpu.lamp_col[k][3] >= 2.0f)
+						{
+							with++;
+							seen |= 1u << uint32_t(nb.gpu.lamp_col[k][3] - 2.0f);
+						}
+					distinct = 0;
+					for (uint32_t b = 0; b < 16; ++b)
+						distinct += (seen >> b) & 1u;
+					return with;
+				};
+				const tally twelve = settle(many[0], 12, 100);
+				frame(many[0], 12, 0.5f);
+				uint32_t distinct12 = 0;
+				const uint32_t with12 = cubes_said(12, distinct12);
+				const tally shifted = settle(many[2], 12, 100); // (lamps 2..13: 0 and 1 leave, 12 and 13 come in)
+				const tally back = settle(many[0], 12, 100);    // (0..11 again)
+				frame(many[0], 12, 0.5f);
+				uint32_t distinct_back = 0;
+				const uint32_t with_back = cubes_said(12, distinct_back);
+				const tally sixteen = settle(many[4], 16, 100); // (lamps 4..19: 14..19 new, six cubes to find)
+				frame(many[4], 16, 0.5f);
+				uint32_t distinct16 = 0;
+				const uint32_t with16 = cubes_said(16, distinct16);
+				hifi::sun::release();
+				std::printf("  sixteen cubes: twelve lamps: %u faces over %u frames (at most %u a frame), %u copies, %u of 12 published with a cube (%u different cubes); two leave and "
+					"two come: %u faces, %u copies; the two back: %u faces, %u copies, %u with a cube; sixteen with six new: %u faces over %u frames (at most %u), %u copies, %u of "
+					"16 with a cube (%u different)\n", twelve.faces, twelve.frames, twelve.most, twelve.copies, with12, distinct12, shifted.faces, shifted.copies, back.faces,
+					back.copies, with_back, sixteen.faces, sixteen.frames, sixteen.most, sixteen.copies, with16, distinct16);
+				check(twelve.faces == 72 && twelve.most == 2 && twelve.frames <= 38 && twelve.copies == 12 && twelve.maps == 12 && with12 == 12 && distinct12 == 12,
+					"twelve lamps: a cube each, two faces a frame at most, each copied once and published with its lamp");
+				check(shifted.faces == 12 && shifted.copies == 2, "two lamps leaving the list and two coming in: only the newcomers' cubes are drawn");
+				check(back.faces == 0 && back.copies == 0 && with_back == 12 && distinct_back == 12, "the two coming back: nothing drawn or copied again (their cubes were kept)");
+				check(sixteen.faces == 36 && sixteen.most == 2 && sixteen.copies == 6 && sixteen.maps == 16 && with16 == 16 && distinct16 == 16,
+					"sixteen lamps, six of them new: the free cubes and those of the lamps out of the list go to them, all sixteen shadowed by their own");
+			}
 			{
 				renderer fresh;
 				std::string fresh_error;
@@ -4006,8 +4131,8 @@ lamps:
 				lamp_r = &r; // (the fresh renderer's lists are done: each frame was read back)
 				std::printf("  ... a renderer with no sun shadow map%s: the cube copied after %u frames (%u), then %u; the block: flags %u, %u with a cube, a buffer of %llu bytes\n",
 					made ? "" : (" NOT MADE: " + fresh_error).c_str(), fresh_frames, fresh_copies, fresh_again, own.flags, own.cubes, static_cast<unsigned long long>(own.bytes));
-				check(made && fresh_copies == 1 && fresh_again == 0 && own.flags == hifi::sun::kHasLamps && own.cubes == 1 && own.bytes == UINT64(256) * 256 * 4 * 6 * 4,
-					"  a renderer with no sun shadow map: the cube copied to a buffer of its own (the four cubes' size) and published with it");
+				check(made && fresh_copies == 1 && fresh_again == 0 && own.flags == hifi::sun::kHasLamps && own.cubes == 1 && own.bytes == UINT64(192) * 192 * 4 * 6 * 16,
+					"  a renderer with no sun shadow map: the cube copied to a buffer of its own (the sixteen cubes' size) and published with it");
 			}
 			r.set_zone_casters(nullptr, nullptr, nullptr);
 			frame(lamp, 1, 1.0f);

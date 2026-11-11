@@ -138,7 +138,9 @@ here holds for the 32-bit process (no DXR there; see memory no-dxr-32bit.md).
   1280: both rings' slots grow with it), and the same SRV carries the lamps' cubes (in World FX's copy after the
   clouds' map, or in the cubes' own buffer when there's no sun map). A block with lamps and no cube has no buffer at
   all: the SRV then gets the ring's address as with no block, and the shader reads no cube (`ss_lamp_col[i].w` below 2).
-  Every index into it is clamped in the shader (`sl_from_map`: the cube 0..3, the face 0..5, the texel to the face).
+  Every index into it is clamped in the shader (`sl_from_map`: the cube 0..15, the face 0..5, the texel to the face). Sixteen cubes of 192 texels a face since
+  2026-11-11 (four of 256 before): a cube for every lamp of the list, 14 MiB in the copy (`_lamp_copy_at` on) and 14
+  in the lamps' depth array; a lamp's word (`lamp_col.w`) is 2 + its cube + half of how far the cube has faded in.
 - Zone: `src/zone/zone_gpu.cpp:258-299` one heap per loaded zone, sized to its textures. `src/zone/draw.cpp:1016-1027`
   switches heap only when the next object's zone differs (the second map), and binds that zone's vertex and index
   buffers as root SRVs with it; the breadcrumb

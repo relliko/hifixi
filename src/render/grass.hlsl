@@ -402,7 +402,45 @@ void floor_light(out float3 all, out float3 suns)
 // pass takes it from the ground: the map's colour has no shadow in it, it's lit whole); light, what the ground there
 // is lit with after them; share, the sun's share of that; glow, the lamps' light there (to go on with sl_lit), on a
 // ground facing up.
+// The game's own lamps (the zone's pass's, this frame's: sun_shadows.hpp zone_lamps; after the block in t2, [kZoneLamps]
+// x how many, then two float4 each: where and its range, its colour and Attenuation2; the 8 nearest the camera that
+// reach the grass): the ground's colour map has none of their light, so the blades take
+// it here, at the root, as HiFi XI's src/zone/draw.cpp one_lamp gives it to the ground (1 / (a2 d^2) within the range,
+// faded out over its outer part), every one in reach (the ground has the four its object names: round a fire or under
+// a street lamp the same ones). The facing wrapped a little (a quarter left edge on): a blade stands up into a low
+// fire's light where the flat ground beside it gets a grazing share.
+static const uint kZoneLamps = kNative + 73;
+float3 zone_lamps_at(float3 P, float3 n)
+{
+	const uint count = min(uint(actors[kZoneLamps].x), 8u);
+	float3 sum = 0.0;
+	[loop] for (uint i = 0; i < count; ++i)
+	{
+		const float4 a = actors[kZoneLamps + 1 + 2 * i], c = actors[kZoneLamps + 2 + 2 * i];
+		const float3 d = a.xyz - P;
+		const float d2 = dot(d, d), r2 = a.w * a.w;
+		[branch] if (d2 < r2)
+		{
+			const float edge = 1.0 - smoothstep(0.36, 1.0, d2 / max(r2, 1e-6));
+			const float facing = 0.25 + 0.75 * max(0.0, dot(n, d) * rsqrt(max(d2, 1e-6)));
+			sum += edge * facing * c.rgb / max(c.w * d2, 1e-3);
+		}
+	}
+	return sum;
+}
+
+// A blade's light at its root (world; the block loaded): kept, what the ground's colour there is to be taken by, a
+// channel each: the map's colour is the ground lit whole by the sun and the ambient, with no shadow and no lamp in it,
+// so the sun's and the clouds' shadows take the sun's part of that light (as the zone's own pass takes it from the
+// ground) and the game's lamps add theirs (zone_lamps_at), up to where the ground's own light clips (its baked shade
+// times its light at 1: kBladeBaked); light, what the ground there is lit with in all; share, the sun's share of
+// that; glow, World FX's lamps' light there (to go on with sl_lit, which fades by the light the blade has already: a
+// blade a game lamp lights well gets little more of it, as the ground), on a ground facing up.
+// In the shade the blade is lifted a little over its ground's ratio (kBladeShadeLift: by 0 in full light, 15% under a
+// whole shadow at the High preset): measured in zone_view, a blade came out 0.71 of its ground's brightness in the sun
+// and 0.71 to 0.74 in the shade, the styling's doing alike (its dark root), but dark on dark it read as black.
 static const float kBladeBaked = 0.6; // (the ground's own baked shade, unknown here: a usual one, for sl_lit's fade)
+static const float kBladeShadeLift = 0.3;
 void blade_light(float3 at, out float3 kept, out float3 light, out float share, out float3 glow)
 {
 	const float3 up = float3(0.0, -1.0, 0.0);
@@ -410,7 +448,10 @@ void blade_light(float3 at, out float3 kept, out float3 light, out float share, 
 	floor_light(all, suns);
 	const float seen = ss_sun_seen(at, up, 0.0);
 	light = max(all - suns * (1.0 - seen), 0.0);
-	kept = saturate(light / all);
+	[branch] if (actors[kZoneLamps].x > 0.0)
+		light = min(light + zone_lamps_at(at, up), max(all, 1.0 / kBladeBaked));
+	kept = light / all;
+	kept *= 1.0 + kBladeShadeLift * saturate(1.0 - dot(kept, float3(0.3, 0.59, 0.11)));
 	share = saturate(dot(suns * seen, float3(0.2126, 0.7152, 0.0722)) / max(dot(light, float3(0.2126, 0.7152, 0.0722)), 1e-4));
 	glow = 0.0;
 	[branch] if (sl_on())

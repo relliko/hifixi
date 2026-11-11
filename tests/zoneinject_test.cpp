@@ -1195,14 +1195,14 @@ int main(int argc, char **argv)
 				cubes[k]->Unmap(0, nullptr);
 			}
 			// (kind: 0 a glow, 1 a zone's lamp, 2 one with its cube; body: a character standing on the point)
-			auto publish_lamp = [&](float kind, bool body, ID3D12Resource *cube, bool stale, bool tuned) {
+			auto publish_lamp = [&](float kind, bool body, ID3D12Resource *cube, bool stale, bool tuned, float share) {
 				sun::block b;
 				b.device = device;
 				b.buffer = cube;
 				sun::gpu_block &g = b.gpu;
 				g.mode[2] = sun::kHasLamps;
 				g.lamp_head[0] = 1.0f;
-				g.lamp_head[1] = 1.0f;
+				g.lamp_head[1] = share;
 				g.lamp_head[2] = body ? 1.0f : 0.0f;
 				const float at[4] = { P[0], P[1] - 3.0f, P[2], 9.0f }, colour[4] = { 0.73f, 0.5f, 0.11f, kind };
 				std::memcpy(g.lamp_pos[0], at, 16);
@@ -1231,6 +1231,7 @@ int main(int argc, char **argv)
 				bool stale;
 				bool tuned = false; // (the tuned look, the default: sun_shadows.hpp; else the faithful port)
 				int sun = 0;        // (the sun's shadows in the block instead: 1 a cascade with nothing in it, 2 all of it in shadow)
+				float share = 1.0f; // (the lamp shadows' setting, lamp_head.y: how much a character's capsule takes)
 			};
 			// The sun's shadows from the block (a cascade made by hand, 128 yalms across round that point of the street, a
 			// texel 2 yalms: every texel nearer the sun than anything, or none): under the empty one the picture is the one
@@ -1281,16 +1282,21 @@ int main(int argc, char **argv)
 				{ "per vertex, no block", false, false, 0.0f, false, -1, false },
 				{ "per vertex", false, true, 0.0f, false, -1, false },
 				{ "a stale block", true, true, 0.0f, false, -1, true },
-				{ "a zone's lamp", true, true, 1.0f, false, -1, false },
-				{ "a zone's lamp, a character under it", true, true, 1.0f, true, -1, false },
-				{ "a zone's lamp, its cube hiding everything", true, true, 2.0f, false, 0, false },
-				{ "a zone's lamp, its cube empty", true, true, 2.0f, false, 1, false },
-				{ "the tuned look: a zone's lamp", true, true, 1.0f, false, -1, false, true },
-				{ "the tuned look: a character under it", true, true, 1.0f, true, -1, false, true },
-				{ "the tuned look: its cube hiding everything", true, true, 2.0f, false, 0, false, true },
+				{ "a zone's lamp, its cube empty and faded in", true, true, 2.49f, false, 1, false },
+				{ "a zone's lamp, a character under it", true, true, 2.49f, true, 1, false },
+				{ "a zone's lamp, its cube hiding everything", true, true, 2.49f, false, 0, false },
+				{ "a zone's lamp, its cube empty, again", true, true, 2.49f, false, 1, false },
+				{ "the tuned look: a zone's lamp", true, true, 2.49f, false, 1, false, true },
+				{ "the tuned look: a character under it", true, true, 2.49f, true, 1, false, true },
+				{ "the tuned look: its cube hiding everything", true, true, 2.49f, false, 0, false, true },
 				{ "the sun: a cascade with nothing in it", true, true, 0.0f, false, -1, false, false, 1 },        // 13
 				{ "the sun: a cascade all in shadow", true, true, 0.0f, false, -1, false, false, 2 },             // 14
 				{ "the sun, per vertex: a cascade all in shadow", false, true, 0.0f, false, -1, false, false, 2 }, // 15
+				{ "a zone's lamp with no cube", true, true, 1.0f, false, -1, false },                              // 16
+				{ "its cube just copied, not faded in", true, true, 2.0f, false, 1, false },                       // 17
+				{ "its cube half faded in", true, true, 2.245f, false, 1, false },                                 // 18
+				{ "lamp shadows at 0, its cube hiding everything", true, true, 2.49f, false, 0, false, false, 0, 0.0f }, // 19
+				{ "lamp shadows at 0, a character under it", true, true, 2.49f, true, 1, false, false, 0, 0.0f },  // 20
 			};
 			constexpr int kPasses = int(sizeof(passes) / sizeof(passes[0]));
 			ID3D12Resource *shots[kPasses] = {}, *words[kPasses] = {};
@@ -1317,7 +1323,7 @@ int main(int argc, char **argv)
 				else if (ps.sun != 0)
 					publish_sun(ps.sun == 2);
 				else
-					publish_lamp(ps.kind, ps.body, ps.cube >= 0 ? cubes[ps.cube] : nullptr, ps.stale, ps.tuned);
+					publish_lamp(ps.kind, ps.body, ps.cube >= 0 ? cubes[ps.cube] : nullptr, ps.stale, ps.tuned, ps.share);
 				hifi::light::take(); // (the light split wanted, as World FX asks each frame)
 				list->ClearRenderTargetView(rtv, sky, 0, nullptr);
 				list->ClearDepthStencilView(dsv_clear, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
@@ -1341,6 +1347,20 @@ int main(int argc, char **argv)
 					from.pResource = split;
 					list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
 					barrier(list, split, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, hifi::light::kRead);
+				}
+				// (the passes' constants live in rings of a few frames, the zone's and the frames' own: what's recorded goes to
+				// the GPU every eight passes, before a later pass writes over a slot not drawn from yet)
+				if (k % 8 == 7 && k + 1 < kPasses)
+				{
+					list->Close();
+					direct->ExecuteCommandLists(1, lists);
+					const UINT64 part = fence->GetCompletedValue() + 1;
+					direct->Signal(fence, part);
+					fence->SetEventOnCompletion(part, e);
+					WaitForSingleObject(e, 120000);
+					alloc->Reset();
+					list->Reset(alloc, nullptr);
+					list->SetDescriptorHeaps(1, &srvh);
 				}
 			}
 			inj::set_options(false);
@@ -1415,6 +1435,26 @@ int main(int argc, char **argv)
 				spot[6], spot[7], spot[8], spot[0], spot[9]);
 			check(std::fabs(spot[6] - spot[2]) < 0.5 && spot[7] < spot[6] - 2.0 && spot[7] >= spot[0] - 0.5 && std::fabs(spot[8] - spot[0]) < 0.5 &&
 				std::fabs(spot[9] - spot[6]) < 0.5 && marked[7] == coded[7] && marked[8] == coded[8], line);
+			{
+				// A zone's lamp with no cube (not drawn yet, no zone to draw it from) lights only its bare pool, the few yalms
+				// round it: nothing further off, where a wall could stand between (it used to light all its reach, through
+				// anything). Its cube just copied changes nothing yet; as it fades in the rest of its light comes with it.
+				// And the zone hides a lamp whole whatever the lamp shadows' setting, which is the characters' share alone.
+				size_t lit_full = 0, lit_bare = 0;
+				for (size_t i = 0; i < size_t(W) * H; ++i)
+				{
+					lit_full += std::memcmp(&img[6][i * 4], &img[0][i * 4], 3) != 0 ? 1 : 0;
+					lit_bare += std::memcmp(&img[16][i * 4], &img[0][i * 4], 3) != 0 ? 1 : 0;
+				}
+				std::snprintf(line, sizeof(line), "  a zone's lamp with no cube: the street 3 yalms under it %.1f (no lamp %.1f, with its cube %.1f), %zu pixels lit (%zu with its "
+					"cube); its cube just copied: %s; half faded in %.1f; lamp shadows at 0: its cube hiding everything %.1f, a character under it %.1f", spot[16], spot[0],
+					spot[6], lit_bare, lit_full, img[17] == img[16] ? "the same picture" : "ANOTHER PICTURE", spot[18], spot[19], spot[20]);
+				check(spot[16] >= spot[0] - 0.5 && spot[16] < spot[0] + 0.6 * (spot[6] - spot[0]) && lit_bare < lit_full * 6 / 10 && marked[16] == coded[16], line);
+				check(img[17] == img[16], "  a cube just copied, not faded in yet: the picture as without it (no pop)");
+				check(spot[18] > spot[16] + 0.2 * (spot[6] - spot[16]) && spot[18] < spot[6] - 0.2 * (spot[6] - spot[16]), "  half faded in: half of the rest of its light");
+				check(std::fabs(spot[19] - spot[0]) < 0.5, "  lamp shadows at 0: what the cube hides is still hidden whole (a wall is a wall)");
+				check(std::fabs(spot[20] - spot[6]) < 0.5, "  ... and a character's capsule takes nothing (the setting is the characters' share)");
+			}
 			// (the tuned look, the default: by day the sunlit street takes next to none of it, the light being there already;
 			// what's in the shade round it does)
 			size_t tuned_changed = 0, tuned_hidden = 0;

@@ -68,15 +68,18 @@ namespace hifi::sun
 	// shadows' strength (0: none); cloud_light: toward the light (world), the map's ground height; cloud_where: where the
 	// map starts (uints), texels a side. mode: x 1 the light split's words marked (above), 0 as before; y the frame's turn
 	// of the taps (float bits); z what the block holds (kHasSun, kHasLamps).
-	// The lamps: lamp_head x how many of lamp_pos/lamp_col are used, y how much of a lamp's glow its shadow takes (World
-	// FX's lamp shadows, 0 none), z how many bodies; lamp_pos[i] where its light is (world) and how far its glow reaches;
-	// lamp_col[i] its colour times its glow's strength, w 0 a glow (never shadowed), 1 a zone's lamp (casts), 2 + k a
-	// zone's lamp with cube k; lamp_where: x where the cubes start in the buffer (uints), y texels a face (cube k's face f
+	// The lamps: lamp_head x how many of lamp_pos/lamp_col are used, y how much of a lamp's glow a character standing
+	// in its light takes (World FX's lamp shadows setting, 0 none: the capsules'; what the zone itself hides, by a
+	// lamp's cube, is always hidden whole), z how many bodies; lamp_pos[i] where its light is (world) and how far its
+	// glow reaches; lamp_col[i] its colour times its glow's strength, w 0 a glow (never shadowed, lights all round), 1 a
+	// zone's lamp with no cube (it lights only its bare pool, kSlBare yalms round it: nothing shows what a wall would
+	// hide), 2 + k + f a zone's lamp with cube k (0..15), f under a half: half of how far the cube has faded in (0 just
+	// drawn: the bare pool still; 0.49: all of its light, shadowed by the cube); lamp_where: x where the cubes start in the buffer (uints), y texels a face (cube k's face f
 	// at x + (6k + f) y y; grass.hlsl kLampFaces' order); lamp_map: x the cubes' near plane, y their faces' scale, z how
 	// many times its lamp's reach a cube's far plane is (kLampCubeReach; under 1 read as 1), w the look (0 tuned, 1
 	// faithful: a small room's); body[j]: a character's feet (world) and size (grass::look's actors).
 	constexpr uint32_t kHasSun = 1, kHasLamps = 2;
-	constexpr uint32_t kMaxLamps = 16, kMaxLampCubes = 4, kMaxBodies = 4;
+	constexpr uint32_t kMaxLamps = 16, kMaxLampCubes = 16, kMaxBodies = 4;
 	struct gpu_block
 	{
 		float rows[18][4];
@@ -224,6 +227,68 @@ namespace hifi::sun
 		std::memcpy(light, detail::ground.light, sizeof(detail::ground.light));
 		detail::ground.known = false;
 		return true;
+	}
+
+	// The game's own lamps as the zone's pass lights with them this frame (zone::frame_lamp's 8 floats each: where, its
+	// range, its colour, Attenuation2; src/zone/draw.cpp one_lamp), said by the zone's injection at each pass and taken
+	// by World FX's blades: the ground's colour map has no lamp light in it, so a blade by a
+	// campfire stood black on lit ground; with these it's lit at its root as that ground is (grass.hlsl zone_lamps_at).
+	// Fresh for kFreshMs as the block: a pass the game draws itself, or none, says none.
+	constexpr uint32_t kMaxZoneLamps = 64, kBladeLamps = 8;
+	namespace detail
+	{
+		struct zone_lamp_state
+		{
+			std::mutex mutex;
+			float lamps[kMaxZoneLamps][8] = {};
+			uint32_t count = 0;
+			ULONGLONG at = 0;
+		};
+		inline zone_lamp_state zone_lamps;
+	}
+	inline void set_zone_lamps(const float *lamps, uint32_t count)
+	{
+		std::lock_guard<std::mutex> lock(detail::zone_lamps.mutex);
+		detail::zone_lamps.count = lamps != nullptr ? (count < kMaxZoneLamps ? count : kMaxZoneLamps) : 0;
+		if (detail::zone_lamps.count != 0)
+			std::memcpy(detail::zone_lamps.lamps, lamps, size_t(detail::zone_lamps.count) * 32);
+		detail::zone_lamps.at = GetTickCount64();
+	}
+	// The kBladeLamps of them nearest eye whose light comes within reach yalms of it (out: 8 floats each); how many
+	inline uint32_t blade_lamps(const float eye[3], float reach, float out[kBladeLamps][8])
+	{
+		std::lock_guard<std::mutex> lock(detail::zone_lamps.mutex);
+		if (GetTickCount64() - detail::zone_lamps.at > kFreshMs)
+			return 0;
+		float far_d[kBladeLamps];
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < detail::zone_lamps.count; ++i)
+		{
+			const float *l = detail::zone_lamps.lamps[i];
+			bool ok = true;
+			for (int k = 0; k < 8; ++k)
+				ok = ok && l[k] == l[k] && l[k] > -1e9f && l[k] < 1e9f;
+			if (!ok || !(l[3] > 0.0f) || !(l[7] > 0.0f))
+				continue;
+			const float dx = l[0] - eye[0], dy = l[1] - eye[1], dz = l[2] - eye[2], d2 = dx * dx + dy * dy + dz * dz, most = reach + l[3];
+			if (d2 > most * most)
+				continue;
+			uint32_t j = n < kBladeLamps ? n++ : kBladeLamps;
+			if (j == kBladeLamps)
+			{
+				if (d2 >= far_d[kBladeLamps - 1])
+					continue;
+				j = kBladeLamps - 1;
+			}
+			for (; j > 0 && far_d[j - 1] > d2; --j)
+			{
+				far_d[j] = far_d[j - 1];
+				std::memcpy(out[j], out[j - 1], 32);
+			}
+			far_d[j] = d2;
+			std::memcpy(out[j], l, 32);
+		}
+		return n;
 	}
 
 	// (status: blocks published, taken by the native passes)
@@ -540,7 +605,7 @@ float sl_from_map(float3 P, float3 n, float3 L, float far_plane, uint k)
 	const float w = max(dot(d, middle), 1e-3);
 	const float2 c = float2(scale * dot(d, right) / w * 0.5 + 0.5, 0.5 - scale * dot(d, up) / w * 0.5) * float(size);
 	const float compared = w - (0.04 + 2.0 * texel);
-	const uint base = ss_lamp_where.x + (min(k, 3u) * 6 + face) * size * size;
+	const uint base = ss_lamp_where.x + (min(k, 15u) * 6 + face) * size * size;
 	float hidden = 0.0;
 	[branch] if (sl_tuned())
 	{
@@ -620,30 +685,38 @@ float sl_bodies(float3 P, float3 L, float last, bool self)
 	return blocked;
 }
 
-// How much the zone's lamp at L is hidden from P (grass.hlsl lamp_blocked): nothing within kSlNear of the light (its
-// own lantern, bowl or bracket is around it), fading in over the next yalm; its cube (cube >= 0) and the capsules
-float sl_blocked(float3 P, float3 n, float3 L, float reach, int cube, bool self)
+// How much the zone's lamp at L is hidden from P: nothing within kSlNear of the light (its own lantern, bowl or bracket
+// is around it), fading in over the next yalm; x by what its cube holds (cube >= 0: the zone), y by the characters'
+// capsules
+float2 sl_blocked(float3 P, float3 n, float3 L, float reach, int cube, bool self)
 {
 	const float len = length(L - P);
 	const float last = (len - kSlFixture) / max(len, 1e-3);
 	const float away = smoothstep(kSlNear, kSlNear + 1.0, len);
-	float blocked = 0.0;
+	float2 blocked = 0.0;
 	[branch] if (last > 0.15 && away > 0.0)
 	{
 		// (the cube's far plane: the lamp's reach as World FX has it, times what the cubes are drawn out to, ss_lamp_map.z)
 		[branch] if (cube >= 0)
-			blocked = sl_from_map(P, n, L, reach * max(ss_lamp_map.z, 1.0), uint(cube));
-		[branch] if (ss_lamp_head.z > 0.0)
-			blocked = max(blocked, sl_bodies(P, L, last, self));
+			blocked.x = sl_from_map(P, n, L, reach * max(ss_lamp_map.z, 1.0), uint(cube));
+		[branch] if (ss_lamp_head.z > 0.0 && ss_lamp_head.y > 0.0)
+			blocked.y = sl_bodies(P, L, last, self);
 	}
 	return blocked * away;
 }
 
-// The lamps' light at P (world), to go onto the colour with sl_lit (grass.hlsl lamp_light's sum): each lamp's glow
-// falling off to nothing at its reach ((1 - d^2 / R^2)^2), a little more on what faces it (wrapped: 30% on what's
-// turned away) by n, the facing the pixel is lit with (its normal map's); a zone's lamp (not an effect's glow) loses
-// ss_lamp_head.y of its light as far as it's hidden (sl_blocked, from ng: the mesh's own facing). The tuned look: the
-// wider pool with its core and the real N.L (above).
+// The lamps' light at P (world), to go onto the colour with sl_lit: each lamp's glow falling off to nothing at its
+// reach ((1 - d^2 / R^2)^2), a little more on what faces it (wrapped: 30% on what's turned away) by n, the facing the
+// pixel is lit with (its normal map's). The tuned look: the wider pool with its core and the real N.L (above).
+// A zone's lamp (not an effect's glow: those light all round, unshadowed) is hidden by the zone and by the characters
+// (sl_blocked, from ng: the mesh's own facing): what its cube says is behind something gets none of its light (a wall
+// between is a wall: with only four cubes for the sixteen lamps, and a shadow taking only the lamp shadows' share, a
+// lamp lit the street side of a wall behind it and the floor below its own); a character's capsule takes
+// ss_lamp_head.y of it, the lamp shadows' setting. A zone's lamp with no cube (not drawn yet, or no zone to draw it
+// from) lights only its bare pool, the kSlBare yalms round it, where nothing much stands between; its wider light
+// comes in with its cube (the fraction of c.w: the cube's fade), light and shadow together, so nothing leaks meanwhile
+// and nothing pops.
+static const float kSlBare = 3.5;
 float3 sl_glow(float3 P, float3 n, float3 ng, bool self)
 {
 	const uint count = min(uint(ss_lamp_head.x), 16u);
@@ -663,13 +736,23 @@ float3 sl_glow(float3 P, float3 n, float3 ng, bool self)
 			const float amount = tuned ? k * k * (kSlPool + kSlCore / (1.0 + d2 / max(core * core, 1e-6))) *
 				(kSlFloor + (1.0 - kSlFloor) * saturate((ndl + kSlWrap) / (1.0 + kSlWrap))) : k * k * (0.3 + 0.7 * saturate(ndl));
 			float3 add = amount * c.rgb;
-			[branch] if (c.w > 0.5 && ss_lamp_head.y > 0.0 && sl_luma(add) > 0.002)
-				add *= 1.0 - ss_lamp_head.y * sl_blocked(P, ng, a.xyz, a.w, int(c.w + 0.5) - 2, self);
+			[branch] if (c.w > 0.5)
+			{
+				const int cube = int(floor(c.w + 0.001)) - 2;
+				const float faded = cube >= 0 ? saturate((frac(c.w + 0.001) - 0.002) / 0.48) : 0.0; // (0 exactly for a cube just copied)
+				add *= lerp(1.0 - smoothstep(0.6 * kSlBare, kSlBare, sqrt(d2)), 1.0, faded);
+				[branch] if (sl_luma(add) > 0.002)
+				{
+					const float2 hidden = sl_blocked(P, ng, a.xyz, a.w, cube, self);
+					add *= (1.0 - hidden.x) * (1.0 - ss_lamp_head.y * hidden.y);
+				}
+			}
 			sum += add;
 		}
 	}
 	return sum;
 }
+
 // The glow on a surface of colour c (what's drawn there before the fog): in proportion to it, a little on top so a
 // near-black surface still warms, less on what's bright already (grass.hlsl lamp_light's last line)
 // The tuned look: by the surface's albedo (its texture and baked shade, as the pass's own light goes onto it: colour =

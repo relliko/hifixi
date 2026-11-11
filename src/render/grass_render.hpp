@@ -546,6 +546,7 @@ namespace grass
 		// The blades' own light (sun_shadows.hpp "The grass"): what of the native passes' block they were lit with
 		// (hifi::sun::kHasSun, kHasLamps; 0 none), and whether they wrote the light split's words (target::light_rtv)
 		uint32_t blade_native = 0;
+		uint32_t blade_zone_lamps = 0; // (the game's own lamps handed to the blades: sun_shadows.hpp blade_lamps)
 		bool blade_words = false;
 		bool sun = false;    // with the sun's shadows (their half-size pass ran before it)
 		bool sun_map = false;           // ... and the shadow map read in it
@@ -1021,19 +1022,24 @@ namespace grass
 		float _caster_world_to_clip[16] = {};
 		// The lamps' shadow maps (draw_lamp_maps): a D32 array of kLampMaps x 6 faces (DEPTH_WRITE between draws; a view
 		// each in a heap of their own), each six for one lamp: where it is, how far it reaches, the host's zone data they
-		// were drawn from, whether they're drawn, and the depth copy and place they were last copied to; the bytes copy_out
-		// keeps free at the depth copy's end for them (0 until they're first wanted)
+		// were drawn from, whether they're drawn; the frame its lamp was last in the look's list (a cube is kept for a lamp
+		// that has left the list until its place is needed: the one longest out goes first, so walking past the same lamps
+		// again draws nothing), and how far it has faded in since it was copied (0..1: the lamp's light past its bare pool
+		// comes in with it, sun_shadows.hpp's sl_glow)
 		struct lamp_cube
 		{
 			float pos[3] = {}, range = 0.0f;
 			uint64_t source = 0;
-			uint32_t faces = 0; // (drawn so far: one a frame)
+			uint32_t faces = 0; // (drawn so far)
 			bool used = false, drawn = false;
+			uint64_t wanted_at = 0;
+			float fade = 0.0f;
 			// (... and the buffer the native passes read them from, and where in it: lamp_dest; sun_shadows.hpp's lamps)
 			ID3D12Resource *native_to = nullptr;
 			UINT64 native_at = 0;
 		};
-		lamp_cube _lamp_cubes[4];
+		lamp_cube _lamp_cubes[16];
+		uint64_t _lamp_frame = 0; // (draw_lamp_maps' calls so far)
 		ID3D12Resource *_lamp_map = nullptr;
 		ID3D12DescriptorHeap *_lamp_map_heap = nullptr;
 		// The cubes for the native passes ([zone] nativelamps): in the sun's shadow map copy after the clouds' map

@@ -12,6 +12,7 @@
 #include "light_split.hpp"
 #include "zone_gpu.hpp"
 #include "zoneshadow.hpp"
+#include "../render/sun_shadows.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -421,6 +422,9 @@ namespace hifi::zone::inject
 			}
 			g.lamp_count = f->native ? std::min(f->lamp_count, kMaxLamps) : 0;
 			std::memcpy(g.lamps, f->lamps, size_t(g.lamp_count) * sizeof(frame_lamp));
+			// (and for World FX's blades, drawn right after this pass: lit by them as the ground is, sun_shadows.hpp)
+			static_assert(sizeof(frame_lamp) == 32 && kMaxLamps <= sun::kMaxZoneLamps);
+			sun::set_zone_lamps(g.lamp_count != 0 ? g.lamps[0].pos : nullptr, g.lamp_count);
 		}
 		if (!f->native)
 			return;

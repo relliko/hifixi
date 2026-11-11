@@ -145,7 +145,11 @@ namespace grass
 		// "The grass"): sun::gpu_block as it is, 73 float4 (read only with the blades' pass's shade.x 1)
 		constexpr UINT kNativeParams = sizeof(hifi::sun::gpu_block) / 4;
 		constexpr UINT kNativeOffset = kLampMapOffset + kLampMapParams;
-		constexpr UINT kActorBytes = (kNativeOffset + kNativeParams) * 4;
+		// ... and after the block the game's own lamps for the blades (grass.hlsl kZoneLamps; sun_shadows.hpp blade_lamps):
+		// how many, then 8 floats each (always written with the block: 0 with none)
+		constexpr UINT kZoneLampParams = 4 + hifi::sun::kBladeLamps * 8;
+		constexpr UINT kZoneLampOffset = kNativeOffset + kNativeParams;
+		constexpr UINT kActorBytes = (kZoneLampOffset + kZoneLampParams) * 4;
 		constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 		constexpr D3D12_RESOURCE_STATES kMotionRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		// (how far its march reaches, yalms; past that the game's own fog is the air; how high the air thins to 1/e)
@@ -165,8 +169,14 @@ namespace grass
 		// yalms off the light (its own lantern, bowl or bracket inside that: grass.hlsl kLampBody) out to its glow's reach;
 		// each face a little wider than a quarter turn (its middle kLampMapScale of it the quarter turn) so a lookup's
 		// neighbours stay on its face. The faces (grass.hlsl kLampFaces): each one's middle, right and up, world axes.
-		constexpr UINT kLampMaps = 4;
-		constexpr UINT kLampMapSize = 256;
+		// (a cube for every lamp of the look's list, 16, since 2026-11-11: with four, the twelve lamps without one lit
+		// through walls and floors. 192 texels a face: a texel 9 cm at 10 yalms, read through a 4 x 4 tent; the sixteen
+		// take 14 MiB in the depth array and 14 in the native passes' copy, where four of 256 took 6 and 6. Drawn
+		// kLampFacesAFrame faces a frame at most, nearest lamp first; a cube just copied fades in over kLampFadeFrames)
+		constexpr UINT kLampMaps = 16;
+		constexpr UINT kLampMapSize = 192;
+		constexpr UINT kLampFacesAFrame = 2;
+		constexpr float kLampFadeFrames = 20.0f;
 		constexpr float kLampMapNear = 1.0f;
 		constexpr float kLampMapScale = 0.95f;
 		constexpr float kLampFaces[6][3][3] = {
@@ -4615,14 +4625,16 @@ namespace grass
 			for (int k = 0; k < 3; ++k)
 				c[k] = std::clamp(s[4 + k], 0.0f, 4.0f);
 			c[3] = std::isfinite(s[7]) && s[7] > 0.5f ? 1.0f : 0.0f; // (casts lamp shadows)
-			// (its cube, when it's drawn and where the native passes read it: 2 + its place)
-			for (uint32_t slot = 0; slot < kLampMaps && c[3] == 1.0f && shadows > 0.0f && dest != nullptr; ++slot)
+			// (its cube, when it's drawn and where the native passes read it: 2 + its place, and in the fraction half of how
+			// far it has faded in. Whatever the lamp shadows' setting: that's the characters' shadows, lamp_head.y; a wall
+			// always hides a lamp)
+			for (uint32_t slot = 0; slot < kLampMaps && c[3] == 1.0f && dest != nullptr; ++slot)
 			{
 				const lamp_cube &q = _lamp_cubes[slot];
 				if (q.used && q.drawn && q.native_to == dest && q.native_at == at && std::fabs(s[0] - q.pos[0]) < 0.01f && std::fabs(s[1] - q.pos[1]) < 0.01f &&
 					std::fabs(s[2] - q.pos[2]) < 0.01f && std::fabs(s[3] - q.range) < 0.01f)
 				{
-					c[3] = 2.0f + float(slot);
+					c[3] = 2.0f + float(slot) + 0.49f * std::clamp(q.fade, 0.0f, 1.0f);
 					any_cube = true;
 				}
 			}
@@ -4960,6 +4972,7 @@ namespace grass
 		const UINT64 face_bytes = UINT64(kLampMapSize) * kLampMapSize * 4;
 
 		// The lamps wanted: the zone's lit ones (their glow reaching past the near plane), nearest the camera first
+		_lamp_frame++;
 		const uint32_t count = std::min<uint32_t>(l.lamp_count, kMaxLamps);
 		uint32_t wanted[kLampMaps];
 		float wanted_d[kLampMaps];
@@ -4988,46 +5001,77 @@ namespace grass
 			wanted[j] = i;
 			wanted_d[j] = d;
 		}
-		// Each cube kept for a lamp still wanted (the same place and reach, the same data), the others let go; the lamps
-		// without one given the free ones
-		bool taken[kLampMaps] = {};
-		for (lamp_cube &c : _lamp_cubes)
+		// Each lamp wanted keeps the cube it has (the same place and reach, the same zone data; a cube of other data is
+		// drawn again). A lamp without one takes a free cube, or else the one whose lamp has been out of the list longest:
+		// a cube isn't let go when its lamp leaves the list, only when its place is needed, so the lamps at the list's edge
+		// coming and going as the camera walks draw nothing again.
+		uint32_t slot_of[kLampMaps];
+		for (uint32_t k = 0; k < n; ++k)
 		{
-			bool keep = false;
-			for (uint32_t k = 0; k < n && c.used && !keep; ++k)
+			const float *s = l.lamps + size_t(wanted[k]) * 8;
+			slot_of[k] = kLampMaps;
+			for (uint32_t slot = 0; slot < kLampMaps && slot_of[k] == kLampMaps; ++slot)
 			{
-				const float *s = l.lamps + size_t(wanted[k]) * 8;
-				if (!taken[k] && std::fabs(s[0] - c.pos[0]) < 0.01f && std::fabs(s[1] - c.pos[1]) < 0.01f && std::fabs(s[2] - c.pos[2]) < 0.01f &&
-					std::fabs(s[3] - c.range) < 0.01f && (c.faces == 0 || c.source == source))
-					keep = taken[k] = true;
+				lamp_cube &c = _lamp_cubes[slot];
+				if (c.used && c.wanted_at != _lamp_frame && std::fabs(s[0] - c.pos[0]) < 0.01f && std::fabs(s[1] - c.pos[1]) < 0.01f &&
+					std::fabs(s[2] - c.pos[2]) < 0.01f && std::fabs(s[3] - c.range) < 0.01f)
+				{
+					if (c.faces != 0 && c.source != source)
+					{
+						c.faces = 0;
+						c.drawn = false;
+						c.fade = 0.0f;
+						c.native_to = nullptr;
+					}
+					c.wanted_at = _lamp_frame;
+					slot_of[k] = slot;
+				}
 			}
-			if (!keep)
-				c = lamp_cube();
 		}
 		for (uint32_t k = 0; k < n; ++k)
-			for (lamp_cube &c : _lamp_cubes)
-				if (!taken[k] && !c.used)
-				{
-					const float *s = l.lamps + size_t(wanted[k]) * 8;
-					c.used = true;
-					std::memcpy(c.pos, s, 12);
-					c.range = s[3];
-					taken[k] = true;
-				}
-
-		// One face of one lamp's cube this frame: a perspective from the light through the face (row vectors: x and y the
-		// face's right and up times kLampMapScale, w the depth along its middle, depth from kLampMapNear to the reach)
-		const UINT step = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-		for (uint32_t slot = 0; slot < kLampMaps; ++slot)
 		{
-			lamp_cube &c = _lamp_cubes[slot];
-			if (!c.used || c.drawn)
+			if (slot_of[k] != kLampMaps)
 				continue;
-			section(list, L"worldfx: a lamp's shadow map");
-			// (out to kLampCubeReach times the glow's reach: HiFi XI's native passes light further than the glow here does,
-			// sun_shadows.hpp's tuned look, and what stands past the old reach must still hide the lamp there)
-			const float nr = kLampMapNear, fr = c.range * hifi::sun::kLampCubeReach, A = fr / (fr - nr), B = -nr * fr / (fr - nr), s = kLampMapScale;
+			uint32_t pick = kLampMaps;
+			for (uint32_t slot = 0; slot < kLampMaps; ++slot)
 			{
+				const lamp_cube &c = _lamp_cubes[slot];
+				if (c.used && c.wanted_at == _lamp_frame)
+					continue;
+				if (pick == kLampMaps || !c.used || (_lamp_cubes[pick].used && c.wanted_at < _lamp_cubes[pick].wanted_at))
+					pick = slot;
+				if (!c.used)
+					break;
+			}
+			if (pick == kLampMaps)
+				continue;
+			const float *s = l.lamps + size_t(wanted[k]) * 8;
+			lamp_cube &c = _lamp_cubes[pick];
+			c = lamp_cube();
+			c.used = true;
+			std::memcpy(c.pos, s, 12);
+			c.range = s[3];
+			c.wanted_at = _lamp_frame;
+			slot_of[k] = pick;
+		}
+
+		// A face or two of the nearest lamps' cubes still to draw this frame (kLampFacesAFrame: a town walked into has its
+		// sixteen within a second, the nearest first, and no frame pays for more): a perspective from the light through
+		// the face (row vectors: x and y the face's right and up times kLampMapScale, w the depth along its middle, depth
+		// from kLampMapNear to the reach)
+		const UINT step = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+		for (uint32_t k = 0; k < n && stats.lamp_map_faces < kLampFacesAFrame; ++k)
+		{
+			if (slot_of[k] == kLampMaps)
+				continue;
+			const uint32_t slot = slot_of[k];
+			lamp_cube &c = _lamp_cubes[slot];
+			while (!c.drawn && stats.lamp_map_faces < kLampFacesAFrame)
+			{
+				section(list, L"worldfx: a lamp's shadow map");
+				// (out to kLampCubeReach times the glow's reach: HiFi XI's native passes light further than the glow's own
+				// reach, sun_shadows.hpp's tuned look, and what stands past the old reach must still hide the lamp there)
+				const float nr = kLampMapNear, fr = c.range * hifi::sun::kLampCubeReach, A = fr / (fr - nr), B = -nr * fr / (fr - nr), s = kLampMapScale;
 				const uint32_t f = c.faces;
 				const float *fw = kLampFaces[f][0], *rt = kLampFaces[f][1], *up = kLampFaces[f][2];
 				auto dot = [](const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
@@ -5048,13 +5092,17 @@ namespace grass
 				list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 				stats.lamp_map_triangles += _zone_draw(_zone_casters_context, list, m, dsv, kLampMapSize);
 				stats.lamp_map_faces++;
+				if (c.faces++ == 0)
+					c.source = source;
+				c.drawn = c.faces == 6;
+				c.fade = 0.0f;
+				c.native_to = nullptr;
 			}
-			if (c.faces++ == 0)
-				c.source = source;
-			c.drawn = c.faces == 6;
-			c.native_to = nullptr;
-			break;
 		}
+		// (a cube where the native passes read it fades in: its lamp's wider light and its shadows together)
+		for (lamp_cube &c : _lamp_cubes)
+			if (c.used && c.drawn && c.native_to != nullptr && c.wanted_at == _lamp_frame)
+				c.fade = std::min(1.0f, c.fade + 1.0f / kLampFadeFrames);
 
 		const D3D12_RESOURCE_DESC desc = _lamp_map->GetDesc();
 		// ... and where HiFi XI's native passes read them (sun_shadows.hpp's lamps: lamp_dest), where they aren't yet: only
@@ -5128,10 +5176,10 @@ namespace grass
 			}
 		}
 
-		// (how many are drawn and where the native passes read them)
+		// (how many of the lamps wanted are drawn and where the native passes read them)
 		uint32_t mapped = 0;
 		for (const lamp_cube &c : _lamp_cubes)
-			mapped += c.drawn && c.native_to != nullptr ? 1 : 0;
+			mapped += c.drawn && c.native_to != nullptr && c.wanted_at == _lamp_frame ? 1 : 0;
 		stats.lamp_maps = mapped;
 	}
 
@@ -6156,9 +6204,9 @@ namespace grass
 					stats.sun_map = true;
 				}
 			}
-			// The lamps' shadow maps (drawn when a lamp comes near, for the native passes: sun_shadows.hpp's lamps), when
-			// lamp shadows are on
-			if (lamps_written != 0 && l.lamp_shadows > 0.0f && actor_data != nullptr)
+			// The lamps' shadow maps (drawn when a lamp comes near, for the native passes: sun_shadows.hpp's lamps), whatever
+			// the lamp shadows' setting (that's the characters' shadows by a lamp: a wall always hides one)
+			if (lamps_written != 0 && actor_data != nullptr)
 				draw_lamp_maps(list, cam, l, eye, actor_data + kLampMapOffset, stats);
 			list->SetGraphicsRootSignature(_root);
 			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -6610,6 +6658,14 @@ namespace grass
 				const hifi::sun::gpu_block c = hifi::sun::constants_for(have, nb, 0.0f);
 				static_assert(sizeof(c) == kNativeParams * 4);
 				std::memcpy(actor_data + kNativeOffset, &c, sizeof(c));
+				// (the game's own lamps in reach of the grass: the blades lit by them as their ground is)
+				float zone_lamps[hifi::sun::kBladeLamps][8];
+				const uint32_t zone_lamp_count = hifi::sun::blade_lamps(eye, std::isfinite(l.distance) ? std::max(l.distance, 0.0f) : 0.0f, zone_lamps);
+				float *const zl = actor_data + kZoneLampOffset;
+				zl[0] = float(zone_lamp_count);
+				zl[1] = zl[2] = zl[3] = 0.0f;
+				std::memcpy(zl + 4, zone_lamps, size_t(zone_lamp_count) * 32);
+				stats.blade_zone_lamps = zone_lamp_count;
 				blade_map = nb.buffer;
 				const uint32_t on = 1;
 				std::memcpy(&blade_constants[48], &on, 4);

@@ -1405,6 +1405,19 @@ int main(int argc, char **argv)
 			{ true, true, true, 1.0f, 2, true }, // 9: ... another's capsule between
 		};
 		constexpr int kGlowPasses = int(sizeof(glow_passes) / sizeof(glow_passes[0]));
+		// (a zone's lamp comes with its cube, faded in: one with nothing in it here, 64 texels a face. Without a cube a
+		// zone's lamp lights only its bare pool: sun_shadows.hpp's sl_glow, zoneinject_test's lamp part)
+		ID3D12Resource *empty_cube = nullptr;
+		{
+			D3D12_RESOURCE_DESC cd = bd;
+			cd.Width = UINT64(64) * 64 * 4 * 6;
+			device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&empty_cube));
+			float *texels = nullptr;
+			empty_cube->Map(0, nullptr, reinterpret_cast<void **>(&texels));
+			for (size_t i = 0; i < size_t(64) * 64 * 6; ++i)
+				texels[i] = 1.0f;
+			empty_cube->Unmap(0, nullptr);
+		}
 		ID3D12Resource *glow_outs[kGlowPasses] = {}, *glow_words[kGlowPasses] = {};
 		bool glow_split[kGlowPasses] = {};
 		for (int k = 0; k < kGlowPasses; ++k)
@@ -1426,7 +1439,15 @@ int main(int argc, char **argv)
 				g.lamp_head[1] = 1.0f;
 				g.lamp_head[2] = gp.body != 0 ? 1.0f : 0.0f;
 				// (3.5 yalms in front here, reach 9: far enough for a lamp's shadows, which start 1.25 yalms off the light)
-				const float at[4] = { centre[0] + 3.5f * way[0] / wl, centre[1], centre[2] + 3.5f * way[2] / wl, 9.0f }, colour[4] = { 1.46f, 1.0f, 0.22f, gp.kind };
+				const float at[4] = { centre[0] + 3.5f * way[0] / wl, centre[1], centre[2] + 3.5f * way[2] / wl, 9.0f }, colour[4] = { 1.46f, 1.0f, 0.22f, gp.kind >= 1.0f ? 2.49f : gp.kind };
+				if (gp.kind >= 1.0f)
+				{
+					b.buffer = empty_cube;
+					g.lamp_where[1] = 64;
+					g.lamp_map[0] = 1.0f;
+					g.lamp_map[1] = 0.95f;
+					g.lamp_map[2] = 1.0f;
+				}
 				std::memcpy(g.lamp_pos[0], at, 16);
 				std::memcpy(g.lamp_col[0], colour, 16);
 				const float own[4] = { root[0], root[1], root[2], 1.0f };
@@ -1530,6 +1551,7 @@ int main(int argc, char **argv)
 				glow_words[k]->Unmap(0, nullptr);
 				glow_words[k]->Release();
 			}
+			empty_cube->Release(); // (the lists that read it are done)
 			std::snprintf(line, sizeof(line), "World FX's lamp glow by the characters' pass (a block with a lamp 3.5 yalms in front): the middle one %.1f -> %.1f, %u of %u words marked "
 				"(none without the block: %u of %u)", glow_mean[0], glow_mean[1], marked[1], coded[1], marked[0], coded[0]);
 			check(glow_mean[1] > glow_mean[0] + 3.0 && coded[1] > 1000 && marked[1] == coded[1] && coded[0] > 1000 && marked[0] == 0, line);

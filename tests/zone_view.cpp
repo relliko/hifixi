@@ -35,7 +35,7 @@
  *     sun's shadows and the lamps' glow (src/render/sun_shadows.hpp). Two frames, the second the picture (the zone pass
  *     reads what World FX drew the frame before, as in game). No ambient occlusion or relief;
  *     ZONE_VIEW_SHADOW=<strength> the sun shadows' strength (0.55, the High preset's); ZONE_VIEW_CLOUDS: unused (no
- *     weather here, so no clouds' shadows). With ZONE_VIEW_LAMPS 28 frames run before the picture's, so the lamps' cubes
+ *     weather here, so no clouds' shadows). With ZONE_VIEW_LAMPS 79 frames run before the picture's (ZONE_VIEW_FRAMES=<n>: another count), so the lamps' cubes
  *     are drawn (a face a frame) as they are in game after a moment.
  *     ZONE_VIEW_BODY="x y z size": a character standing there (its capsule: the lamps' shadows); ZONE_VIEW_SMALLROOM=1:
  *     lit as a Mog House; ZONE_VIEW_FXLAMPS=0: World FX given no lamps; ZONE_VIEW_REPEAT=<n>: the zone pass n times over
@@ -874,6 +874,8 @@ int main(int argc, char **argv)
 	uint32_t blade_native = 0, blades_drawn = 0;
 	bool blade_words = false;
 	auto blades_at_zone_end = [&](ID3D12GraphicsCommandList *l) {
+		// (the zone pass's lamps said for the blades, as the plugin's injection says them at each pass: sun_shadows.hpp)
+		hifi::sun::set_zone_lamps(f.lamp_count != 0 ? f.lamps[0].pos : nullptr, f.lamp_count);
 		if (!grass_on || grass_after)
 			return;
 		grass::look bl = fl;
@@ -923,8 +925,11 @@ int main(int argc, char **argv)
 	HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 	hifi::zone::draw_stats st;
 	double record_ms = 0.0;
-	// (with lamps: frames enough for World FX to keep room for the cubes, then draw the four nearest lamps' six faces)
-	const uint64_t last = fx ? (fx_lamps.empty() ? 2 : 30) : 1;
+	// (with lamps: frames enough for World FX to draw the sixteen lamps' cubes, two faces a frame, and fade them in;
+	// ZONE_VIEW_FRAMES=<n>: another count, e.g. 3 to see the lamps before their cubes are there)
+	uint64_t last = fx ? (fx_lamps.empty() ? 2 : 80) : 1;
+	if (const char *fv = std::getenv("ZONE_VIEW_FRAMES"); fv != nullptr && fx)
+		last = std::clamp<uint64_t>(std::strtoull(fv, nullptr, 10), 2, 400);
 	uint32_t lamp_faces = 0, lamp_copies = 0;
 	// (each frame timed on the GPU: timestamps before the zone pass, after it, after World FX; the frames before the
 	// picture's are the same frame over again, so the least of them is the pass's time with nothing else in the way)
